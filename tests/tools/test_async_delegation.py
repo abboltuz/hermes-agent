@@ -208,7 +208,9 @@ def test_api_profile_route_provenance_survives_durable_delegation():
     assert evt["origin_profile"] == "writer"
     assert evt["origin_api_route_profile"] == "writer"
 
-    durable = ad.get_durable_delegation(res["delegation_id"])
+    durable = ad.get_durable_delegation(
+        res["delegation_id"], profile="writer"
+    )
     assert durable is not None
     assert durable["origin_profile"] == "writer"
     assert durable["origin_api_route_profile"] == "writer"

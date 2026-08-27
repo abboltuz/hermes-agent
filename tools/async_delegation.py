@@ -121,12 +121,26 @@ _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
 
 
-def _db_path():
+def _db_path(profile: str = ""):
+    """Return the durable ledger path for an explicit originating profile.
+
+    Background delivery runs outside the request's runtime scope.  Resolving
+    only through ``get_hermes_home()`` there silently selects the default
+    profile's ledger, so a claim can look like a legacy/non-durable event while
+    the real named-profile row remains pending forever.
+    """
+    profile_name = str(profile or "").strip()
+    if profile_name and profile_name != "custom":
+        from hermes_cli.profiles import get_profile_dir
+
+        return get_profile_dir(profile_name) / "state.db"
     return get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(*, profile: str = "") -> sqlite3.Connection:
+    # Preserve the long-standing zero-argument seam used by tests and local
+    # embedders when no explicit profile is needed.
+    path = _db_path(profile) if profile else _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
@@ -184,7 +198,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, profile: str = "") -> Iterator[sqlite3.Connection]:
     """Open a connection, commit/rollback on exit, and ALWAYS close it.
 
     ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the
@@ -194,7 +208,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     to the garbage collector. On a long-running gateway that exhausts
     ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was #69567 / PR #69594).
     """
-    conn = _connect()
+    conn = _connect(profile=profile)
     try:
         with conn:
             yield conn
@@ -257,7 +271,9 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         )
         if key in record
     }
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(
+        profile=str(record.get("origin_profile") or "")
+    ) as conn:
         conn.execute(
             """INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
@@ -271,19 +287,21 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              owner_started_at, json.dumps(task_payload),
              record.get("origin_session_id", "")),
         )
-    _prune_durable_records()
+    _prune_durable_records(profile=str(record.get("origin_profile") or ""))
 
 
-def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _transaction() as conn:
+def _delete_durable_delegation(
+    delegation_id: str, *, profile: str = ""
+) -> None:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
-def _prune_durable_records() -> None:
+def _prune_durable_records(*, profile: str = "") -> None:
     """Bound terminal history, preferring delivered records for deletion."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
@@ -320,7 +338,9 @@ def _prune_durable_records() -> None:
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(
+        profile=str(event.get("origin_profile") or "")
+    ) as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending'
@@ -330,15 +350,15 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
         )
 
 
-def _note_delivery_attempt(delegation_id: str) -> None:
-    with _DB_LOCK, _transaction() as conn:
+def _note_delivery_attempt(delegation_id: str, *, profile: str = "") -> None:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         conn.execute(
             "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
             (time.time(), delegation_id),
         )
 
 
-def recover_abandoned_delegations() -> int:
+def recover_abandoned_delegations(*, profile: str = "") -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
@@ -346,7 +366,7 @@ def recover_abandoned_delegations() -> int:
         return 0
     now = time.time()
     recovered = 0
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
@@ -390,6 +410,10 @@ def recover_abandoned_delegations() -> int:
             ):
                 if task.get(_k):
                     event[_k] = task[_k]
+            if profile and not event.get("origin_profile"):
+                # Older durable rows predate the explicit provenance field,
+                # but their physical profile ledger is itself authoritative.
+                event["origin_profile"] = profile
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -401,7 +425,7 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
-def restore_undelivered_completions(target_queue) -> int:
+def restore_undelivered_completions(target_queue, *, profile: str = "") -> int:
     """Enqueue durable pending completions as fresh turns after process start.
 
     Every restored event is stamped ``restored=True`` (in-memory only — the
@@ -420,10 +444,10 @@ def restore_undelivered_completions(target_queue) -> int:
     102K-token context on the staging fleet) for a result nobody is waiting
     on anymore; the payload stays queryable on the dropped row.
     """
-    recover_abandoned_delegations()
+    recover_abandoned_delegations(profile=profile)
     now = time.time()
     restored = 0
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         rows = conn.execute(
             """SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations
@@ -451,15 +475,17 @@ def restore_undelivered_completions(target_queue) -> int:
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
+                if profile and not evt.get("origin_profile"):
+                    evt["origin_profile"] = profile
             target_queue.put(evt)
             restored += 1
     return restored
 
 
-def mark_completion_delivered(delegation_id: str) -> bool:
+def mark_completion_delivered(delegation_id: str, *, profile: str = "") -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
                WHERE delegation_id=? AND delivery_state!='delivered'""",
@@ -468,10 +494,12 @@ def mark_completion_delivered(delegation_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def claim_completion_delivery(
+    delegation_id: str, claim_id: str, *, profile: str = ""
+) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
@@ -496,10 +524,17 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    profile = str(evt.get("origin_profile") or "")
+    return (
+        claim_id
+        if claim_completion_delivery(delegation_id, claim_id, profile=profile)
+        else None
+    )
 
 
-def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def release_completion_delivery(
+    delegation_id: str, claim_id: str, *, profile: str = ""
+) -> bool:
     """Release a failed delivery claim so another consumer may retry.
 
     Attempts are counted at claim time, so a row that keeps being claimed and
@@ -510,7 +545,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     pending rows).
     """
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         capped = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
@@ -535,7 +570,9 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def drop_completion_delivery(
+    delegation_id: str, claim_id: str, *, profile: str = ""
+) -> bool:
     """Terminally drop a claimed completion that can never be delivered.
 
     Used when the delivery target is permanently gone — the spawning session
@@ -545,7 +582,7 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     completion that will be fail-closed dropped again every time.
     """
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       updated_at=?, delivery_claim=NULL,
@@ -557,10 +594,12 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def complete_completion_delivery(
+    delegation_id: str, claim_id: str, *, profile: str = ""
+) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
@@ -574,16 +613,26 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
-        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+        complete_completion_delivery(
+            str(evt.get("delegation_id") or ""),
+            claim_id,
+            profile=str(evt.get("origin_profile") or ""),
+        )
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
-        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+        release_completion_delivery(
+            str(evt.get("delegation_id") or ""),
+            claim_id,
+            profile=str(evt.get("origin_profile") or ""),
+        )
 
 
-def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
-    with _DB_LOCK, _transaction() as conn:
+def get_durable_delegation(
+    delegation_id: str, *, profile: str = ""
+) -> Optional[Dict[str, Any]]:
+    with _DB_LOCK, _transaction(profile=profile) as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
@@ -902,7 +951,10 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _delete_durable_delegation(
+            delegation_id,
+            profile=str(record.get("origin_profile") or ""),
+        )
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -1156,7 +1208,10 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _delete_durable_delegation(
+            delegation_id,
+            profile=str(record.get("origin_profile") or ""),
+        )
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",

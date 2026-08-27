@@ -470,6 +470,7 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+        self._restored_delegation_profiles: set[str] = set()
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
@@ -511,6 +512,28 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    def restore_delegation_profiles(self, profiles) -> int:
+        """Restore pending delegation rows from secondary profile ledgers.
+
+        The module-global registry is constructed before a gateway runner has
+        loaded its multiplex profile set, so startup can initially restore
+        only the active/default ``state.db``. Once the runner knows the served
+        profiles it calls this method for every secondary ledger.
+        """
+        from tools.async_delegation import restore_undelivered_completions
+
+        restored = 0
+        for raw_profile in profiles:
+            profile = str(raw_profile or "").strip()
+            if not profile or profile in self._restored_delegation_profiles:
+                continue
+            restored += restore_undelivered_completions(
+                self.completion_queue,
+                profile=profile,
+            )
+            self._restored_delegation_profiles.add(profile)
+        return restored
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
