@@ -435,6 +435,37 @@ describe('toChatMessages', () => {
     ])
   })
 
+  it('projects a typed Kanban wake as a clean system timeline event', () => {
+    const messages = toChatMessages([
+      {
+        role: 'user',
+        content: '[INTERNAL KANBAN WAKE — NOT USER-AUTHORED]\nEVENT {"task_id":"t_123"}\n[/INTERNAL KANBAN WAKE]',
+        display_kind: 'internal_notification',
+        display_metadata: {
+          source: 'kanban',
+          internal: true,
+          kind: 'kanban_wake',
+          display_text: '✔ [default] @worker Kanban t_123 done — shipped the fix',
+          events: [
+            {
+              board: 'default',
+              task_id: 't_123',
+              event_id: 42,
+              run_id: 7,
+              event_kind: 'completed',
+              occurred_at: 1
+            }
+          ]
+        },
+        timestamp: 1
+      }
+    ])
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].role).toBe('system')
+    expect(chatMessageText(messages[0])).toBe('✔ [default] @worker Kanban t_123 done — shipped the fix')
+  })
+
   // A backend older than this app serves display_metadata as unparsed JSON
   // text. Indexing into that string used to throw and fail the whole resume.
   it.each([

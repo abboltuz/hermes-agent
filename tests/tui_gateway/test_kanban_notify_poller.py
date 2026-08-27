@@ -14,6 +14,8 @@ unsubscribe) and ``_format_kanban_event_text``.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
     _collect_kanban_notifications,
@@ -72,9 +74,15 @@ class TestCollectKanbanNotifications:
         first = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
-        assert tid in first[0]
-        assert "done" in first[0]
-        assert "shipped the fix" in first[0]
+        wake = first[0]
+        assert wake.task_id == tid
+        assert wake.kind == "completed"
+        assert wake.event_id > 0
+        assert wake.created_at > 0
+        assert wake.board_slug == kb.DEFAULT_BOARD
+        assert tid in wake.text
+        assert "done" in wake.text
+        assert "shipped the fix" in wake.text
         rows = _sub_rows(tid)
         assert len(rows) == 1, "done must retain the originating session"
         first_cursor = rows[0]["last_event_id"]
@@ -96,8 +104,8 @@ class TestCollectKanbanNotifications:
         reopened = _collect_kanban_notifications(_session())
 
         assert len(reopened) == 2
-        assert "ready" in reopened[0]
-        assert "review corrections" in reopened[1]
+        assert "ready" in reopened[0].text
+        assert "review corrections" in reopened[1].text
         rows = _sub_rows(tid)
         assert len(rows) == 1
         assert rows[0]["chat_id"] == SESSION_KEY
@@ -128,8 +136,8 @@ class TestCollectKanbanNotifications:
             second = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
-        assert "blocked" in first[0]
-        assert "waiting on review" in first[0]
+        assert "blocked" in first[0].text
+        assert "waiting on review" in first[0].text
         assert second == []
         assert spy_connect.called
         # Blocked is not a final status -> subscription stays alive so a
@@ -177,10 +185,10 @@ class TestCollectKanbanNotifications:
 
         monkeypatch.setattr(kb, "count_notify_subs", fail_probe)
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            wakes = _collect_kanban_notifications(_session())
 
-        assert len(texts) == 1
-        assert tid in texts[0]
+        assert len(wakes) == 1
+        assert tid in wakes[0].text
         spy_connect.assert_called_once()
 
     def test_no_session_key_is_a_noop(self):
@@ -218,13 +226,13 @@ class TestCollectKanbanNotifications:
         # active while the poller collects (as a profile-bound RPC would set).
         token = set_hermes_home_override(str(other_profile_home))
         try:
-            texts = _collect_kanban_notifications(session)
+            wakes = _collect_kanban_notifications(session)
         finally:
             reset_hermes_home_override(token)
 
-        assert len(texts) == 1
-        assert tid in texts[0]
-        assert "cross-profile delivery" in texts[0]
+        assert len(wakes) == 1
+        assert tid in wakes[0].text
+        assert "cross-profile delivery" in wakes[0].text
         # Completion is reversible, so the shared-board subscription remains
         # owned by this exact Desktop session until the task is archived.
         rows = _sub_rows(tid)
@@ -276,16 +284,15 @@ class TestNotificationPollerLoopKanbanWiring:
         import tui_gateway.server as server
 
         emits: list = []
-        submits: list = []
+        submits: list[dict] = []
         monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
-        )
+        def capture_submit(rid, sid, sess, text, **kwargs):
+            submits.append({"text": text, **kwargs})
+
+        monkeypatch.setattr(server, "_run_prompt_submit", capture_submit)
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,
@@ -328,9 +335,26 @@ class TestNotificationPollerLoopKanbanWiring:
             thread.join(timeout=5)
 
         status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
+        assert all(isinstance(text, str) for text in status_texts)
         assert any(tid in t for t in status_texts), status_texts
         assert any(e == "message.start" for e, _ in emits)
-        assert any(tid in text for text in submits), submits
+        assert len(submits) == 1
+        submitted = submits[0]
+        assert "[INTERNAL KANBAN WAKE — NOT USER-AUTHORED]" in submitted["text"]
+        assert tid in submitted["text"]
+        assert submitted["display_kind"] == "internal_notification"
+        metadata = submitted["display_metadata"]
+        assert metadata["source"] == "kanban"
+        assert metadata["internal"] is True
+        assert metadata["kind"] == "kanban_wake"
+        assert metadata["display_text"] == status_texts[0]
+        assert len(metadata["events"]) == 1
+        event = metadata["events"][0]
+        assert event["board"] == kb.DEFAULT_BOARD
+        assert event["task_id"] == tid
+        assert event["event_id"] > 0
+        assert event["event_kind"] == "completed"
+        assert event["occurred_at"] > 0
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
@@ -348,6 +372,10 @@ class TestNotificationPollerLoopKanbanWiring:
                 and session.get("_kanban_pending")
             )
             assert not submits
+            pending = session["_kanban_pending"]
+            assert len(pending) == 1
+            assert pending[0].task_id == tid
+            assert pending[0].kind == "completed"
 
             with session["history_lock"]:
                 session["running"] = False
@@ -357,6 +385,49 @@ class TestNotificationPollerLoopKanbanWiring:
             stop.set()
             thread.join(timeout=5)
 
-        assert any(tid in text for text in submits), submits
+        assert len(submits) == 1
+        assert tid in submits[0]["text"]
+        assert submits[0]["display_kind"] == "internal_notification"
+        assert submits[0]["display_metadata"]["source"] == "kanban"
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+    @pytest.mark.parametrize(
+        ("event_kind", "payload"),
+        [
+            ("completed", {"summary": "done"}),
+            ("blocked", {"reason": "needs input"}),
+            ("gave_up", {"error": "spawn failed"}),
+            ("crashed", {}),
+            ("timed_out", {"limit_seconds": 30}),
+            ("status", {"status": "ready"}),
+        ],
+    )
+    def test_existing_wake_kinds_still_dispatch_typed_agent_turn(
+        self, monkeypatch, event_kind, payload
+    ):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, event_kind, payload, run_id=17)
+        finally:
+            conn.close()
+        session = self._poller_session(running=False)
+
+        stop, thread, _emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(lambda: submits), "agent turn was never dispatched"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert len(submits) == 1
+        assert submits[0]["display_kind"] == "internal_notification"
+        metadata = submits[0]["display_metadata"]
+        assert metadata["source"] == "kanban"
+        assert len(metadata["events"]) == 1
+        event = metadata["events"][0]
+        assert event["task_id"] == tid
+        assert event["event_kind"] == event_kind
+        assert event["run_id"] == 17

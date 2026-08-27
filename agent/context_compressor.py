@@ -4183,6 +4183,10 @@ class ContextCompressor(ContextEngine):
 
         parts = []
         for msg in turns:
+            if msg.get("role") == "user" and msg.get("display_kind"):
+                # Typed timeline events are operational context, not user input.
+                # Do not flatten them back into a misleading ``[USER]`` line.
+                continue
             role = msg.get("role", "unknown")
             content = msg.get("content")
             if isinstance(content, list):
@@ -5390,12 +5394,15 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _is_synthetic_compression_user_turn(cls, message: Any) -> bool:
         """Recognize internal user-role rows after SessionDB projection.
 
-        SessionDB preserves role/content but not underscore-prefixed metadata,
-        so stable runtime-notification, todo, and continuation content markers
-        are authoritative.
+        Persisted timeline sidecars are authoritative provenance for typed
+        operational rows. Stable runtime-notification, todo, and continuation
+        content markers remain the fallback for legacy rows because SessionDB
+        does not preserve underscore-prefixed in-process metadata.
         """
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
+        if message.get("display_kind"):
+            return True
         if cls._has_compressed_summary_metadata(message):
             return True
         content = message.get("content")
@@ -5502,6 +5509,11 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _is_actionable_user_turn(cls, message: Any) -> bool:
         """Return whether *message* contains user input worth anchoring."""
         if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        # Timeline sidecars identify operational rows that occupy the user
+        # protocol slot but were not authored by the human. They must never
+        # anchor the compaction tail or become the inferred user objective.
+        if message.get("display_kind"):
             return False
         if cls._has_compressed_summary_metadata(message):
             return False

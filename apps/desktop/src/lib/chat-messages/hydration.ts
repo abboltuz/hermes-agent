@@ -112,6 +112,12 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
       : `${count} background agent${count === 1 ? '' : 's'} finished`
   }
 
+  if (message.display_kind === 'internal_notification') {
+    const displayText = parseDisplayMetadata(message.display_metadata)?.display_text
+
+    return typeof displayText === 'string' && displayText.trim() ? displayText.trim() : content
+  }
+
   return content
 }
 
@@ -203,7 +209,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.display_kind === 'model_switch' ||
       message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'auto_continue' ||
-      message.display_kind === 'personality_switch'
+      message.display_kind === 'personality_switch' ||
+      message.display_kind === 'internal_notification'
         ? 'system'
         : message.role
 
