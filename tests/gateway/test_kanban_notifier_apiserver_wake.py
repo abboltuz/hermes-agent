@@ -72,13 +72,27 @@ def _make_runner(adapters):
     return runner
 
 
-def _create_completed_subscription(platform, chat_id, session_id=None):
+def _create_completed_subscription(
+    platform,
+    chat_id,
+    session_id=None,
+    *,
+    notifier_profile=None,
+    delivery_metadata=None,
+):
     conn = kb.connect()
     try:
         tid = kb.create_task(
             conn, title="notify once", assignee="worker", session_id=session_id,
         )
-        kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform=platform,
+            chat_id=chat_id,
+            notifier_profile=notifier_profile,
+            delivery_metadata=delivery_metadata,
+        )
         kb.complete_task(conn, tid, summary="done once")
         return tid
     finally:
@@ -111,12 +125,16 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id, internal_turn):
+    async def fake_self_post(
+        adapter, *, text, session_id, internal_turn, profile="", route_profile=""
+    ):
         posts.append(
             {
                 "text": text,
                 "session_id": session_id,
                 "internal_turn": internal_turn,
+                "profile": profile,
+                "route_profile": route_profile,
             }
         )
 
@@ -181,7 +199,9 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id, internal_turn):
+    async def fake_self_post(
+        adapter, *, text, session_id, internal_turn, profile="", route_profile=""
+    ):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -196,6 +216,40 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
     assert _unseen_terminal_events(tid, "api_server", "origin-b") == []
 
 
+def test_named_profile_apiserver_sub_uses_shared_listener_with_scoped_route(
+    tmp_path, monkeypatch,
+):
+    """Port-binding adapters have no secondary registry entry; a named
+    profile subscription must still use the shared listener while carrying
+    the profile-qualified route into the self-post."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-profile.db"))
+    kb.init_db()
+    tid = _create_completed_subscription(
+        "api_server",
+        "writer-session",
+        notifier_profile="writer",
+        delivery_metadata={"api_route_profile": "writer"},
+    )
+    posts = []
+
+    async def fake_self_post(
+        adapter, *, text, session_id, internal_turn, profile="", route_profile=""
+    ):
+        posts.append((adapter, session_id, profile, route_profile))
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    shared = ApiServerLikeAdapter()
+    runner = _make_runner({Platform.API_SERVER: shared})
+    runner._profile_adapters = {"writer": {}}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert posts == [(shared, "writer-session", "writer", "writer")]
+    assert _unseen_terminal_events(tid, "api_server", "writer-session") == []
+
+
 def test_apiserver_wake_failure_rewinds_then_retries_destination(
     tmp_path, monkeypatch,
 ):
@@ -206,7 +260,9 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     )
     attempted_sessions = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id, internal_turn):
+    async def fail_once_then_succeed(
+        adapter, *, text, session_id, internal_turn, profile="", route_profile=""
+    ):
         attempted_sessions.append(session_id)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")
@@ -229,4 +285,3 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     assert attempted_sessions == ["origin-session", "origin-session"]
     assert "worker-session" not in attempted_sessions
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
-

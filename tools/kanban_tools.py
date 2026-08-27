@@ -1574,6 +1574,12 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             except Exception:
                 notifier_profile = "default"
         delivery_metadata: dict[str, Any] = {}
+        if platform.lower() == "api_server":
+            api_route_profile = get_session_env(
+                "HERMES_SESSION_API_ROUTE_PROFILE", ""
+            )
+            if api_route_profile:
+                delivery_metadata["api_route_profile"] = api_route_profile
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:

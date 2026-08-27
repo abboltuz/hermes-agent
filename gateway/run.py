@@ -25523,6 +25523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
             scope_id=scope_id,
+            profile=str(evt.get("origin_profile") or "").strip() or None,
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -25586,6 +25587,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter,
                             text=synth_text,
                             session_id=raw_sid,
+                            profile=str(evt.get("origin_profile") or ""),
+                            route_profile=str(
+                                evt.get("origin_api_route_profile") or ""
+                            ),
                             display_metadata=display_metadata,
                         )
                         return True
@@ -25658,6 +25663,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter,
                     text=synth_text,
                     session_id=raw_sid,
+                    profile=str(evt.get("origin_profile") or ""),
+                    route_profile=str(
+                        evt.get("origin_api_route_profile") or ""
+                    ),
                     display_metadata=display_metadata,
                 )
                 return True
@@ -25956,6 +25965,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "chat_id",
             "thread_id",
             "user_id",
+            "origin_profile",
+            "origin_api_route_profile",
         ))
 
     @staticmethod
@@ -26174,6 +26185,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "chat_id",
             "thread_id",
             "user_id",
+            "origin_profile",
+            "origin_api_route_profile",
         ))
 
     @staticmethod
@@ -26449,6 +26462,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": user_id,
                         "user_name": user_name,
                         "message_id": message_id,
+                        "origin_session_id": (
+                            watcher.get("origin_session_id")
+                            or getattr(session, "origin_session_id", "")
+                            or ""
+                        ),
+                        "origin_profile": (
+                            watcher.get("origin_profile")
+                            or getattr(session, "origin_profile", "")
+                            or ""
+                        ),
+                        "origin_api_route_profile": (
+                            watcher.get("origin_api_route_profile")
+                            or getattr(session, "origin_api_route_profile", "")
+                            or ""
+                        ),
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
                         "exit_code": session.exit_code,

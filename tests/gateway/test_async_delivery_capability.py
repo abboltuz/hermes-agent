@@ -164,17 +164,26 @@ class TestAdapterCapabilityFlag:
         from gateway.session_context import clear_session_vars, get_session_env
 
         tokens = APIServerAdapter._bind_api_server_session(
-            chat_id="c1", session_key="sk1", session_id="sid1"
+            chat_id="c1",
+            session_key="sk1",
+            session_id="sid1",
+            profile="writer",
+            api_route_profile="writer",
         )
         try:
             assert async_delivery_supported() is False
             assert get_session_env("HERMES_SESSION_PLATFORM") == "api_server"
+            assert get_session_env("HERMES_SESSION_PROFILE") == "writer"
+            assert (
+                get_session_env("HERMES_SESSION_API_ROUTE_PROFILE") == "writer"
+            )
         finally:
             clear_session_vars(tokens)
 
 
 # ---------------------------------------------------------------------------
-# terminal_tool: refuses to register a watcher on unsupported sessions
+# terminal_tool: API sessions with a raw continuation id register a self-post
+# watcher; truly unreachable finite sessions still refuse the promise.
 # ---------------------------------------------------------------------------
 
 class TestTerminalNotifyGate:
@@ -193,11 +202,37 @@ class TestTerminalNotifyGate:
             terminal_tool(command=command, background=True, notify_on_complete=True)
         )
 
-    def test_api_server_skips_watcher_and_notes(self):
+    def test_api_server_registers_profile_aware_self_post_watcher(self):
         from tools.process_registry import process_registry
 
         tokens = set_session_vars(
-            platform="api_server", chat_id="s1", session_key="s1", async_delivery=False
+            platform="api_server",
+            chat_id="raw-s1",
+            session_key="memory-scope",
+            session_id="raw-s1",
+            profile="writer",
+            api_route_profile="writer",
+            async_delivery=False,
+        )
+        try:
+            d = self._run_bg("sleep 30 && echo DONE")
+        finally:
+            clear_session_vars(tokens)
+
+        assert d.get("notify_on_complete") is True
+        assert not d.get("notify_unsupported")
+        assert len(process_registry.pending_watchers) == 1
+        watcher = process_registry.pending_watchers[0]
+        assert watcher["origin_session_id"] == "raw-s1"
+        assert watcher["origin_profile"] == "writer"
+        assert watcher["origin_api_route_profile"] == "writer"
+        process_registry.kill_process(d["session_id"])
+
+    def test_unreachable_stateless_session_still_skips_watcher(self):
+        from tools.process_registry import process_registry
+
+        tokens = set_session_vars(
+            platform="kanban", chat_id="", session_key="", async_delivery=False
         )
         try:
             d = self._run_bg("sleep 30 && echo DONE")
@@ -205,8 +240,6 @@ class TestTerminalNotifyGate:
             clear_session_vars(tokens)
 
         assert d.get("notify_on_complete") is False
-        assert d.get("notify_unsupported"), "must explain the limitation"
         assert "poll" in d["notify_unsupported"].lower()
-        assert len(process_registry.pending_watchers) == 0
-
-
+        assert process_registry.pending_watchers == []
+        process_registry.kill_process(d["session_id"])

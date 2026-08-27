@@ -438,16 +438,16 @@ class GatewayKanbanWatchersMixin:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
                                 try:
+                                    platform = (sub.get("platform") or "").lower()
                                     owner_profile = sub.get("notifier_profile") or None
                                     if owner_profile and owner_profile != notifier_profile:
                                         _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                        if not _owner_adapters:
+                                        if platform != "api_server" and not _owner_adapters:
                                             logger.debug(
                                                 "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
                                                 sub.get("task_id"), owner_profile, notifier_profile,
                                             )
                                             continue
-                                    platform = (sub.get("platform") or "").lower()
                                     if platform not in active_platforms:
                                         logger.debug(
                                             "kanban notifier: subscription for %s on %s skipped; adapter not connected",
@@ -505,6 +505,10 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
+                    sub_delivery_metadata = sub.get("delivery_metadata") or {}
+                    sub_api_route_profile = str(
+                        sub_delivery_metadata.get("api_route_profile") or ""
+                    ).strip()
                     # Route via the SAME chokepoint the authorization path uses
                     # (gateway/authz_mixin.py::_authorization_adapter): a stamped
                     # profile with its own adapter-registry entry must be served
@@ -514,7 +518,17 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    if plat is _Platform.API_SERVER:
+                        # api_server is a port-binding platform: one shared
+                        # default adapter owns the listener for every multiplex
+                        # profile. Profile isolation is enforced by the
+                        # qualified self-post route + scoped credential below,
+                        # not by a secondary adapter (none is allowed to bind).
+                        adapter = self.adapters.get(_Platform.API_SERVER)
+                    else:
+                        adapter = self._authorization_adapter(
+                            plat, sub_profile or None
+                        )
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -865,6 +879,8 @@ class GatewayKanbanWatchersMixin:
                                     adapter,
                                     text=_synth,
                                     session_id=_session_key,
+                                    profile=sub_profile,
+                                    route_profile=sub_api_route_profile,
                                     display_metadata=_wake_metadata,
                                 )
                                 logger.info(

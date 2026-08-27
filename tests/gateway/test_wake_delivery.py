@@ -41,6 +41,13 @@ class ApiServerLikeAdapter:
         raise AssertionError("non-push adapter must not receive handle_message wakes")
 
 
+class ProfileAwareApiServerLikeAdapter(ApiServerLikeAdapter):
+    def _wake_request_target(self, *, profile="", route_profile=""):
+        assert profile == "writer"
+        assert route_profile == "writer"
+        return "/p/writer/v1/chat/completions", "writer-key"
+
+
 def _source():
     return SessionSource(
         platform=Platform.TELEGRAM,
@@ -144,4 +151,53 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     asyncio.run(run())
     assert calls["n"] == 2
 
+
+def test_deliver_wake_named_profile_uses_qualified_route_and_scoped_key():
+    from aiohttp import web
+
+    seen = {}
+
+    async def handler(request):
+        seen["path"] = request.path
+        seen["auth"] = request.headers.get("Authorization")
+        return web.json_response({"choices": []})
+
+    async def run():
+        app = web.Application()
+        app.router.add_post("/p/writer/v1/chat/completions", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            adapter = ProfileAwareApiServerLikeAdapter(port=port)
+            await deliver_wake(
+                adapter,
+                text="done",
+                session_id="writer-session",
+                profile="writer",
+                route_profile="writer",
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen == {
+        "path": "/p/writer/v1/chat/completions",
+        "auth": "Bearer writer-key",
+    }
+
+
+def test_named_profile_never_falls_back_on_unaware_adapter():
+    with pytest.raises(RuntimeError, match="refusing default-profile fallback"):
+        asyncio.run(
+            deliver_wake(
+                ApiServerLikeAdapter(key="default-key"),
+                text="done",
+                session_id="writer-session",
+                profile="writer",
+                route_profile="writer",
+            )
+        )
 

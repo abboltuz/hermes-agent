@@ -3442,11 +3442,16 @@ def terminal_tool(
                         get_session_env as _gse,
                     )
 
-                    # Finite sessions (stateless HTTP requests and one-shot
-                    # Kanban workers) cannot route a completion back to the
-                    # agent after the turn/process ends. Refuse the promise:
-                    # drop the flags and tell the agent to poll.
-                    if not _async_ok():
+                    _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                    _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
+                    # api_server cannot push, but its raw continuation id is a
+                    # durable return address: the gateway watcher self-posts
+                    # the completion through the exact profile-qualified HTTP
+                    # route. Other finite runtimes still have no wake path.
+                    _api_self_post_ok = (
+                        _gw_platform == "api_server" and bool(_gw_chat_id)
+                    )
+                    if not _async_ok() and not _api_self_post_ok:
                         notify_on_complete = False
                         watch_patterns = None
                         result_data["notify_on_complete"] = False
@@ -3465,19 +3470,29 @@ def terminal_tool(
                             proc_session.id,
                         )
                     else:
-                        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
                         if _gw_platform:
-                            _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
                             _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
                             _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
                             _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
                             _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
+                            _gw_profile = _gse("HERMES_SESSION_PROFILE", "")
+                            _gw_api_route_profile = _gse(
+                                "HERMES_SESSION_API_ROUTE_PROFILE", ""
+                            )
                             proc_session.watcher_platform = _gw_platform
                             proc_session.watcher_chat_id = _gw_chat_id
                             proc_session.watcher_user_id = _gw_user_id
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
+                            proc_session.origin_profile = _gw_profile
+                            proc_session.origin_api_route_profile = (
+                                _gw_api_route_profile
+                            )
+                            if _gw_platform == "api_server":
+                                # Raw continuation id, distinct from the
+                                # optional long-term-memory session_key.
+                                proc_session.origin_session_id = _gw_chat_id
                             # Stamp the spawning conversation's session-db id
                             # so the gateway's completion pre-flight
                             # (_classify_completion_target) can drop the
@@ -3524,6 +3539,11 @@ def terminal_tool(
                             "user_name": proc_session.watcher_user_name,
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
+                            "origin_session_id": proc_session.origin_session_id,
+                            "origin_profile": proc_session.origin_profile,
+                            "origin_api_route_profile": (
+                                proc_session.origin_api_route_profile
+                            ),
                             "notify_on_complete": True,
                             "parent_session_id": proc_session.parent_session_id,
                         })

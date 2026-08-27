@@ -87,6 +87,34 @@ class TestProfileScopedApiAuthentication:
         finally:
             _api_request_profile.reset(profile_token)
 
+    def test_named_profile_wake_target_uses_profile_route_and_secret(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        worker_home = tmp_path / "profiles" / "worker"
+        worker_home.mkdir(parents=True)
+        worker_key = "worker-profile-api-key-123456"
+        (worker_home / ".env").write_text(
+            f"API_SERVER_KEY={worker_key}\n", encoding="utf-8"
+        )
+        adapter._api_key = "default-listener-api-key-123456"
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda name: worker_home
+        )
+        ss.set_multiplex_active(True)
+
+        path, key = adapter._wake_request_target(
+            profile="worker", route_profile="worker"
+        )
+
+        assert path == "/p/worker/v1/chat/completions"
+        assert key == worker_key
+
+    def test_named_profile_wake_target_rejects_route_mismatch(self, adapter):
+        with pytest.raises(RuntimeError, match="profile/route mismatch"):
+            adapter._wake_request_target(
+                profile="worker", route_profile="reviewer"
+            )
+
 
 @pytest.mark.asyncio
 async def test_profile_middleware_binds_auth_before_handler(
@@ -159,5 +187,4 @@ async def test_profile_middleware_binds_auth_before_handler(
         )
         assert accepted.status == 200
         assert (await accepted.json())["profile"] == "worker"
-
 

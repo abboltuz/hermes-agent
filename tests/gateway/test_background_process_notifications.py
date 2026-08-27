@@ -531,7 +531,9 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id, internal_turn):
+    async def fake_self_post(
+        adapter, *, text, session_id, internal_turn, profile="", route_profile=""
+    ):
         posts.append(
             {
                 "text": text,
@@ -583,7 +585,9 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id, internal_turn):
+    async def fake_self_post(
+        adapter, *, text, session_id, internal_turn, profile="", route_profile=""
+    ):
         posts.append((session_id, internal_turn))
 
     import gateway.wake as wake_mod

@@ -48,6 +48,13 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
 def worker_env(monkeypatch, tmp_path):
     """Simulate being a worker: HERMES_HOME isolated, HERMES_KANBAN_TASK set
     after we've created the task."""
+    # Gateway/API tests in the same pytest process may have bound and then
+    # explicitly cleared the task-local session ContextVars.  Restore the
+    # pristine ``_UNSET`` state so this fixture's legacy env-backed session
+    # values remain observable regardless of test ordering.
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -66,7 +73,8 @@ def worker_env(monkeypatch, tmp_path):
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
-    return tid
+    yield tid
+    reset_session_vars()
 
 
 def test_show_defaults_to_env_task_id(worker_env):
@@ -869,6 +877,36 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id_alt"] == "alt-user-9"
     assert s["chat_type"] == "forum"
     assert s["delivery_mode"] == "notify+wake"
+
+
+def test_create_subscribes_api_session_with_profile_route(worker_env):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    tokens = set_session_vars(
+        platform="api_server",
+        chat_id="raw-writer-session",
+        session_key="memory-scope",
+        session_id="raw-writer-session",
+        profile="writer",
+        api_route_profile="writer",
+        async_delivery=False,
+    )
+    try:
+        out = kt._handle_create(
+            {"title": "auto-sub api profile", "assignee": "peer"}
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    data = json.loads(out)
+    assert data["ok"] is True
+    subs = _sub_index(_list_subs_for_task(data["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "api_server"
+    assert subs[0]["chat_id"] == "raw-writer-session"
+    assert subs[0]["notifier_profile"] == "writer"
+    assert subs[0]["delivery_metadata"]["api_route_profile"] == "writer"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

@@ -88,6 +88,12 @@ def _prefix_names_served_profile(profile: str) -> bool:
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+# Preserve whether the request actually used a ``/p/<profile>`` prefix.  The
+# resolved runtime profile alone is insufficient because bare/default and
+# explicitly-qualified/default are distinct self-post routes.
+_api_request_route_profile: ContextVar[str] = ContextVar(
+    "api_server_request_route_profile", default=""
+)
 _api_request_browser_control_principal: ContextVar[str] = ContextVar(
     "api_server_browser_control_principal", default=""
 )
@@ -2185,6 +2191,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         @web.middleware
         async def profile_prefix_middleware(request: "web.Request", handler):
+            route_profile = str(request.match_info.get("profile") or "").strip()
             profile = self._resolve_request_profile(request)
             if profile is _PROFILE_REJECTED:
                 return web.json_response(
@@ -2192,6 +2199,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             token = _api_request_profile.set(profile)
+            route_token = _api_request_route_profile.set(route_profile)
             try:
                 with self._profile_scope(profile):
                     resolved_profile = profile or "default"
@@ -2207,9 +2215,62 @@ class APIServerAdapter(BasePlatformAdapter):
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
             finally:
+                _api_request_route_profile.reset(route_token)
                 _api_request_profile.reset(token)
 
         return profile_prefix_middleware
+
+    def _wake_request_target(
+        self,
+        *,
+        profile: str = "",
+        route_profile: str = "",
+    ) -> tuple[str, str]:
+        """Resolve the exact self-post route and its profile-scoped API key.
+
+        A multiplex listener is owned by the default adapter, so reading
+        ``self._api_key`` for a named profile would authenticate as the wrong
+        principal. Named wakes therefore enter that profile's secret scope
+        and fail closed when its own API_SERVER_KEY is unavailable.
+        """
+        from urllib.parse import quote
+
+        runtime_profile = str(profile or "").strip()
+        qualified_profile = str(route_profile or "").strip()
+        if runtime_profile and runtime_profile not in {"default", "custom"}:
+            if qualified_profile and qualified_profile != runtime_profile:
+                raise RuntimeError(
+                    "wake self-post profile/route mismatch: "
+                    f"profile={runtime_profile!r}, route={qualified_profile!r}"
+                )
+            qualified_profile = runtime_profile
+            token = _api_request_profile.set(runtime_profile)
+            try:
+                with self._profile_scope(runtime_profile):
+                    api_key = self._expected_api_key()
+            finally:
+                _api_request_profile.reset(token)
+        else:
+            allowed_qualifiers = {""}
+            if runtime_profile != "custom":
+                allowed_qualifiers.add("default")
+            if qualified_profile not in allowed_qualifiers:
+                raise RuntimeError(
+                    "wake self-post route names a profile without matching "
+                    f"runtime provenance: {qualified_profile!r}"
+                )
+            api_key = str(self._api_key or "")
+
+        if not api_key:
+            target = runtime_profile or qualified_profile or "default"
+            raise RuntimeError(
+                "wake self-post requires a profile-scoped API_SERVER_KEY for "
+                f"profile {target!r}"
+            )
+        path = "/v1/chat/completions"
+        if qualified_profile:
+            path = f"/p/{quote(qualified_profile, safe='')}{path}"
+        return path, api_key
 
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
@@ -2289,6 +2350,55 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+
+    def _idempotency_cache_key(
+        self,
+        idempotency_key: str,
+        request: "web.Request",
+        *,
+        gateway_session_key: Optional[str],
+        route: Optional[Dict[str, Any]],
+    ) -> str:
+        """Namespace a client key by every authenticated routing boundary.
+
+        The response cache is process-global, including on a multiplex
+        listener. A bare client key is therefore not authority to reuse a
+        response from another profile, session, principal, or HTTP route.
+        Hash the namespace so session identifiers never become cache keys or
+        loggable diagnostics themselves.
+        """
+        profile = _api_request_profile.get() or ""
+        if not profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                profile = get_active_profile_name() or "default"
+            except Exception:
+                profile = "default"
+        principal = _api_request_browser_control_principal.get()
+        if not principal:
+            principal = self._derive_browser_control_principal(profile)
+        model_route = {
+            str(key): route.get(key)
+            for key in sorted(route or {})
+            if key in {"model", "provider", "base_url"}
+        }
+        namespace = {
+            "profile": profile,
+            "principal": principal,
+            "session_id": request.headers.get("X-Hermes-Session-Id", "").strip(),
+            "gateway_session_key": gateway_session_key or "",
+            "http_route": request.path,
+            "model_route": model_route,
+        }
+        encoded = json.dumps(
+            namespace,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return f"{idempotency_key}:{digest}"
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -5051,6 +5161,10 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object."), status=400
+            )
 
         internal_turn_kwargs: Dict[str, Any] = {}
         from gateway.internal_turn import (
@@ -5328,6 +5442,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            cache_key = self._idempotency_cache_key(
+                idempotency_key,
+                request,
+                gateway_session_key=gateway_session_key,
+                route=route,
+            )
             fp = _make_request_fingerprint(
                 body,
                 keys=[
@@ -5342,7 +5462,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
             )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await _idem_cache.get_or_set(
+                    cache_key, fp, _compute_completion
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -6261,6 +6383,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
                 status=400,
             )
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object."), status=400
+            )
 
         raw_input = body.get("input")
         if raw_input is None:
@@ -6462,6 +6588,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            cache_key = self._idempotency_cache_key(
+                idempotency_key,
+                request,
+                gateway_session_key=gateway_session_key,
+                route=route,
+            )
             fp = _make_request_fingerprint(
                 body,
                 keys=[
@@ -6476,7 +6608,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
             )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+                result, usage = await _idem_cache.get_or_set(
+                    cache_key, fp, _compute_response
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -7208,16 +7342,18 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
+        profile: str = "",
+        api_route_profile: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
         This is the SINGLE structural chokepoint every API-server agent-entry
         path must use to seed session context — it hardwires
         ``platform="api_server"`` and ``async_delivery=False`` so a new route
-        physically cannot reintroduce the silent-no-op bug (#10760) by
-        forgetting to mark the channel as non-delivering. There is no
-        ``async_delivery`` parameter to get wrong; the stateless HTTP path can
-        never wake the agent after the turn ends, on ANY route.
+        cannot pretend the HTTP channel itself supports push delivery. There
+        is no ``async_delivery`` parameter to get wrong. Detached producers
+        may still wake a bound session through the explicit, profile-aware
+        self-post path when this binding captured a raw continuation id.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -7231,6 +7367,8 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            profile=profile,
+            api_route_profile=api_route_profile,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
@@ -7295,6 +7433,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        request_route_profile = _api_request_route_profile.get()
+        bound_profile = request_profile or ""
+        if not bound_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                bound_profile = get_active_profile_name() or "default"
+            except Exception:
+                bound_profile = "default"
         request_browser_control_principal = (
             _api_request_browser_control_principal.get()
         )
@@ -7310,6 +7457,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    profile=bound_profile,
+                    api_route_profile=request_route_profile,
                     browser_control_principal=request_browser_control_principal,
                     browser_control_transport_family=(
                         request_browser_control_transport_family
@@ -7758,6 +7907,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        request_route_profile = _api_request_route_profile.get()
+        bound_profile = request_profile or ""
+        if not bound_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                bound_profile = get_active_profile_name() or "default"
+            except Exception:
+                bound_profile = "default"
         request_browser_control_principal = (
             _api_request_browser_control_principal.get()
         )
@@ -7854,6 +8012,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                profile=bound_profile,
+                                api_route_profile=request_route_profile,
                                 browser_control_principal=(
                                     request_browser_control_principal
                                 ),
