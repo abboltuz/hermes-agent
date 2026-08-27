@@ -93,12 +93,13 @@ def _source():
     )
 
 
-def _event(*, internal: bool, text: str = "hello world"):
+def _event(*, internal: bool, text: str = "hello world", metadata=None):
     return MessageEvent(
         text=text,
         source=_source(),
         message_id=None if internal else "msg-82888",
         internal=internal,
+        metadata=metadata or {},
     )
 
 
@@ -129,12 +130,28 @@ async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_pat
     )
 
     await runner._handle_message_with_agent(
-        _event(internal=True, text="[ASYNC DELEGATION BATCH COMPLETE]"),
+        _event(
+            internal=True,
+            text="[ASYNC DELEGATION BATCH COMPLETE]",
+            metadata={
+                "source": "delegation",
+                "kind": "async_delegation_complete",
+                "event_id": "deleg_123",
+                "raw_payload": {"must": "not be copied"},
+            },
+        ),
         _source(), SESSION_KEY, 1,
     )
 
     kwargs = runner._run_agent.call_args.kwargs
     assert kwargs["persist_user_display_kind"] == "internal_notification"
+    assert kwargs["persist_user_display_metadata"] == {
+        "source": "delegation",
+        "internal": True,
+        "kind": "async_delegation_complete",
+        "platform": "telegram",
+        "event_id": "deleg_123",
+    }
 
 
 @pytest.mark.asyncio
@@ -156,6 +173,35 @@ async def test_real_user_event_gets_no_marker(monkeypatch, tmp_path):
 
     kwargs = runner._run_agent.call_args.kwargs
     assert kwargs["persist_user_display_kind"] is None
+    assert kwargs["persist_user_display_metadata"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_agent_wrapper_threads_display_metadata_to_inner(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent_inner = AsyncMock(return_value={"final_response": "done"})
+    metadata = {
+        "source": "delegation",
+        "internal": True,
+        "kind": "async_delegation_complete",
+    }
+
+    await runner._run_agent(
+        message="internal wake",
+        context_prompt="context",
+        history=[],
+        source=_source(),
+        session_id="sess-82888",
+        persist_user_display_kind="internal_notification",
+        persist_user_display_metadata=metadata,
+    )
+
+    assert (
+        runner._run_agent_inner.call_args.kwargs["persist_user_display_metadata"]
+        == metadata
+    )
 
 
 # ── 3: gateway-side fallback rows carry the marker for internal events ─────
@@ -187,6 +233,12 @@ async def test_failed_early_fallback_row_is_marked_for_internal_event(
     for entry in entries:
         assert entry["role"] == "user"  # alternation invariant: role unchanged
         assert entry["display_kind"] == "internal_notification"
+        assert entry["display_metadata"] == {
+            "source": "gateway_internal",
+            "internal": True,
+            "kind": "internal_notification",
+            "platform": "telegram",
+        }
 
 
 @pytest.mark.asyncio
@@ -213,6 +265,7 @@ async def test_failed_early_fallback_row_is_unmarked_for_real_user(
     assert entries
     for entry in entries:
         assert "display_kind" not in entry
+        assert "display_metadata" not in entry
 
 
 @pytest.mark.asyncio
@@ -240,6 +293,12 @@ async def test_no_new_messages_fallback_row_is_marked_for_internal_event(
     for entry in entries:
         assert entry["role"] == "user"
         assert entry["display_kind"] == "internal_notification"
+        assert entry["display_metadata"] == {
+            "source": "gateway_internal",
+            "internal": True,
+            "kind": "internal_notification",
+            "platform": "telegram",
+        }
 
 
 # ── 4: DB round-trip replay + provider-payload hygiene ─────────────────────
@@ -259,6 +318,11 @@ def test_marked_row_replays_cleanly_and_never_reaches_provider(tmp_path):
             role="user",
             content="[ASYNC DELEGATION BATCH COMPLETE — 2/2 succeeded]",
             display_kind="internal_notification",
+            display_metadata={
+                "source": "delegation",
+                "internal": True,
+                "kind": "async_delegation_complete",
+            },
         )
         db.append_message(session_id=sid, role="assistant", content="noted")
 
@@ -266,6 +330,11 @@ def test_marked_row_replays_cleanly_and_never_reaches_provider(tmp_path):
         replayed = db.get_messages_as_conversation(sid)
         user_row, = [m for m in replayed if m["role"] == "user"]
         assert user_row["display_kind"] == "internal_notification"
+        assert user_row["display_metadata"] == {
+            "source": "delegation",
+            "internal": True,
+            "kind": "async_delegation_complete",
+        }
         assert user_row["content"].startswith("[ASYNC DELEGATION BATCH COMPLETE")
 
         # Provider hygiene: the per-request copy in conversation_loop pops
@@ -284,5 +353,6 @@ def test_marked_row_replays_cleanly_and_never_reaches_provider(tmp_path):
         assert "display_metadata" not in api_msg
         assert api_msg["role"] == "user"
         assert user_row["display_kind"] == "internal_notification"
+        assert user_row["display_metadata"]["source"] == "delegation"
     finally:
         db.close()

@@ -6704,6 +6704,28 @@ class _StopAfterOneNotificationPoll:
         return self._checks > 1
 
 
+def test_async_delegation_display_metadata_carries_internal_provenance():
+    metadata = server._async_delegation_display_metadata(
+        {
+            "delegation_id": "deleg_123",
+            "results": [{"status": "completed"}],
+            "total_duration_seconds": 3.5,
+            "raw_payload": {"must": "not be copied"},
+        }
+    )
+
+    assert metadata == {
+        "source": "delegation",
+        "internal": True,
+        "kind": "async_delegation_complete",
+        "delegation_id": "deleg_123",
+        "task_count": 1,
+        "completed_count": 1,
+        "failed_count": 0,
+        "duration_seconds": 3.5,
+    }
+
+
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch,
 ):
@@ -6730,8 +6752,10 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
-        delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
+    def _deliver(_rid, sid, session, text, **kwargs):
+        delivered["a" if sid == "sid-a-live-handoff" else "b"].append(
+            (text, kwargs)
+        )
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
@@ -6758,7 +6782,18 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         )
 
         assert len(delivered["a"]) == 1
-        assert "proc-live-handoff completed normally" in delivered["a"][0]
+        text, kwargs = delivered["a"][0]
+        assert "proc-live-handoff completed normally" in text
+        assert kwargs == {
+            "display_kind": "internal_notification",
+            "display_metadata": {
+                "source": "process",
+                "internal": True,
+                "kind": "completion",
+                "session_id": "proc-live-handoff",
+                "event_id": "proc-live-handoff",
+            },
+        }
         assert delivered["b"] == []
         assert isolated_queue.empty()
     finally:
@@ -6839,7 +6874,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -6880,7 +6915,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -6946,7 +6981,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -7209,6 +7244,69 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         assert len(turns) == 2
         assert "proc_polled" in turns[1]
         assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid_a", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        process_registry._poll_observed.discard(event["session_id"])
+
+
+def test_post_turn_completion_keeps_process_provenance(monkeypatch, tmp_path):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+
+    class _ProvenanceAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+            **kwargs,
+        ):
+            kwargs["persist_user_display_kind"] = persist_user_display_kind
+            kwargs["persist_user_display_metadata"] = persist_user_display_metadata
+            turns.append((prompt, kwargs))
+            return {"final_response": "", "messages": []}
+
+    session = _session(
+        session_key="session-a",
+        agent=_ProvenanceAgent(turns),
+        running=True,
+    )
+    event = {
+        "type": "completion",
+        "session_id": "proc_typed_post_turn",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry._completion_consumed.discard(event["session_id"])
+    process_registry._poll_observed.add(event["session_id"])
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit("rid-a", "sid_a", session, "human turn")
+
+        assert len(turns) == 2
+        nested_prompt, nested_kwargs = turns[1]
+        assert event["session_id"] in nested_prompt
+        assert nested_kwargs["persist_user_display_kind"] == "internal_notification"
+        assert nested_kwargs["persist_user_display_metadata"] == {
+            "source": "process",
+            "internal": True,
+            "kind": "completion",
+            "session_id": event["session_id"],
+            "event_id": event["session_id"],
+        }
     finally:
         server._sessions.pop("sid_a", None)
         process_registry._completion_consumed.discard(event["session_id"])
@@ -17176,7 +17274,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_kwargs):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False

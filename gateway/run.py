@@ -6409,6 +6409,10 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_display_kind"] = (
                     ctx.persist_user_display_kind
                 )
+            if ctx.persist_user_display_metadata is not None:
+                _conversation_kwargs["persist_user_display_metadata"] = (
+                    ctx.persist_user_display_metadata
+                )
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
@@ -6734,6 +6738,38 @@ class TurnRunner:
 # DB-backed commands and is how many suites construct a bare runner).  A plain
 # ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
 _SESSION_DB_UNPINNED = object()
+
+
+def _internal_event_display_metadata(event: MessageEvent, source: SessionSource) -> dict | None:
+    """Allow-list bounded provenance for a synthetic gateway event."""
+    if not getattr(event, "internal", False):
+        return None
+    raw = getattr(event, "metadata", None)
+    raw = raw if isinstance(raw, dict) else {}
+
+    def _text(key: str, fallback: str = "", limit: int = 512) -> str:
+        value = raw.get(key, fallback)
+        return str(value or "").strip()[:limit]
+
+    platform_value = getattr(getattr(source, "platform", None), "value", None)
+    metadata: dict[str, Any] = {
+        "source": _text("source", "gateway_internal", 128) or "gateway_internal",
+        "internal": True,
+        "kind": _text("kind", "internal_notification", 128)
+        or "internal_notification",
+    }
+    platform = str(platform_value or "").strip()[:128]
+    if platform:
+        metadata["platform"] = platform
+    for key in ("event_id", "delegation_id", "session_id"):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            metadata[key] = value
+        else:
+            bounded = str(value or "").strip()[:512]
+            if bounded:
+                metadata[key] = bounded
+    return metadata
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -19382,6 +19418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind = (
             "internal_notification" if getattr(event, "internal", False) else None
         )
+        persist_user_display_metadata = _internal_event_display_metadata(event, source)
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -20577,6 +20614,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -21018,6 +21056,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
                 if persist_user_display_kind:
                     _user_entry["display_kind"] = persist_user_display_kind
+                if persist_user_display_metadata is not None:
+                    _user_entry["display_metadata"] = persist_user_display_metadata
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
                 # Dedupe: skip if this platform message_id is already in the
@@ -21062,6 +21102,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                     if persist_user_display_kind:
                         _user_entry["display_kind"] = persist_user_display_kind
+                    if persist_user_display_metadata is not None:
+                        _user_entry["display_metadata"] = persist_user_display_metadata
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
                     await self.async_session_store.append_to_transcript(
@@ -21261,6 +21303,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         }
                         if 'persist_user_display_kind' in locals() and persist_user_display_kind:
                             _user_entry["display_kind"] = persist_user_display_kind
+                        if (
+                            'persist_user_display_metadata' in locals()
+                            and persist_user_display_metadata is not None
+                        ):
+                            _user_entry["display_metadata"] = persist_user_display_metadata
                         if getattr(event, "message_id", None):
                             _user_entry["message_id"] = str(event.message_id)
                         await self.async_session_store.append_to_transcript(
@@ -28299,6 +28346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[dict] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -28319,6 +28367,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
                 message_type=message_type,
             )
 
@@ -28332,6 +28381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
                 message_type=message_type,
             )
 
@@ -28475,6 +28525,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[dict] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -28785,6 +28836,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

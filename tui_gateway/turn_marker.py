@@ -38,8 +38,77 @@ _MAX_ENTRIES = 32
 # Enough to re-submit any realistic prompt; guards the sidecar against a
 # pathological multi-megabyte paste being journaled on every turn.
 _MAX_PROMPT_CHARS = 64_000
+_MAX_DISPLAY_KIND_CHARS = 128
+_MAX_METADATA_TEXT_CHARS = 16_000
+_MAX_METADATA_ID_CHARS = 512
+_MAX_METADATA_EVENTS = 64
 
 _lock = threading.Lock()
+
+
+def _bounded_string(value: Any, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:limit] if value else None
+
+
+def _sanitize_display_metadata(value: Any) -> dict[str, Any] | None:
+    """Return the bounded provenance subset safe to journal across restarts."""
+    if not isinstance(value, dict):
+        return None
+
+    out: dict[str, Any] = {}
+    for key in ("source", "kind", "platform", "delegation_id", "event_id", "session_id"):
+        item = value.get(key)
+        if key == "event_id" and isinstance(item, int) and not isinstance(item, bool):
+            out[key] = item
+            continue
+        bounded = _bounded_string(item, _MAX_METADATA_ID_CHARS)
+        if bounded is not None:
+            out[key] = bounded
+
+    display_text = _bounded_string(value.get("display_text"), _MAX_METADATA_TEXT_CHARS)
+    if display_text is not None:
+        out["display_text"] = display_text
+
+    for key in ("internal", "recovered"):
+        if isinstance(value.get(key), bool):
+            out[key] = value[key]
+
+    for key in ("task_count", "completed_count", "failed_count"):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool):
+            out[key] = max(0, item)
+
+    duration = value.get("duration_seconds")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        out["duration_seconds"] = max(0.0, float(duration))
+
+    raw_events = value.get("events")
+    if isinstance(raw_events, list):
+        events: list[dict[str, Any]] = []
+        for raw_event in raw_events[:_MAX_METADATA_EVENTS]:
+            if not isinstance(raw_event, dict):
+                continue
+            event: dict[str, Any] = {}
+            for key in ("board", "task_id", "event_kind"):
+                bounded = _bounded_string(raw_event.get(key), _MAX_METADATA_ID_CHARS)
+                if bounded is not None:
+                    event[key] = bounded
+            for key in ("event_id", "run_id"):
+                item = raw_event.get(key)
+                if isinstance(item, int) and not isinstance(item, bool):
+                    event[key] = item
+            occurred_at = raw_event.get("occurred_at")
+            if isinstance(occurred_at, (int, float)) and not isinstance(occurred_at, bool):
+                event["occurred_at"] = occurred_at
+            if event:
+                events.append(event)
+        if events:
+            out["events"] = events
+
+    return out or None
 
 
 def _marker_path(home: Path | str) -> Path:
@@ -95,7 +164,13 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
 
 
 def record_turn_start(
-    home: Path | str, session_key: str, prompt: str, *, attempts: int = 0
+    home: Path | str,
+    session_key: str,
+    prompt: str,
+    *,
+    attempts: int = 0,
+    display_kind: str | None = None,
+    display_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Persist the marker for a turn that is about to run.
 
@@ -111,6 +186,12 @@ def record_turn_start(
         "prompt": prompt[:_MAX_PROMPT_CHARS],
         "started_at": now,
     }
+    bounded_kind = _bounded_string(display_kind, _MAX_DISPLAY_KIND_CHARS)
+    if bounded_kind is not None:
+        entry["display_kind"] = bounded_kind
+    bounded_metadata = _sanitize_display_metadata(display_metadata)
+    if bounded_metadata is not None:
+        entry["display_metadata"] = bounded_metadata
     try:
         with _lock:
             path = _marker_path(home)
@@ -156,4 +237,15 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
         attempts = max(0, int(entry.get("attempts") or 0))
     except (TypeError, ValueError):
         return None
-    return {"attempts": attempts, "prompt": prompt, "started_at": started_at}
+    marker: dict[str, Any] = {
+        "attempts": attempts,
+        "prompt": prompt,
+        "started_at": started_at,
+    }
+    display_kind = _bounded_string(entry.get("display_kind"), _MAX_DISPLAY_KIND_CHARS)
+    if display_kind is not None:
+        marker["display_kind"] = display_kind
+    display_metadata = _sanitize_display_metadata(entry.get("display_metadata"))
+    if display_metadata is not None:
+        marker["display_metadata"] = display_metadata
+    return marker
