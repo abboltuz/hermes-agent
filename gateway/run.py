@@ -6772,6 +6772,36 @@ def _internal_event_display_metadata(event: MessageEvent, source: SessionSource)
     return metadata
 
 
+def _watch_event_display_metadata(evt: dict) -> dict[str, Any]:
+    """Build bounded provenance for a queued process/delegation event."""
+    event_type = str(evt.get("type") or "").strip()[:128]
+    session_id = str(evt.get("session_id") or "").strip()[:512]
+    if event_type == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "").strip()[:512]
+        metadata: dict[str, Any] = {
+            "source": "delegation",
+            "internal": True,
+            "kind": "async_delegation_complete",
+        }
+        if delegation_id:
+            metadata["delegation_id"] = delegation_id
+            metadata["event_id"] = delegation_id
+    else:
+        event_id = str(
+            evt.get("event_id") or evt.get("message_id") or session_id
+        ).strip()[:512]
+        metadata = {
+            "source": "process",
+            "internal": True,
+            "kind": event_type or "process_notification",
+        }
+        if event_id:
+            metadata["event_id"] = event_id
+    if session_id:
+        metadata["session_id"] = session_id
+    return metadata
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -21840,6 +21870,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=source,
                             message_id=None,
                             channel_prompt=None,
+                            internal=True,
+                            metadata={
+                                "source": "heartbeat",
+                                "internal": True,
+                                "kind": "heartbeat_tick",
+                                "session_id": session_id,
+                                "event_id": (
+                                    f"{session_id}:"
+                                    f"{getattr(getattr(mgr, 'state', None), 'fire_count', 0)}"
+                                ),
+                            },
                         )
                         self._enqueue_fifo(quick_key, hb_event, adapter)
                     except Exception as exc:
@@ -22009,12 +22050,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
+                goal_state = mgr.state
+                goal_created_ms = int(
+                    (getattr(goal_state, "created_at", 0.0) or 0.0) * 1000
+                )
+                goal_turn = int(getattr(goal_state, "turns_used", 0) or 0)
                 cont_event = MessageEvent(
                     text=prompt,
                     message_type=MessageType.TEXT,
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
+                    metadata={
+                        "source": "goal",
+                        "internal": True,
+                        "kind": "goal_continuation",
+                        "session_id": sid,
+                        "event_id": f"{sid}:{goal_created_ms}:{goal_turn}",
+                    },
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -25503,6 +25557,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        display_metadata = _watch_event_display_metadata(evt)
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -25527,7 +25582,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            display_metadata=display_metadata,
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -25594,7 +25654,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    display_metadata=display_metadata,
+                )
                 return True
             except Exception as e:
                 logger.warning(
@@ -25604,7 +25669,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return False
         try:
-            metadata = {}
+            metadata = dict(display_metadata)
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
@@ -28055,6 +28120,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -28141,6 +28208,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "messages": api_messages,
             "stream": True,
         }
+        if (
+            persist_user_display_kind is not None
+            or persist_user_display_metadata is not None
+        ):
+            from gateway.internal_turn import (
+                INTERNAL_TURN_FIELD,
+                build_internal_turn_envelope,
+            )
+
+            body[INTERNAL_TURN_FIELD] = build_internal_turn_envelope(
+                persist_user_display_kind,
+                persist_user_display_metadata,
+            )
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -28551,6 +28631,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
             )
 
         from run_agent import AIAgent

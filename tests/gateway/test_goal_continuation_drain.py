@@ -196,6 +196,16 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
-    assert adapter._pending_messages[adapter_key].text.startswith(
+    continuation = adapter._pending_messages[adapter_key]
+    assert continuation.text.startswith(
         "[Continuing toward your standing goal]"
     )
+    assert continuation.internal is True
+    assert continuation.metadata["source"] == "goal"
+    assert continuation.metadata["internal"] is True
+    assert continuation.metadata["kind"] == "goal_continuation"
+    assert continuation.metadata["session_id"] == session_entry.session_id
+    assert continuation.metadata["event_id"].startswith(
+        f"{session_entry.session_id}:"
+    )
+    assert continuation.metadata["event_id"].endswith(":1")

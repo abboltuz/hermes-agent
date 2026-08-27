@@ -13,6 +13,7 @@ import asyncio
 import pytest
 
 from gateway.config import Platform
+from gateway.internal_turn import INTERNAL_TURN_FIELD
 from gateway.session import SessionSource
 from gateway.wake import deliver_wake, adapter_supports_push
 
@@ -85,7 +86,17 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         runner, port = await _serve(handler)
         try:
             adapter = ApiServerLikeAdapter(host="0.0.0.0", port=port, key="sekrit")
-            await deliver_wake(adapter, text="task done — wake", session_id="raw-sid-42")
+            await deliver_wake(
+                adapter,
+                text="task done — wake",
+                session_id="raw-sid-42",
+                display_metadata={
+                    "source": "process",
+                    "internal": True,
+                    "kind": "process_notification",
+                    "event_id": "proc-42",
+                },
+            )
         finally:
             await runner.cleanup()
 
@@ -96,6 +107,15 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
     ]
+    assert seen["body"][INTERNAL_TURN_FIELD] == {
+        "display_kind": "internal_notification",
+        "display_metadata": {
+            "source": "process",
+            "internal": True,
+            "kind": "process_notification",
+            "event_id": "proc-42",
+        },
+    }
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):

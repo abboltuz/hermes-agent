@@ -531,8 +531,14 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, internal_turn):
+        posts.append(
+            {
+                "text": text,
+                "session_id": session_id,
+                "internal_turn": internal_turn,
+            }
+        )
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -546,7 +552,20 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
     assert result is True
     api_adapter.handle_message.assert_not_awaited()
     assert posts == [
-        {"text": "[SYSTEM: subagent finished]", "session_id": "raw-hq-session-id"}
+        {
+            "text": "[SYSTEM: subagent finished]",
+            "session_id": "raw-hq-session-id",
+            "internal_turn": {
+                "display_kind": "internal_notification",
+                "display_metadata": {
+                    "source": "process",
+                    "internal": True,
+                    "kind": "process_notification",
+                    "session_id": "proc_watch",
+                    "event_id": "proc_watch",
+                },
+            },
+        }
     ]
 
 
@@ -564,8 +583,8 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append(session_id)
+    async def fake_self_post(adapter, *, text, session_id, internal_turn):
+        posts.append((session_id, internal_turn))
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -577,7 +596,21 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     }
     result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
     assert result is True
-    assert posts == ["raw-origin-sid"]
+    assert posts == [
+        (
+            "raw-origin-sid",
+            {
+                "display_kind": "internal_notification",
+                "display_metadata": {
+                    "source": "process",
+                    "internal": True,
+                    "kind": "process_notification",
+                    "session_id": "proc_watch",
+                    "event_id": "proc_watch",
+                },
+            },
+        )
+    ]
 
 
 def test_gateway_drain_retains_and_formats_overflow_events():

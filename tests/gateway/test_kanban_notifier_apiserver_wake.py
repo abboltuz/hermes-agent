@@ -111,8 +111,14 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, internal_turn):
+        posts.append(
+            {
+                "text": text,
+                "session_id": session_id,
+                "internal_turn": internal_turn,
+            }
+        )
 
     import gateway.wake as wake_mod
 
@@ -128,6 +134,13 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert len(posts) == 1
     assert posts[0]["session_id"] == "origin-session"
     assert all(post["session_id"] != "worker-session" for post in posts)
+    wake_metadata = posts[0]["internal_turn"]["display_metadata"]
+    assert wake_metadata["source"] == "kanban"
+    assert wake_metadata["internal"] is True
+    assert wake_metadata["kind"] == "kanban_wake"
+    assert wake_metadata["task_id"] == tid
+    assert isinstance(wake_metadata["event_id"], int)
+    assert wake_metadata["event_kind"] == "completed"
     wake_text = posts[0]["text"]
     assert tid in wake_text
     # Graph-safe wake turn (#70752): the synthetic turn must carry the
@@ -168,7 +181,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, internal_turn):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -193,7 +206,7 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     )
     attempted_sessions = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id):
+    async def fail_once_then_succeed(adapter, *, text, session_id, internal_turn):
         attempted_sessions.append(session_id)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")

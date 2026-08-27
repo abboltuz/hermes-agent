@@ -5052,6 +5052,35 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        internal_turn_kwargs: Dict[str, Any] = {}
+        from gateway.internal_turn import (
+            INTERNAL_TURN_FIELD,
+            parse_internal_turn_envelope,
+        )
+
+        if INTERNAL_TURN_FIELD in body:
+            # This private envelope changes how the persisted user row is
+            # trusted and rendered. Never honor it on the adapter's historical
+            # no-key test/manual-wiring path: an unauthenticated caller must not
+            # be able to impersonate an internal Hermes producer.
+            if not self._expected_api_key():
+                return web.json_response(
+                    _openai_error(
+                        "Internal turn provenance requires API key authentication."
+                    ),
+                    status=403,
+                )
+            try:
+                display_kind, display_metadata = parse_internal_turn_envelope(
+                    body[INTERNAL_TURN_FIELD]
+                )
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc)), status=400)
+            internal_turn_kwargs = {
+                "persist_user_display_kind": display_kind,
+                "persist_user_display_metadata": display_metadata,
+            }
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -5272,6 +5301,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                **internal_turn_kwargs,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5293,13 +5323,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                **internal_turn_kwargs,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                keys=[
+                    "model",
+                    "provider",
+                    "model_options",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                    INTERNAL_TURN_FIELD,
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
@@ -7218,6 +7258,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7308,10 +7350,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    conversation_kwargs: Dict[str, Any] = {
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if persist_user_display_kind:
+                        conversation_kwargs["persist_user_display_kind"] = (
+                            persist_user_display_kind
+                        )
+                    if persist_user_display_metadata is not None:
+                        conversation_kwargs["persist_user_display_metadata"] = (
+                            persist_user_display_metadata
+                        )
                     result = agent.run_conversation(
                         user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                        **conversation_kwargs,
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
