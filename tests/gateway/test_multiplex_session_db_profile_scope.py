@@ -457,3 +457,133 @@ def test_runner_session_db_follows_the_active_profile_scope(multiplex_homes):
     assert runner._session_db_handles == {}
     assert root_db._db._conn is None
     assert profile_db._db._conn is None
+
+
+def test_named_profile_delegation_preflight_self_posts_and_acks_own_ledger(
+    multiplex_homes, monkeypatch,
+):
+    """A completion owned only by a secondary profile must survive preflight,
+    self-post on that profile route, and acknowledge that profile's row."""
+    from collections import OrderedDict
+    from types import SimpleNamespace
+    import threading
+    import time
+
+    from gateway.run import GatewayRunner, _SESSION_DB_UNPINNED
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+
+    _root, profile_home = multiplex_homes
+    parent_session_id = "writer-parent-session"
+    profile_token = set_hermes_home_override(str(profile_home))
+    try:
+        db = SessionDB()
+        db.create_session(parent_session_id, "api_server")
+        db.close()
+    finally:
+        reset_hermes_home_override(profile_token)
+
+    now = time.time()
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-profile-delivery",
+        "session_key": "memory-scope",
+        "origin_session_id": "raw-writer-session",
+        "parent_session_id": parent_session_id,
+        "origin_profile": "fitness",
+        "origin_api_route_profile": "fitness",
+        "goal": "profile delivery",
+        "status": "completed",
+        "summary": "done",
+        "dispatched_at": now - 1,
+        "completed_at": now,
+    }
+    ad._persist_dispatch(
+        {
+            **event,
+            "role": "leaf",
+            "model": "test-model",
+        }
+    )
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    runner.session_store = SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={},
+    )
+    runner._session_source_cache = {}
+    runner._session_db_pinned = _SESSION_DB_UNPINNED
+    runner._session_db_handles = {}
+    runner._session_db_handles_lock = threading.Lock()
+    runner._completion_delivery_lock = threading.Lock()
+    runner._completion_deliveries_inflight = set()
+    runner._completion_deliveries_delivered = OrderedDict()
+    runner._completion_delivery_retention = 2048
+    posts = []
+
+    async def capture_wake(
+        _adapter, *, text, session_id, profile="", route_profile="", **_kwargs
+    ):
+        posts.append((text, session_id, profile, route_profile))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", capture_wake)
+    try:
+        delivered = asyncio.run(
+            runner._deliver_completion_notification("done", event)
+        )
+    finally:
+        runner.close_all_session_db_handles()
+
+    assert delivered is True
+    assert posts == [
+        ("done", "raw-writer-session", "fitness", "fitness")
+    ]
+    row = ad.get_durable_delegation(
+        event["delegation_id"], profile="fitness"
+    )
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+
+
+def test_restart_restores_secondary_profile_delegation_ledger(
+    multiplex_homes,
+):
+    """Gateway startup can discover pending rows outside the active DB."""
+    import time
+
+    from tools import async_delegation as ad
+    from tools.process_registry import ProcessRegistry
+
+    now = time.time()
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-profile-restart",
+        "session_key": "memory-scope",
+        "origin_session_id": "raw-writer-session",
+        "parent_session_id": "writer-parent-session",
+        "origin_profile": "fitness",
+        "origin_api_route_profile": "fitness",
+        "goal": "restart delivery",
+        "status": "completed",
+        "summary": "restored",
+        "dispatched_at": now - 1,
+        "completed_at": now,
+    }
+    ad._persist_dispatch({**event, "role": "leaf", "model": "test-model"})
+    ad._persist_completion(
+        event, {"status": "completed", "summary": "restored"}
+    )
+
+    registry = ProcessRegistry()
+    assert registry.completion_queue.empty()
+    assert registry.restore_delegation_profiles(["fitness"]) == 1
+    restored = registry.completion_queue.get_nowait()
+    assert restored["delegation_id"] == event["delegation_id"]
+    assert restored["origin_profile"] == "fitness"
+    assert restored["origin_api_route_profile"] == "fitness"
+    assert restored["restored"] is True
+    assert registry.restore_delegation_profiles(["fitness"]) == 0

@@ -12892,6 +12892,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+
+            if getattr(self.config, "multiplex_profiles", False):
+                from hermes_cli.profiles import get_active_profile_name
+
+                active_profile = get_active_profile_name() or "default"
+                secondary_profiles = [
+                    profile_name
+                    for profile_name, _profile_home in _multiplex_profile_homes(
+                        self.config
+                    )
+                    if profile_name != active_profile
+                ]
+                recovered_delegations = (
+                    process_registry.restore_delegation_profiles(
+                        secondary_profiles
+                    )
+                )
+                if recovered_delegations:
+                    logger.info(
+                        "Recovered %s async delegation completion(s) from "
+                        "secondary profile ledgers",
+                        recovered_delegations,
+                    )
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
@@ -25732,7 +25755,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return (evt_type, producer_id, started_at)
         return None
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_completion_target(
+        self,
+        parent_session_id: str,
+        *,
+        profile: str = "",
+    ) -> str:
         """Classify an async-completion delivery target before adapter acceptance.
 
         Returns one of:
@@ -25751,7 +25779,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           continuation exists). The claim should be released so a later
           consumer can retry; the attempt cap bounds the churn.
         """
-        session_db = getattr(self, "_session_db", None)
+        profile_name = str(profile or "").strip()
+        if profile_name and profile_name != "custom" and getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        ):
+            try:
+                from hermes_cli.profiles import get_profile_dir
+
+                # ``_session_db`` is a scope-sensitive property in production.
+                # Resolve the handle while the originating profile is active;
+                # the returned AsyncSessionDB remains pinned to that path after
+                # the short scope exits. Test-pinned fakes still win unchanged.
+                with _profile_runtime_scope(get_profile_dir(profile_name)):
+                    session_db = getattr(self, "_session_db", None)
+            except Exception:
+                logger.debug(
+                    "Async-completion pre-flight could not resolve profile %s",
+                    profile_name,
+                    exc_info=True,
+                )
+                return "retry"
+        else:
+            session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return "retry"
         try:
@@ -25821,7 +25870,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
                     if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
+                        durable_delegation_id,
+                        durable_claim_id,
+                        profile=str(evt.get("origin_profile") or ""),
                     ):
                         return None
                 except Exception as exc:
@@ -25838,7 +25889,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # would falsely acknowledge the durable row as delivered.
                 # Verify the target here, before acceptance, and give drops an
                 # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
+                verdict = await self._classify_completion_target(
+                    parent_session_id,
+                    profile=str(evt.get("origin_profile") or ""),
+                )
                 if verdict == "terminal":
                     logger.warning(
                         "Async delegation %s targets permanently-gone session %s; "
@@ -25851,7 +25905,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             from tools.async_delegation import drop_completion_delivery
 
                             drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
+                                durable_delegation_id,
+                                durable_claim_id,
+                                profile=str(evt.get("origin_profile") or ""),
                             )
                         except Exception:
                             logger.debug(
@@ -25865,7 +25921,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             from tools.async_delegation import release_completion_delivery
 
                             release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
+                                durable_delegation_id,
+                                durable_claim_id,
+                                profile=str(evt.get("origin_profile") or ""),
                             )
                         except Exception:
                             logger.debug(
@@ -25883,7 +25941,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Legacy/unstamped events keep today's behavior and deliver.
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
-                verdict = await self._classify_completion_target(parent_session_id)
+                verdict = await self._classify_completion_target(
+                    parent_session_id,
+                    profile=str(evt.get("origin_profile") or ""),
+                )
                 if verdict == "terminal":
                     logger.warning(
                         "Background process %s completion targets "
@@ -25933,7 +25994,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from tools.async_delegation import complete_completion_delivery
 
                     complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
+                        durable_delegation_id,
+                        durable_claim_id,
+                        profile=str(evt.get("origin_profile") or ""),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -25950,7 +26013,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from tools.async_delegation import release_completion_delivery
 
                     release_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
+                        durable_delegation_id,
+                        durable_claim_id,
+                        profile=str(evt.get("origin_profile") or ""),
                     )
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
