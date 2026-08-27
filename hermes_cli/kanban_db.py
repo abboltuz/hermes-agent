@@ -3633,6 +3633,71 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def is_notification_event_current(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    run_id: Optional[int],
+    kind: str,
+) -> bool:
+    """Return whether one durable notification event still matches live state."""
+    row = conn.execute(
+        "SELECT task_id, kind, payload, run_id FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    if row is None or row["task_id"] != task_id or row["kind"] != kind:
+        return False
+    stored_run_id = int(row["run_id"]) if row["run_id"] is not None else None
+    if stored_run_id != run_id:
+        return False
+    if run_id is not None:
+        newer_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND id > ? LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if newer_run is not None:
+            return False
+
+    if kind in {"completed", "blocked", "gave_up", "status"}:
+        superseding_kinds = {
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "status",
+            "unblocked",
+        }
+        if kind != "completed":
+            superseding_kinds.add("archived")
+        placeholders = ",".join("?" for _ in superseding_kinds)
+        newer = conn.execute(
+            f"SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            f"AND kind IN ({placeholders}) LIMIT 1",
+            (task_id, int(event_id), *sorted(superseding_kinds)),
+        ).fetchone()
+        if newer is not None:
+            return False
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    if kind == "completed":
+        return task.status in {"done", "archived"}
+    if kind in {"blocked", "gave_up"}:
+        return task.status == "blocked"
+    if kind in {"crashed", "timed_out"}:
+        return True
+    if kind == "status":
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return isinstance(payload, dict) and payload.get("status") == task.status
+    return False
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {

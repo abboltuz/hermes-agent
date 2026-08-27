@@ -10588,6 +10588,73 @@ class _KanbanWake(NamedTuple):
     run_id: Optional[int]
     kind: str
     created_at: int
+    platform: str
+    chat_id: str
+    thread_id: str
+
+
+def _kanban_wake_identity(wake: _KanbanWake) -> tuple[str, str, str, str, int]:
+    """Immutable event identity within one concrete subscription route."""
+    return (
+        wake.board_slug,
+        wake.platform,
+        wake.chat_id,
+        wake.thread_id,
+        wake.event_id,
+    )
+
+
+def _dedupe_kanban_wakes(wakes: list[_KanbanWake]) -> list[_KanbanWake]:
+    """Preserve order while coalescing repeated delivery of one event row."""
+    seen: set[tuple[str, str, str, str, int]] = set()
+    deduped: list[_KanbanWake] = []
+    for wake in wakes:
+        identity = _kanban_wake_identity(wake)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(wake)
+    return deduped
+
+
+def _partition_current_kanban_wakes(
+    wakes: list[_KanbanWake],
+) -> tuple[list[_KanbanWake], list[_KanbanWake]]:
+    """Split wakes into current and temporarily unverifiable; omit stale ones."""
+    from hermes_cli import kanban_db as _kb
+
+    current: list[_KanbanWake] = []
+    retry: list[_KanbanWake] = []
+    connections: dict[str, Any] = {}
+    failed_boards: set[str] = set()
+    try:
+        for wake in _dedupe_kanban_wakes(wakes):
+            if wake.board_slug in failed_boards:
+                retry.append(wake)
+                continue
+            try:
+                conn = connections.get(wake.board_slug)
+                if conn is None:
+                    conn = _kb.connect(board=wake.board_slug)
+                    connections[wake.board_slug] = conn
+                if _kb.is_notification_event_current(
+                    conn,
+                    task_id=wake.task_id,
+                    event_id=wake.event_id,
+                    run_id=wake.run_id,
+                    kind=wake.kind,
+                ):
+                    current.append(wake)
+            except Exception:
+                failed_boards.add(wake.board_slug)
+                retry.append(wake)
+    finally:
+        for conn in connections.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return current, retry
 
 
 def _kanban_wake_event_metadata(wake: _KanbanWake) -> dict[str, Any]:
@@ -10880,6 +10947,9 @@ def _collect_kanban_notifications(session: dict) -> list[_KanbanWake]:
                                 run_id=getattr(ev, "run_id", None),
                                 kind=str(getattr(ev, "kind", "") or ""),
                                 created_at=int(getattr(ev, "created_at", 0) or 0),
+                                platform=str(sub.get("platform") or ""),
+                                chat_id=str(sub.get("chat_id") or ""),
+                                thread_id=str(sub.get("thread_id") or ""),
                             )
                         )
                 # Unsubscribe only on archive. ``done`` is reversible in
@@ -10959,18 +11029,42 @@ def _notification_poller_loop(
                         sid,
                         {"kind": "process", "text": _kb_wake.text},
                     )
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_wakes)
+                # The durable cursor stays claimed. Buffer typed identities
+                # until idle; transient validation/submit failures requeue only
+                # this in-memory batch rather than rewinding shared delivery.
+                session["_kanban_pending"] = _dedupe_kanban_wakes(
+                    list(session.get("_kanban_pending") or []) + _kanban_wakes
+                )
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list[_KanbanWake] = []
                 with session["history_lock"]:
                     if not session.get("running"):
                         session["running"] = True
-                        _batch = list(_pending)
+                        _batch = _dedupe_kanban_wakes(list(_pending))
                         session["_kanban_pending"] = []
                 if _batch:
+                    _candidate_batch = list(_batch)
+                    _batch, _retry_batch = _partition_current_kanban_wakes(_batch)
+                    _retryable_identities = {
+                        _kanban_wake_identity(wake)
+                        for wake in _batch + _retry_batch
+                    }
+                    _requeue_on_failure = [
+                        wake
+                        for wake in _candidate_batch
+                        if _kanban_wake_identity(wake) in _retryable_identities
+                    ]
+                    if _retry_batch:
+                        with session["history_lock"]:
+                            session["_kanban_pending"] = _dedupe_kanban_wakes(
+                                _retry_batch
+                                + list(session.get("_kanban_pending") or [])
+                            )
+                    if not _batch:
+                        with session["history_lock"]:
+                            session["running"] = False
+                        continue
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
@@ -11000,6 +11094,10 @@ def _notification_poller_loop(
                             file=sys.stderr,
                         )
                         with session["history_lock"]:
+                            session["_kanban_pending"] = _dedupe_kanban_wakes(
+                                _requeue_on_failure
+                                + list(session.get("_kanban_pending") or [])
+                            )
                             session["running"] = False
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)

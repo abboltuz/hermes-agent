@@ -80,6 +80,9 @@ class TestCollectKanbanNotifications:
         assert wake.event_id > 0
         assert wake.created_at > 0
         assert wake.board_slug == kb.DEFAULT_BOARD
+        assert wake.platform == "tui"
+        assert wake.chat_id == SESSION_KEY
+        assert wake.thread_id == ""
         assert tid in wake.text
         assert "done" in wake.text
         assert "shipped the fix" in wake.text
@@ -271,6 +274,94 @@ class TestFormatKanbanEventText:
         assert "timed out" in text
 
 
+class TestKanbanWakeLiveState:
+    def test_current_completed_event_is_actionable(self):
+        tid = _create_subscribed_task()
+        _complete(tid, summary="still current")
+        wake = _collect_kanban_notifications(_session())[0]
+
+        conn = kb.connect()
+        try:
+            assert kb.is_notification_event_current(
+                conn,
+                task_id=wake.task_id,
+                event_id=wake.event_id,
+                run_id=wake.run_id,
+                kind=wake.kind,
+            )
+        finally:
+            conn.close()
+
+    def test_completed_event_remains_current_after_archive(self):
+        tid = _create_subscribed_task()
+        _complete(tid, summary="final completion")
+        wake = _collect_kanban_notifications(_session())[0]
+        conn = kb.connect()
+        try:
+            assert kb.archive_task(conn, tid)
+            assert kb.is_notification_event_current(
+                conn,
+                task_id=wake.task_id,
+                event_id=wake.event_id,
+                run_id=wake.run_id,
+                kind=wake.kind,
+            )
+        finally:
+            conn.close()
+
+    def test_old_completed_event_is_stale_after_reopen_and_recomplete(self):
+        tid = _create_subscribed_task()
+        _complete(tid, summary="first completion")
+        old_wake = _collect_kanban_notifications(_session())[0]
+
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+                kb._append_event(conn, tid, "status", {"status": "ready"})
+            assert kb.complete_task(conn, tid, summary="second completion")
+            assert not kb.is_notification_event_current(
+                conn,
+                task_id=old_wake.task_id,
+                event_id=old_wake.event_id,
+                run_id=old_wake.run_id,
+                kind=old_wake.kind,
+            )
+        finally:
+            conn.close()
+
+    def test_old_crash_event_is_stale_after_new_run_starts(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            claimed = kb.claim_task(conn, tid, claimer="worker-one")
+            assert claimed is not None
+            with kb.write_txn(conn):
+                old_run_id = kb._end_run(conn, tid, outcome="crashed", status="crashed")
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                    (tid,),
+                )
+                kb._append_event(conn, tid, "crashed", {}, run_id=old_run_id)
+        finally:
+            conn.close()
+        old_wake = _collect_kanban_notifications(_session())[0]
+
+        conn = kb.connect()
+        try:
+            assert kb.claim_task(conn, tid, claimer="worker-two") is not None
+            assert not kb.is_notification_event_current(
+                conn,
+                task_id=old_wake.task_id,
+                event_id=old_wake.event_id,
+                run_id=old_wake.run_id,
+                kind=old_wake.kind,
+            )
+        finally:
+            conn.close()
+
+
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.
 
@@ -392,6 +483,246 @@ class TestNotificationPollerLoopKanbanWiring:
         assert session["_kanban_pending"] == []
         assert session["running"] is True
 
+    def test_stale_pending_wake_is_suppressed_at_idle_boundary(self, monkeypatch):
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="became stale")
+        stale_wake = _collect_kanban_notifications(_session())[0]
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+                kb._append_event(conn, tid, "status", {"status": "ready"})
+        finally:
+            conn.close()
+
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = [stale_wake]
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+        stop, thread, _emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(
+                lambda: session.get("_kanban_pending") == []
+                and session.get("running") is False
+            ), "stale pending wake was not consumed"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert submits == []
+
+    def test_live_state_read_failure_keeps_wake_pending(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="retry validation")
+        wake = _collect_kanban_notifications(_session())[0]
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = [wake]
+        checked = threading.Event()
+
+        def fail_validation(*_args, **_kwargs):
+            checked.set()
+            raise OSError("board temporarily unavailable")
+
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+        monkeypatch.setattr(kb, "is_notification_event_current", fail_validation)
+        stop, thread, _emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert checked.wait(timeout=5), "live-state validation was never attempted"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert submits == []
+        assert session.get("running") is False
+        assert session.get("_kanban_pending") == [wake]
+
+    def test_validation_retry_stays_before_concurrent_new_wake(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="older wake")
+        older = _collect_kanban_notifications(_session())[0]
+        newer = older._replace(event_id=older.event_id + 100, text="newer wake")
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = [older]
+        injected = False
+
+        def fail_after_concurrent_enqueue(*_args, **_kwargs):
+            nonlocal injected
+            if not injected:
+                session["_kanban_pending"] = [newer]
+                injected = True
+            raise OSError("board temporarily unavailable")
+
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+        monkeypatch.setattr(kb, "is_notification_event_current", fail_after_concurrent_enqueue)
+        stop, thread, _emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(
+                lambda: len(session.get("_kanban_pending") or []) == 2
+                and session.get("running") is False
+            )
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert submits == []
+        assert session.get("_kanban_pending") == [older, newer]
+
+    def test_submit_failure_requeues_current_wake(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="retry submit")
+        wake = _collect_kanban_notifications(_session())[0]
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = [wake]
+        attempted = threading.Event()
+
+        def fail_submit(*_args, **_kwargs):
+            attempted.set()
+            raise RuntimeError("submit unavailable")
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+        monkeypatch.setattr(server, "_run_prompt_submit", fail_submit)
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-poller-test", session),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            assert attempted.wait(timeout=5), "submit was never attempted"
+            assert self._wait_for(lambda: session.get("running") is False)
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert session.get("_kanban_pending") == [wake]
+
+    def test_submit_failure_preserves_mixed_batch_order(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="mixed batch")
+        older_retry = _collect_kanban_notifications(_session())[0]
+        newer_current = older_retry._replace(
+            event_id=older_retry.event_id + 1,
+            text="newer current wake",
+        )
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = [older_retry, newer_current]
+        attempted = threading.Event()
+
+        def fail_submit(*_args, **_kwargs):
+            attempted.set()
+            raise RuntimeError("submit unavailable")
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+        monkeypatch.setattr(
+            server,
+            "_partition_current_kanban_wakes",
+            lambda _batch: ([newer_current], [older_retry]),
+        )
+        monkeypatch.setattr(server, "_run_prompt_submit", fail_submit)
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-poller-test", session),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            assert attempted.wait(timeout=5), "submit was never attempted"
+            assert self._wait_for(lambda: session.get("running") is False)
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert session.get("_kanban_pending") == [older_retry, newer_current]
+
+    def test_duplicate_pending_event_identity_dispatches_once(self, monkeypatch):
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="one durable event")
+        wake = _collect_kanban_notifications(_session())[0]
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = [wake, wake]
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+
+        stop, thread, _emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(lambda: submits), "pending wake was never dispatched"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert len(submits) == 1
+        assert len(submits[0]["display_metadata"]["events"]) == 1
+        assert submits[0]["display_metadata"]["events"][0]["event_id"] == wake.event_id
+
+    def test_distinct_subscription_identity_is_not_collapsed(self, monkeypatch):
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="same event, two routes")
+        wake = _collect_kanban_notifications(_session())[0]
+        routed_copy = wake._replace(thread_id="secondary-thread")
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = [wake, routed_copy]
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+
+        stop, thread, _emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(lambda: submits), "pending wakes were never dispatched"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert len(submits) == 1
+        assert len(submits[0]["display_metadata"]["events"]) == 2
+
+    def test_same_text_with_distinct_event_ids_is_not_collapsed(self, monkeypatch):
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "crashed", {})
+                kb._append_event(conn, tid, "crashed", {})
+        finally:
+            conn.close()
+        wakes = _collect_kanban_notifications(_session())
+        assert len(wakes) == 2
+        assert wakes[0].text == wakes[1].text
+        assert wakes[0].event_id != wakes[1].event_id
+
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = wakes
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _session: [])
+        stop, thread, _emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(lambda: submits), "pending wakes were never dispatched"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert len(submits[0]["display_metadata"]["events"]) == 2
+
     @pytest.mark.parametrize(
         ("event_kind", "payload"),
         [
@@ -410,6 +741,16 @@ class TestNotificationPollerLoopKanbanWiring:
         conn = kb.connect()
         try:
             with kb.write_txn(conn):
+                current_status = {
+                    "completed": "done",
+                    "blocked": "blocked",
+                    "gave_up": "blocked",
+                }.get(event_kind)
+                if current_status:
+                    conn.execute(
+                        "UPDATE tasks SET status = ? WHERE id = ?",
+                        (current_status, tid),
+                    )
                 kb._append_event(conn, tid, event_kind, payload, run_id=17)
         finally:
             conn.close()
