@@ -466,6 +466,31 @@ describe('toChatMessages', () => {
     expect(chatMessageText(messages[0])).toBe('✔ [default] @worker Kanban t_123 done — shipped the fix')
   })
 
+  it.each([
+    [
+      'JSON text',
+      JSON.stringify({ source: 'kanban', display_text: '✔ recovered Kanban display text' }),
+      '✔ recovered Kanban display text'
+    ],
+    ['unparseable text', '{not-json', 'opaque internal Kanban payload'],
+    ['missing metadata', undefined, 'opaque internal Kanban payload']
+  ])('projects an internal notification given %s', (_case, displayMetadata, expected) => {
+    const read = () =>
+      toChatMessages([
+        {
+          role: 'user',
+          content: 'opaque internal Kanban payload',
+          display_kind: 'internal_notification',
+          display_metadata: displayMetadata as SessionMessage['display_metadata'],
+          timestamp: 1
+        }
+      ])
+
+    expect(read).not.toThrow()
+    expect(read()[0].role).toBe('system')
+    expect(chatMessageText(read()[0])).toBe(expected)
+  })
+
   // A backend older than this app serves display_metadata as unparsed JSON
   // text. Indexing into that string used to throw and fail the whole resume.
   it.each([

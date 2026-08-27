@@ -228,6 +228,95 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
     assert stamped == [("session-key", "auto_continue")]
 
 
+def test_internal_notification_bypasses_context_reference_expansion(
+    emits, turn_env, marker_home, monkeypatch
+):
+    """Untrusted Kanban text must stay inert inside an internal wake."""
+    from agent import context_references, model_metadata
+
+    calls: list[str] = []
+    seen: list[str] = []
+
+    def _preprocess(message, **_kwargs):
+        calls.append(message)
+        return types.SimpleNamespace(
+            blocked=False,
+            expanded=True,
+            message="EXPANDED UNTRUSTED REFERENCE",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(context_references, "preprocess_context_references", _preprocess)
+    monkeypatch.setattr(
+        model_metadata, "get_model_context_length", lambda *args, **kwargs: 100_000
+    )
+
+    def _run(message, **_kwargs):
+        seen.append(message)
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    prompt = (
+        "[INTERNAL KANBAN WAKE — NOT USER-AUTHORED]\n"
+        'EVENT {"notification":"@url:https://example.invalid '
+        '@file:secret.txt @plugin:payload"}\n'
+        "[/INTERNAL KANBAN WAKE]"
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        _session(agent=agent, running=True),
+        prompt,
+        display_kind="internal_notification",
+        display_metadata={"source": "kanban"},
+    )
+
+    assert calls == []
+    assert seen == [prompt]
+
+
+def test_human_prompt_still_expands_context_references(
+    emits, turn_env, marker_home, monkeypatch
+):
+    from agent import context_references, model_metadata
+
+    calls: list[str] = []
+    seen: list[str] = []
+
+    def _preprocess(message, **_kwargs):
+        calls.append(message)
+        return types.SimpleNamespace(
+            blocked=False,
+            expanded=True,
+            message="EXPANDED HUMAN REFERENCE",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(context_references, "preprocess_context_references", _preprocess)
+    monkeypatch.setattr(
+        model_metadata, "get_model_context_length", lambda *args, **kwargs: 100_000
+    )
+
+    def _run(message, **_kwargs):
+        seen.append(message)
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    prompt = "Please inspect @file:notes.txt"
+
+    server._run_prompt_submit(
+        "rid", "sid", _session(agent=agent, running=True), prompt
+    )
+
+    assert calls == [prompt]
+    assert seen == ["EXPANDED HUMAN REFERENCE"]
+
+
 # ── Scheduling decision ────────────────────────────────────────────────
 
 
