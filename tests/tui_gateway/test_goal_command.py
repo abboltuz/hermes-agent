@@ -266,10 +266,19 @@ def test_active_goal_retries_once_without_judging_failed_turn(
     mgr.set("finish the current task")
     continuation = mgr.next_continuation_prompt()
     seen_prompts = []
+    seen_provenance = []
     results = iter([_compression_failure(), {"final_response": "recovered work"}])
 
-    def run_conversation(message, **_kwargs):
+    def run_conversation(
+        message,
+        persist_user_display_kind=None,
+        persist_user_display_metadata=None,
+        **_kwargs,
+    ):
         seen_prompts.append(message)
+        seen_provenance.append(
+            (persist_user_display_kind, persist_user_display_metadata)
+        )
         return next(results)
 
     judged = []
@@ -289,6 +298,19 @@ def test_active_goal_retries_once_without_judging_failed_turn(
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
     assert seen_prompts == ["initial work", continuation]
+    assert seen_provenance == [
+        (None, None),
+        (
+            "internal_notification",
+            {
+                "source": "goal",
+                "internal": True,
+                "kind": "goal_continuation",
+                "session_id": session_key,
+                "display_text": "Continuing toward standing goal",
+            },
+        ),
+    ]
     assert judged == ["recovered work"]
     assert GoalManager(session_key).state.turns_used == 0
     assert server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS not in session

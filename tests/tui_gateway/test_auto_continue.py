@@ -117,6 +117,54 @@ def test_marker_roundtrip(tmp_path):
     assert read_turn_marker(tmp_path, "abc") is None
 
 
+def test_marker_roundtrip_preserves_only_bounded_provenance(tmp_path):
+    record_turn_start(
+        tmp_path,
+        "kanban-session",
+        "internal wake",
+        display_kind="internal_notification",
+        display_metadata={
+            "source": "kanban",
+            "internal": True,
+            "kind": "kanban_wake",
+            "display_text": "task completed",
+            "events": [
+                {
+                    "board": "hermes-agent-source",
+                    "task_id": "t_123",
+                    "event_id": 17,
+                    "run_id": 9,
+                    "event_kind": "completed",
+                    "occurred_at": 1234,
+                    "arbitrary": "drop me",
+                }
+            ],
+            "raw_payload": {"secret": "must not be journaled"},
+        },
+    )
+
+    marker = read_turn_marker(tmp_path, "kanban-session")
+
+    assert marker is not None
+    assert marker["display_kind"] == "internal_notification"
+    assert marker["display_metadata"] == {
+        "source": "kanban",
+        "internal": True,
+        "kind": "kanban_wake",
+        "display_text": "task completed",
+        "events": [
+            {
+                "board": "hermes-agent-source",
+                "task_id": "t_123",
+                "event_id": 17,
+                "run_id": 9,
+                "event_kind": "completed",
+                "occurred_at": 1234,
+            }
+        ],
+    }
+
+
 def test_marker_survives_corrupt_sidecar(tmp_path):
     path = tmp_path / "desktop" / "interrupted_turns.json"
     path.parent.mkdir(parents=True)
@@ -152,6 +200,45 @@ def test_concluded_turn_clears_marker(emits, turn_env, marker_home):
     assert read_turn_marker(marker_home, "session-key") is None
 
 
+def test_internal_turn_marker_records_provenance(emits, turn_env, marker_home):
+    seen_mid_turn: list = []
+
+    def _run(message, **kwargs):
+        seen_mid_turn.append(read_turn_marker(marker_home, "session-key"))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    metadata = {
+        "source": "kanban",
+        "internal": True,
+        "kind": "kanban_wake",
+        "events": [
+            {
+                "board": "hermes-agent-source",
+                "task_id": "t_123",
+                "event_id": 17,
+                "run_id": 9,
+                "event_kind": "completed",
+                "occurred_at": 1234,
+            }
+        ],
+    }
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        _session(agent=agent, running=True),
+        "internal wake",
+        display_kind="internal_notification",
+        display_metadata=metadata,
+    )
+
+    assert seen_mid_turn[0]["display_kind"] == "internal_notification"
+    assert seen_mid_turn[0]["display_metadata"] == metadata
+
+
 def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
     """An exception is a CONCLUDED turn (terminal frame + retained snapshot own
     recovery) — only a process death may leave the marker behind."""
@@ -184,19 +271,40 @@ def test_continuation_turn_records_attempt_and_original_prompt(
     agent = types.SimpleNamespace(
         session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
     )
+    original_metadata = {
+        "source": "kanban",
+        "internal": True,
+        "kind": "kanban_wake",
+        "events": [{"task_id": "t_1", "event_id": 7, "event_kind": "completed"}],
+    }
     session = _session(
         agent=agent,
         running=True,
         _auto_continue_attempt=2,
         _auto_continue_prompt="the original prompt",
+        _auto_continue_marker_provenance={
+            "display_kind": "internal_notification",
+            "display_metadata": original_metadata,
+        },
     )
 
-    server._run_prompt_submit("rid", "sid", session, server._auto_continue_note("the original prompt"))
+    recovered_metadata = dict(original_metadata, recovered=True)
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        server._auto_continue_note("the original prompt"),
+        display_kind="internal_notification",
+        display_metadata=recovered_metadata,
+    )
 
     assert [(m["attempts"], m["prompt"]) for m in seen] == [(2, "the original prompt")]
+    assert seen[0]["display_kind"] == "internal_notification"
+    assert seen[0]["display_metadata"] == original_metadata
     # Consumed, so the NEXT user turn starts from a clean slate.
     assert "_auto_continue_attempt" not in session
     assert "_auto_continue_prompt" not in session
+    assert "_auto_continue_marker_provenance" not in session
 
 
 def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home):
@@ -278,6 +386,48 @@ def test_internal_notification_bypasses_context_reference_expansion(
     assert seen == [prompt]
 
 
+def test_typed_internal_source_bypasses_context_reference_expansion(
+    emits, turn_env, marker_home, monkeypatch
+):
+    from agent import context_references, model_metadata
+
+    calls: list[str] = []
+
+    def _preprocess(message, **_kwargs):
+        calls.append(message)
+        return types.SimpleNamespace(
+            blocked=False,
+            expanded=True,
+            message="EXPANDED UNTRUSTED REFERENCE",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(context_references, "preprocess_context_references", _preprocess)
+    monkeypatch.setattr(
+        model_metadata, "get_model_context_length", lambda *args, **kwargs: 100_000
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda message, **kwargs: {"final_response": "done"},
+        clear_interrupt=lambda: None,
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        _session(agent=agent, running=True),
+        "delegation output mentions @file:secret.txt",
+        display_kind="async_delegation_complete",
+        display_metadata={
+            "source": "delegation",
+            "internal": True,
+            "kind": "async_delegation_complete",
+        },
+    )
+
+    assert calls == []
+
+
 def test_human_prompt_still_expands_context_references(
     emits, turn_env, marker_home, monkeypatch
 ):
@@ -350,6 +500,74 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+
+
+def test_internal_marker_recovery_preserves_provenance(
+    emits, schedule_env, marker_home
+):
+    metadata = {
+        "source": "kanban",
+        "internal": True,
+        "kind": "kanban_wake",
+        "events": [
+            {
+                "board": "hermes-agent-source",
+                "task_id": "t_123",
+                "event_id": 17,
+                "run_id": 9,
+                "event_kind": "completed",
+                "occurred_at": 1234,
+            }
+        ],
+    }
+    record_turn_start(
+        marker_home,
+        "session-key",
+        "internal wake",
+        display_kind="internal_notification",
+        display_metadata=metadata,
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is not None
+    (text, kwargs), = schedule_env
+    assert "internal wake" in text
+    assert kwargs["display_kind"] == "internal_notification"
+    assert kwargs["display_metadata"] == {**metadata, "recovered": True}
+
+
+def test_auto_continue_dispatch_failure_clears_staged_provenance(
+    emits, schedule_env, marker_home, monkeypatch
+):
+    metadata = {
+        "source": "kanban",
+        "internal": True,
+        "kind": "kanban_wake",
+        "events": [{"task_id": "t_1", "event_id": 17, "event_kind": "completed"}],
+    }
+    record_turn_start(
+        marker_home,
+        "session-key",
+        "internal @file:/tmp/secret.txt",
+        display_kind="internal_notification",
+        display_metadata=metadata,
+    )
+
+    def fail_submit(*_args, **_kwargs):
+        raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", fail_submit)
+    session = _session(running=False)
+
+    server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert session["running"] is False
+    assert session["_auto_continue_scheduled"] is False
+    assert "_auto_continue_attempt" not in session
+    assert "_auto_continue_prompt" not in session
+    assert "_auto_continue_marker_provenance" not in session
+    assert read_turn_marker(marker_home, "session-key") is not None
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):

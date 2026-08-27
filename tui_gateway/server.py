@@ -8619,6 +8619,24 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     session["_auto_continue_scheduled"] = True
     attempt = marker["attempts"] + 1
     text = _auto_continue_note(marker["prompt"])
+    original_display_kind = marker.get("display_kind")
+    original_display_metadata = marker.get("display_metadata")
+    if isinstance(original_display_kind, str) and original_display_kind:
+        recovered_display_kind = original_display_kind
+        recovered_display_metadata = (
+            dict(original_display_metadata)
+            if isinstance(original_display_metadata, dict)
+            else {}
+        )
+        recovered_display_metadata["recovered"] = True
+    else:
+        recovered_display_kind = "auto_continue"
+        recovered_display_metadata = {
+            "source": "chat",
+            "internal": False,
+            "kind": "recovery",
+            "recovered": True,
+        }
 
     def kickoff() -> None:
         rid = f"__auto_continue__{int(time.time() * 1000)}"
@@ -8648,6 +8666,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             # behind for a racing user turn to inherit.
             session["_auto_continue_attempt"] = attempt
             session["_auto_continue_prompt"] = marker["prompt"]
+            session["_auto_continue_marker_provenance"] = {
+                "display_kind": original_display_kind,
+                "display_metadata": original_display_metadata,
+            }
         try:
             _emit(
                 "status.update",
@@ -8655,7 +8677,14 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 {"kind": "process", "text": "Resuming interrupted turn…"},
             )
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind=recovered_display_kind,
+                display_metadata=recovered_display_metadata,
+            )
         except Exception as exc:
             print(
                 f"[tui_gateway] auto-continue dispatch failed: "
@@ -8664,6 +8693,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             )
             with session["history_lock"]:
                 session["running"] = False
+                session["_auto_continue_scheduled"] = False
+                session.pop("_auto_continue_attempt", None)
+                session.pop("_auto_continue_prompt", None)
+                session.pop("_auto_continue_marker_provenance", None)
 
     threading.Thread(target=kickoff, daemon=True).start()
     logger.info(
@@ -10624,6 +10657,13 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
 
     tick_no = mgr.state.ticks_fired if mgr.state else "?"
     rid = f"__loop__{int(time.time() * 1000)}"
+    loop_display_metadata = {
+        "source": "loop",
+        "internal": True,
+        "kind": "loop_tick",
+        "event_id": f"{sid_key}:{tick_no}",
+        "display_text": wakeup[:16_000],
+    }
     try:
         _emit(
             "status.update",
@@ -10659,7 +10699,14 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                             return
                         session["running"] = True
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        payload["message"],
+                        display_kind="internal_notification",
+                        display_metadata=loop_display_metadata,
+                    )
                     return
             except Exception:
                 pass
@@ -10668,7 +10715,14 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, wakeup)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            wakeup,
+            display_kind="internal_notification",
+            display_metadata=loop_display_metadata,
+        )
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
@@ -11034,7 +11088,14 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="internal_notification",
+                    display_metadata=_process_notification_display_metadata(evt),
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11112,7 +11173,14 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="internal_notification",
+                    display_metadata=_process_notification_display_metadata(evt),
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11145,7 +11213,10 @@ def _async_delegation_display_metadata(evt: dict) -> dict:
         if result.get("status") in {"failed", "error"}
     )
     metadata = {
-        "delegation_id": str(evt.get("delegation_id") or ""),
+        "source": "delegation",
+        "internal": True,
+        "kind": "async_delegation_complete",
+        "delegation_id": str(evt.get("delegation_id") or "")[:512],
         "task_count": task_count,
         "completed_count": completed_count or task_count - failed_count,
         "failed_count": failed_count,
@@ -11153,6 +11224,23 @@ def _async_delegation_display_metadata(evt: dict) -> dict:
     duration = evt.get("total_duration_seconds") or evt.get("duration_seconds")
     if isinstance(duration, (int, float)):
         metadata["duration_seconds"] = duration
+    return metadata
+
+
+def _process_notification_display_metadata(evt: dict) -> dict:
+    """Build bounded provenance for a process/watch notification turn."""
+    kind = str(evt.get("type") or "completion")[:128]
+    session_id = str(evt.get("session_id") or "")[:512]
+    event_id = str(evt.get("message_id") or session_id)[:512]
+    metadata = {
+        "source": "process",
+        "internal": True,
+        "kind": kind,
+    }
+    if session_id:
+        metadata["session_id"] = session_id
+    if event_id:
+        metadata["event_id"] = event_id
     return metadata
 
 
@@ -11440,6 +11528,15 @@ def _start_usage_ticker(
     return stop, thread
 
 
+def _is_internal_prompt_turn(
+    display_kind: str | None, display_metadata: dict | None
+) -> bool:
+    """Whether a prompt is operational data rather than user-authored text."""
+    return display_kind == "internal_notification" or (
+        isinstance(display_metadata, dict) and display_metadata.get("internal") is True
+    )
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -11531,8 +11628,21 @@ def _run_prompt_submit(
         marker_key = str(session.get("session_key") or "")
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
+        marker_display_kind = display_kind
+        marker_display_metadata = display_metadata
+        marker_provenance = session.pop("_auto_continue_marker_provenance", None)
+        if isinstance(marker_provenance, dict):
+            marker_display_kind = marker_provenance.get("display_kind")
+            marker_display_metadata = marker_provenance.get("display_metadata")
         if isinstance(marker_text, str) and marker_text.strip():
-            record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+            record_turn_start(
+                marker_home,
+                marker_key,
+                marker_text,
+                attempts=marker_attempt,
+                display_kind=marker_display_kind,
+                display_metadata=marker_display_metadata,
+            )
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -11590,7 +11700,7 @@ def _run_prompt_submit(
             # expansion, filesystem reads, or outbound fetches. Human prompts
             # and every other existing turn kind keep their current behavior.
             if (
-                display_kind != "internal_notification"
+                not _is_internal_prompt_turn(display_kind, display_metadata)
                 and isinstance(prompt, str)
                 and "@" in prompt
             ):
@@ -12360,7 +12470,20 @@ def _run_prompt_submit(
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    display_kind="internal_notification",
+                    display_metadata={
+                        "source": "goal",
+                        "internal": True,
+                        "kind": "goal_continuation",
+                        "session_id": str(session.get("session_key") or "")[:512],
+                        "display_text": "Continuing toward standing goal",
+                    },
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -12406,7 +12529,24 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    if _evt.get("type") == "async_delegation":
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            synth,
+                            display_kind="async_delegation_complete",
+                            display_metadata=_async_delegation_display_metadata(_evt),
+                        )
+                    else:
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            synth,
+                            display_kind="internal_notification",
+                            display_metadata=_process_notification_display_metadata(_evt),
+                        )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)

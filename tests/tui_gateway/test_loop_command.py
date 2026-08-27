@@ -142,6 +142,7 @@ def test_tui_tick_fires_when_idle_and_due(server, session):
 
     def fake_submit(rid, sid_, session_, text, **kwargs):
         fired["text"] = text
+        fired["kwargs"] = kwargs
 
     with patch.object(server, "_run_prompt_submit", fake_submit), \
          patch.object(server, "_emit"):
@@ -149,8 +150,78 @@ def test_tui_tick_fires_when_idle_and_due(server, session):
 
     assert "poll the build" in fired.get("text", "")
     assert "[/loop wakeup #1" in fired["text"]
+    assert fired["kwargs"] == {
+        "display_kind": "internal_notification",
+        "display_metadata": {
+            "source": "loop",
+            "internal": True,
+            "kind": "loop_tick",
+            "event_id": f"{session_key}:1",
+            "display_text": fired["text"],
+        },
+    }
     # Session claimed for the wakeup turn.
     assert s["running"] is True
+
+
+def test_tui_tick_bounds_persisted_display_text(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("x" * 20_000, interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+    fired = {}
+
+    def fake_submit(_rid, _sid, _session, text, **kwargs):
+        fired["text"] = text
+        fired["metadata"] = kwargs["display_metadata"]
+
+    with patch.object(server, "_run_prompt_submit", fake_submit), patch.object(
+        server, "_emit"
+    ):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    assert len(fired["text"]) > 16_000
+    assert len(fired["metadata"]["display_text"]) == 16_000
+
+
+def test_tui_slash_tick_prompt_keeps_loop_provenance(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("/review", interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+    fired = {}
+
+    def fake_dispatch(_rid, _params):
+        return {"result": {"type": "send", "message": "expanded review prompt"}}
+
+    def fake_submit(_rid, _sid, _session, text, **kwargs):
+        fired["text"] = text
+        fired["kwargs"] = kwargs
+
+    with (
+        patch.dict(server._methods, {"command.dispatch": fake_dispatch}),
+        patch.object(server, "_run_prompt_submit", fake_submit),
+        patch.object(server, "_emit"),
+    ):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    assert fired["text"] == "expanded review prompt"
+    assert fired["kwargs"] == {
+        "display_kind": "internal_notification",
+        "display_metadata": {
+            "source": "loop",
+            "internal": True,
+            "kind": "loop_tick",
+            "event_id": f"{session_key}:1",
+            "display_text": "/review",
+        },
+    }
 
 
 def test_tui_tick_defers_when_running(server, session):
