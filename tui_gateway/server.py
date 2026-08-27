@@ -11585,7 +11585,15 @@ def _run_prompt_submit(
             streamer = make_stream_renderer(cols)
             prompt = text
 
-            if isinstance(prompt, str) and "@" in prompt:
+            # Internal notifications contain untrusted operational text. Never
+            # let @url/@file/plugin-like tokens inside that data trigger context
+            # expansion, filesystem reads, or outbound fetches. Human prompts
+            # and every other existing turn kind keep their current behavior.
+            if (
+                display_kind != "internal_notification"
+                and isinstance(prompt, str)
+                and "@" in prompt
+            ):
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
 
