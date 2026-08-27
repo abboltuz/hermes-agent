@@ -554,6 +554,20 @@ export type TimelineDisplayMetadata =
       failed_count?: number
       duration_seconds?: number
     }
+  | {
+      source: 'kanban'
+      internal: true
+      kind: 'kanban_wake'
+      display_text: string
+      events: Array<{
+        board: string
+        task_id: string
+        event_id: number
+        run_id: null | number
+        event_kind: string
+        occurred_at: number
+      }>
+    }
   | { reactions: MessageReaction[] }
 
 /** One emoji reaction on a message. One per author, iOS-Tapback style. */
@@ -581,7 +595,13 @@ export interface SessionMessage {
   reasoning_content?: null | string
   reasoning_details?: unknown
   display_kind?:
-    'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | 'personality_switch' | string
+    | 'async_delegation_complete'
+    | 'auto_continue'
+    | 'hidden'
+    | 'internal_notification'
+    | 'model_switch'
+    | 'personality_switch'
+    | string
   /**
    * A backend older than this app can still serve this as unparsed JSON text,
    * so readers must narrow before indexing into it.
