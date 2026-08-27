@@ -1364,6 +1364,10 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert len(gave_up) == 1
         assert (gave_up[0].payload or {}).get("protocol_violations") == \
             _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
 
@@ -1376,6 +1380,42 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 
 
 
+
+
+def test_protocol_terminal_block_is_not_repromoted(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="protocol terminal", assignee="worker")
+        for index, pid in enumerate((992001, 992002, 992003), start=1):
+            _drive_protocol_violation(conn, tid, pid)
+            task = kb.get_task(conn, tid)
+            assert task.status == ("blocked" if index == 3 else "ready")
+
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 1
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload["protocol_violations"] == payload["protocol_violation_limit"]
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        spawn_calls = []
+
+        def record_spawn(task, *_args, **_kwargs):
+            spawn_calls.append(task.id)
+            return 993000
+
+        dispatch = kb.dispatch_once(conn, spawn_fn=record_spawn)
+        assert dispatch.spawned == []
+        assert spawn_calls == []
+
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.claim_task(conn, tid, claimer="explicit-retry") is not None
+    finally:
+        conn.close()
 
 
 def test_notify_sub_starts_caught_up_on_active_task(kanban_home):

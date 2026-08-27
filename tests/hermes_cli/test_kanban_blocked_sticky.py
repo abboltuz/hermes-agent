@@ -13,9 +13,8 @@ These tests pin down:
 
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
-* Circuit-breaker blocks (``gave_up`` event, status flipped via
-  ``_record_task_failure``) still auto-recover — the original intent
-  of #40c1decb3 is preserved.
+* Transient circuit-breaker blocks (``gave_up`` without a protocol-terminal
+  marker) still auto-recover — the original intent of #40c1decb3 is preserved.
 * An explicit ``kanban_unblock`` clears the sticky state.
 * The full block → promote → crash → ``gave_up`` loop is broken after
   this fix: subsequent ticks leave the task blocked.
@@ -79,10 +78,74 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
 
 
 # ---------------------------------------------------------------------------
-# Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
+# Transient circuit-breaker blocks still auto-recover (#40c1decb3)
 # ---------------------------------------------------------------------------
 
 
+def test_transient_force_tripped_gave_up_remains_recoverable(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="transient breaker")
+        assert kb._record_task_failure(
+            conn,
+            tid,
+            "temporary worker crash",
+            outcome="crashed",
+            failure_limit=3,
+            force_trip=True,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert "protocol_violations" not in (gave_up[0].payload or {})
+
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_malformed_protocol_payload_does_not_make_block_permanent(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy malformed")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "gave_up",
+                {
+                    "protocol_violations": "3",
+                    "protocol_violation_limit": 3,
+                },
+            )
+
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+
+
+def test_zero_protocol_retry_limit_is_terminal(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="zero protocol retries")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+            kb._append_event(
+                conn,
+                tid,
+                "gave_up",
+                {
+                    "protocol_violations": 1,
+                    "protocol_violation_limit": 0,
+                },
+            )
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
