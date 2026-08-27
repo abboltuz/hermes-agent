@@ -782,11 +782,25 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_events = (
+                            [ev for ev in d["events"] if ev.kind in _WAKE_KINDS]
                             if wake_agent
-                            else set()
+                            else []
                         )
+                        _wake_kinds = {ev.kind for ev in _wake_events}
+                        _wake_metadata = None
+                        if _wake_events:
+                            _latest_wake = max(_wake_events, key=lambda ev: ev.id)
+                            _wake_metadata = {
+                                "source": "kanban",
+                                "internal": True,
+                                "kind": "kanban_wake",
+                                "event_id": _latest_wake.id,
+                                "task_id": sub["task_id"],
+                                "event_kind": _latest_wake.kind,
+                            }
+                            if _latest_wake.run_id is not None:
+                                _wake_metadata["run_id"] = _latest_wake.run_id
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
@@ -851,6 +865,7 @@ class GatewayKanbanWatchersMixin:
                                     adapter,
                                     text=_synth,
                                     session_id=_session_key,
+                                    display_metadata=_wake_metadata,
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
@@ -939,6 +954,7 @@ class GatewayKanbanWatchersMixin:
                                 text=_synth,
                                 session_id=_session_key,
                                 source=_source,
+                                display_metadata=_wake_metadata,
                             )
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

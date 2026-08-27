@@ -59,6 +59,8 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    display_kind: str = "internal_notification",
+    display_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -70,6 +72,18 @@ async def deliver_wake(
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
     """
+    from gateway.internal_turn import build_internal_turn_envelope
+
+    envelope = build_internal_turn_envelope(
+        display_kind,
+        display_metadata
+        or {
+            "source": "gateway_wake",
+            "internal": True,
+            "kind": "wake",
+        },
+    )
+
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError(
@@ -82,6 +96,7 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            metadata=envelope["display_metadata"],
         )
         await adapter.handle_message(synth_event)
         return
@@ -91,11 +106,20 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    await _self_post_chat_completion(
+        adapter,
+        text=text,
+        session_id=session_id,
+        internal_turn=envelope,
+    )
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any,
+    *,
+    text: str,
+    session_id: str,
+    internal_turn: dict[str, Any],
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -127,10 +151,13 @@ async def _self_post_chat_completion(
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    from gateway.internal_turn import INTERNAL_TURN_FIELD
+
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
         "messages": [{"role": "user", "content": text}],
         "stream": False,
+        INTERNAL_TURN_FIELD: internal_turn,
     }
 
     last_err: Optional[BaseException] = None

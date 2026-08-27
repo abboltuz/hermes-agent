@@ -27,6 +27,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.internal_turn import INTERNAL_TURN_FIELD
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
@@ -390,6 +391,37 @@ class TestAgentExecution:
             user_message="hello",
             conversation_history=[],
             task_id="session-123",
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_forwards_internal_persistence_sidecar(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        metadata = {
+            "source": "process",
+            "internal": True,
+            "kind": "process_notification",
+            "event_id": "proc-7",
+        }
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="process completed",
+                conversation_history=[],
+                session_id="internal-session",
+                persist_user_display_kind="internal_notification",
+                persist_user_display_metadata=metadata,
+            )
+
+        mock_agent.run_conversation.assert_called_once_with(
+            user_message="process completed",
+            conversation_history=[],
+            task_id="internal-session",
+            persist_user_display_kind="internal_notification",
+            persist_user_display_metadata=metadata,
         )
 
     @pytest.mark.asyncio
@@ -982,6 +1014,147 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
             data = await resp.json()
             assert "messages" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_authenticated_internal_turn_reaches_agent_persistence_sidecar(self):
+        adapter = _make_adapter(api_key="api-secret")
+        app = _create_app(adapter)
+        envelope = {
+            "display_kind": "internal_notification",
+            "display_metadata": {
+                "source": "process",
+                "internal": True,
+                "kind": "process_notification",
+                "event_id": "proc-7",
+            },
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new=AsyncMock(
+                    return_value=(
+                        {"final_response": "ok", "messages": [], "api_calls": 1},
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    )
+                ),
+            ) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer api-secret"},
+                    json={
+                        "model": "test",
+                        "messages": [
+                            {"role": "user", "content": "process completed"}
+                        ],
+                        "stream": False,
+                        INTERNAL_TURN_FIELD: envelope,
+                    },
+                )
+
+        assert resp.status == 200
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["persist_user_display_kind"] == "internal_notification"
+        assert kwargs["persist_user_display_metadata"] == envelope["display_metadata"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_internal_turn_reaches_agent_persistence_sidecar(self):
+        adapter = _make_adapter(api_key="api-secret")
+        app = _create_app(adapter)
+        metadata = {
+            "source": "kanban",
+            "internal": True,
+            "kind": "kanban_wake",
+            "event_id": 42,
+            "task_id": "task-42",
+        }
+
+        async def _mock_run_agent(**kwargs):
+            callback = kwargs.get("stream_delta_callback")
+            if callback:
+                callback("ok")
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_run_agent", side_effect=_mock_run_agent
+            ) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer api-secret"},
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "task done"}],
+                        "stream": True,
+                        INTERNAL_TURN_FIELD: {
+                            "display_kind": "internal_notification",
+                            "display_metadata": metadata,
+                        },
+                    },
+                )
+                assert resp.status == 200
+                await resp.text()
+
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["persist_user_display_kind"] == "internal_notification"
+        assert kwargs["persist_user_display_metadata"] == metadata
+
+    @pytest.mark.asyncio
+    async def test_internal_turn_envelope_requires_configured_api_key(self, adapter):
+        app = _create_app(adapter)
+        envelope = {
+            "display_kind": "internal_notification",
+            "display_metadata": {
+                "source": "process",
+                "internal": True,
+                "kind": "process_notification",
+            },
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "wake"}],
+                        INTERNAL_TURN_FIELD: envelope,
+                    },
+                )
+
+        assert resp.status == 403
+        mock_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_malformed_authenticated_internal_turn_is_rejected(self):
+        adapter = _make_adapter(api_key="api-secret")
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer api-secret"},
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "wake"}],
+                        INTERNAL_TURN_FIELD: {
+                            "display_kind": "internal_notification",
+                            "display_metadata": {
+                                "source": "process",
+                                "internal": False,
+                                "kind": "process_notification",
+                            },
+                        },
+                    },
+                )
+
+        assert resp.status == 400
+        mock_run.assert_not_awaited()
 
 
     @pytest.mark.asyncio

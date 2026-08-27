@@ -165,6 +165,37 @@ class TestRunAgentProxyDispatch:
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 
+    @pytest.mark.asyncio
+    async def test_run_agent_preserves_internal_provenance_through_proxy_dispatch(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        metadata = {
+            "source": "process",
+            "internal": True,
+            "kind": "process_notification",
+            "event_id": "proc-7",
+        }
+        runner._run_agent_via_proxy = AsyncMock(
+            return_value={"final_response": "handled", "messages": []}
+        )
+
+        await runner._run_agent(
+            message="[Background process completed]",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="internal-session",
+            persist_user_display_kind="internal_notification",
+            persist_user_display_metadata=metadata,
+        )
+
+        kwargs = runner._run_agent_via_proxy.call_args.kwargs
+        assert kwargs["persist_user_display_kind"] == "internal_notification"
+        assert kwargs["persist_user_display_metadata"] == metadata
+
 
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""
@@ -221,6 +252,50 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_internal_turn_adds_bounded_provenance_envelope(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        source = _make_source()
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                b"data: [DONE]\n\n"
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    await runner._run_agent_via_proxy(
+                        message="[Background process completed]",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="internal-session",
+                        persist_user_display_kind="internal_notification",
+                        persist_user_display_metadata={
+                            "source": "process",
+                            "internal": True,
+                            "kind": "process_notification",
+                            "event_id": "proc-7",
+                            "ignored": "must not cross the boundary",
+                        },
+                    )
+
+        assert session.captured_json["_hermes_internal_turn"] == {
+            "display_kind": "internal_notification",
+            "display_metadata": {
+                "source": "process",
+                "internal": True,
+                "kind": "process_notification",
+                "event_id": "proc-7",
+            },
+        }
 
 
     @pytest.mark.asyncio
