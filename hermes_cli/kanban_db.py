@@ -4519,9 +4519,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      ``"gave_up"``, *not* ``"blocked"``. Generic/transient trips may
+      recover automatically; protocol-terminal trips are classified by
+      :func:`_has_protocol_terminal_block` below.
 
     The cheapest signal that distinguishes the two is the most recent
     ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
@@ -4531,8 +4531,8 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    DB manipulation). Generic breaker recovery is handled by the remaining
+    guards; protocol-terminal events are checked separately below.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
@@ -4541,6 +4541,35 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         (task_id,),
     ).fetchone()
     return bool(row) and row["kind"] == "blocked"
+
+
+def _has_protocol_terminal_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the latest breaker event exhausted protocol retries."""
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('gave_up', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["kind"] != "gave_up" or not row["payload"]:
+        return False
+    try:
+        payload = json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    violations = payload.get("protocol_violations")
+    limit = payload.get("protocol_violation_limit")
+    if (
+        not isinstance(violations, int)
+        or isinstance(violations, bool)
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit < 0
+    ):
+        return False
+    return violations >= limit
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -4583,7 +4612,7 @@ def recompute_ready(
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
+    parent completes), *except* in three cases:
 
     1. The most recent block event was a worker-initiated
        ``kanban_block`` — those stay blocked until an explicit
@@ -4594,6 +4623,11 @@ def recompute_ready(
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
        breaker could never trip (#35072).
+
+    3. The latest breaker event explicitly records an exhausted
+       protocol-violation budget. Those deterministic failures stay blocked
+       until an explicit ``kanban_unblock`` even when the independent unified
+       failure counter is still below its own threshold.
 
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
@@ -4615,11 +4649,13 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for explicit human intervention — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+            if cur_status == "blocked" and (
+                _has_sticky_block(conn, task_id)
+                or _has_protocol_terminal_block(conn, task_id)
+            ):
+                # Explicit blocks and exhausted protocol retries both require
+                # operator release. ``unblock_task`` emits ``"unblocked"``,
+                # which clears either event-derived predicate.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
