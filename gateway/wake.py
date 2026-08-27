@@ -59,6 +59,8 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    profile: str = "",
+    route_profile: str = "",
     display_kind: str = "internal_notification",
     display_metadata: dict[str, Any] | None = None,
 ) -> None:
@@ -110,6 +112,8 @@ async def deliver_wake(
         adapter,
         text=text,
         session_id=session_id,
+        profile=profile,
+        route_profile=route_profile,
         internal_turn=envelope,
     )
 
@@ -120,6 +124,8 @@ async def _self_post_chat_completion(
     text: str,
     session_id: str,
     internal_turn: dict[str, Any],
+    profile: str = "",
+    route_profile: str = "",
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -136,17 +142,40 @@ async def _self_post_chat_completion(
         # Wildcard bind address — connect over loopback.
         host = "127.0.0.1"
     port = int(getattr(adapter, "_port", 0) or 8642)
-    api_key = str(getattr(adapter, "_api_key", "") or "")
-    if not api_key:
-        raise RuntimeError(
-            "wake self-post requires API_SERVER_KEY: session continuation via "
-            "X-Hermes-Session-Id is rejected (403) on an unauthenticated API "
-            "server, so the wake cannot reach the target session"
+    target_resolver = getattr(adapter, "_wake_request_target", None)
+    if callable(target_resolver):
+        path, api_key = target_resolver(
+            profile=profile,
+            route_profile=route_profile,
         )
+    else:
+        # Compatibility for adapter-like test doubles and third-party
+        # stateless adapters. They may use the historical default route, but
+        # can never claim to deliver a named-profile wake with the listener
+        # owner's credential.
+        if str(profile or "").strip() not in {"", "default"} or str(
+            route_profile or ""
+        ).strip() not in {"", "default"}:
+            raise RuntimeError(
+                "wake self-post adapter cannot resolve named-profile "
+                "credentials; refusing default-profile fallback"
+            )
+        api_key = str(getattr(adapter, "_api_key", "") or "")
+        path = (
+            "/p/default/v1/chat/completions"
+            if str(route_profile or "").strip() == "default"
+            else "/v1/chat/completions"
+        )
+        if not api_key:
+            raise RuntimeError(
+                "wake self-post requires API_SERVER_KEY: session continuation via "
+                "X-Hermes-Session-Id is rejected (403) on an unauthenticated API "
+                "server, so the wake cannot reach the target session"
+            )
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    url = f"http://{host}:{port}{path}"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,

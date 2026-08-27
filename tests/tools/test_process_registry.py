@@ -949,6 +949,25 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_checkpoint_persists_api_wake_route_authority(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+        session = _make_session(sid="proc_profile_wake")
+        session.pid = 12345
+        session.origin_session_id = "raw-writer-session"
+        session.origin_profile = "writer"
+        session.origin_api_route_profile = "writer"
+        registry._running[session.id] = session
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            registry._write_checkpoint()
+
+        row = json.loads(checkpoint.read_text())[0]
+        assert row["origin_session_id"] == "raw-writer-session"
+        assert row["origin_profile"] == "writer"
+        assert row["origin_api_route_profile"] == "writer"
+
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{

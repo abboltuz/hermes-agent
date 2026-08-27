@@ -1007,6 +1007,109 @@ class TestChatCompletionsEndpoint:
             assert "Invalid JSON" in data["error"]["message"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [None, [], "text", 42])
+    async def test_non_object_json_returns_openai_400(self, adapter, payload):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["type"] == "invalid_request_error"
+            assert "JSON object" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_is_isolated_by_session_id(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        body = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "same request"}],
+        }
+        idem = f"idem-session-scope-{uuid.uuid4().hex}"
+        mock_result = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter,
+                "_run_agent",
+                new=AsyncMock(return_value=(mock_result, usage)),
+            ) as mock_run:
+                responses = []
+                for session_id in ("session-A", "session-B"):
+                    responses.append(
+                        await cli.post(
+                            "/v1/chat/completions",
+                            json=body,
+                            headers={
+                                "Authorization": "Bearer sk-secret",
+                                "Idempotency-Key": idem,
+                                "X-Hermes-Session-Id": session_id,
+                            },
+                        )
+                    )
+
+        assert [resp.status for resp in responses] == [200, 200]
+        assert [
+            resp.headers["X-Hermes-Session-Id"] for resp in responses
+        ] == ["session-A", "session-B"]
+        assert mock_run.call_count == 2
+        assert [
+            call.kwargs["session_id"] for call in mock_run.call_args_list
+        ] == ["session-A", "session-B"]
+
+    def test_idempotency_namespace_changes_across_profile_key_and_route(
+        self, auth_adapter
+    ):
+        from types import SimpleNamespace
+
+        from gateway.platforms.api_server import _api_request_profile
+
+        base = SimpleNamespace(
+            headers={"X-Hermes-Session-Id": "session-A"},
+            path="/v1/chat/completions",
+        )
+        default_key = auth_adapter._idempotency_cache_key(
+            "same-key", base, gateway_session_key="memory-A", route=None
+        )
+        profile_token = _api_request_profile.set("writer")
+        try:
+            writer_key = auth_adapter._idempotency_cache_key(
+                "same-key", base, gateway_session_key="memory-A", route=None
+            )
+        finally:
+            _api_request_profile.reset(profile_token)
+        other_session = SimpleNamespace(
+            headers={"X-Hermes-Session-Id": "session-B"},
+            path="/v1/chat/completions",
+        )
+        session_key = auth_adapter._idempotency_cache_key(
+            "same-key",
+            other_session,
+            gateway_session_key="memory-B",
+            route=None,
+        )
+        responses_route = SimpleNamespace(
+            headers={"X-Hermes-Session-Id": "session-A"},
+            path="/v1/responses",
+        )
+        route_key = auth_adapter._idempotency_cache_key(
+            "same-key",
+            responses_route,
+            gateway_session_key="memory-A",
+            route=None,
+        )
+
+        assert len({default_key, writer_key, session_key, route_key}) == 4
+
+    @pytest.mark.asyncio
     async def test_missing_messages_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -1490,6 +1593,22 @@ class TestDeriveChatSessionId:
 
 
 class TestResponsesEndpoint:
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [None, [], "text", 42])
+    async def test_non_object_json_returns_openai_400(self, adapter, payload):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["type"] == "invalid_request_error"
+            assert "JSON object" in data["error"]["message"]
 
 
     @pytest.mark.asyncio

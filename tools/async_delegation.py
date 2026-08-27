@@ -224,6 +224,11 @@ def _capture_routing_origin() -> Dict[str, Any]:
             ("scope_id", "HERMES_SESSION_SCOPE_ID"),
             ("user_id", "HERMES_SESSION_USER_ID"),
             ("user_name", "HERMES_SESSION_USER_NAME"),
+            # API-server self-posts share the default listener, so the
+            # originating runtime profile and exact /p/<profile> qualifier
+            # are both durable routing authority, not display metadata.
+            ("origin_profile", "HERMES_SESSION_PROFILE"),
+            ("origin_api_route_profile", "HERMES_SESSION_API_ROUTE_PROFILE"),
         ):
             value = get_session_env(env_name, "")
             if value:
@@ -247,7 +252,8 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            "scope_id", "user_id", "user_name", "origin_profile",
+            "origin_api_route_profile",
         )
         if key in record
     }
@@ -375,7 +381,13 @@ def recover_abandoned_delegations() -> int:
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            for _k in (
+                "scope_id",
+                "user_id",
+                "user_name",
+                "origin_profile",
+                "origin_api_route_profile",
+            ):
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -575,17 +587,25 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, task_json
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
         return None
+    try:
+        task_payload = json.loads(row[8] or "{}")
+    except Exception:
+        task_payload = {}
     return {
         "delegation_id": delegation_id, "origin_session": row[0], "state": row[1],
         "dispatched_at": row[2], "completed_at": row[3],
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "origin_profile": task_payload.get("origin_profile") or "",
+        "origin_api_route_profile": (
+            task_payload.get("origin_api_route_profile") or ""
+        ),
     }
 
 
@@ -988,7 +1008,13 @@ def _push_completion_event(
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in (
+        "scope_id",
+        "user_id",
+        "user_name",
+        "origin_profile",
+        "origin_api_route_profile",
+    ):
         if record.get(_k):
             evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
@@ -1202,7 +1228,13 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in (
+        "scope_id",
+        "user_id",
+        "user_name",
+        "origin_profile",
+        "origin_api_route_profile",
+    ):
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on

@@ -102,6 +102,15 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+# Exact ``/p/<profile>`` URL qualifier used by an API-server request.  This is
+# deliberately distinct from ``HERMES_SESSION_PROFILE``: a bare request is
+# served by the default profile but must wake through the bare route, while a
+# request to ``/p/default/...`` must preserve that qualified route.  Detached
+# producers persist both values so a wake cannot silently fall back to another
+# profile on the shared multiplex listener.
+_SESSION_API_ROUTE_PROFILE: ContextVar = ContextVar(
+    "HERMES_SESSION_API_ROUTE_PROFILE", default=_UNSET
+)
 _BROWSER_CONTROL_PRINCIPAL: ContextVar = ContextVar(
     "HERMES_BROWSER_CONTROL_PRINCIPAL", default=_UNSET
 )
@@ -121,8 +130,10 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # True  — long-lived CLI sessions (in-process completion_queue drain) and the
 #         real gateway platforms (Telegram/Discord/Slack/...), which hold a
 #         persistent outbound channel and run the watcher/drain loops.
-# False — finite runtimes that can end before a detached completion returns:
-#         stateless API-server requests and dispatcher-spawned Kanban workers.
+# False — the channel itself cannot push after the turn ends. Dispatcher
+#         workers have no return path; API-server requests may still be woken
+#         by producer-specific self-post logic when a raw continuation id and
+#         profile route were captured.
 #
 # Tools that promise async delivery (terminal notify_on_complete /
 # watch_patterns, delegate_task background=True) read this via
@@ -157,6 +168,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_SESSION_API_ROUTE_PROFILE": _SESSION_API_ROUTE_PROFILE,
     "HERMES_BROWSER_CONTROL_PRINCIPAL": _BROWSER_CONTROL_PRINCIPAL,
     "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY": _BROWSER_CONTROL_TRANSPORT_FAMILY,
     "HERMES_CRON_SESSION": _CRON_SESSION,
@@ -242,6 +254,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    api_route_profile: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -283,6 +296,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _SESSION_API_ROUTE_PROFILE.set(api_route_profile),
         _BROWSER_CONTROL_PRINCIPAL.set(browser_control_principal),
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
         _CRON_SESSION.set(cron_session),
@@ -324,6 +338,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_API_ROUTE_PROFILE,
         _BROWSER_CONTROL_PRINCIPAL,
         _BROWSER_CONTROL_TRANSPORT_FAMILY,
         _CRON_SESSION,

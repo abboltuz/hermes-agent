@@ -402,6 +402,13 @@ class ProcessSession:
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
+    # API-server wake authority. ``origin_session_id`` is the raw
+    # X-Hermes-Session-Id (which may differ from session_key when the caller
+    # also supplies X-Hermes-Session-Key); profile + route qualifier select
+    # the matching scoped credential on a multiplex listener.
+    origin_session_id: str = ""
+    origin_profile: str = ""
+    origin_api_route_profile: str = ""
     watcher_interval: int = 0                   # 0 = no watcher configured
     # Session-db id of the conversation that spawned this process. Lets the
     # gateway's completion pre-flight (_classify_completion_target) drop
@@ -632,6 +639,9 @@ class ProcessRegistry:
                     "user_name": session.watcher_user_name,
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_profile": session.origin_profile,
+                    "origin_api_route_profile": session.origin_api_route_profile,
                     "message": (
                         f"Watch patterns disabled for process {session.id} — "
                         f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -672,6 +682,9 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
+            "origin_session_id": session.origin_session_id,
+            "origin_profile": session.origin_profile,
+            "origin_api_route_profile": session.origin_api_route_profile,
         }
         _redact_process_result(notification)
         self.completion_queue.put(notification)
@@ -696,6 +709,9 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
+            "origin_session_id": session.origin_session_id,
+            "origin_profile": session.origin_profile,
+            "origin_api_route_profile": session.origin_api_route_profile,
             "message": (
                 f"Watch patterns disabled for process {session.id} — "
                 f"reached the lifetime cap of {WATCH_LIFETIME_MAX_HITS} delivered "
@@ -1644,6 +1660,9 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
+                "origin_session_id": session.origin_session_id,
+                "origin_profile": session.origin_profile,
+                "origin_api_route_profile": session.origin_api_route_profile,
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)
@@ -2808,6 +2827,9 @@ class ProcessRegistry:
                             "watcher_user_name": s.watcher_user_name,
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_message_id": s.watcher_message_id,
+                            "origin_session_id": s.origin_session_id,
+                            "origin_profile": s.origin_profile,
+                            "origin_api_route_profile": s.origin_api_route_profile,
                             "watcher_interval": s.watcher_interval,
                             "parent_session_id": s.parent_session_id,
                             "notify_on_complete": s.notify_on_complete,
@@ -2905,6 +2927,11 @@ class ProcessRegistry:
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
                 watcher_message_id=entry.get("watcher_message_id", ""),
+                origin_session_id=entry.get("origin_session_id", ""),
+                origin_profile=entry.get("origin_profile", ""),
+                origin_api_route_profile=entry.get(
+                    "origin_api_route_profile", ""
+                ),
                 watcher_interval=entry.get("watcher_interval", 0),
                 parent_session_id=entry.get("parent_session_id", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
@@ -2927,6 +2954,9 @@ class ProcessRegistry:
                     "user_name": session.watcher_user_name,
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
+                    "origin_session_id": session.origin_session_id,
+                    "origin_profile": session.origin_profile,
+                    "origin_api_route_profile": session.origin_api_route_profile,
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })

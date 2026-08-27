@@ -175,6 +175,45 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_api_profile_route_provenance_survives_durable_delegation():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="api_server",
+        chat_id="raw-writer-session",
+        session_key="memory-scope",
+        session_id="raw-writer-session",
+        profile="writer",
+        api_route_profile="writer",
+        async_delivery=False,
+    )
+    try:
+        res = ad.dispatch_async_delegation(
+            goal="profile wake",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="memory-scope",
+            origin_session_id="raw-writer-session",
+            runner=lambda: {"status": "completed", "summary": "done"},
+            max_async_children=1,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["origin_session_id"] == "raw-writer-session"
+    assert evt["origin_profile"] == "writer"
+    assert evt["origin_api_route_profile"] == "writer"
+
+    durable = ad.get_durable_delegation(res["delegation_id"])
+    assert durable is not None
+    assert durable["origin_profile"] == "writer"
+    assert durable["origin_api_route_profile"] == "writer"
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
@@ -824,4 +863,3 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
-
