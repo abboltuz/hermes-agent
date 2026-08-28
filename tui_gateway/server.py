@@ -43,6 +43,7 @@ from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
     record_turn_start,
+    sanitize_display_metadata,
 )
 from tui_gateway.transport import (
     StdioTransport,
@@ -2126,6 +2127,8 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
+    prompt_provenance: dict | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2142,6 +2145,8 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **({"display_metadata": display_metadata} if display_metadata else {}),
+        **({"prompt_provenance": prompt_provenance} if prompt_provenance else {}),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -2231,6 +2236,8 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    display_metadata: dict | None = None,
+    prompt_provenance: dict | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2241,6 +2248,8 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        display_metadata=display_metadata,
+        prompt_provenance=prompt_provenance,
     )
 
     def _complete(done: dict) -> None:
@@ -8526,7 +8535,93 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _normalize_client_message_id(value: Any) -> str | None:
+    """Return a bounded opaque client turn id, never an authority claim."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:512] if value else None
+
+
+def _fresh_message_id(prefix: str = "turn") -> str:
+    return f"{prefix}:{uuid.uuid4().hex}"
+
+
+def _neutral_transient_provenance() -> dict[str, Any]:
+    """Fail closed when an older caller supplied no semantic envelope."""
+    from agent.message_provenance import (
+        OriginKind,
+        TrustKind,
+        TurnKind,
+        build_provenance,
+    )
+
+    return build_provenance(
+        OriginKind.LEGACY_UNKNOWN,
+        TurnKind.LEGACY_UNKNOWN,
+        TrustKind.LEGACY_UNKNOWN,
+    ).as_message_fields()
+
+
+def _prompt_provenance_fields(
+    session: dict,
+    sid: str,
+    *,
+    display_kind: str | None = None,
+    display_metadata: dict | None = None,
+    message_id: Any = None,
+) -> dict[str, Any]:
+    """Build one semantic envelope reused by live and durable projections."""
+    from agent.message_provenance import provenance_for_runtime_turn
+
+    display = display_metadata if isinstance(display_metadata, dict) else {}
+    metadata: dict[str, Any] = {
+        "producer": "tui_gateway_prompt",
+        "source": display.get("source"),
+        "event_kind": display.get("kind"),
+        "event_id": display.get("event_id"),
+        "task_id": display.get("task_id"),
+        "job_id": display.get("job_id"),
+        "process_id": display.get("process_id"),
+        "delegation_id": display.get("delegation_id"),
+        "run_id": display.get("run_id"),
+        "generation_id": display.get("generation_id"),
+        "platform": display.get("platform") or _session_source(session),
+        "session_id": session.get("session_key") or sid,
+        "thread_id": display.get("thread_id"),
+        "chat_id": display.get("chat_id"),
+        "message_id": (
+            _normalize_client_message_id(message_id)
+            or _normalize_client_message_id(display.get("message_id"))
+            or _fresh_message_id("turn")
+        ),
+        "recovered": display.get("recovered"),
+    }
+    return provenance_for_runtime_turn(
+        platform=_session_source(session),
+        display_kind=display_kind,
+        metadata=metadata,
+    ).as_message_fields()
+
+
+def _normalized_transient_provenance(value: Any) -> dict[str, Any]:
+    from agent.message_provenance import decode_message_provenance
+
+    if isinstance(value, dict):
+        decoded = decode_message_provenance(value)
+        if decoded is not None:
+            return decoded.as_message_fields()
+    return _neutral_transient_provenance()
+
+
+def _start_inflight_turn(
+    session: dict,
+    text: Any,
+    *,
+    provenance: dict | None = None,
+    display_kind: str | None = None,
+    display_metadata: dict | None = None,
+) -> None:
     now = time.time()
     session["inflight_turn"] = {
         "assistant": "",
@@ -8534,7 +8629,12 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
+        **_normalized_transient_provenance(provenance),
     }
+    if display_kind:
+        session["inflight_turn"]["display_kind"] = display_kind
+    if bounded_display := sanitize_display_metadata(display_metadata):
+        session["inflight_turn"]["display_metadata"] = bounded_display
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -8550,7 +8650,9 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
     session["inflight_turn"] = turn
 
 
-def _record_inflight_correction(session: dict, text: Any) -> None:
+def _record_inflight_correction(
+    session: dict, text: Any, *, provenance: dict | None = None
+) -> None:
     """Record an accepted mid-turn correction on the live turn.
 
     The correction is appended, never written over ``user``: a resuming client
@@ -8569,6 +8671,9 @@ def _record_inflight_correction(session: dict, text: Any) -> None:
     corrections = list(turn.get("corrections") or [])
     corrections.append(correction)
     turn["corrections"] = corrections
+    correction_provenance = list(turn.get("correction_provenance") or [])
+    correction_provenance.append(_normalized_transient_provenance(provenance))
+    turn["correction_provenance"] = correction_provenance
     # Arrival-order boundary: how much assistant text had already streamed
     # when this correction was accepted. Resuming clients use it to place the
     # correction bubble AFTER the output the user had already seen and BEFORE
@@ -8814,20 +8919,20 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    provenance: dict | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
-    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
-    arrivals share a slot and merge losslessly (mirroring the consecutive-user
-    merge in ``repair_message_sequence``). Image-bearing submissions stay as
-    separate envelopes, so their attachment ownership and chronology survive.
-    ``transport`` is pinned so the drained turn streams back to the client that
-    sent it even if the session transport is rebound meanwhile.
+    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Every
+    accepted submission remains a separate semantic envelope, including equal
+    text, so identity and arrival order survive. ``transport`` is pinned so the
+    drained turn streams back to the client that sent it even if the session
+    transport is rebound meanwhile.
     """
     image_paths = list(image_paths or [])
-    # #84417: scrub any live-turn self-duplicates first so the consecutive-text
-    # merge below cannot glue "{original}\\n\\n{later}" and re-fire original
-    # on drain after a later correction settles.
+    # #84417: scrub any legacy/live-turn self-duplicates first so an inherited
+    # merged envelope cannot re-fire the original on drain after a later
+    # correction settles.
     _drop_queued_duplicates_of_inflight_user(session)
     # Never queue a text-only self-copy of the live inflight user prompt. The
     # live turn already owns that text; draining it after settle would restart
@@ -8839,21 +8944,14 @@ def _enqueue_prompt(
         )
         if original and text.strip() == original:
             return
-    queued = {"text": text, "transport": transport}
+    queued = {
+        "text": text,
+        "transport": transport,
+        "provenance": _normalized_transient_provenance(provenance),
+    }
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
-    if (
-        existing
-        and isinstance(existing.get("text"), str)
-        and isinstance(text, str)
-        and not existing.get("image_paths")
-        and not image_paths
-        and not session.get("queued_prompts")
-    ):
-        prev = existing["text"]
-        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
-        return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
         return
@@ -8972,7 +9070,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    provenance: dict | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -9014,7 +9118,9 @@ def _handle_busy_submit(
         try:
             if agent.steer(plain_text):
                 with session["history_lock"]:
-                    _record_inflight_correction(session, plain_text)
+                    _record_inflight_correction(
+                        session, plain_text, provenance=provenance
+                    )
                     _drop_queued_duplicates_of_inflight_user(session)
                     session["last_active"] = time.time()
                 return _ok(rid, {"status": "steered"})
@@ -9034,7 +9140,9 @@ def _handle_busy_submit(
         try:
             if agent.redirect(plain_text):
                 with session["history_lock"]:
-                    _record_inflight_correction(session, plain_text)
+                    _record_inflight_correction(
+                        session, plain_text, provenance=provenance
+                    )
                     # #84417: do not re-fire the live turn's original user text
                     # from a stale server-queue self-duplicate after settle.
                     _drop_queued_duplicates_of_inflight_user(session)
@@ -9050,7 +9158,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            provenance=provenance,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -9121,10 +9235,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    prompt_provenance=queued.get("provenance"),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    prompt_provenance=queued.get("provenance"),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -9142,6 +9262,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    prompt_provenance=queued.get("provenance"),
                 )
             else:
                 _run_prompt_submit(
@@ -9150,6 +9271,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    prompt_provenance=queued.get("provenance"),
                 )
     except Exception as exc:
         print(
@@ -9185,6 +9307,11 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    snapshot.update(_normalized_transient_provenance(turn))
+    if turn.get("display_kind"):
+        snapshot["display_kind"] = str(turn["display_kind"])
+    if bounded_display := sanitize_display_metadata(turn.get("display_metadata")):
+        snapshot["display_metadata"] = bounded_display
     raw_corrections = turn.get("corrections") or []
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [
@@ -9196,6 +9323,11 @@ def _inflight_snapshot(session: dict) -> dict | None:
         # Mid-turn redirects. Carried alongside the original prompt (not over
         # it) so resume can rebuild every user bubble the turn produced.
         snapshot["corrections"] = [c for c, _ in correction_pairs]
+        raw_semantics = turn.get("correction_provenance") or []
+        if len(raw_semantics) == len(correction_pairs):
+            snapshot["correction_provenance"] = [
+                _normalized_transient_provenance(item) for item in raw_semantics
+            ]
         # Assistant-text lengths at each correction boundary (parallel list).
         # Only sent when every correction has one, so clients can trust the
         # pairing; older in-memory turns without offsets omit the field and
@@ -9289,19 +9421,32 @@ def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
     return True
 
 
-def _queued_prompt_snapshot(session: dict) -> dict | None:
-    """Return the accepted next-turn prompt without its transport handle.
+def _queued_prompt_snapshots(session: dict) -> list[dict]:
+    """Return every accepted next-turn prompt without transport handles.
 
-    A busy ``prompt.submit`` lives only in ``session["queued_prompt"]`` until
-    the current turn winds down. Desktop may reconnect or restart during that
-    window, so the live-session projection must carry the user-visible text;
-    otherwise the accepted prompt disappears until it finally drains.
+    Busy ``prompt.submit`` calls live in the head slot plus a FIFO tail until
+    the current turn winds down. Desktop/Ink may reconnect during that window,
+    so the live-session projection carries every user-visible envelope.
     """
-    queued = session.get("queued_prompt")
-    if not isinstance(queued, dict):
-        return None
-    user = _inflight_text(queued.get("text"))
-    return {"user": user} if user else None
+    tail = session.get("queued_prompts")
+    raw = [session.get("queued_prompt"), *(tail if isinstance(tail, list) else [])]
+    snapshots: list[dict] = []
+    for queued in raw:
+        if not isinstance(queued, dict):
+            continue
+        user = _inflight_text(queued.get("text"))
+        if not user:
+            continue
+        snapshot = {"user": user}
+        snapshot.update(_normalized_transient_provenance(queued.get("provenance")))
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def _queued_prompt_snapshot(session: dict) -> dict | None:
+    """Backward-compatible head snapshot for older clients and previews."""
+    snapshots = _queued_prompt_snapshots(session)
+    return snapshots[0] if snapshots else None
 
 
 # ── Methods: session ─────────────────────────────────────────────────
@@ -9770,7 +9915,8 @@ def _live_session_payload(
             session.get("history") or []
         )
         inflight = _inflight_snapshot(session)
-        queued = _queued_prompt_snapshot(session)
+        queued_prompts = _queued_prompt_snapshots(session)
+        queued = queued_prompts[0] if queued_prompts else None
         running = bool(session.get("running"))
         inflight_turn = session.get("inflight_turn")
         turn_started_at = (
@@ -9807,6 +9953,7 @@ def _live_session_payload(
         payload["inflight"] = inflight
     if queued:
         payload["queued"] = queued
+        payload["queued_prompts"] = queued_prompts
     if approval := _pending_approval_request_payload(str(session.get("session_key") or "")):
         payload["pending_approval"] = approval
     if clarify := _pending_clarify_request_payload(sid):
@@ -10768,7 +10915,31 @@ def _kanban_wake_event_metadata(wake: _KanbanWake) -> dict[str, Any]:
         "run_id": wake.run_id,
         "event_kind": wake.kind,
         "occurred_at": wake.created_at,
+        "platform": wake.platform,
+        "chat_id": wake.chat_id,
+        "thread_id": wake.thread_id,
     }
+
+
+def _kanban_wake_batch_message_id(wakes: list[_KanbanWake]) -> str:
+    """Stable bounded id for one routed generation-aware wake batch."""
+    identity = [
+        {
+            "board": wake.board_slug,
+            "task_id": wake.task_id,
+            "event_id": wake.event_id,
+            "run_id": wake.run_id,
+            "event_kind": wake.kind,
+            "platform": wake.platform,
+            "chat_id": wake.chat_id,
+            "thread_id": wake.thread_id,
+        }
+        for wake in wakes
+    ]
+    encoded = json.dumps(
+        identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return f"kanban-wake:{hashlib.sha256(encoded).hexdigest()[:32]}"
 
 
 def _format_kanban_wake_prompt(wakes: list[_KanbanWake]) -> str:
@@ -11179,6 +11350,7 @@ def _notification_poller_loop(
                                 "source": "kanban",
                                 "internal": True,
                                 "kind": "kanban_wake",
+                                "message_id": _kanban_wake_batch_message_id(_batch),
                                 "display_text": "\n\n".join(
                                     wake.text for wake in _batch
                                 ),
@@ -11746,40 +11918,20 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    prompt_provenance: dict | None = None,
 ) -> bool:
-    from agent.message_provenance import (
-        may_authorize_control,
-        provenance_for_runtime_turn,
-    )
+    from agent.message_provenance import may_authorize_control
 
-    _display_source = (
-        display_metadata.get("source")
-        if isinstance(display_metadata, dict)
-        else None
+    prompt_provenance_fields = (
+        _normalized_transient_provenance(prompt_provenance)
+        if prompt_provenance is not None
+        else _prompt_provenance_fields(
+            session,
+            sid,
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+        )
     )
-    _display_event_kind = (
-        display_metadata.get("kind")
-        if isinstance(display_metadata, dict)
-        else None
-    )
-    _display_event_id = (
-        display_metadata.get("event_id")
-        if isinstance(display_metadata, dict)
-        else None
-    )
-    prompt_provenance = provenance_for_runtime_turn(
-        platform=_session_source(session),
-        display_kind=display_kind,
-        metadata={
-            "producer": "tui_gateway_prompt",
-            "source": _display_source,
-            "event_kind": _display_event_kind,
-            "event_id": _display_event_id,
-            "platform": _session_source(session),
-            "session_id": session.get("session_key") or sid,
-        },
-    )
-    prompt_provenance_fields = prompt_provenance.as_message_fields()
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -11799,7 +11951,13 @@ def _run_prompt_submit(
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(
+                session,
+                text,
+                provenance=prompt_provenance_fields,
+                display_kind=display_kind,
+                display_metadata=display_metadata,
+            )
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -11844,6 +12002,8 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
+        leftover_steer = None
+        leftover_steer_provenance = None
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -11866,6 +12026,18 @@ def _run_prompt_submit(
         if isinstance(marker_provenance, dict):
             marker_display_kind = marker_provenance.get("display_kind")
             marker_display_metadata = marker_provenance.get("display_metadata")
+        marker_display_metadata = (
+            dict(marker_display_metadata)
+            if isinstance(marker_display_metadata, dict)
+            else {}
+        )
+        marker_message_id = (
+            prompt_provenance_fields.get("provenance_metadata", {}).get("message_id")
+            if isinstance(prompt_provenance_fields.get("provenance_metadata"), dict)
+            else None
+        )
+        if marker_message_id:
+            marker_display_metadata.setdefault("message_id", marker_message_id)
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(
                 marker_home,
@@ -12641,6 +12813,24 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+                leftover_steer = (
+                    result.get("pending_steer")
+                    if isinstance(result, dict)
+                    else None
+                )
+                turn = session.get("inflight_turn")
+                if isinstance(leftover_steer, str) and isinstance(turn, dict):
+                    corrections = list(turn.get("corrections") or [])
+                    correction_provenance = list(
+                        turn.get("correction_provenance") or []
+                    )
+                    for index in range(len(corrections) - 1, -1, -1):
+                        if corrections[index] == leftover_steer:
+                            if index < len(correction_provenance):
+                                leftover_steer_provenance = correction_provenance[
+                                    index
+                                ]
+                            break
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
             # Closing bookend of the "tui prompt accepted" record above —
@@ -12682,12 +12872,16 @@ def _run_prompt_submit(
         # during the final API call), so the agent couldn't inject it and
         # returned it in result["pending_steer"]. Requeue it as the next turn
         # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
-        # A real queued prompt still wins: the merge in _enqueue_prompt keeps
-        # both texts.
-        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+        # A real queued prompt still wins: _enqueue_prompt preserves both
+        # semantic envelopes in FIFO order.
+        if isinstance(leftover_steer, str) and leftover_steer.strip():
             with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+                _enqueue_prompt(
+                    session,
+                    leftover_steer,
+                    session.get("transport"),
+                    provenance=leftover_steer_provenance,
+                )
         if _drain_queued_prompt(rid, sid, session):
             return
 

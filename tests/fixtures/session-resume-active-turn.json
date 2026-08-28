@@ -8,7 +8,14 @@
   },
   "inflight": {
     "assistant": "partial answer",
+    "origin_kind": "human_user",
+    "provenance_metadata": {
+      "message_id": "desktop:active-turn-1",
+      "producer": "desktop_renderer"
+    },
     "streaming": true,
+    "trust_kind": "user_authorized",
+    "turn_kind": "prompt",
     "user": "current prompt"
   },
   "message_count": 1,

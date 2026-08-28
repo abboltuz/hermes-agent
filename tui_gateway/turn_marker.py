@@ -53,13 +53,24 @@ def _bounded_string(value: Any, limit: int) -> str | None:
     return value[:limit] if value else None
 
 
-def _sanitize_display_metadata(value: Any) -> dict[str, Any] | None:
+def sanitize_display_metadata(value: Any) -> dict[str, Any] | None:
     """Return the bounded provenance subset safe to journal across restarts."""
     if not isinstance(value, dict):
         return None
 
     out: dict[str, Any] = {}
-    for key in ("source", "kind", "platform", "delegation_id", "event_id", "session_id"):
+    for key in (
+        "source",
+        "kind",
+        "platform",
+        "delegation_id",
+        "event_id",
+        "session_id",
+        "message_id",
+        "generation_id",
+        "chat_id",
+        "thread_id",
+    ):
         item = value.get(key)
         if key == "event_id" and isinstance(item, int) and not isinstance(item, bool):
             out[key] = item
@@ -92,7 +103,17 @@ def _sanitize_display_metadata(value: Any) -> dict[str, Any] | None:
             if not isinstance(raw_event, dict):
                 continue
             event: dict[str, Any] = {}
-            for key in ("board", "task_id", "event_kind"):
+            for key in (
+                "board",
+                "task_id",
+                "event_kind",
+                "platform",
+                "chat_id",
+                "thread_id",
+            ):
+                if key == "thread_id" and raw_event.get(key) == "":
+                    event[key] = ""
+                    continue
                 bounded = _bounded_string(raw_event.get(key), _MAX_METADATA_ID_CHARS)
                 if bounded is not None:
                     event[key] = bounded
@@ -189,7 +210,7 @@ def record_turn_start(
     bounded_kind = _bounded_string(display_kind, _MAX_DISPLAY_KIND_CHARS)
     if bounded_kind is not None:
         entry["display_kind"] = bounded_kind
-    bounded_metadata = _sanitize_display_metadata(display_metadata)
+    bounded_metadata = sanitize_display_metadata(display_metadata)
     if bounded_metadata is not None:
         entry["display_metadata"] = bounded_metadata
     try:
@@ -245,7 +266,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
     display_kind = _bounded_string(entry.get("display_kind"), _MAX_DISPLAY_KIND_CHARS)
     if display_kind is not None:
         marker["display_kind"] = display_kind
-    display_metadata = _sanitize_display_metadata(entry.get("display_metadata"))
+    display_metadata = sanitize_display_metadata(entry.get("display_metadata"))
     if display_metadata is not None:
         marker["display_metadata"] = display_metadata
     return marker

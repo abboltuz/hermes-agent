@@ -31,12 +31,30 @@ def _session(agent=None, **extra):
     }
 
 
+def _without_provenance(entry, *, origin="legacy_unknown", message_id=None):
+    copied = dict(entry)
+    provenance = copied.pop("provenance")
+    assert provenance["origin_kind"] == origin
+    assert provenance["turn_kind"] == (
+        "prompt" if origin == "human_user" else "legacy_unknown"
+    )
+    assert provenance["trust_kind"] == (
+        "user_authorized" if origin == "human_user" else "legacy_unknown"
+    )
+    if message_id is not None:
+        assert provenance["provenance_metadata"]["message_id"] == message_id
+    return copied
+
+
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
 
 def test_enqueue_pins_text_and_transport():
     session = _session()
     server._enqueue_prompt(session, "hello", "ws-1")
-    assert session["queued_prompt"] == {"text": "hello", "transport": "ws-1"}
+    assert _without_provenance(session["queued_prompt"]) == {
+        "text": "hello",
+        "transport": "ws-1",
+    }
 
 
 def test_enqueue_preserves_order_after_an_image_turn():
@@ -45,8 +63,11 @@ def test_enqueue_preserves_order_after_an_image_turn():
     server._enqueue_prompt(session, "C", "ws-1", image_paths=["/tmp/c.png"])
     server._enqueue_prompt(session, "D", "ws-1")
 
-    assert session["queued_prompt"] == {"text": "B", "transport": "ws-1"}
-    assert session["queued_prompts"] == [
+    assert _without_provenance(session["queued_prompt"]) == {
+        "text": "B",
+        "transport": "ws-1",
+    }
+    assert [_without_provenance(entry) for entry in session["queued_prompts"]] == [
         {"text": "C", "transport": "ws-1", "image_paths": ["/tmp/c.png"]},
         {"text": "D", "transport": "ws-1"},
     ]
@@ -166,7 +187,7 @@ def test_enqueue_skips_text_duplicate_of_inflight_user():
     assert session.get("queued_prompt") is None
 
     server._enqueue_prompt(session, "different follow-up", "ws-1")
-    assert session["queued_prompt"] == {
+    assert _without_provenance(session["queued_prompt"]) == {
         "text": "different follow-up",
         "transport": "ws-1",
     }
@@ -186,7 +207,10 @@ def test_enqueue_followup_does_not_merge_stale_inflight_self_duplicate():
 
     server._enqueue_prompt(session, "Q", "ws-1")
 
-    assert session.get("queued_prompt") == {"text": "Q", "transport": "ws-1"}
+    assert _without_provenance(session["queued_prompt"]) == {
+        "text": "Q",
+        "transport": "ws-1",
+    }
     assert not session.get("queued_prompts")
 
 
@@ -227,7 +251,10 @@ def test_hard_interrupt_queue_path_scrubs_stale_inflight_self_duplicate(monkeypa
     resp = server._handle_busy_submit("r1", "sid", session, "Q", "ws-1")
 
     assert resp["result"]["status"] == "queued"
-    assert session.get("queued_prompt") == {"text": "Q", "transport": "ws-1"}
+    assert _without_provenance(session["queued_prompt"]) == {
+        "text": "Q",
+        "transport": "ws-1",
+    }
     assert not session.get("queued_prompts")
     # Interrupt is async-threaded; policy still enqueued Q after scrubbing P.
 
@@ -559,7 +586,9 @@ def test_busy_submit_claims_attached_image_for_queued_turn(monkeypatch):
     assert redirected == []
     assert not interrupted.wait(0.1)
     assert session["attached_images"] == []
-    assert session["queued_prompt"] == {
+    assert _without_provenance(
+        session["queued_prompt"], origin="human_user"
+    ) == {
         "text": "is this B?",
         "image_paths": ["/tmp/b.png"],
         "transport": None,
@@ -588,7 +617,10 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
         server._methods["prompt.submit"]("c", {"session_id": "sid", "text": "C"})
 
         assert session["queued_prompt"]["image_paths"] == ["/tmp/b.png"]
-        assert session["queued_prompts"] == [
+        assert [
+            _without_provenance(entry, origin="human_user")
+            for entry in session["queued_prompts"]
+        ] == [
             {"text": "C", "image_paths": ["/tmp/c.png"], "transport": None}
         ]
 
@@ -599,7 +631,20 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     finally:
         server._sessions.pop("sid", None)
 
-    assert dispatched == [
+    normalized_dispatches = []
+    message_ids = []
+    for dispatch_rid, dispatch_sid, dispatch_text, dispatch_kwargs in dispatched:
+        provenance = dispatch_kwargs.pop("prompt_provenance")
+        assert provenance["origin_kind"] == "human_user"
+        assert provenance["turn_kind"] == "prompt"
+        assert provenance["trust_kind"] == "user_authorized"
+        message_ids.append(provenance["provenance_metadata"]["message_id"])
+        normalized_dispatches.append(
+            (dispatch_rid, dispatch_sid, dispatch_text, dispatch_kwargs)
+        )
+
+    assert len(set(message_ids)) == 2
+    assert normalized_dispatches == [
         (
             "drain-b",
             "sid",
@@ -779,4 +824,3 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
-

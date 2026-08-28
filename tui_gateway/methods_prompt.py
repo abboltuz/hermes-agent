@@ -337,6 +337,12 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    prompt_provenance = _prompt_provenance_fields(
+        session,
+        sid,
+        display_kind=display_kind,
+        message_id=params.get("message_id"),
+    )
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -376,6 +382,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            provenance=prompt_provenance,
         )
         if busy_response is not None:
             return busy_response
@@ -812,11 +819,21 @@ def _(rid, params: dict) -> dict:
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        _start_inflight_turn(
+            session,
+            text,
+            provenance=prompt_provenance,
+            display_kind=display_kind,
+        )
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            prompt_provenance=prompt_provenance,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -908,7 +925,14 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            prompt_provenance=prompt_provenance,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

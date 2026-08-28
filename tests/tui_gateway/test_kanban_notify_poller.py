@@ -438,6 +438,7 @@ class TestNotificationPollerLoopKanbanWiring:
         assert metadata["source"] == "kanban"
         assert metadata["internal"] is True
         assert metadata["kind"] == "kanban_wake"
+        assert metadata["message_id"].startswith("kanban-wake:")
         assert metadata["display_text"] == status_texts[0]
         assert len(metadata["events"]) == 1
         event = metadata["events"][0]
@@ -446,6 +447,9 @@ class TestNotificationPollerLoopKanbanWiring:
         assert event["event_id"] > 0
         assert event["event_kind"] == "completed"
         assert event["occurred_at"] > 0
+        assert event["platform"] == "tui"
+        assert event["chat_id"] == SESSION_KEY
+        assert event["thread_id"] == ""
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
