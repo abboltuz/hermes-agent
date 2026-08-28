@@ -204,6 +204,127 @@ def test_v27_migration_backfills_known_rows_and_never_guesses_human(tmp_path):
     reopened.close()
 
 
+def test_v27_migration_opens_real_v26_table_and_preserves_row_identity(tmp_path):
+    """Exercise column reconciliation against an actual pre-v27 messages table.
+
+    This is deliberately stronger than nulling fields on today's schema: the
+    four semantic columns do not exist when the database is reopened.
+    """
+    path = tmp_path / "state-v26.db"
+    db = SessionDB(db_path=path)
+    db.create_session("parent", source="api", model="test/model")
+    db.create_session(
+        "child",
+        source="api",
+        model="test/model",
+        parent_session_id="parent",
+    )
+    first_id = db.append_message(
+        "parent",
+        role="user",
+        content="ambiguous legacy prompt",
+        display_kind="internal_notification",
+        display_metadata={"source": "kanban", "event_id": "wake-27"},
+    )
+    second_id = db.append_message("child", role="assistant", content="answer")
+    with db._lock:
+        db._conn.execute("UPDATE messages SET timestamp = 1234.5 WHERE id = ?", (first_id,))
+        db._conn.commit()
+    db.close()
+
+    legacy_columns = [
+        "id",
+        "session_id",
+        "role",
+        "content",
+        "tool_call_id",
+        "tool_calls",
+        "tool_name",
+        "effect_disposition",
+        "timestamp",
+        "token_count",
+        "finish_reason",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "platform_message_id",
+        "observed",
+        "_compressed_summary",
+        "active",
+        "compacted",
+        "api_content",
+        "display_kind",
+        "display_metadata",
+    ]
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute("PRAGMA foreign_keys = OFF")
+        for (view_name,) in raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'view' AND name LIKE 'messages_fts%'"
+        ).fetchall():
+            raw.execute(f'DROP VIEW "{view_name}"')
+        raw.execute(
+            """CREATE TABLE messages_v26 (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT NOT NULL REFERENCES sessions(id),
+                   role TEXT NOT NULL,
+                   content TEXT,
+                   tool_call_id TEXT,
+                   tool_calls TEXT,
+                   tool_name TEXT,
+                   effect_disposition TEXT,
+                   timestamp REAL NOT NULL,
+                   token_count INTEGER,
+                   finish_reason TEXT,
+                   reasoning TEXT,
+                   reasoning_content TEXT,
+                   reasoning_details TEXT,
+                   codex_reasoning_items TEXT,
+                   codex_message_items TEXT,
+                   platform_message_id TEXT,
+                   observed INTEGER DEFAULT 0,
+                   _compressed_summary INTEGER NOT NULL DEFAULT 0,
+                   active INTEGER NOT NULL DEFAULT 1,
+                   compacted INTEGER NOT NULL DEFAULT 0,
+                   api_content TEXT,
+                   display_kind TEXT,
+                   display_metadata TEXT
+               )"""
+        )
+        joined = ", ".join(legacy_columns)
+        raw.execute(f"INSERT INTO messages_v26 ({joined}) SELECT {joined} FROM messages")
+        raw.execute("DROP TABLE messages")
+        raw.execute("ALTER TABLE messages_v26 RENAME TO messages")
+        raw.execute("UPDATE schema_version SET version = 26")
+        raw.commit()
+        names = {row[1] for row in raw.execute("PRAGMA table_info(messages)")}
+        assert "origin_kind" not in names
+        assert "provenance_metadata" not in names
+    finally:
+        raw.close()
+
+    migrated = SessionDB(db_path=path)
+    parent = migrated.get_messages_as_conversation("parent", include_row_ids=True)
+    child = migrated.get_messages_as_conversation("child", include_row_ids=True)
+
+    assert parent[0]["_row_id"] == first_id
+    assert parent[0]["timestamp"] == 1234.5
+    assert parent[0]["content"] == "ambiguous legacy prompt"
+    assert parent[0]["origin_kind"] == "agent"
+    assert parent[0]["turn_kind"] == "continuation"
+    assert parent[0]["display_metadata"] == {"source": "kanban", "event_id": "wake-27"}
+    assert child[0]["_row_id"] == second_id
+    assert child[0]["origin_kind"] == "assistant"
+    with migrated._read_ctx() as conn:
+        assert conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE id = 'child'"
+        ).fetchone()[0] == "parent"
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
+    migrated.close()
+
+
 def test_session_archive_import_cannot_forge_user_authority(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     result = db.import_sessions(
