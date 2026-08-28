@@ -15,6 +15,12 @@ from datetime import datetime
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
+from agent.message_provenance import (
+    OriginKind,
+    TrustKind,
+    TurnKind,
+    stamp_provenance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +95,27 @@ def mirror_to_session(
             "mirror": True,
             "mirror_source": source_label,
         }
+        mirror_origin = (
+            OriginKind.ASSISTANT
+            if role == "assistant"
+            else OriginKind.AUTOMATION
+            if source_label.lower() in {"cron", "automation", "heartbeat"}
+            else OriginKind.INTERNAL_SYSTEM
+        )
+        stamp_provenance(
+            mirror_msg,
+            mirror_origin,
+            TurnKind.DELIVERY_MIRROR,
+            TrustKind.NO_CONTROL,
+            {
+                "producer": "gateway_mirror",
+                "source": source_label,
+                "platform": platform,
+                "chat_id": str(chat_id),
+                "thread_id": str(thread_id) if thread_id is not None else None,
+                "session_id": session_id,
+            },
+        )
 
         _append_to_sqlite(session_id, mirror_msg)
 
@@ -217,6 +244,10 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
             session_id=session_id,
             role=message.get("role", "assistant"),
             content=message.get("content"),
+            origin_kind=message.get("origin_kind"),
+            turn_kind=message.get("turn_kind"),
+            trust_kind=message.get("trust_kind"),
+            provenance_metadata=message.get("provenance_metadata"),
         )
     except Exception as e:
         logger.debug("Mirror SQLite write failed: %s", e)

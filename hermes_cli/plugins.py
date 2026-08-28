@@ -2011,6 +2011,10 @@ class PluginContext:
         msg = content if role == "user" else f"[{role}] {content}"
 
         if cli is not None:
+            plugin_id = self.manifest.key or self.manifest.name
+            factory = getattr(cli, "_plugin_input_message", None)
+            if callable(factory):
+                msg = factory(msg, plugin_id)
             if getattr(cli, "_agent_running", False):
                 # Agent is mid-turn - interrupt with the message
                 cli._interrupt_queue.put(msg)

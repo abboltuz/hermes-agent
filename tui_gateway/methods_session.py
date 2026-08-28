@@ -16,7 +16,8 @@ def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
     cols = int(params.get("cols", 80))
-    history = _coerce_seed_history(params.get("messages"))
+    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    history = _coerce_seed_history(params.get("messages"), source=source)
     title = str(params.get("title") or "").strip()
     # When set, this is a branch: the new chat copies an existing conversation's
     # history and links back to it so list_sessions_rich keeps it visible and the
@@ -32,7 +33,6 @@ def _(rid, params: dict) -> dict:
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
-    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -3217,6 +3217,10 @@ def _(rid, params: dict) -> dict:
                         # space the same way #82756 did.
                         "display_kind": msg.get("display_kind"),
                         "display_metadata": msg.get("display_metadata"),
+                        "origin_kind": msg.get("origin_kind"),
+                        "turn_kind": msg.get("turn_kind"),
+                        "trust_kind": msg.get("trust_kind"),
+                        "provenance_metadata": msg.get("provenance_metadata"),
                         # Preserve the parent's original message timestamps —
                         # branch copies are history, not new activity (9d73006ad).
                         "timestamp": msg.get("timestamp"),

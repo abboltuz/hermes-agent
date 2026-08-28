@@ -4998,6 +4998,20 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _ProvenanceInputMessage(str):
+    """Queue item for machine-authored CLI turns that use provider role=user."""
+
+    def __new__(cls, text: str, *, origin: str, turn: str, trust: str, metadata=None):
+        from agent.message_provenance import build_provenance
+
+        instance = super().__new__(cls, text)
+        instance.text = text
+        instance.provenance = build_provenance(
+            origin, turn, trust, metadata
+        ).as_message_fields()
+        return instance
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -5005,6 +5019,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     Provides a REPL interface with rich formatting, command history,
     and tool execution capabilities.
     """
+
+    def _plugin_input_message(self, text: str, plugin_id: str):
+        return _ProvenanceInputMessage(
+            text,
+            origin="automation",
+            turn="task_instruction",
+            trust="untrusted_external",
+            metadata={
+                "producer": "plugin_injection",
+                "source": plugin_id,
+                "session_id": str(getattr(self, "session_id", "") or ""),
+            },
+        )
     
     def __init__(
         self,
@@ -9689,6 +9716,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         for msg in self.conversation_history:
             role = msg.get("role", "unknown")
 
+            from agent.message_provenance import display_actor, is_display_visible
+
+            if not is_display_visible(msg):
+                continue
+
             if role == "tool":
                 hidden_tool_messages += 1
                 continue
@@ -9703,7 +9735,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             content_text = "" if content is None else str(content)
 
             if role == "user":
-                _cli_visible_print(f"\n  [You #{visible_index}]{_ts_suffix(msg)}")
+                actor = display_actor(msg)
+                label = "You" if actor == "user" else actor.replace("_", " ").title()
+                _cli_visible_print(f"\n  [{label} #{visible_index}]{_ts_suffix(msg)}")
                 _cli_visible_print(
                     f"    {content_text[:preview_limit]}{'...' if len(content_text) > preview_limit else ''}"
                 )
@@ -12809,7 +12843,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             continue
                         prompt = mgr.due_prompt()
                         if prompt:
-                            self._pending_input.put(prompt)
+                            self._pending_input.put(
+                                _ProvenanceInputMessage(
+                                    prompt,
+                                    origin="automation",
+                                    turn="continuation",
+                                    trust="trusted_internal",
+                                    metadata={
+                                        "producer": "cli_heartbeat",
+                                        "session_id": self.session_id,
+                                    },
+                                )
+                            )
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
@@ -12884,7 +12929,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             state = mgr.state
             tick_no = state.ticks_fired if state else "?"
             _cprint(f"  {_DIM}↻ /loop wakeup #{tick_no} firing…{_RST}")
-            self._pending_input.put(wakeup)
+            self._pending_input.put(
+                _ProvenanceInputMessage(
+                    wakeup,
+                    origin="automation",
+                    turn="continuation",
+                    trust="trusted_internal",
+                    metadata={
+                        "producer": "cli_loop",
+                        "session_id": self.session_id,
+                    },
+                )
+            )
         except Exception as exc:
             logging.debug("loop tick injection failed: %s", exc)
             try:
@@ -13008,7 +13064,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            self._pending_input.put(
+                _ProvenanceInputMessage(
+                    synthetic_message,
+                    origin="agent",
+                    turn="notification",
+                    trust="trusted_internal",
+                    metadata={
+                        "producer": "cli_process_notification",
+                        "session_id": self.session_id,
+                        "event_id": str(event.get("event_id") or ""),
+                        "process_id": str(event.get("process_id") or ""),
+                        "delegation_id": str(event.get("delegation_id") or ""),
+                    },
+                )
+            )
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -13158,7 +13228,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    self._pending_input.put(
+                        _ProvenanceInputMessage(
+                            prompt,
+                            origin="automation",
+                            turn="continuation",
+                            trust="trusted_internal",
+                            metadata={
+                                "producer": "cli_goal",
+                                "session_id": self.session_id,
+                            },
+                        )
+                    )
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
@@ -14248,10 +14329,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 change_parts.append(f"Reconnected servers: {', '.join(sorted(reconnected))}")
             tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
             change_detail = ". ".join(change_parts) + ". " if change_parts else ""
-            self.conversation_history.append({
+            reload_message = {
                 "role": "user",
                 "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
-            })
+                "display_kind": "internal_notification",
+            }
+            from agent.message_provenance import stamp_provenance
+
+            stamp_provenance(
+                reload_message,
+                "internal_system",
+                "notification",
+                "no_control",
+                {"producer": "cli_mcp_reload", "session_id": self.session_id},
+            )
+            self.conversation_history.append(reload_message)
 
             # Persist session immediately so the session log reflects the
             # updated tools list (self.agent.tools was refreshed above).
@@ -16267,7 +16359,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -16318,6 +16416,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         agent = self.agent
         if agent is None:
             return None
+        from agent.message_provenance import (
+            may_authorize_control,
+            provenance_for_runtime_turn,
+        )
+
+        turn_provenance = provenance or provenance_for_runtime_turn(
+            platform="cli",
+            metadata={
+                "producer": "cli_input",
+                "platform": "cli",
+                "session_id": self.session_id,
+            },
+        ).as_message_fields()
 
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -16387,7 +16498,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
 
         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
-        if isinstance(message, str) and "@" in message:
+        if (
+            isinstance(message, str)
+            and "@" in message
+            and may_authorize_control(
+                {"role": "user", "content": message, **turn_provenance}
+            )
+        ):
             try:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
@@ -16436,7 +16553,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from agent.message_metadata import stamp_message_timestamp
 
             staged_user_message = stamp_message_timestamp(
-                {"role": "user", "content": message}
+                {"role": "user", "content": message, **turn_provenance}
             )
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
@@ -16628,6 +16745,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
+                        persist_user_provenance=turn_provenance,
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
@@ -16734,6 +16852,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # Signal TTS to stop on interrupt
                             if stop_event is not None:
                                 stop_event.set()
+                            if isinstance(interrupt_msg, _ProvenanceInputMessage):
+                                self.agent._pending_interrupt_provenance = (
+                                    interrupt_msg.provenance
+                                )
                             self.agent.interrupt(interrupt_msg)
                             # Clear any active overlay states the interrupted agent
                             # left behind.  approval/clarify/sudo/secret prompts gate
@@ -17269,7 +17391,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print()
         msg_count = len(self.conversation_history)
         if msg_count > 0:
-            user_msgs = len([m for m in self.conversation_history if m.get("role") == "user"])
+            from agent.message_provenance import is_human_intent
+
+            user_msgs = len(
+                [m for m in self.conversation_history if is_human_intent(m)]
+            )
             tool_calls = len([m for m in self.conversation_history if m.get("role") == "tool" or m.get("tool_calls")])
             elapsed = datetime.now() - self.session_start
             hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
@@ -20370,6 +20496,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    queued_provenance = None
+                    if isinstance(user_input, _ProvenanceInputMessage):
+                        queued_provenance = user_input.provenance
+                        user_input = user_input.text
+                    queued_may_control = True
+                    if queued_provenance is not None:
+                        from agent.message_provenance import may_authorize_control
+
+                        queued_may_control = may_authorize_control(
+                            {
+                                "role": "user",
+                                "content": str(user_input),
+                                **queued_provenance,
+                            }
+                        )
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
@@ -20399,12 +20541,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # of sending the word to the agent. Voice transcripts are
                     # already stop-checked at the transcription points, so this
                     # only intercepts typed input.
-                    if not is_voice_input and self._typed_voice_stop(user_input):
+                    if (
+                        queued_may_control
+                        and not is_voice_input
+                        and self._typed_voice_stop(user_input)
+                    ):
                         continue
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.
-                    _file_drop = _detect_file_drop(user_input) if isinstance(user_input, str) else None
+                    _file_drop = (
+                        _detect_file_drop(user_input)
+                        if queued_may_control and isinstance(user_input, str)
+                        else None
+                    )
                     if _file_drop:
                         _drop_path = _file_drop["path"]
                         _remainder = _file_drop["remainder"]
@@ -20424,6 +20574,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # the digit isn't sent to the agent as a message.
                     if (
                         not _file_drop
+                        and queued_may_control
                         and self._pending_resume_sessions
                         and isinstance(user_input, str)
                         and self._consume_pending_resume_selection(user_input)
@@ -20436,12 +20587,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # turn is spent. See handle_bang_shell().
                     if (
                         not _file_drop
+                        and queued_may_control
                         and isinstance(user_input, str)
                         and self.handle_bang_shell(user_input)
                     ):
                         continue
 
-                    if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
+                    if (
+                        not _file_drop
+                        and queued_may_control
+                        and isinstance(user_input, str)
+                        and _looks_like_slash_command(user_input)
+                    ):
                         _cprint(f"\n⚙️  {user_input}")
                         try:
                             if not self.process_command(user_input):
@@ -20471,7 +20628,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Expand paste references back to full content
                     _paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
-                    if paste_refs:
+                    if paste_refs and queued_may_control:
                         user_input = self._expand_paste_references(user_input)
                     print()
                     self._print_user_message_preview(user_input)
@@ -20490,7 +20647,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            provenance=queued_provenance,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -20988,11 +21150,32 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    from agent.message_provenance import (
+        OriginKind,
+        TrustKind,
+        TurnKind,
+        build_provenance,
+    )
+
+    continuation_provenance = build_provenance(
+        OriginKind.AGENT,
+        TurnKind.CONTINUATION,
+        TrustKind.TRUSTED_INTERNAL,
+        {
+            "producer": "kanban_goal_loop",
+            "source": "kanban",
+            "event_kind": "goal_continuation",
+            "task_id": task_id,
+            "run_id": worker_run_id,
+            "session_id": getattr(cli, "session_id", "") or "",
+        },
+    ).as_message_fields()
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
+            persist_user_provenance=continuation_provenance,
         )
         # Keep session_id in sync if mid-run compression rotated it.
         if (

@@ -26,6 +26,13 @@ from agent.replay_cleanup import (
 from gateway.run import _build_gateway_agent_history
 
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
 # High-risk confirmation patterns. A user message matching one of these
 # (case-insensitive) is considered a "confirmation text" and is subject
 # to the expiry rule. Add new patterns here as new high-risk side effects
@@ -46,9 +53,19 @@ def _make_history_with_confirmation(
     gateway/run.py:11616, 11650, 11692, etc).
     """
     return [
-        {"role": "user", "content": "can you force a restart?", "timestamp": user_message_at},
+        {
+            "role": "user",
+            "content": "can you force a restart?",
+            "timestamp": user_message_at,
+            **HUMAN_PROVENANCE,
+        },
         {"role": "assistant", "content": "Rebooting the host is dangerous. To confirm, please type: 'confirm forced restart'", "timestamp": assistant_warning_at},
-        {"role": "user", "content": confirmation_message, "timestamp": confirmation_at},
+        {
+            "role": "user",
+            "content": confirmation_message,
+            "timestamp": confirmation_at,
+            **HUMAN_PROVENANCE,
+        },
         {"role": "assistant", "content": "OK, restarting now.", "timestamp": assistant_action_at},
     ]
 
@@ -93,7 +110,12 @@ def test_non_confirmation_text_is_preserved():
     confirmation_at = current_time - 300   # 5 min ago
 
     history = [
-        {"role": "user", "content": "can you help me with the docs?", "timestamp": user_message_at},
+        {
+            "role": "user",
+            "content": "can you help me with the docs?",
+            "timestamp": user_message_at,
+            **HUMAN_PROVENANCE,
+        },
         {"role": "assistant", "content": "Sure, what do you need?", "timestamp": confirmation_at},
     ]
 

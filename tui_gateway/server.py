@@ -3474,6 +3474,10 @@ def _persist_branch_seed(session: dict) -> None:
                         # space the same way #82756 did.
                         "display_kind": msg.get("display_kind"),
                         "display_metadata": msg.get("display_metadata"),
+                        "origin_kind": msg.get("origin_kind"),
+                        "turn_kind": msg.get("turn_kind"),
+                        "trust_kind": msg.get("trust_kind"),
+                        "provenance_metadata": msg.get("provenance_metadata"),
                         # Preserve the parent's original message timestamps —
                         # append_message would otherwise stamp time.time() and the
                         # branch's copied history would all appear authored "now".
@@ -5008,6 +5012,20 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
     # providers (vLLM, Qwen) reject system messages that are not at the
     # beginning of the API message list (#48338).
     entry = {"role": "user", "content": marker, "display_kind": "model_switch"}
+    from agent.message_provenance import (
+        OriginKind,
+        TrustKind,
+        TurnKind,
+        stamp_provenance,
+    )
+
+    stamp_provenance(
+        entry,
+        OriginKind.INTERNAL_SYSTEM,
+        TurnKind.NOTIFICATION,
+        TrustKind.NO_CONTROL,
+        {"producer": "model_switch", "source": "tui"},
+    )
 
     def _replace_markers() -> None:
         history = session.setdefault("history", [])
@@ -5032,6 +5050,16 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
                 role="user",
                 content=marker,
                 display_kind="model_switch",
+                **{
+                    key: entry[key]
+                    for key in (
+                        "origin_kind",
+                        "turn_kind",
+                        "trust_kind",
+                        "provenance_metadata",
+                    )
+                    if key in entry
+                },
             )
             return
 
@@ -5043,6 +5071,16 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
                     role="user",
                     content=marker,
                     display_kind="model_switch",
+                    **{
+                        key: entry[key]
+                        for key in (
+                            "origin_kind",
+                            "turn_kind",
+                            "trust_kind",
+                            "provenance_metadata",
+                        )
+                        if key in entry
+                    },
                 )
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)
@@ -7205,10 +7243,28 @@ def _apply_personality_to_session(
         # as a real user turn on the gateway side while no client counts it, so
         # every later rewind resolves one turn too early and `replace_messages`
         # hard-deletes the difference (#82756).
+        from agent.message_provenance import (
+            OriginKind,
+            TrustKind,
+            TurnKind,
+            stamp_provenance,
+        )
+
+        marker_message = {"role": "user", "content": marker}
+        stamp_provenance(
+            marker_message,
+            OriginKind.INTERNAL_SYSTEM,
+            TurnKind.NOTIFICATION,
+            TrustKind.NO_CONTROL,
+            {
+                "producer": "personality_switch",
+                "source": "desktop_ui",
+                "session_id": session.get("session_key") or sid,
+            },
+        )
+        marker_message["display_kind"] = "personality_switch"
         with session["history_lock"]:
-            session["history"].append(
-                {"role": "user", "content": marker, "display_kind": "personality_switch"}
-            )
+            session["history"].append(marker_message)
             session["history_version"] = int(session.get("history_version", 0)) + 1
         info = _session_info(agent)
         _emit("session.info", sid, info)
@@ -7345,18 +7401,26 @@ def _preview_restart_history(session: dict, max_messages: int = 24, max_tool_cha
     if not history:
         return []
 
-    # Anchor on the last user turn so we always include at least the most
-    # recent request and the assistant/tool work that followed it. Then
-    # extend backwards up to max_messages so we capture the prior context.
-    last_user_idx = None
+    # Anchor on the last semantic driver so a notification or runtime
+    # placeholder carried as provider role=user cannot displace the request
+    # the preview agent is meant to continue.
+    from agent.message_provenance import (
+        is_actionable_continuation,
+        is_human_intent,
+    )
+
+    last_driver_idx = None
     for idx in range(len(history) - 1, -1, -1):
-        if history[idx].get("role") == "user":
-            last_user_idx = idx
+        message = history[idx]
+        if isinstance(message, dict) and (
+            is_human_intent(message) or is_actionable_continuation(message)
+        ):
+            last_driver_idx = idx
             break
 
     start = max(0, len(history) - max_messages)
-    if last_user_idx is not None:
-        start = min(start, last_user_idx)
+    if last_driver_idx is not None:
+        start = min(start, last_driver_idx)
 
     trimmed: list[dict] = []
     for msg in history[start:]:
@@ -8180,20 +8244,6 @@ def _is_text_only_busy_payload(content: Any) -> bool:
     return False
 
 
-def _is_display_hidden_marker(role: str | None, text: str) -> bool:
-    """Gateway bookkeeping notices (model-switch, personality) are persisted as
-    role=user ``[System: …]`` rows so strict providers accept them mid-history.
-    They are model-facing runtime metadata, not user turns, and must never
-    render as a user bubble in ANY client transcript (desktop, TUI, CLI, web).
-
-    Filtering here — the single display projection every surface reads — hides
-    them everywhere while the raw marker stays in ``session["history"]`` for the
-    model. It also removes the stored marker from the payload the desktop
-    reconciles against, so it can no longer shift user-message ordinals and
-    duplicate the optimistic prompt (#67603)."""
-    return role == "user" and text.lstrip().startswith("[System:")
-
-
 def _skill_scaffold_projection(content_text: str) -> str:
     """Return the invocation a slash-skill-expanded turn came from, else "".
 
@@ -8271,6 +8321,10 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         m = project_compaction_message_for_display(m)
         if m is None:
             continue
+        from agent.message_provenance import is_display_visible
+
+        if not is_display_visible(m):
+            continue
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
             continue
@@ -8282,8 +8336,6 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
-        if _is_display_hidden_marker(role, content_text):
-            continue
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -8362,14 +8414,37 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
+        for provenance_field in (
+            "origin_kind",
+            "turn_kind",
+            "trust_kind",
+            "provenance_metadata",
+        ):
+            if m.get(provenance_field) is not None:
+                msg[provenance_field] = m[provenance_field]
         messages.append(msg)
 
     return messages
 
 
-def _coerce_seed_history(value: Any) -> list[dict]:
+def _coerce_seed_history(value: Any, *, source: str) -> list[dict]:
+    """Validate and type client seed history at the trusted session boundary.
+
+    Semantic/display fields supplied by the client are intentionally ignored.
+    The authenticated surface identity and protocol role determine a fresh
+    bounded envelope, so a branch fallback cannot forge internal trust or lose
+    the local-human identity of its draft turns.
+    """
     if not isinstance(value, list):
         return []
+
+    from agent.message_provenance import (
+        OriginKind,
+        TrustKind,
+        TurnKind,
+        build_provenance,
+        provenance_for_runtime_turn,
+    )
 
     history = []
     for item in value:
@@ -8386,7 +8461,33 @@ def _coerce_seed_history(value: Any) -> list[dict]:
         if not isinstance(content, str) or not content.strip():
             continue
 
-        history.append({"role": role, "content": content})
+        metadata = {
+            "producer": "session_create_seed",
+            "source": source,
+            "platform": source,
+        }
+        if role == "user":
+            provenance = provenance_for_runtime_turn(
+                platform=source,
+                metadata=metadata,
+            )
+        elif role == "assistant":
+            provenance = build_provenance(
+                OriginKind.ASSISTANT,
+                TurnKind.RESPONSE,
+                TrustKind.NO_CONTROL,
+                metadata,
+            )
+        else:
+            provenance = build_provenance(
+                OriginKind.INTERNAL_SYSTEM,
+                TurnKind.RUNTIME_SCAFFOLDING,
+                TrustKind.NO_CONTROL,
+                metadata,
+            )
+        history.append(
+            {"role": role, "content": content, **provenance.as_message_fields()}
+        )
 
     return history
 
@@ -11646,6 +11747,39 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> bool:
+    from agent.message_provenance import (
+        may_authorize_control,
+        provenance_for_runtime_turn,
+    )
+
+    _display_source = (
+        display_metadata.get("source")
+        if isinstance(display_metadata, dict)
+        else None
+    )
+    _display_event_kind = (
+        display_metadata.get("kind")
+        if isinstance(display_metadata, dict)
+        else None
+    )
+    _display_event_id = (
+        display_metadata.get("event_id")
+        if isinstance(display_metadata, dict)
+        else None
+    )
+    prompt_provenance = provenance_for_runtime_turn(
+        platform=_session_source(session),
+        display_kind=display_kind,
+        metadata={
+            "producer": "tui_gateway_prompt",
+            "source": _display_source,
+            "event_kind": _display_event_kind,
+            "event_id": _display_event_id,
+            "platform": _session_source(session),
+            "session_id": session.get("session_key") or sid,
+        },
+    )
+    prompt_provenance_fields = prompt_provenance.as_message_fields()
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -11798,7 +11932,9 @@ def _run_prompt_submit(
             # expansion, filesystem reads, or outbound fetches. Human prompts
             # and every other existing turn kind keep their current behavior.
             if (
-                not _is_internal_prompt_turn(display_kind, display_metadata)
+                may_authorize_control(
+                    {"role": "user", "content": prompt, **prompt_provenance_fields}
+                )
                 and isinstance(prompt, str)
                 and "@" in prompt
             ):
@@ -11998,6 +12134,8 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if "persist_user_provenance" in _run_params:
+                run_kwargs["persist_user_provenance"] = prompt_provenance_fields
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -15001,7 +15139,13 @@ def _format_live_history_output(session: dict) -> str:
     lines = ["Conversation History", "────────────────────────────────────────"]
     for idx, message in enumerate(messages, start=1):
         role = str(message.get("role") or "unknown")
-        label = "You" if role == "user" else "Hermes" if role == "assistant" else role.title()
+        if role == "user":
+            from agent.message_provenance import display_actor
+
+            actor = display_actor(message)
+            label = "You" if actor == "user" else actor.replace("_", " ").title()
+        else:
+            label = "Hermes" if role == "assistant" else role.title()
         text = str(message.get("text") or message.get("context") or "").strip()
         if len(text) > 400:
             text = f"{text[:400]}..."

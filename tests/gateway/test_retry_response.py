@@ -9,6 +9,12 @@ from unittest.mock import AsyncMock, MagicMock
 from gateway.run import GatewayRunner
 from gateway.platforms.base import MessageEvent, MessageType
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "external_actor",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 @pytest.fixture
 def gateway(tmp_path):
@@ -28,7 +34,7 @@ async def test_retry_returns_response_not_none(gateway):
         session_id="test-session"
     )
     gateway.session_store.load_transcript.return_value = [
-        {"role": "user", "content": "Hello Hermes"},
+        {"role": "user", "content": "Hello Hermes", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "Hi there!"},
     ]
     gateway.session_store.rewrite_transcript = MagicMock()
@@ -42,5 +48,4 @@ async def test_retry_returns_response_not_none(gateway):
     result = await gateway._handle_retry_command(event)
     assert result is not None, "/retry must not return None"
     assert result == expected_response
-
 

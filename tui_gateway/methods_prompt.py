@@ -1346,11 +1346,29 @@ def _(rid, params: dict) -> dict:
                 else None
             )
             try:
+                from agent.message_provenance import (
+                    OriginKind,
+                    TrustKind,
+                    TurnKind,
+                    build_provenance,
+                )
+
+                task_provenance = build_provenance(
+                    OriginKind.AGENT,
+                    TurnKind.TASK_INSTRUCTION,
+                    TrustKind.TRUSTED_INTERNAL,
+                    {
+                        "producer": "tui_background_task",
+                        "task_id": task_id,
+                        "session_id": session.get("session_key") or parent,
+                    },
+                ).as_message_fields()
                 result = AIAgent(
                     **_background_agent_kwargs(session["agent"], task_id)
                 ).run_conversation(
                     user_message=text,
                     task_id=task_id,
+                    persist_user_provenance=task_provenance,
                 )
             finally:
                 if home_token is not None:
@@ -1476,6 +1494,23 @@ def _(rid, params: dict) -> dict:
                 else None
             )
             try:
+                from agent.message_provenance import (
+                    OriginKind,
+                    TrustKind,
+                    TurnKind,
+                    build_provenance,
+                )
+
+                restart_provenance = build_provenance(
+                    OriginKind.INTERNAL_SYSTEM,
+                    TurnKind.TASK_INSTRUCTION,
+                    TrustKind.TRUSTED_INTERNAL,
+                    {
+                        "producer": "preview_restart",
+                        "task_id": task_id,
+                        "session_id": session.get("session_key") or parent,
+                    },
+                ).as_message_fields()
                 result = AIAgent(
                     **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
                     **_preview_restart_callbacks(parent, task_id),
@@ -1483,6 +1518,7 @@ def _(rid, params: dict) -> dict:
                     user_message=prompt,
                     task_id=task_id,
                     conversation_history=parent_history or None,
+                    persist_user_provenance=restart_provenance,
                 )
             finally:
                 if home_token is not None:

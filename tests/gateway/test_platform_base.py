@@ -97,6 +97,19 @@ class TestMessageEventIsCommand:
         event = MessageEvent(text="/new")
         assert event.is_command() is True
 
+    def test_internal_text_cannot_become_a_command_from_legacy_boolean(self):
+        event = MessageEvent(text="/new", internal=True, allow_gateway_control=True)
+        assert event.is_command() is False
+
+    def test_plugin_claims_cannot_authorize_command_interpretation(self):
+        event = MessageEvent(
+            text="/approve @file",
+            internal=True,
+            allow_gateway_control=True,
+            metadata={"hermes_plugin_injection": True},
+        )
+        assert event.is_command() is False
+
 
 class TestMessageEventGetCommand:
     def test_simple_command(self):

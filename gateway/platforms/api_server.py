@@ -45,6 +45,7 @@ import concurrent.futures
 import errno
 import hashlib
 import hmac
+import inspect
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
@@ -4299,7 +4300,8 @@ class APIServerAdapter(BasePlatformAdapter):
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
-            "reasoning_content", "display_kind",
+            "reasoning_content", "display_kind", "display_metadata",
+            "origin_kind", "turn_kind", "trust_kind", "provenance_metadata",
         )
         return {key: message.get(key) for key in safe_keys if key in message}
 
@@ -7511,6 +7513,52 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_kwargs["persist_user_display_metadata"] = (
                             persist_user_display_metadata
                         )
+                    from agent.message_provenance import (
+                        OriginKind,
+                        TrustKind,
+                        TurnKind,
+                        build_provenance,
+                        provenance_for_runtime_turn,
+                    )
+
+                    if persist_user_display_kind:
+                        current_provenance = provenance_for_runtime_turn(
+                            platform="api_server",
+                            display_kind=persist_user_display_kind,
+                            metadata={
+                                "producer": "api_server_ingress",
+                                "platform": "api_server",
+                                "session_id": effective_task_id,
+                            },
+                        )
+                    else:
+                        current_provenance = build_provenance(
+                            OriginKind.EXTERNAL_ACTOR,
+                            TurnKind.PROMPT,
+                            TrustKind.USER_AUTHORIZED,
+                            {
+                                "producer": "api_server_ingress",
+                                "platform": "api_server",
+                                "session_id": effective_task_id,
+                            },
+                        )
+                    try:
+                        _run_signature = inspect.signature(agent.run_conversation)
+                        _run_parameters = _run_signature.parameters
+                        _accepts_run_kwargs = any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in _run_parameters.values()
+                        )
+                    except (TypeError, ValueError):
+                        _run_parameters = {}
+                        _accepts_run_kwargs = False
+                    if (
+                        "persist_user_provenance" in _run_parameters
+                        or _accepts_run_kwargs
+                    ):
+                        conversation_kwargs["persist_user_provenance"] = (
+                            current_provenance.as_message_fields()
+                        )
                     result = agent.run_conversation(
                         user_message=user_message,
                         **conversation_kwargs,
@@ -8027,10 +8075,28 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
+                            from agent.message_provenance import (
+                                OriginKind,
+                                TrustKind,
+                                TurnKind,
+                                build_provenance,
+                            )
+
+                            run_provenance = build_provenance(
+                                OriginKind.EXTERNAL_ACTOR,
+                                TurnKind.PROMPT,
+                                TrustKind.USER_AUTHORIZED,
+                                {
+                                    "producer": "api_run_ingress",
+                                    "platform": "api_server",
+                                    "session_id": effective_task_id,
+                                },
+                            ).as_message_fields()
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                persist_user_provenance=run_provenance,
                             )
                         finally:
                             # Worker finished (interrupted or complete) —

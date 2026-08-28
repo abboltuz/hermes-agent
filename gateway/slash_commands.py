@@ -5031,7 +5031,9 @@ class GatewaySlashCommandsMixin:
 
         # Count messages for context
         history = await self.async_session_store.load_transcript(target_id)
-        msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
+        from agent.message_provenance import is_human_intent
+
+        msg_count = len([m for m in history if is_human_intent(m)]) if history else 0
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
         if source.platform == Platform.MATRIX and allow_cross_room:
@@ -5240,6 +5242,12 @@ class GatewaySlashCommandsMixin:
                         # replays the parent's exact wire bytes (warm provider
                         # prompt cache) instead of a full cold prefill.
                         "api_content": extract_api_content_sidecar(msg),
+                        "display_kind": msg.get("display_kind"),
+                        "display_metadata": msg.get("display_metadata"),
+                        "origin_kind": msg.get("origin_kind"),
+                        "turn_kind": msg.get("turn_kind"),
+                        "trust_kind": msg.get("trust_kind"),
+                        "provenance_metadata": msg.get("provenance_metadata"),
                         "timestamp": msg.get("timestamp"),
                     }
                     for msg in history
@@ -5264,7 +5272,9 @@ class GatewaySlashCommandsMixin:
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
 
-        msg_count = len([m for m in history if m.get("role") == "user"])
+        from agent.message_provenance import is_human_intent
+
+        msg_count = len([m for m in history if is_human_intent(m)])
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 

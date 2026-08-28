@@ -29,6 +29,9 @@ def _sample_session():
                 "content": "Why is login broken?",
                 "timestamp": 1700000001,
                 "platform_message_id": "evt-2",
+                "origin_kind": "human_user",
+                "turn_kind": "prompt",
+                "trust_kind": "user_authorized",
             },
             {
                 "id": 3,
@@ -48,6 +51,9 @@ def _sample_session():
                 "role": "user",
                 "content": [{"type": "text", "text": "Only show me the prompts."}],
                 "timestamp": 1700000004,
+                "origin_kind": "human_user",
+                "turn_kind": "prompt",
+                "trust_kind": "user_authorized",
             },
         ],
     }
@@ -133,5 +139,4 @@ def test_sessions_export_cli_prompt_only_stdout(monkeypatch, capsys):
         "exported": "sess-123",
         "closed": True,
     }
-
 

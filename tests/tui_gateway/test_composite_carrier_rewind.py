@@ -15,6 +15,12 @@ from agent.context_compressor import (
 from hermes_state import SessionDB
 from tui_gateway import server
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 def _composite_carrier() -> dict:
     return {
@@ -23,6 +29,7 @@ def _composite_carrier() -> dict:
             f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n"
             f"{_SUMMARY_END_MARKER}\n\nREAL ASK"
         ),
+        **HUMAN_PROVENANCE,
     }
 
 
@@ -38,10 +45,18 @@ def carrier_session(tmp_path):
         installed_ids.append(sid)
         db.create_session(session_key, source="tui")
         for message in history:
+            provenance = {
+                key: message[key]
+                for key in ("origin_kind", "turn_kind", "trust_kind")
+                if key in message
+            }
+            if message["role"] == "user" and not provenance:
+                provenance = HUMAN_PROVENANCE
             db.append_message(
                 session_key,
                 message["role"],
                 message.get("content"),
+                **provenance,
             )
         durable = db.get_messages_as_conversation(session_key)
         agent = SimpleNamespace(
@@ -377,10 +392,28 @@ def test_history_projection_unwraps_composite_and_hides_sole_handoff():
     }
 
     assert server._history_to_messages(
-        [composite, {"role": "user", "content": "newer ask", "_row_id": 9}]
+        [
+            composite,
+            {
+                "role": "user",
+                "content": "newer ask",
+                "_row_id": 9,
+                **HUMAN_PROVENANCE,
+            },
+        ]
     ) == [
-        {"role": "user", "text": "REAL ASK", "row_id": 7},
-        {"role": "user", "text": "newer ask", "row_id": 9},
+        {
+            "role": "user",
+            "text": "REAL ASK",
+            "row_id": 7,
+            **HUMAN_PROVENANCE,
+        },
+        {
+            "role": "user",
+            "text": "newer ask",
+            "row_id": 9,
+            **HUMAN_PROVENANCE,
+        },
     ]
     assert server._history_to_messages([sole_handoff]) == []
 

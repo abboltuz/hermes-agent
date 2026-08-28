@@ -12,12 +12,18 @@ from hermes_cli.partial_compress import (
     split_history_for_partial_compress,
 )
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 def _history(n_pairs: int) -> list[dict[str, str]]:
     """Build n_pairs of (user, assistant) exchanges."""
     h: list[dict[str, str]] = []
     for i in range(n_pairs):
-        h.append({"role": "user", "content": f"u{i}"})
+        h.append({"role": "user", "content": f"u{i}", **HUMAN_PROVENANCE})
         h.append({"role": "assistant", "content": f"a{i}"})
     return h
 
@@ -67,13 +73,13 @@ def test_here_count_clamped_low_and_high():
 def test_split_tail_always_starts_on_user():
     # Tool messages interleaved — tail must still snap to a user turn.
     h = [
-        {"role": "user", "content": "u0"},
+        {"role": "user", "content": "u0", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "a0"},
-        {"role": "user", "content": "u1"},
+        {"role": "user", "content": "u1", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "a1"},
         {"role": "tool", "content": "t1"},
         {"role": "assistant", "content": "a1b"},
-        {"role": "user", "content": "u2"},
+        {"role": "user", "content": "u2", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "a2"},
     ]
     head, tail = split_history_for_partial_compress(h, keep_last=1)

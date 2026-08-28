@@ -3904,6 +3904,10 @@ class SessionStore:
             # #82888). DB-only; stripped from provider-bound payloads.
             display_kind=message.get("display_kind"),
             display_metadata=message.get("display_metadata"),
+            origin_kind=message.get("origin_kind"),
+            turn_kind=message.get("turn_kind"),
+            trust_kind=message.get("trust_kind"),
+            provenance_metadata=message.get("provenance_metadata"),
         )
 
     # Maximum in-memory pending messages per session before dropping the

@@ -127,6 +127,10 @@ def _count_visible_turns(
             continue
         role = msg.get("role")
         if role == "user":
+            from agent.message_provenance import is_human_intent
+
+            if not is_human_intent(msg):
+                continue
             users += 1
         elif role == "assistant":
             assistants += 1
@@ -140,6 +144,10 @@ def _latest_user_prompt(
 ) -> Optional[str]:
     for msg in reversed(messages):
         if isinstance(msg, Mapping) and msg.get("role") == "user":
+            from agent.message_provenance import is_human_intent
+
+            if not is_human_intent(msg):
+                continue
             text = _coerce_text(msg.get("content")).strip()
             if text:
                 return text
@@ -174,6 +182,11 @@ def _recent_window(
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if isinstance(msg, Mapping) and msg.get("role") in {"user", "assistant"}:
+            if msg.get("role") == "user":
+                from agent.message_provenance import is_human_intent
+
+                if not is_human_intent(msg):
+                    continue
             count += 1
             if count >= window:
                 cut = i

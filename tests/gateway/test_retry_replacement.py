@@ -17,15 +17,24 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionStore
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "external_actor",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
+def _human(content):
+    return {"role": "user", "content": content, **HUMAN_PROVENANCE}
+
 
 def _composite_carrier(ask="REAL ASK"):
-    return {
-        "role": "user",
-        "content": (
+    return _human(
+        (
             f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n"
             f"{_SUMMARY_END_MARKER}\n\n{ask}"
-        ),
-    }
+        )
+    )
 
 
 def _seed_pending_recovery(store, session_id):
@@ -83,7 +92,9 @@ def test_rewind_session_keeps_pending_recovery_state_when_lease_rejects(
     store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
     session_id = "rewind-pending-lease"
     store._db.create_session(session_id=session_id, source="test")
-    store._db.append_message(session_id, "user", _composite_carrier()["content"])
+    store._db.append_message(
+        session_id, "user", _composite_carrier()["content"], **HUMAN_PROVENANCE
+    )
     store._db.append_message(session_id, "assistant", "old answer")
     pending = _seed_pending_recovery(store, session_id)
     before = store._db.get_messages(session_id, include_inactive=True)
@@ -126,6 +137,7 @@ def test_rewind_session_surfaces_unretryable_media_before_mutation(
             {"type": "text", "text": _composite_carrier()["content"]},
             {"type": "image_url", "image_url": {"url": "image"}},
         ],
+        **HUMAN_PROVENANCE,
     )
     store._db.append_message(session_id, "assistant", "old answer")
     before = store._db.get_messages(session_id, include_inactive=True)
@@ -146,7 +158,9 @@ def test_transcript_mutation_serializes_pending_queue_drain(
     store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
     session_id = f"serialized-{operation}"
     store._db.create_session(session_id=session_id, source="test")
-    store._db.append_message(session_id, "user", _composite_carrier()["content"])
+    store._db.append_message(
+        session_id, "user", _composite_carrier()["content"], **HUMAN_PROVENANCE
+    )
     store._db.append_message(session_id, "assistant", "old answer")
     _seed_pending_recovery(store, session_id)
 
@@ -235,9 +249,9 @@ async def test_gateway_retry_replaces_last_user_turn_in_transcript(tmp_path, mon
     store._db.create_session(session_id=session_id, source="test")
     for msg in [
         {"role": "session_meta", "tools": []},
-        {"role": "user", "content": "first question"},
+        _human("first question"),
         {"role": "assistant", "content": "first answer"},
-        {"role": "user", "content": "retry me"},
+        _human("retry me"),
         {"role": "assistant", "content": "old answer"},
     ]:
         store.append_to_transcript(session_id, msg)
@@ -256,7 +270,7 @@ async def test_gateway_retry_replaces_last_user_turn_in_transcript(tmp_path, mon
         assert [m.get("content") for m in transcript_before if m.get("role") == "user"] == [
             "first question"
         ]
-        store.append_to_transcript(session_id, {"role": "user", "content": event.text})
+        store.append_to_transcript(session_id, _human(event.text))
         store.append_to_transcript(session_id, {"role": "assistant", "content": "new answer"})
         return "new answer"
 
@@ -289,9 +303,13 @@ async def test_gateway_retry_redispatches_live_carrier_text_and_keeps_scaffold(
     store = SessionStore(sessions_dir=tmp_path, config=config)
     session_id = "retry-carrier-session"
     store._db.create_session(session_id=session_id, source="test")
-    store._db.append_message(session_id, "user", "older ask")
+    store._db.append_message(
+        session_id, "user", "older ask", **HUMAN_PROVENANCE
+    )
     store._db.append_message(session_id, "assistant", "older answer")
-    store._db.append_message(session_id, "user", _composite_carrier()["content"])
+    store._db.append_message(
+        session_id, "user", _composite_carrier()["content"], **HUMAN_PROVENANCE
+    )
     store._db.append_message(session_id, "assistant", "failed answer")
 
     gw = GatewayRunner.__new__(GatewayRunner)
@@ -341,7 +359,9 @@ async def test_gateway_retry_does_not_rewind_a_newer_plain_turn(
     store = SessionStore(sessions_dir=tmp_path, config=config)
     session_id = "retry-carrier-race-session"
     store._db.create_session(session_id=session_id, source="test")
-    store._db.append_message(session_id, "user", _composite_carrier()["content"])
+    store._db.append_message(
+        session_id, "user", _composite_carrier()["content"], **HUMAN_PROVENANCE
+    )
     store._db.append_message(session_id, "assistant", "failed answer")
 
     gw = GatewayRunner.__new__(GatewayRunner)
@@ -352,7 +372,9 @@ async def test_gateway_retry_does_not_rewind_a_newer_plain_turn(
     original_rewind = store.rewind_session
 
     def append_newer_turn_then_rewind(*args, **kwargs):
-        store._db.append_message(session_id, "user", "newer ask")
+        store._db.append_message(
+            session_id, "user", "newer ask", **HUMAN_PROVENANCE
+        )
         store._db.append_message(session_id, "assistant", "newer answer")
         return original_rewind(*args, **kwargs)
 
@@ -390,6 +412,7 @@ async def test_gateway_retry_rejects_media_before_redispatch_or_token_reset():
                         {"type": "text", "text": "look again"},
                         {"type": "image_url", "image_url": {"url": "image"}},
                     ],
+                    **HUMAN_PROVENANCE,
                 },
                 {"role": "assistant", "content": "old answer"},
             ]
@@ -453,7 +476,7 @@ async def test_gateway_retry_stops_when_transcript_rewrite_fails():
         get_or_create_session=AsyncMock(return_value=session_entry),
         load_transcript=AsyncMock(
             return_value=[
-                {"role": "user", "content": "retry me"},
+                _human("retry me"),
                 {"role": "assistant", "content": "old answer"},
             ]
         ),
@@ -485,7 +508,9 @@ def test_gateway_undo_prefills_live_carrier_text_and_keeps_scaffold(
     store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
     session_id = "undo-carrier-session"
     store._db.create_session(session_id=session_id, source="test")
-    store._db.append_message(session_id, "user", _composite_carrier()["content"])
+    store._db.append_message(
+        session_id, "user", _composite_carrier()["content"], **HUMAN_PROVENANCE
+    )
     store._db.append_message(session_id, "assistant", "failed answer")
 
     result = store.rewind_session(session_id)
@@ -524,16 +549,21 @@ async def test_gateway_retry_preserves_archived_compaction_rows_when_probe_fails
 
     session_id = "retry_archived_session"
     store._db.create_session(session_id=session_id, source="test")
-    store._db.append_message(session_id=session_id, role="user", content="old question")
+    store._db.append_message(
+        session_id=session_id,
+        role="user",
+        content="old question",
+        **HUMAN_PROVENANCE,
+    )
     store._db.append_message(session_id=session_id, role="assistant", content="old answer")
     # In-place compaction: the two rows above are soft-archived and the
     # compacted transcript becomes the live set under the same id.
     store._db.archive_and_compact(
         session_id,
         [
-            {"role": "user", "content": "first question"},
+            _human("first question"),
             {"role": "assistant", "content": "first answer"},
-            {"role": "user", "content": "retry me"},
+            _human("retry me"),
             {"role": "assistant", "content": "old answer"},
         ],
     )
@@ -554,7 +584,7 @@ async def test_gateway_retry_preserves_archived_compaction_rows_when_probe_fails
 
     async def fake_handle_message(event):
         assert event.text == "retry me"
-        store.append_to_transcript(session_id, {"role": "user", "content": event.text})
+        store.append_to_transcript(session_id, _human(event.text))
         store.append_to_transcript(session_id, {"role": "assistant", "content": "new answer"})
         return "new answer"
 

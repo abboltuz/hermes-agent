@@ -13,6 +13,7 @@ Covers three layers:
 from __future__ import annotations
 
 import sqlite3
+import types
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,80 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Goal loop logic (callback-injected, no live model)
 # ---------------------------------------------------------------------------
+
+def test_quiet_kanban_agent_uses_worker_platform(monkeypatch):
+    """The initial ``-q`` worker turn must not inherit local CLI identity."""
+    import cli as cli_mod
+
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    shell = cli_mod.HermesCLI(compact=True)
+    shell._session_db = object()
+    shell._resumed = False
+    shell.conversation_history = []
+    shell._install_tool_callbacks = lambda: None
+    shell._ensure_tirith_security = lambda: None
+    shell._ensure_runtime_credentials = lambda: True
+
+    captured = {}
+
+    def _fake_agent(*_args, **kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(cli_mod, "AIAgent", _fake_agent)
+
+    assert shell._init_agent() is True
+    assert captured["platform"] == "kanban"
+
+
+def test_quiet_kanban_goal_loop_stamps_trusted_continuation(monkeypatch):
+    """Autonomous follow-up prompts stay agent continuations, never users."""
+    import cli as cli_mod
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    task = types.SimpleNamespace(
+        title="Finish report",
+        body="Meet the acceptance criteria",
+        goal_max_turns=3,
+    )
+
+    class _Conn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(kb, "connect", lambda: _Conn())
+    monkeypatch.setattr(kb, "get_task", lambda _conn, _task_id: task)
+    monkeypatch.setattr(kb, "goal_run_status", lambda *_args, **_kwargs: "doing")
+
+    calls = []
+
+    class _Agent:
+        session_id = "session-1"
+
+        def run_conversation(self, **kwargs):
+            calls.append(kwargs)
+            return {"final_response": "continued"}
+
+    shell = types.SimpleNamespace(
+        agent=_Agent(),
+        conversation_history=[],
+        session_id="session-1",
+    )
+
+    def _run_loop(**kwargs):
+        kwargs["run_turn"]("continue working")
+        return {"outcome": "completed"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _run_loop)
+
+    cli_mod._run_kanban_goal_loop_q(shell, "first response")
+
+    provenance = calls[0]["persist_user_provenance"]
+    assert provenance["origin_kind"] == "agent"
+    assert provenance["turn_kind"] == "continuation"
+    assert provenance["trust_kind"] == "trusted_internal"
+
 
 def _patch_judge(monkeypatch, verdicts):
     """Make judge_goal return a scripted sequence of verdicts."""

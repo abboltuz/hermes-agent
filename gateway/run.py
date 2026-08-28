@@ -1435,6 +1435,16 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
+    for _provenance_key in (
+        "origin_kind",
+        "turn_kind",
+        "trust_kind",
+        "provenance_metadata",
+        "display_kind",
+        "display_metadata",
+    ):
+        if msg.get(_provenance_key) is not None:
+            entry[_provenance_key] = msg[_provenance_key]
     # api_content sidecar (persist-what-you-send, prompt-cache stability):
     # forward the exact bytes previously sent to the API for this message so
     # the agent's api_messages build can substitute them and keep the request
@@ -6438,6 +6448,10 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_display_metadata"] = (
                     ctx.persist_user_display_metadata
                 )
+            if ctx.persist_user_provenance is not None:
+                _conversation_kwargs["persist_user_provenance"] = (
+                    ctx.persist_user_provenance
+                )
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
@@ -6783,6 +6797,9 @@ def _internal_event_display_metadata(event: MessageEvent, source: SessionSource)
         "kind": _text("kind", "internal_notification", 128)
         or "internal_notification",
     }
+    if raw.get("hermes_plugin_injection") is True:
+        metadata["source"] = "plugin_injection"
+        metadata["kind"] = "plugin_message"
     platform = str(platform_value or "").strip()[:128]
     if platform:
         metadata["platform"] = platform
@@ -10362,7 +10379,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # we deliver it ourselves (mirroring the draining-case send above).
         try:
             from tools.approval import has_blocking_approval
-            if event.allow_gateway_control and has_blocking_approval(session_key):
+            from agent.message_provenance import (
+                may_authorize_control,
+                provenance_for_gateway_ingress,
+            )
+
+            _approval_provenance = provenance_for_gateway_ingress(
+                platform=event.source.platform,
+                internal=bool(getattr(event, "internal", False)),
+                is_bot=bool(event.source.is_bot),
+                authorized=bool(event.allow_gateway_control),
+            )
+            if may_authorize_control(
+                {
+                    "role": "user",
+                    "content": event.text,
+                    **_approval_provenance.as_message_fields(),
+                }
+            ) and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
                 _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
                 _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
@@ -17250,7 +17284,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
-        allow_gateway_control = event.allow_gateway_control
+        from agent.message_provenance import (
+            may_authorize_control,
+            provenance_for_gateway_ingress,
+        )
+
+        _control_provenance = provenance_for_gateway_ingress(
+            platform=source.platform,
+            internal=bool(getattr(event, "internal", False)),
+            is_bot=bool(source.is_bot),
+            authorized=bool(event.allow_gateway_control),
+        )
+        allow_gateway_control = may_authorize_control(
+            {
+                "role": "user",
+                "content": event.text,
+                **_control_provenance.as_message_fields(),
+            }
+        )
         _up_state = self._peek_session_state(_quick_key)
         if (
             allow_gateway_control
@@ -18886,7 +18937,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
-        if "@" in message_text:
+        from agent.message_provenance import (
+            may_authorize_control,
+            provenance_for_gateway_ingress,
+        )
+
+        _reference_provenance = provenance_for_gateway_ingress(
+            platform=source.platform,
+            internal=bool(getattr(event, "internal", False)),
+            is_bot=bool(source.is_bot),
+            authorized=bool(event.allow_gateway_control),
+        )
+        if (
+            "@" in message_text
+            and may_authorize_control(
+                {
+                    "role": "user",
+                    "content": message_text,
+                    **_reference_provenance.as_message_fields(),
+                }
+            )
+        ):
             try:
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length_async
@@ -19497,6 +19568,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "internal_notification" if getattr(event, "internal", False) else None
         )
         persist_user_display_metadata = _internal_event_display_metadata(event, source)
+        from agent.message_provenance import (
+            provenance_for_gateway_ingress,
+        )
+
+        _provenance_metadata = {
+            "producer": "gateway_ingress",
+            "source": str(
+                (persist_user_display_metadata or {}).get("source")
+                or "gateway"
+            ),
+            "event_kind": str(
+                (persist_user_display_metadata or {}).get("kind") or ""
+            ),
+            "platform": source.platform.value if source.platform else "gateway",
+            "session_id": session_entry.session_id,
+            "chat_id": source.chat_id,
+            "thread_id": source.thread_id,
+            "message_id": source.message_id,
+            "actor_id": source.user_id,
+            "authorized_via": "role" if source.role_authorized else "identity",
+        }
+        _ingress_provenance = provenance_for_gateway_ingress(
+            platform=source.platform,
+            internal=bool(getattr(event, "internal", False)),
+            is_bot=bool(source.is_bot),
+            authorized=bool(event.allow_gateway_control),
+            internal_source=(persist_user_display_metadata or {}).get("source"),
+            event_kind=(persist_user_display_metadata or {}).get("kind"),
+            metadata=_provenance_metadata,
+        )
+        persist_user_provenance = _ingress_provenance.as_message_fields()
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -20693,6 +20795,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_provenance=persist_user_provenance,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -21136,6 +21239,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _user_entry["display_kind"] = persist_user_display_kind
                 if persist_user_display_metadata is not None:
                     _user_entry["display_metadata"] = persist_user_display_metadata
+                _user_entry.update(persist_user_provenance)
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
                 # Dedupe: skip if this platform message_id is already in the
@@ -21182,6 +21286,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _user_entry["display_kind"] = persist_user_display_kind
                     if persist_user_display_metadata is not None:
                         _user_entry["display_metadata"] = persist_user_display_metadata
+                    _user_entry.update(persist_user_provenance)
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
                     await self.async_session_store.append_to_transcript(
@@ -21386,6 +21491,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             and persist_user_display_metadata is not None
                         ):
                             _user_entry["display_metadata"] = persist_user_display_metadata
+                        if 'persist_user_provenance' in locals():
+                            _user_entry.update(persist_user_provenance)
                         if getattr(event, "message_id", None):
                             _user_entry["message_id"] = str(event.message_id)
                         await self.async_session_store.append_to_transcript(
@@ -23057,6 +23164,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                from agent.message_provenance import (
+                    OriginKind,
+                    TrustKind,
+                    TurnKind,
+                    build_provenance,
+                )
+
+                task_provenance = build_provenance(
+                    OriginKind.AGENT,
+                    TurnKind.TASK_INSTRUCTION,
+                    TrustKind.TRUSTED_INTERNAL,
+                    {
+                        "producer": "gateway_background_task",
+                        "platform": platform_key,
+                        "task_id": task_id,
+                    },
+                ).as_message_fields()
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -23092,6 +23216,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
+                        persist_user_provenance=task_provenance,
                     )
                 finally:
                     self._cleanup_agent_resources(agent)
@@ -23984,7 +24109,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reload_msg = {
                 "role": "user",
                 "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
+                "display_kind": "internal_notification",
             }
+            from agent.message_provenance import stamp_provenance
+
+            stamp_provenance(
+                reload_msg,
+                "internal_system",
+                "notification",
+                "no_control",
+                {"producer": "gateway_mcp_reload"},
+            )
             try:
                 session_entry = await self.async_session_store.get_or_create_session(event.source)
                 await self.async_session_store.append_to_transcript(
@@ -28433,6 +28568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        persist_user_provenance: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -28738,6 +28874,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        persist_user_provenance: Optional[dict] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -28759,6 +28896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_provenance=persist_user_provenance,
                 message_type=message_type,
             )
 
@@ -28773,6 +28911,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_provenance=persist_user_provenance,
                 message_type=message_type,
             )
 
@@ -28917,6 +29056,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        persist_user_provenance: Optional[dict] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -28944,6 +29084,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_message_id=event_message_id,
                 persist_user_display_kind=persist_user_display_kind,
                 persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_provenance=persist_user_provenance,
             )
 
         from run_agent import AIAgent
@@ -29230,6 +29371,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
+            persist_user_provenance=persist_user_provenance,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

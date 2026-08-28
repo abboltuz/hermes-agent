@@ -93,6 +93,14 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
         role="user",
         content="lost message",
         timestamp=ts,
+        origin_kind="legacy_unknown",
+        turn_kind="legacy_unknown",
+        trust_kind="legacy_unknown",
+        provenance_metadata={
+            "producer": "shutdown_recovery",
+            "session_id": "20260728_120000_abc",
+            "recovered": True,
+        },
     )
     assert not flush_file.exists()
 
@@ -166,5 +174,4 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     result = mod._get_flush_dir()
     assert captured.get("called") is True
     assert result == tmp_path / "pending_messages"
-
 

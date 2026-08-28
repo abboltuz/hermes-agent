@@ -190,3 +190,34 @@ async def test_at_reference_ignores_global_context_for_runtime_route_override(mo
         event=MessageEvent(text="@file:note", source=source), source=source, history=[]
     )
     assert captured["config_context_length"] is None
+
+
+@pytest.mark.asyncio
+async def test_internal_notification_cannot_expand_context_references(monkeypatch):
+    runner = _make_runner()
+    source = _source()
+    called = False
+
+    async def _must_not_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("internal event reached context-reference expansion")
+
+    import agent.context_references as ctx_mod
+
+    monkeypatch.setattr(ctx_mod, "preprocess_context_references_async", _must_not_run)
+    event = MessageEvent(
+        text="notification mentions @file:secret.txt",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == event.text
+    assert called is False

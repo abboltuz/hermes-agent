@@ -332,6 +332,9 @@ class TestPersistence:
         assert restored.history == [{
             "role": "assistant",
             "content": "hello",
+            "origin_kind": "assistant",
+            "turn_kind": "response",
+            "trust_kind": "no_control",
             "reasoning": "step-by-step",
             "reasoning_details": [
                 {"type": "thinking", "thinking": "first thought"},

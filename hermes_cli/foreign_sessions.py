@@ -372,8 +372,29 @@ def import_foreign_session(source: str, path, db=None) -> str:
             cwd=parsed.get("cwd"),
             origin_json=json.dumps(origin),
         )
+        from agent.message_provenance import (
+            OriginKind,
+            TrustKind,
+            TurnKind,
+            stamp_provenance,
+        )
+
+        imported_rows = []
         for turn in turns:
-            db.append_message(session_id, turn["role"], turn["content"])
+            row = {"role": turn["role"], "content": turn["content"]}
+            stamp_provenance(
+                row,
+                OriginKind.IMPORTED,
+                TurnKind.PROMPT if turn["role"] == "user" else TurnKind.RESPONSE,
+                TrustKind.NO_CONTROL,
+                {
+                    "producer": "foreign_session_import",
+                    "import_source": _SOURCE_DB_NAMES[source],
+                    "session_id": session_id,
+                },
+            )
+            imported_rows.append(row)
+        db.append_messages_batch(session_id, imported_rows)
         try:
             db.set_session_title(session_id, title)
         except Exception:
