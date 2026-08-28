@@ -387,10 +387,19 @@ def _provision_libpython(
             os.replace(staging, dst)
         _discard_snapshots(snapshots)
         return True
-    except OSError:
+    except OSError as exc:
         logger.warning("libpython provision failed", exc_info=True)
-        _restore_snapshots(snapshots)
+        if not _restore_snapshots(snapshots):
+            raise _AnchorInstallFailed(
+                "libpython provisioning failed and rollback was incomplete"
+            ) from exc
         return False
+    except BaseException as exc:
+        if not _restore_snapshots(snapshots):
+            raise _AnchorInstallFailed(
+                "libpython provisioning was interrupted and rollback was incomplete"
+            ) from exc
+        raise
     finally:
         for staging, _dst in staged:
             try:
@@ -425,29 +434,6 @@ def _copy_alias(venv_bin: Path, name: str, anchor: Path) -> bool:
             except OSError:
                 pass
         return False
-
-
-def _materialize_aliases(
-    venv_bin: Path,
-    anchor: Path,
-    source_file: Path,
-    *,
-    refresh: bool = False,
-) -> bool:
-    """Materialize uv alias names as real-file copies of the anchor.
-
-    Returns True only when every alias that needed materializing succeeded.
-    """
-    ok = True
-    for name in _alias_names(venv_bin, source_file):
-        alias = venv_bin / name
-        try:
-            if refresh or alias.is_symlink() or not alias.exists():
-                ok = _copy_alias(venv_bin, name, anchor) and ok
-        except OSError:
-            ok = False
-            continue
-    return ok
 
 
 def _passes_boot_gate(staged: Path, venv_dir: Path) -> bool:
@@ -554,6 +540,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
     dylibs = [dst for _src, dst in _libpython_targets(venv_dir, source_file)]
     snapshots = _snapshot_paths([venv_py, *aliases, *dylibs])
     tmp_path: Path | None = None
+    alias_stage_dir: Path | None = None
     try:
         marker.unlink(missing_ok=True)
         if not _provision_libpython(venv_dir, source_file, refresh=True):
@@ -570,23 +557,31 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
             raise _BootGateFailed(
                 f"staged copy at {tmp_path} failed encodings/prefix probe"
             )
-        # Promote aliases while the original store-backed canonical route is
-        # still live.  A partial alias cutover therefore remains bootable even
-        # before bounded rollback runs.
-        aliases_ok = _materialize_aliases(
-            venv_bin, tmp_path, source_file, refresh=True
+        # Stage each alias under its final basename one directory below the
+        # venv root.  That preserves both CPython's pyvenv.cfg discovery and
+        # @executable_path/../lib while keeping codesign away from live paths.
+        alias_stage_dir = Path(
+            tempfile.mkdtemp(prefix=".python-aliases-tcc-", dir=str(venv_dir))
         )
-        if not aliases_ok:
-            raise _AnchorInstallFailed("alias materialization was incomplete")
         for alias in aliases:
-            if not _macos_sign_managed_python(alias):
+            staged_alias = alias_stage_dir / alias.name
+            if not _copy_alias(alias_stage_dir, alias.name, tmp_path):
+                raise _AnchorInstallFailed(
+                    f"alias materialization failed: {alias.name}"
+                )
+            if not _macos_sign_managed_python(staged_alias):
                 raise _AnchorInstallFailed(f"alias signing failed: {alias.name}")
-            if not _macos_verify_managed_python_identity(alias):
+            if not _macos_verify_managed_python_identity(staged_alias):
                 raise _AnchorInstallFailed(
                     f"alias identity verification failed: {alias.name}"
                 )
-            if not _passes_boot_gate(alias, venv_dir):
+            if not _passes_boot_gate(staged_alias, venv_dir):
                 raise _AnchorInstallFailed(f"alias boot gate failed: {alias.name}")
+
+        # Promote only complete, signed, verified, boot-tested aliases while
+        # the original store-backed canonical route is still live.
+        for alias in aliases:
+            os.replace(alias_stage_dir / alias.name, alias)
 
         # Canonical promotion is the last executable cutover.
         os.replace(tmp_path, venv_py)
@@ -599,7 +594,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
         # layout.  It is written atomically and strictly last.
         _write_marker(venv_bin, source_file)
         _discard_snapshots(snapshots)
-    except Exception as exc:
+    except BaseException as exc:
         try:
             marker.unlink(missing_ok=True)
         except OSError:
@@ -615,6 +610,9 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
                 "anchor installation failed and predecessor rollback was incomplete"
             ) from exc
         raise
+    finally:
+        if alias_stage_dir is not None:
+            shutil.rmtree(alias_stage_dir, ignore_errors=True)
 
 
 def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:

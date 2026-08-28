@@ -892,6 +892,44 @@ class TestAnchoredAliasesBootE2E:
         assert tcc.tcc_anchor_state(root)[0] == "active"
         _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
 
+    def test_interrupted_alias_signing_preserves_predecessor_and_retries(
+        self, tmp_path, monkeypatch
+    ):
+        root, venv_bin, minor, console_script = _real_macos_venv(tmp_path)
+        _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
+        original_targets = {
+            name: os.readlink(venv_bin / name)
+            for name in ("python", "python3", minor)
+        }
+        original_sign = tcc._macos_sign_managed_python
+        sign_calls = 0
+
+        def interrupt_second_sign(path):
+            nonlocal sign_calls
+            sign_calls += 1
+            if sign_calls == 2:
+                Path(path).write_bytes(b"corrupt-interrupted-signature")
+                raise KeyboardInterrupt
+            return original_sign(path)
+
+        monkeypatch.setattr(
+            tcc, "_macos_sign_managed_python", interrupt_second_sign
+        )
+        with pytest.raises(KeyboardInterrupt):
+            tcc.ensure_tcc_anchor(root)
+
+        assert not (venv_bin / ".tcc-anchor-source").exists()
+        for name, target in original_targets.items():
+            entrypoint = venv_bin / name
+            assert entrypoint.is_symlink()
+            assert os.readlink(entrypoint) == target
+        _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
+
+        monkeypatch.setattr(tcc, "_macos_sign_managed_python", original_sign)
+        assert tcc.ensure_tcc_anchor(root) is not None
+        assert tcc.tcc_anchor_state(root)[0] == "active"
+        _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
+
     def test_libpython_refresh_failure_preserves_live_dependent_process(
         self, tmp_path, monkeypatch
     ):
@@ -970,6 +1008,55 @@ class TestAnchoredAliasesBootE2E:
             [str(predecessor)], capture_output=True, text=True, check=True
         )
         assert retried.stdout.strip() == "2"
+
+    def test_interrupted_libpython_promotion_restores_complete_predecessor(
+        self, tmp_path, monkeypatch
+    ):
+        venv = tmp_path / "venv"
+        venv_lib = venv / "lib"
+        store = tmp_path / "uv" / "python" / _STORE_ROOT
+        store_bin = store / "bin"
+        store_lib = store / "lib"
+        venv_lib.mkdir(parents=True)
+        store_bin.mkdir(parents=True)
+        store_lib.mkdir()
+        source_python = store_bin / "python3.11"
+        source_python.write_bytes(b"source")
+        names = ("libpython3.11.dylib", "libpython3.dylib")
+        for name in names:
+            (venv_lib / name).write_bytes(f"old-{name}".encode())
+            (store_lib / name).write_bytes(f"new-{name}".encode())
+
+        original_replace = tcc.os.replace
+        promotions = 0
+        interrupted = False
+
+        def interrupt_second_promotion(src, dst):
+            nonlocal promotions, interrupted
+            destination = Path(dst)
+            if (
+                not interrupted
+                and destination.parent == venv_lib
+                and destination.name in names
+            ):
+                promotions += 1
+                if promotions == 2:
+                    interrupted = True
+                    raise KeyboardInterrupt
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(tcc.os, "replace", interrupt_second_promotion)
+        with pytest.raises(KeyboardInterrupt):
+            tcc._provision_libpython(venv, source_python, refresh=True)
+
+        assert {
+            name: (venv_lib / name).read_bytes() for name in names
+        } == {name: f"old-{name}".encode() for name in names}
+
+        assert tcc._provision_libpython(venv, source_python, refresh=True)
+        assert {
+            name: (venv_lib / name).read_bytes() for name in names
+        } == {name: f"new-{name}".encode() for name in names}
 
     def test_concurrent_ensure_calls_are_transaction_serialized(
         self, tmp_path, monkeypatch
