@@ -396,6 +396,12 @@ describe('failed-turn-aware ordinal space', () => {
 })
 
 describe('resolveDurableRowId', () => {
+  const human = {
+    origin_kind: 'human_user',
+    turn_kind: 'prompt',
+    trust_kind: 'user_authorized'
+  }
+
   const gatewayWith = (messages: unknown[]) => {
     const request = (async (method: string) => {
       expect(method).toBe('session.history')
@@ -408,9 +414,9 @@ describe('resolveDurableRowId', () => {
 
   it('resolves a unique content match to its durable row id', async () => {
     const request = gatewayWith([
-      { role: 'user', text: 'first prompt', row_id: 11 },
+      { role: 'user', text: 'first prompt', row_id: 11, ...human },
       { role: 'assistant', text: 'reply', row_id: 12 },
-      { role: 'user', text: 'typo prompt', row_id: 13 }
+      { role: 'user', text: 'typo prompt', row_id: 13, ...human }
     ])
 
     expect(await resolveDurableRowId(request, 'sid', 'typo prompt', 1)).toBe(13)
@@ -418,17 +424,54 @@ describe('resolveDurableRowId', () => {
 
   it('ignores synthetic user-role injections (display_kind rows)', async () => {
     const request = gatewayWith([
-      { role: 'user', text: 'real prompt', row_id: 11 },
-      { role: 'user', text: 'real prompt', row_id: 12, display_kind: 'auto_continue' }
+      { role: 'user', text: 'real prompt', row_id: 11, ...human },
+      {
+        role: 'user',
+        text: 'real prompt',
+        row_id: 12,
+        display_kind: 'auto_continue',
+        origin_kind: 'automation',
+        turn_kind: 'continuation',
+        trust_kind: 'trusted_internal'
+      }
     ])
 
     expect(await resolveDurableRowId(request, 'sid', 'real prompt', 0)).toBe(11)
   })
 
+  it('fails closed for a user-role row without provenance', async () => {
+    const request = gatewayWith([{ role: 'user', text: 'unknown source', row_id: 11 }])
+
+    expect(await resolveDurableRowId(request, 'sid', 'unknown source', 0)).toBeUndefined()
+  })
+
+  it('ignores typed machine user-role rows without relying on display_kind', async () => {
+    const request = gatewayWith([
+      {
+        role: 'user',
+        text: 'same text',
+        row_id: 11,
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized'
+      },
+      {
+        role: 'user',
+        text: 'same text',
+        row_id: 12,
+        origin_kind: 'automation',
+        turn_kind: 'continuation',
+        trust_kind: 'trusted_internal'
+      }
+    ])
+
+    expect(await resolveDurableRowId(request, 'sid', 'same text', 0)).toBe(11)
+  })
+
   it('refuses ambiguous matches unless the target is provably the newest turn', async () => {
     const request = gatewayWith([
-      { role: 'user', text: 'same text', row_id: 11 },
-      { role: 'user', text: 'same text', row_id: 13 }
+      { role: 'user', text: 'same text', row_id: 11, ...human },
+      { role: 'user', text: 'same text', row_id: 13, ...human }
     ])
 
     // Ambiguous + target not the latest -> undefined (plain resubmit).
@@ -454,9 +497,23 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
   }
 
   const historyMessages = [
-    { role: 'user', text: 'first prompt', row_id: 11 },
+    {
+      role: 'user',
+      text: 'first prompt',
+      row_id: 11,
+      origin_kind: 'human_user',
+      turn_kind: 'prompt',
+      trust_kind: 'user_authorized'
+    },
     { role: 'assistant', text: 'ok', row_id: 12 },
-    { role: 'user', text: 'typo prompt', row_id: 13 }
+    {
+      role: 'user',
+      text: 'typo prompt',
+      row_id: 13,
+      origin_kind: 'human_user',
+      turn_kind: 'prompt',
+      trust_kind: 'user_authorized'
+    }
   ]
 
   const makeGateway = (calls: Call[]) =>

@@ -29,7 +29,8 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       continue
     }
 
-    const { context, display_kind, name, role, text, timestamp } = row as TranscriptRow
+    const { context, display_kind, name, origin_kind, role, text, timestamp, trust_kind, turn_kind } =
+      row as TranscriptRow
 
     const createdAt =
       typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 ? timestamp : undefined
@@ -46,7 +47,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
     // Display-only timeline events: render as dim ◈ markers instead of
     // opaque user messages. Hidden compaction handoffs are skipped entirely.
-    if (display_kind === 'hidden') {
+    if (display_kind === 'hidden' || turn_kind === 'runtime_scaffolding') {
       continue
     }
 
@@ -90,7 +91,23 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       out.push({ role, text, ...(createdAt !== undefined && { createdAt }), ...(pending.length && { tools: pending }) })
       pending = []
     } else if (role === 'user' || role === 'system') {
-      out.push({ role, text, ...(createdAt !== undefined && { createdAt }) })
+      const isLocalUserActor =
+        origin_kind === 'human_user' &&
+        (turn_kind === 'prompt' || turn_kind === 'task_instruction' || turn_kind === 'ui_action') &&
+        trust_kind === 'user_authorized'
+
+      const displayRole = role === 'user' && !isLocalUserActor ? 'system' : role
+
+      const actorLabel =
+        !origin_kind || origin_kind === 'legacy_unknown'
+          ? 'Source unknown'
+          : origin_kind === 'external_actor'
+            ? 'External actor'
+            : String(origin_kind || 'system').replaceAll('_', ' ')
+
+      const displayText = displayRole === 'system' && role === 'user' ? `[${actorLabel}] ${text}` : text
+
+      out.push({ role: displayRole, text: displayText, ...(createdAt !== undefined && { createdAt }) })
       pending = []
     }
   }
@@ -112,7 +129,10 @@ interface TranscriptRow {
   display_kind?: string
   display_metadata?: { task_count?: number; [key: string]: unknown }
   name?: string
+  origin_kind?: string
   role?: string
   text?: string
   timestamp?: number
+  trust_kind?: string
+  turn_kind?: string
 }

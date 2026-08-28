@@ -53,8 +53,8 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   return [missing.join('\n'), visibleText].filter(Boolean).join('\n\n') || visibleText
 }
 
-function transcriptContent(displayKind: SessionMessage['display_kind'], content: string): string | null {
-  return displayKind === 'hidden' ? null : content
+function transcriptContent(message: SessionMessage, content: string): string | null {
+  return message.display_kind === 'hidden' || message.turn_kind === 'runtime_scaffolding' ? null : content
 }
 
 // A remote backend older than this app serves display_metadata as raw JSON text,
@@ -119,6 +119,16 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
   }
 
   return content
+}
+
+function isLocalUserActor(message: SessionMessage): boolean {
+  return (
+    message.origin_kind === 'human_user' &&
+    (message.turn_kind === 'prompt' ||
+      message.turn_kind === 'task_instruction' ||
+      message.turn_kind === 'ui_action') &&
+    message.trust_kind === 'user_authorized'
+  )
 }
 
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
@@ -200,12 +210,23 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         ? message.display_content
         : message.content || message.text || message.context || message.name
 
+    const actorPrefixedContent =
+      message.role === 'user' && !message.display_kind && !isLocalUserActor(message)
+        ? `[${
+            !message.origin_kind || message.origin_kind === 'legacy_unknown'
+              ? 'Source unknown'
+              : message.origin_kind === 'external_actor'
+                ? 'External actor'
+                : message.origin_kind.replaceAll('_', ' ')
+          }] ${String(content || '')}`
+        : content
+
     const rawDisplayContent = transcriptContent(
-      message.display_kind,
-      timelineDisplayContent(message, displayContentForMessage(message.role, content))
+      message,
+      timelineDisplayContent(message, displayContentForMessage(message.role, actorPrefixedContent))
     )
 
-    const displayRole =
+    const timelineRole =
       message.display_kind === 'model_switch' ||
       message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'auto_continue' ||
@@ -213,6 +234,9 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.display_kind === 'internal_notification'
         ? 'system'
         : message.role
+
+    const displayRole =
+      timelineRole === 'user' && !isLocalUserActor(message) ? 'system' : timelineRole
 
     // Persisted user turns carry `@image:<path>` directive lines inline in
     // the text (see tui_gateway/server.py's persist-time rewrite). The
