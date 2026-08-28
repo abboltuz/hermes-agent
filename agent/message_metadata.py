@@ -8,7 +8,17 @@ from typing import Any, MutableMapping, Optional, TypeVar
 
 # These fields describe Hermes' durable record, not provider-visible message
 # content. They must not influence context-pressure decisions.
-PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp"})
+PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
+    {
+        "timestamp",
+        "display_kind",
+        "display_metadata",
+        "origin_kind",
+        "turn_kind",
+        "trust_kind",
+        "provenance_metadata",
+    }
+)
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
 
@@ -35,7 +45,10 @@ def append_message(
     *,
     timestamp: Optional[float] = None,
 ) -> _Message:
-    """Stamp and append one live transcript message."""
+    """Stamp, semantically classify, and append one live transcript message."""
+    from agent.message_provenance import normalize_message_for_durable_write
+
     stamp_message_timestamp(message, timestamp=timestamp)
+    message.update(normalize_message_for_durable_write(message))
     messages.append(message)
     return message

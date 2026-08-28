@@ -19,7 +19,14 @@ def db(tmp_path, monkeypatch):
 @pytest.fixture
 def session(db):
     key = db.create_session("react-test", "test")
-    db.append_message(key, "user", "how do i center a div")
+    db.append_message(
+        key,
+        "user",
+        "how do i center a div",
+        origin_kind="human_user",
+        turn_kind="prompt",
+        trust_kind="user_authorized",
+    )
     db.append_message(key, "assistant", "use flexbox")
     rows = [m["_row_id"] for m in db.get_messages_as_conversation(key, include_row_ids=True)]
 
@@ -154,7 +161,14 @@ def test_latest_user_message_is_the_agents_default_target(session, db):
     key, rows = session
     assert db.latest_user_message_row_id(key) == rows[0]
 
-    db.append_message(key, "user", "thanks!")
+    db.append_message(
+        key,
+        "user",
+        "thanks!",
+        origin_kind="human_user",
+        turn_kind="prompt",
+        trust_kind="user_authorized",
+    )
     newest = db.get_messages_as_conversation(key, include_row_ids=True)[-1]["_row_id"]
 
     assert db.latest_user_message_row_id(key) == newest

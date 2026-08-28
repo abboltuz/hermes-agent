@@ -412,6 +412,10 @@ class HolographicMemoryProvider(MemoryProvider):
         for msg in messages:
             if msg.get("role") != "user":
                 continue
+            from agent.message_provenance import is_human_intent
+
+            if not is_human_intent(msg):
+                continue
             # Compaction handoff summaries can be inserted as role="user"
             # messages; their prose reliably matches the decision patterns, so
             # without this guard the compactor's own output is stored as a

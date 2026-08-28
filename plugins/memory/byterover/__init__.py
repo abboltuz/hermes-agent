@@ -354,6 +354,11 @@ class ByteRoverMemoryProvider(MemoryProvider):
         parts = []
         for msg in messages[-10:]:  # last 10 messages
             role = msg.get("role", "")
+            if role == "user":
+                from agent.message_provenance import is_human_intent
+
+                if not is_human_intent(msg):
+                    continue
             content = msg.get("content", "")
             if isinstance(content, str) and content.strip() and role in {"user", "assistant"}:
                 parts.append(f"{role}: {content[:500]}")

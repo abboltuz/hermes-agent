@@ -78,6 +78,11 @@ def snapshot_recent_messages(
         role = str(message.get("role") or "")
         if role not in ("user", "assistant"):
             continue
+        if role == "user":
+            from agent.message_provenance import is_human_intent
+
+            if not is_human_intent(message):
+                continue
         text = _message_text(message).strip()
         if not text:
             continue

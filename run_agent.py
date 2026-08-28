@@ -2394,6 +2394,10 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    "origin_kind": msg.get("origin_kind"),
+                    "turn_kind": msg.get("turn_kind"),
+                    "trust_kind": msg.get("trust_kind"),
+                    "provenance_metadata": msg.get("provenance_metadata"),
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8
@@ -4513,6 +4517,34 @@ class AIAgent:
             return
         if not (self._memory_manager and final_response and original_user_message):
             return
+        from agent.message_provenance import is_human_intent
+
+        current_turn_provenance = getattr(
+            self, "_current_turn_user_provenance", None
+        )
+        if not isinstance(current_turn_provenance, dict) or not is_human_intent(
+            current_turn_provenance
+        ):
+            return
+        if messages is not None:
+            current_task_id = str(getattr(self, "_current_task_id", "") or "")
+            current_turn_message = next(
+                (
+                    message
+                    for message in reversed(messages)
+                    if isinstance(message, dict)
+                    and isinstance(message.get("provenance_metadata"), dict)
+                    and str(
+                        message["provenance_metadata"].get("task_id") or ""
+                    )
+                    == current_task_id
+                ),
+                None,
+            )
+            if current_turn_message is not None and not is_human_intent(
+                current_turn_message
+            ):
+                return
         # Multimodal turns carry content as a list of typed parts; providers
         # expect plain strings, so flatten to text first (newline-joined for
         # memory, vs the default space-join used for log/trajectory previews).
@@ -8500,6 +8532,7 @@ class AIAgent:
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_provenance: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
@@ -8874,6 +8907,7 @@ class AIAgent:
                         persist_user_timestamp=persist_user_timestamp,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
+                        persist_user_provenance=persist_user_provenance,
                         moa_config=moa_config,
                     )
                 finally:

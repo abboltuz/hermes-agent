@@ -2981,10 +2981,28 @@ def _run_single_child(
                 _schema_retries = 1
                 _retry_result = None
                 try:
+                    from agent.message_provenance import (
+                        OriginKind,
+                        TrustKind,
+                        TurnKind,
+                        build_provenance,
+                    )
+
+                    _retry_provenance = build_provenance(
+                        OriginKind.AGENT,
+                        TurnKind.CONTINUATION,
+                        TrustKind.TRUSTED_INTERNAL,
+                        {
+                            "producer": "delegate_schema_retry",
+                            "task_id": child_task_id,
+                            "delegation_id": child_task_id,
+                        },
+                    ).as_message_fields()
                     _retry_result = child.run_conversation(
                         user_message=build_retry_message(_schema_errors),
                         task_id=child_task_id,
                         stream_callback=_relay_child_text,
+                        persist_user_provenance=_retry_provenance,
                     )
                 except Exception as _retry_exc:
                     logger.warning(

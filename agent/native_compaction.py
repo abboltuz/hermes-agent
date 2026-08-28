@@ -383,6 +383,11 @@ def prune_pre_checkpoint_items(
 
         is_summary = enable_summary_retention and _is_summary_item(item)
         is_user = item.get("role") == "user"
+        if is_user and isinstance(source, dict):
+            from agent.message_provenance import is_human_intent
+
+            if not is_human_intent(source):
+                is_user = False
 
         if not is_user and not is_summary:
             continue

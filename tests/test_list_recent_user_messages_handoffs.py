@@ -25,6 +25,12 @@ HANDOFF_CONTENT = (
     f"User asked: 'old task'\n\n{_SUMMARY_END_MARKER}"
 )
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 @pytest.fixture()
 def db(tmp_path):
@@ -35,11 +41,15 @@ def db(tmp_path):
 
 def test_legacy_handoff_rows_are_not_recent_user_messages(db):
     db.create_session(session_id="s1", source="cli", model="m")
-    db.append_message("s1", role="user", content="first question")
+    db.append_message(
+        "s1", role="user", content="first question", **HUMAN_PROVENANCE
+    )
     db.append_message("s1", role="assistant", content="first answer")
     # Legacy shape: durable role=user handoff with NO display_kind.
     db.append_message("s1", role="user", content=HANDOFF_CONTENT)
-    db.append_message("s1", role="user", content="second question")
+    db.append_message(
+        "s1", role="user", content="second question", **HUMAN_PROVENANCE
+    )
     db.append_message("s1", role="assistant", content="second answer")
 
     recents = db.list_recent_user_messages("s1", limit=10)
@@ -56,7 +66,9 @@ def test_handoff_skip_respects_limit_with_headroom(db):
     db.create_session(session_id="s2", source="cli", model="m")
     for i in range(3):
         db.append_message("s2", role="user", content=HANDOFF_CONTENT)
-        db.append_message("s2", role="user", content=f"question {i}")
+        db.append_message(
+            "s2", role="user", content=f"question {i}", **HUMAN_PROVENANCE
+        )
 
     recents = db.list_recent_user_messages("s2", limit=2)
 
@@ -66,7 +78,9 @@ def test_handoff_skip_respects_limit_with_headroom(db):
 def test_display_kind_rows_still_excluded(db):
     """The pre-existing SQL-side display_kind filter is unchanged."""
     db.create_session(session_id="s3", source="cli", model="m")
-    db.append_message("s3", role="user", content="real question")
+    db.append_message(
+        "s3", role="user", content="real question", **HUMAN_PROVENANCE
+    )
     db.append_message(
         "s3",
         role="user",

@@ -4364,6 +4364,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         actual_text = cls._message_text(message.get("content")).strip()
         return actual_text == expected_text
 
+    @staticmethod
+    def _is_human_message(message: Dict[str, Any]) -> bool:
+        from agent.message_provenance import is_human_intent
+
+        return is_human_intent(message)
+
     @classmethod
     def _extract_current_turn_messages(
         cls,
@@ -4402,6 +4408,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if (
                     isinstance(message, dict)
                     and message.get("role") == "user"
+                    and cls._is_human_message(message)
                     and cls._message_matches_text(message, user_content)
                 ):
                     start_idx = idx
@@ -4409,7 +4416,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if start_idx is None:
             for idx in range(end_idx, -1, -1):
                 message = messages[idx]
-                if isinstance(message, dict) and message.get("role") == "user":
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") == "user"
+                    and cls._is_human_message(message)
+                ):
                     start_idx = idx
                     break
         if start_idx is None:
@@ -4561,6 +4572,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 continue
 
             if role not in {"user", "assistant"}:
+                continue
+            if role == "user" and not cls._is_human_message(message):
                 continue
 
             flush_tool_parts()

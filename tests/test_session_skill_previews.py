@@ -29,6 +29,17 @@ SKILL_BODY = (
     "Look at what the repo already does, and copy it. Create the worktree and branch. "
 )
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+SCAFFOLD_PROVENANCE = {
+    "origin_kind": "internal_system",
+    "turn_kind": "runtime_scaffolding",
+    "trust_kind": "no_control",
+}
+
 
 @pytest.fixture()
 def db(tmp_path):
@@ -53,7 +64,9 @@ def _install_skill(tmp_path, monkeypatch, name="work", body=SKILL_BODY):
 
 def _seed(db, session_id, content, *, title=None, reply="On it."):
     db.create_session(session_id=session_id, source="cli", model="m")
-    db.append_message(session_id, role="user", content=content)
+    db.append_message(
+        session_id, role="user", content=content, **HUMAN_PROVENANCE
+    )
     db.append_message(session_id, role="assistant", content=reply)
     if title:
         db.set_session_title(session_id, title)
@@ -104,7 +117,9 @@ class TestCompactionPreview:
     def test_literal_marker_text_is_still_a_real_user_preview(self, db):
         message = "[CONTEXT COMPACTION — REFERENCE ONLY] what does this label mean?"
         db.create_session(session_id="s1", source="cli", model="m")
-        db.append_message("s1", role="user", content=message)
+        db.append_message(
+            "s1", role="user", content=message, **HUMAN_PROVENANCE
+        )
 
         (row,) = db.list_sessions_rich(limit=10)
 
@@ -118,8 +133,15 @@ class TestCompactionPreview:
             f"{_SUMMARY_END_MARKER}"
         )
         db.create_session(session_id="s1", source="cli", model="m")
-        db.append_message("s1", role="user", content=summary)
-        db.append_message("s1", role="user", content="test the browser controller")
+        db.append_message(
+            "s1", role="user", content=summary, **SCAFFOLD_PROVENANCE
+        )
+        db.append_message(
+            "s1",
+            role="user",
+            content="test the browser controller",
+            **HUMAN_PROVENANCE,
+        )
 
         (row,) = db.list_sessions_rich(limit=10)
 
@@ -132,8 +154,15 @@ class TestCompactionPreview:
             f"{_SUMMARY_END_MARKER}\n\n"
         )
         db.create_session(session_id="s1", source="cli", model="m")
-        db.append_message("s1", role="user", content=summary)
-        db.append_message("s1", role="user", content="test the browser controller")
+        db.append_message(
+            "s1", role="user", content=summary, **SCAFFOLD_PROVENANCE
+        )
+        db.append_message(
+            "s1",
+            role="user",
+            content="test the browser controller",
+            **HUMAN_PROVENANCE,
+        )
 
         (row,) = db.list_sessions_rich(limit=10)
 
@@ -147,7 +176,9 @@ class TestCompactionPreview:
             "test the browser controller"
         )
         db.create_session(session_id="s1", source="cli", model="m")
-        db.append_message("s1", role="user", content=carrier)
+        db.append_message(
+            "s1", role="user", content=carrier, **HUMAN_PROVENANCE
+        )
 
         (row,) = db.list_sessions_rich(limit=10)
 
@@ -163,7 +194,9 @@ class TestCompactionPreview:
             f"{_SUMMARY_END_MARKER}"
         )
         db.create_session(session_id="s1", source="cli", model="m")
-        db.append_message("s1", role="user", content=carrier)
+        db.append_message(
+            "s1", role="user", content=carrier, **HUMAN_PROVENANCE
+        )
 
         (row,) = db.list_sessions_rich(limit=10)
 
@@ -178,8 +211,15 @@ class TestCompactionPreview:
             f"{_SUMMARY_END_MARKER}"
         )
         db.create_session(session_id="s1", source="cli", model="m")
-        db.append_message("s1", role="user", content=carrier)
-        db.append_message("s1", role="user", content="test the browser controller")
+        db.append_message(
+            "s1", role="user", content=carrier, **SCAFFOLD_PROVENANCE
+        )
+        db.append_message(
+            "s1",
+            role="user",
+            content="test the browser controller",
+            **HUMAN_PROVENANCE,
+        )
 
         (row,) = db.list_sessions_rich(limit=10)
 
@@ -210,5 +250,4 @@ class TestSkillScaffoldedSessionLookup:
         for i in range(3):
             _seed(db, f"s{i}", message, title=f"Title {i}")
         assert len(db.list_skill_scaffolded_sessions(limit=2)) == 2
-
 

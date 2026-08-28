@@ -452,7 +452,9 @@ class InsightsEngine:
             cursor = self._conn.execute(
                 """SELECT
                      COUNT(*) as total_messages,
-                     SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
+                     SUM(CASE WHEN m.origin_kind IN ('human_user', 'external_actor')
+                                   AND m.turn_kind IN ('prompt', 'task_instruction', 'ui_action')
+                              THEN 1 ELSE 0 END) as user_messages,
                      SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
                      SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
                    FROM messages m
@@ -464,7 +466,9 @@ class InsightsEngine:
             cursor = self._conn.execute(
                 """SELECT
                      COUNT(*) as total_messages,
-                     SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
+                     SUM(CASE WHEN m.origin_kind IN ('human_user', 'external_actor')
+                                   AND m.turn_kind IN ('prompt', 'task_instruction', 'ui_action')
+                              THEN 1 ELSE 0 END) as user_messages,
                      SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
                      SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
                    FROM messages m

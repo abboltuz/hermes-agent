@@ -17,6 +17,12 @@ from agent.context_compressor import (
 )
 from hermes_state import SessionDB
 
+_HUMAN = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 class StubProviderError(Exception):
     def __init__(self, message, *, status_code=None, response=None):
@@ -139,7 +145,7 @@ class TestSummarizeToolResultClarify:
                 ],
             },
             {"role": "tool", "tool_call_id": "clarify-1", "content": content},
-            {"role": "user", "content": "recent request"},
+            {"role": "user", **_HUMAN, "content": "recent request"},
             {"role": "assistant", "content": "recent response"},
         ]
 
@@ -370,7 +376,7 @@ class TestPreflightDeferral:
 
 class TestCompress:
     def _make_messages(self, n):
-        return [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(n)]
+        return [{**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(n)]
 
 
 
@@ -389,7 +395,7 @@ class TestCompress:
 
         unique_ask = "PLEASE_COMPUTE_THE_ARITHMETIC_CHAIN_XYZ"
         turns = [
-            {"role": "user", "content": unique_ask},
+            {"role": "user", **_HUMAN, "content": unique_ask},
             {"role": "assistant", "content": "working on it"},
         ]
         summary = c._build_static_fallback_summary(turns, reason="provider down")
@@ -454,7 +460,7 @@ class TestCompress:
     def test_compress_strips_db_persisted_from_assembled_messages(self, compressor):
         """Regression for #57491: shallow copies must not carry flush markers."""
         msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
+            {**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
             for i in range(10)
         ]
         with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
@@ -471,7 +477,7 @@ class TestCompress:
         import agent.context_compressor as _cc
 
         msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
+            {**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
             for i in range(10)
         ]
         # Make the per-site helper leak the marker (dict.copy keeps it).
@@ -493,7 +499,7 @@ class TestCompress:
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3)
 
         msgs = [{"role": "system", "content": "sys"}] + [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+            {**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
             for i in range(10)
         ]
 
@@ -547,13 +553,14 @@ class TestTailBudgetCodexReplayFields:
         }
         messages = [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": "initial ask"},
+            {"role": "user", **_HUMAN, "content": "initial ask"},
             {"role": "assistant", "content": "first answer"},
-            {"role": "user", "content": "older follow-up"},
+            {"role": "user", **_HUMAN, "content": "older follow-up"},
             big_hidden_message,
         ]
         messages.extend(
             {
+                **(_HUMAN if i % 2 == 0 else {}),
                 "role": "user" if i % 2 == 0 else "assistant",
                 "content": f"tail visible message {i}",
             }
@@ -601,13 +608,14 @@ class TestTailBudgetCodexReplayFields:
         hidden_message = {"role": "assistant", "content": "ok", field_name: field_value}
         messages = [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": "initial ask"},
+            {"role": "user", **_HUMAN, "content": "initial ask"},
             {"role": "assistant", "content": "first answer"},
-            {"role": "user", "content": "older follow-up"},
+            {"role": "user", **_HUMAN, "content": "older follow-up"},
             hidden_message,
         ]
         messages.extend(
             {
+                **(_HUMAN if i % 2 == 0 else {}),
                 "role": "user" if i % 2 == 0 else "assistant",
                 "content": f"tail visible message {i}",
             }
@@ -629,13 +637,13 @@ class TestGenerateSummaryNoneContent:
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
-            {"role": "user", "content": "do something"},
+            {"role": "user", **_HUMAN, "content": "do something"},
             {"role": "assistant", "content": None, "tool_calls": [
                 {"function": {"name": "search"}}
             ]},
             {"role": "tool", "content": "result"},
             {"role": "assistant", "content": None},
-            {"role": "user", "content": "thanks"},
+            {"role": "user", **_HUMAN, "content": "thanks"},
         ]
 
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
@@ -649,7 +657,7 @@ class TestGenerateSummaryNoneContent:
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         msgs = [{"role": "system", "content": None}] + [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            {**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
         with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
@@ -677,7 +685,7 @@ class TestNonStringContent:
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
-            {"role": "user", "content": "do something"},
+            {"role": "user", **_HUMAN, "content": "do something"},
             {"role": "assistant", "content": "ok"},
         ]
 
@@ -700,7 +708,7 @@ class TestNonStringContent:
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
-            {"role": "user", "content": "do something"},
+            {"role": "user", **_HUMAN, "content": "do something"},
             {"role": "assistant", "content": "ok"},
         ]
 
@@ -726,7 +734,7 @@ class TestNonStringContent:
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
-            {"role": "user", "content": "fix the login bug on prod"},
+            {"role": "user", **_HUMAN, "content": "fix the login bug on prod"},
             {"role": "assistant", "content": "on it"},
             {
                 "role": "user",
@@ -763,7 +771,7 @@ class TestNonStringContent:
             "## Historical Remaining Work\n- keep me\n\n"
             "## Goal\nfinish"
         )
-        turns = [{"role": "user", "content": "real ask"}]
+        turns = [{"role": "user", **_HUMAN, "content": "real ask"}]
 
         first = c._ground_historical_task_snapshot(summary, turns)
         assert _re.search(r"(?m)^## Historical Remaining Work$", first)
@@ -781,7 +789,7 @@ class TestSummaryFailureCooldown:
             c = ContextCompressor(model="test", quiet_mode=True)
 
         messages = [
-            {"role": "user", "content": "do something"},
+            {"role": "user", **_HUMAN, "content": "do something"},
             {"role": "assistant", "content": "ok"},
         ]
 
@@ -807,7 +815,7 @@ class TestAuthFailureAborts:
 
     def _msgs(self, n=10):
         return [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            {**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(n)
         ]
 
@@ -1031,7 +1039,7 @@ class TestSummaryFallbackToMainModel:
 
     def _msgs(self):
         return [
-            {"role": "user", "content": "do something"},
+            {"role": "user", **_HUMAN, "content": "do something"},
             {"role": "assistant", "content": "ok"},
         ]
 
@@ -1185,7 +1193,7 @@ class TestStreamingClosedFallback:
 
     def _msgs(self):
         return [
-            {"role": "user", "content": "do something"},
+            {"role": "user", **_HUMAN, "content": "do something"},
             {"role": "assistant", "content": "ok"},
         ]
 
@@ -1258,13 +1266,13 @@ class TestAuxModelFallbackSurfacedToCallers:
     def _make_msgs(self):
         return [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 1"},
             {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
+            {"role": "user", **_HUMAN, "content": "msg 3"},
             {"role": "assistant", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},
+            {"role": "user", **_HUMAN, "content": "msg 5"},
             {"role": "assistant", "content": "msg 6"},
-            {"role": "user", "content": "msg 7"},
+            {"role": "user", **_HUMAN, "content": "msg 7"},
         ]
 
     def test_compress_exposes_aux_failure_fields_after_successful_fallback(self):
@@ -1351,13 +1359,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
         msgs = [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 1"},
             {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
+            {"role": "user", **_HUMAN, "content": "msg 3"},
             {"role": "assistant", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},
+            {"role": "user", **_HUMAN, "content": "msg 5"},
             {"role": "assistant", "content": "msg 6"},
-            {"role": "user", "content": "msg 7"},
+            {"role": "user", **_HUMAN, "content": "msg 7"},
         ]
 
         with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
@@ -1380,7 +1388,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         secret = "ghp_" + ("a" * 36)
         msgs = [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": f"Fix /tmp/project/app.py and never leak {secret}"},
+            {"role": "user", **_HUMAN, "content": f"Fix /tmp/project/app.py and never leak {secret}"},
             {
                 "role": "assistant",
                 "content": "I will inspect it.",
@@ -1396,9 +1404,9 @@ class TestSummaryFailureTrackingForGatewayWarning:
             },
             {"role": "tool", "tool_call_id": "call-1", "content": f"read /tmp/project/app.py with token {secret}"},
             {"role": "assistant", "content": "Found the bug in /tmp/project/app.py"},
-            {"role": "user", "content": "Patch it after this"},
+            {"role": "user", **_HUMAN, "content": "Patch it after this"},
             {"role": "assistant", "content": "Ready to patch"},
-            {"role": "user", "content": "current live request should stay in tail"},
+            {"role": "user", **_HUMAN, "content": "current live request should stay in tail"},
         ]
 
         with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
@@ -1424,13 +1432,13 @@ class TestAbortOnSummaryFailure:
     def _make_msgs(self):
         return [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 1"},
             {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
+            {"role": "user", **_HUMAN, "content": "msg 3"},
             {"role": "assistant", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},
+            {"role": "user", **_HUMAN, "content": "msg 5"},
             {"role": "assistant", "content": "msg 6"},
-            {"role": "user", "content": "msg 7"},
+            {"role": "user", **_HUMAN, "content": "msg 7"},
         ]
 
     def _make_compressor(self):
@@ -1560,13 +1568,13 @@ class TestCompressWithClient:
         # head_last=assistant, tail_first=assistant (same shape as the
         # existing consecutive-user test) → role resolves to "user".
         msgs = [
-            {"role": "user", "content": "msg 0"},
+            {"role": "user", **_HUMAN, "content": "msg 0"},
             {"role": "assistant", "content": "msg 1"},
-            {"role": "user", "content": "msg 2"},
+            {"role": "user", **_HUMAN, "content": "msg 2"},
             {"role": "assistant", "content": "msg 3"},
-            {"role": "user", "content": "msg 4"},
+            {"role": "user", **_HUMAN, "content": "msg 4"},
             {"role": "assistant", "content": "msg 5"},
-            {"role": "user", "content": "msg 6"},
+            {"role": "user", **_HUMAN, "content": "msg 6"},
             {"role": "assistant", "content": "msg 7"},
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
@@ -1603,13 +1611,13 @@ class TestCompressWithClient:
         # not collide with either neighbor and should be inserted standalone.
         msgs = [
             {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": "msg 1"},
-            {"role": "user", "content": "msg 2"},  # last head — user
+            {"role": "user", **_HUMAN, "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 2"},  # last head — user
             {"role": "assistant", "content": "msg 3"},
-            {"role": "user", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},
+            {"role": "user", **_HUMAN, "content": "msg 4"},
+            {"role": "user", **_HUMAN, "content": "msg 5"},
             {"role": "assistant", "content": "msg 6"},
-            {"role": "user", "content": "msg 7"},
+            {"role": "user", **_HUMAN, "content": "msg 7"},
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
@@ -1639,13 +1647,13 @@ class TestCompressWithClient:
         # head_last=assistant, tail_first=assistant → summary_role="user", no collision.
         # Need 8 messages: min_for_compress = 2+3+1 = 6, must have > 6.
         msgs = [
-            {"role": "user", "content": "msg 0"},
+            {"role": "user", **_HUMAN, "content": "msg 0"},
             {"role": "assistant", "content": "msg 1"},
-            {"role": "user", "content": "msg 2"},
+            {"role": "user", **_HUMAN, "content": "msg 2"},
             {"role": "assistant", "content": "msg 3"},
-            {"role": "user", "content": "msg 4"},
+            {"role": "user", **_HUMAN, "content": "msg 4"},
             {"role": "assistant", "content": "msg 5"},
-            {"role": "user", "content": "msg 6"},
+            {"role": "user", **_HUMAN, "content": "msg 6"},
             {"role": "assistant", "content": "msg 7"},
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
@@ -1680,14 +1688,14 @@ class TestCompressWithClient:
         # the system prompt (always implicitly protected).
         msgs = [
             {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 1"},
             {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},      # compressed
+            {"role": "user", **_HUMAN, "content": "msg 3"},      # compressed
             {"role": "assistant", "content": "msg 4"},  # compressed
-            {"role": "user", "content": "msg 5"},       # compressed
-            {"role": "user", "content": "msg 6"},       # tail start
+            {"role": "user", **_HUMAN, "content": "msg 5"},       # compressed
+            {"role": "user", **_HUMAN, "content": "msg 6"},       # tail start
             {"role": "assistant", "content": "msg 7"},
-            {"role": "user", "content": "msg 8"},
+            {"role": "user", **_HUMAN, "content": "msg 8"},
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
@@ -1728,14 +1736,14 @@ class TestCompressWithClient:
 
         msgs = [
             {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 1"},
             {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
+            {"role": "user", **_HUMAN, "content": "msg 3"},
             {"role": "assistant", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},
-            {"role": "user", "content": [{"type": "text", "text": "PRESERVED_TAIL_CONTENT"}]},
+            {"role": "user", **_HUMAN, "content": "msg 5"},
+            {"role": "user", **_HUMAN, "content": [{"type": "text", "text": "PRESERVED_TAIL_CONTENT"}]},
             {"role": "assistant", "content": "msg 7"},
-            {"role": "user", "content": "msg 8"},
+            {"role": "user", **_HUMAN, "content": "msg 8"},
         ]
 
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
@@ -1836,7 +1844,7 @@ class TestSummaryTargetRatio:
             )
         msgs = (
             [{"role": "system", "content": "System prompt"}]
-            + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            + [{**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
                for i in range(8)]
         )
         with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
@@ -1874,7 +1882,7 @@ class TestSummaryTargetRatio:
             )
         # No system prompt — this is what the gateway passes to compress().
         msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            {**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
         head_size = c._protect_head_size(msgs)
@@ -1924,19 +1932,19 @@ class TestTokenBudgetTailProtection:
         c.protect_last_n = 20
         messages = [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": "old start"},
+            {"role": "user", **_HUMAN, "content": "old start"},
             {"role": "assistant", "content": "old ack"},
-            {"role": "user", "content": "middle work"},
+            {"role": "user", **_HUMAN, "content": "middle work"},
             {"role": "assistant", "content": "middle ack"},
-            {"role": "user", "content": "middle ask 2"},
+            {"role": "user", **_HUMAN, "content": "middle ask 2"},
             {"role": "assistant", "content": "middle answer 2"},
-            {"role": "user", "content": "middle ask 3"},
+            {"role": "user", **_HUMAN, "content": "middle ask 3"},
             {"role": "assistant", "content": "middle answer 3"},
-            {"role": "user", "content": "recent ask 1"},
+            {"role": "user", **_HUMAN, "content": "recent ask 1"},
             {"role": "assistant", "content": "recent answer 1"},
-            {"role": "user", "content": "recent ask 2"},
+            {"role": "user", **_HUMAN, "content": "recent ask 2"},
             {"role": "assistant", "content": "recent answer 2"},
-            {"role": "user", "content": "latest ask"},
+            {"role": "user", **_HUMAN, "content": "latest ask"},
         ]
 
         cut = c._find_tail_cut_by_tokens(messages, head_end=1)
@@ -1980,7 +1988,7 @@ class TestTokenBudgetTailProtection:
         messages = [
             {"role": "tool", "content": "x" * 5000, "tool_call_id": "c0"},
             {"role": "assistant", "content": "ack"},
-            {"role": "user", "content": "recent"},
+            {"role": "user", **_HUMAN, "content": "recent"},
             {"role": "assistant", "content": "reply"},
         ]
         result, pruned = c._prune_old_tool_results(
@@ -2014,12 +2022,12 @@ class TestTokenBudgetTailProtection:
             {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}},
         ]
         messages = [
-            {"role": "user", "content": "head1"},               # 0
-            {"role": "user", "content": multimodal_content},    # 1: BIG (index under test)
+            {"role": "user", **_HUMAN, "content": "head1"},               # 0
+            {"role": "user", **_HUMAN, "content": multimodal_content},    # 1: BIG (index under test)
             {"role": "assistant", "content": "tail1"},           # 2
-            {"role": "user", "content": "tail2"},                # 3
+            {"role": "user", **_HUMAN, "content": "tail2"},                # 3
             {"role": "assistant", "content": "tail3"},           # 4
-            {"role": "user", "content": "tail4"},                # 5
+            {"role": "user", **_HUMAN, "content": "tail4"},                # 5
         ]
         c.tail_token_budget = 80  # soft_ceiling = 120
         head_end = 0
@@ -2271,14 +2279,14 @@ class TestTruncateToolCallArgsJson:
         })
         assert len(args_payload) > 500  # triggers the Pass-3 shrink
         messages = [
-            {"role": "user", "content": "please write two files"},
+            {"role": "user", **_HUMAN, "content": "please write two files"},
             {"role": "assistant", "content": None, "tool_calls": [
                 {"id": "call_1", "type": "function",
                  "function": {"name": "write_file", "arguments": args_payload}},
             ]},
             {"role": "tool", "tool_call_id": "call_1",
              "content": '{"bytes_written": 727}'},
-            {"role": "user", "content": "ok"},
+            {"role": "user", **_HUMAN, "content": "ok"},
             {"role": "assistant", "content": "done"},
         ]
         result, _ = c._prune_old_tool_results(messages, protect_tail_count=2)
@@ -2429,9 +2437,9 @@ class TestTurnPairPreservation:
     def test_user_in_compressed_region_pulled_back(self, compressor):
         """User in the middle (not at head_end) is pulled into the tail (#10896)."""
         msgs = [
-            {"role": "user", "content": "head"},       # 0
+            {"role": "user", **_HUMAN, "content": "head"},       # 0
             {"role": "assistant", "content": "hi"},     # 1
-            {"role": "user", "content": "do thing"},   # 2  <- last user
+            {"role": "user", **_HUMAN, "content": "do thing"},   # 2  <- last user
             {"role": "assistant", "content": "done"},  # 3
         ]
         # head_end=0, so head_end+1=1 <= last_user_idx=2: the #10896 pullback
@@ -2448,8 +2456,8 @@ class TestTurnPairPreservation:
         together and the tail never starts with a dangling user ask.
         """
         msgs = [
-            {"role": "user", "content": "first exchange"},   # 0 head
-            {"role": "user", "content": "THE ACTIVE ASK"},   # 1 = head_end, last user
+            {"role": "user", **_HUMAN, "content": "first exchange"},   # 0 head
+            {"role": "user", **_HUMAN, "content": "THE ACTIVE ASK"},   # 1 = head_end, last user
             {"role": "assistant", "content": "done"},        # 2 reply
             {"role": "tool", "tool_call_id": "c1", "content": "toolout"},  # 3
             {"role": "assistant", "content": "final reply"}, # 4
@@ -2465,13 +2473,13 @@ class TestTurnPairPreservation:
         """End-to-end: after _find_tail_cut_by_tokens, the tail never starts
         with an unanswered user message."""
         msgs = [
-            {"role": "user", "content": "initial"},
+            {"role": "user", **_HUMAN, "content": "initial"},
             {"role": "assistant", "content": "ok"},
         ]
         for i in range(5):
-            msgs.append({"role": "user", "content": f"step {i}"})
+            msgs.append({"role": "user", **_HUMAN, "content": f"step {i}"})
             msgs.append({"role": "assistant", "content": f"done {i}"})
-        msgs.append({"role": "user", "content": "lights off please"})
+        msgs.append({"role": "user", **_HUMAN, "content": "lights off please"})
         msgs.append({"role": "assistant", "content": "lights are off"})
 
         head_end = compressor.protect_first_n
@@ -2502,7 +2510,7 @@ class TestSanitizerStripsOrphanedToolCalls:
                     {"id": "tc_orphan", "function": {"name": "search", "arguments": "{}"}},
                 ],
             },
-            {"role": "user", "content": "never mind"},
+            {"role": "user", **_HUMAN, "content": "never mind"},
         ]
 
         sanitized = compressor._sanitize_tool_pairs(msgs)
@@ -2561,7 +2569,7 @@ class TestSanitizerStripsOrphanedToolCalls:
                     {"id": "tc_orphan", "function": {"name": "search", "arguments": "{}"}},
                 ],
             },
-            {"role": "user", "content": "thanks"},
+            {"role": "user", **_HUMAN, "content": "thanks"},
         ]
 
         sanitized = compressor._sanitize_tool_pairs(msgs)
@@ -2589,7 +2597,7 @@ class TestSanitizerStripsOrphanedToolCalls:
                 ],
             },
             # No tool result for call_abc — orphaned
-            {"role": "user", "content": "next"},
+            {"role": "user", **_HUMAN, "content": "next"},
         ]
 
         sanitized = compressor._sanitize_tool_pairs(msgs)
@@ -2658,7 +2666,7 @@ class TestSanitizerStripsOrphanedToolCalls:
                 ],
             },
             {"role": "tool", "tool_call_id": "call_1", "content": "result"},
-            {"role": "user", "content": "next question"},
+            {"role": "user", **_HUMAN, "content": "next question"},
         ]
 
         sanitized = compressor._sanitize_tool_pairs(msgs)
@@ -2685,7 +2693,7 @@ class TestSanitizerPreservesInFlightToolChain:
         """A trailing assistant tool_call with no result yet is pending, not
         orphaned — preserve it verbatim.  #79278"""
         msgs = [
-            {"role": "user", "content": "summarize"},
+            {"role": "user", **_HUMAN, "content": "summarize"},
             {
                 "role": "assistant",
                 "content": "",
@@ -2752,7 +2760,7 @@ class TestSanitizerPreservesInFlightToolChain:
                     {"id": "call_orphan", "function": {"name": "search", "arguments": "{}"}},
                 ],
             },
-            {"role": "user", "content": "interim"},
+            {"role": "user", **_HUMAN, "content": "interim"},
             {
                 "role": "assistant",
                 "content": "",
@@ -2797,7 +2805,7 @@ class TestSanitizerPreservesInFlightToolChain:
         from agent.agent_runtime_helpers import repair_message_sequence
 
         history = [
-            {"role": "user", "content": "Do the work and use the tools."},
+            {"role": "user", **_HUMAN, "content": "Do the work and use the tools."},
             {"role": "assistant", "content": "", "tool_calls": [
                 {"id": "call_1", "type": "function",
                  "function": {"name": "run_side_effect", "arguments": "{}"}}]},
@@ -2849,7 +2857,7 @@ class TestSanitizerPreservesInFlightToolChain:
         whole batch — stripping c2/c3 there loses their late results exactly
         like the tail-is-assistant shape.  #79278 follow-up."""
         msgs = [
-            {"role": "user", "content": "run the batch"},
+            {"role": "user", **_HUMAN, "content": "run the batch"},
             {"role": "assistant", "content": "", "tool_calls": [
                 {"id": "c1", "function": {"name": "a", "arguments": "{}"}},
                 {"id": "c2", "function": {"name": "b", "arguments": "{}"}},
@@ -2884,7 +2892,7 @@ class TestCooldownReentryAbort:
 
     def _msgs(self, n=12):
         return [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            {**(_HUMAN if i % 2 == 0 else {}), "role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(n)
         ]
 
@@ -2979,11 +2987,11 @@ class TestDoubleCompactionSummaryRole:
         # Without the fix, summary_role would be "assistant".
         msgs = [
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 1"},
             {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
+            {"role": "user", **_HUMAN, "content": "msg 3"},
             {"role": "assistant", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},
+            {"role": "user", **_HUMAN, "content": "msg 5"},
             {"role": "assistant", "content": "msg 6"},
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
@@ -3015,11 +3023,11 @@ class TestDoubleCompactionSummaryRole:
         msgs = [
             {"role": "user", "content": f"{SUMMARY_PREFIX}\nold persisted summary"},
             {"role": "assistant", "content": "handoff acknowledged"},
-            {"role": "user", "content": "new work after restart"},
+            {"role": "user", **_HUMAN, "content": "new work after restart"},
             {"role": "assistant", "content": "new answer after restart"},
-            {"role": "user", "content": "more new work after restart"},
+            {"role": "user", **_HUMAN, "content": "more new work after restart"},
             {"role": "assistant", "content": "more new answer after restart"},
-            {"role": "user", "content": "tail request"},
+            {"role": "user", **_HUMAN, "content": "tail request"},
             {"role": "assistant", "content": "tail answer"},
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
@@ -3047,13 +3055,13 @@ class TestDoubleCompactionSummaryRole:
         # The fix should merge into tail instead of flipping to assistant.
         msgs = [
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "msg 1"},
+            {"role": "user", **_HUMAN, "content": "msg 1"},
             {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
+            {"role": "user", **_HUMAN, "content": "msg 3"},
             {"role": "assistant", "content": "msg 4"},
-            {"role": "user", "content": "msg 5"},       # tail start (user)
+            {"role": "user", **_HUMAN, "content": "msg 5"},       # tail start (user)
             {"role": "assistant", "content": "msg 6"},
-            {"role": "user", "content": "msg 7"},
+            {"role": "user", **_HUMAN, "content": "msg 7"},
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
@@ -3094,7 +3102,7 @@ class TestSummaryPromptBounding:
         c._previous_summary = "PREV_HEAD " + ("p" * (cap * 2)) + " PREV_TAIL"
 
         messages = [
-            {"role": "user", "content": f"turn-{i}-" + ("x" * 6000)}
+            {"role": "user", **_HUMAN, "content": f"turn-{i}-" + ("x" * 6000)}
             for i in range(80)
         ]
 
@@ -3147,16 +3155,16 @@ class TestMinTailUserMessages:
             )
         c.tail_token_budget = 200
         messages = [
-            {"role": "user", "content": "start"},
+            {"role": "user", **_HUMAN, "content": "start"},
             {"role": "assistant", "content": None,
              "tool_calls": [{"function": {"name": "read_file", "arguments": "{}"}}]},
             {"role": "tool", "content": "result content",
              "tool_call_id": "call_1"},
-            {"role": "user", "content": "user 3rd last"},
+            {"role": "user", **_HUMAN, "content": "user 3rd last"},
             {"role": "assistant", "content": "reply 3rd last"},
-            {"role": "user", "content": "user 2nd last"},
+            {"role": "user", **_HUMAN, "content": "user 2nd last"},
             {"role": "assistant", "content": "reply 2nd last"},
-            {"role": "user", "content": "user last"},
+            {"role": "user", **_HUMAN, "content": "user last"},
             {"role": "assistant", "content": "reply last"},
         ]
         head_end = c.protect_first_n
@@ -3209,13 +3217,13 @@ class TestMinTailUserMessages:
         c_default.tail_token_budget = 200
         c_explicit.tail_token_budget = 200
         messages = [
-            {"role": "user", "content": "head msg"},
+            {"role": "user", **_HUMAN, "content": "head msg"},
             {"role": "assistant", "content": "head reply"},
         ]
         for i in range(3):
-            messages.append({"role": "user", "content": f"user {i}"})
+            messages.append({"role": "user", **_HUMAN, "content": f"user {i}"})
             messages.append({"role": "assistant", "content": "X" * 4000})
-        messages.append({"role": "user", "content": "final user"})
+        messages.append({"role": "user", **_HUMAN, "content": "final user"})
         messages.append({"role": "assistant", "content": "final reply"})
         head_end = c_default.protect_first_n
         assert (
@@ -3236,17 +3244,17 @@ class TestMinTailUserMessages:
                 min_tail_user_messages=3,
             )
         messages = [
-            {"role": "user", "content": "head"},                 # 0 (head)
+            {"role": "user", **_HUMAN, "content": "head"},                 # 0 (head)
             {"role": "assistant", "content": "head reply"},      # 1
-            {"role": "user", "content": "real oldest"},          # 2  <- 3rd real user
+            {"role": "user", **_HUMAN, "content": "real oldest"},          # 2  <- 3rd real user
             {"role": "assistant", "content": "reply oldest"},    # 3
-            {"role": "user", "content": "real middle"},          # 4
+            {"role": "user", **_HUMAN, "content": "real middle"},          # 4
             {"role": "assistant", "content": "reply middle"},    # 5
-            {"role": "user", "content": ""},                     # 6  blank echo
+            {"role": "user", **_HUMAN, "content": ""},                     # 6  blank echo
             {"role": "assistant", "content": "reply to echo"},   # 7
-            {"role": "user", "content": "   "},                  # 8  whitespace echo
+            {"role": "user", **_HUMAN, "content": "   "},                  # 8  whitespace echo
             {"role": "assistant", "content": "another reply"},   # 9
-            {"role": "user", "content": "real latest"},          # 10
+            {"role": "user", **_HUMAN, "content": "real latest"},          # 10
             {"role": "assistant", "content": "final reply"},     # 11
         ]
         head_end = c.protect_first_n  # = 1
@@ -3289,10 +3297,10 @@ class TestMinTailUserMessages:
         # Budget covers roughly one bulky turn — without the N-anchor the
         # cut lands after users 2..3.
         c.tail_token_budget = 150
-        messages = [{"role": "user", "content": "head"},
+        messages = [{"role": "user", **_HUMAN, "content": "head"},
                     {"role": "assistant", "content": "head reply"}]
         for i in (3, 2, 1):
-            messages.append({"role": "user", "content": f"real {i}"})
+            messages.append({"role": "user", **_HUMAN, "content": f"real {i}"})
             messages.append({"role": "assistant", "content": "B" * 6000})
         head_end = c.protect_first_n
         cut = c._find_tail_cut_by_tokens(messages, head_end)
@@ -3365,7 +3373,7 @@ class TestPreLlmFeasibilityCheck:
         """
         msgs = [{"role": "system", "content": "system prompt"}]
         for i in range(n_pairs):
-            msgs.append({"role": "user", "content": f"question {i}"})
+            msgs.append({"role": "user", **_HUMAN, "content": f"question {i}"})
             msgs.append({"role": "assistant", "content": content})
         return msgs
 
@@ -3466,11 +3474,11 @@ class TestPreLlmFeasibilityCheck:
         msgs = [{"role": "system", "content": "system prompt"}]
         # Small middle: a few lightweight early exchanges.
         for i in range(6):
-            msgs.append({"role": "user", "content": f"early question {i}"})
+            msgs.append({"role": "user", **_HUMAN, "content": f"early question {i}"})
             msgs.append({"role": "assistant", "content": "brief answer"})
         # Fat tail: recent turns carrying big tool-style payloads.
         for i in range(4):
-            msgs.append({"role": "user", "content": f"recent request {i}"})
+            msgs.append({"role": "user", **_HUMAN, "content": f"recent request {i}"})
             msgs.append({"role": "assistant", "content": "big result " + "x" * 20000})
 
         with patch.object(compressor, "_generate_summary") as mock_gen:

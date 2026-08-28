@@ -327,6 +327,12 @@ def _shape_message(
         "content": content,
         "timestamp": m.get("timestamp"),
     }
+    from agent.message_provenance import display_actor
+
+    entry["actor"] = display_actor(m)
+    for field in ("origin_kind", "turn_kind", "trust_kind"):
+        if m.get(field) is not None:
+            entry[field] = m.get(field)
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):

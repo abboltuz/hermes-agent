@@ -20,8 +20,18 @@ from agent.review_engine import (
     snapshot_recent_messages,
     start_review,
 )
+from agent.message_provenance import stamp_provenance
 from tools import async_delegation as ad
 from tools.process_registry import process_registry
+
+
+def _human(content):
+    return stamp_provenance(
+        {"role": "user", "content": content},
+        "human_user",
+        "prompt",
+        "user_authorized",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +55,7 @@ def _clean_state():
 def test_snapshot_takes_last_ten_chat_messages_only():
     msgs = (
         [{"role": "system", "content": "sys"}]
-        + [{"role": "user", "content": f"m{i}"} for i in range(15)]
+        + [_human(f"m{i}") for i in range(15)]
         + [{"role": "tool", "content": "tool out"}]
     )
     snap = snapshot_recent_messages(msgs)
@@ -57,7 +67,7 @@ def test_snapshot_takes_last_ten_chat_messages_only():
 
 def test_snapshot_skips_toolcall_stub_assistant_messages():
     msgs = [
-        {"role": "user", "content": "make a PR"},
+        _human("make a PR"),
         {"role": "assistant", "content": "", "tool_calls": [{"id": "x"}]},
         {"role": "tool", "content": "created"},
         {"role": "assistant", "content": "PR #123: https://example.com/pr/123"},
@@ -70,19 +80,16 @@ def test_snapshot_skips_toolcall_stub_assistant_messages():
 
 
 def test_snapshot_handles_multimodal_content_lists():
-    msgs = [{
-        "role": "user",
-        "content": [
+    msgs = [_human([
             {"type": "text", "text": "look at this"},
             {"type": "image_url", "image_url": {"url": "x"}},
-        ],
-    }]
+        ])]
     snap = snapshot_recent_messages(msgs)
     assert snap[0]["text"] == "look at this\n[image_url]"
 
 
 def test_snapshot_caps_oversized_messages():
-    msgs = [{"role": "user", "content": "x" * 50_000}]
+    msgs = [_human("x" * 50_000)]
     snap = snapshot_recent_messages(msgs)
     assert len(snap[0]["text"]) < 13_000
     assert snap[0]["text"].endswith("[... truncated ...]")

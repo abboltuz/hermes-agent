@@ -19,6 +19,12 @@ from agent.native_compaction import (
     resolve_compact_threshold,
 )
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 def _agent(
     model="gpt-5.6",
@@ -541,7 +547,7 @@ class TestPrunePreCheckpointItems:
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
 
         msgs = [
-            {"role": "user", "content": "the goal"},
+            {"role": "user", "content": "the goal", **HUMAN_PROVENANCE},
             {
                 "role": "assistant",
                 "content": "ok",
@@ -549,7 +555,7 @@ class TestPrunePreCheckpointItems:
                     {"type": "compaction", "encrypted_content": "blob"}
                 ],
             },
-            {"role": "user", "content": "follow-up"},
+            {"role": "user", "content": "follow-up", **HUMAN_PROVENANCE},
         ]
         items = _chat_messages_to_responses_input(msgs, native_compaction_eligible=True)
         assert items[0] == {"type": "compaction", "encrypted_content": "blob"}

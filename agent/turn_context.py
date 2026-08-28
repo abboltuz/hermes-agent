@@ -209,8 +209,12 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
         # their text parts; an image-only turn yields "" and is skipped, since
         # there is nothing to title from.
         user_text = ""
+        from agent.message_provenance import is_human_intent
+
         for msg in reversed(messages or []):
-            if isinstance(msg, dict) and msg.get("role") == "user":
+            if not isinstance(msg, dict):
+                continue
+            if is_human_intent(msg):
                 user_text = flatten_message_text(msg.get("content")).strip()
                 break
         if not user_text:
@@ -466,6 +470,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    persist_user_provenance: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -689,8 +694,12 @@ def build_turn_context(
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
     if conversation_history and agent._user_turn_count == 0:
+        from agent.message_provenance import is_human_intent
+
         prior_user_turns = sum(
-            1 for m in conversation_history if m.get("role") == "user"
+            1
+            for m in conversation_history
+            if isinstance(m, dict) and is_human_intent(m)
         )
         if prior_user_turns > 0:
             agent._user_turn_count = prior_user_turns
@@ -713,15 +722,48 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    from agent.message_provenance import (
+        build_provenance,
+        is_human_intent,
+        provenance_for_runtime_turn,
+    )
+
+    _semantic_surface = getattr(agent, "platform", None)
+    _session_source = str(_semantic_surface or "").strip()
+    _provenance_metadata = {
+        "producer": "turn_context",
+        "platform": str(getattr(agent, "platform", "") or "direct"),
+        "source": _session_source,
+        "session_id": str(getattr(agent, "session_id", "") or ""),
+        "task_id": str(effective_task_id or ""),
+    }
+    if persist_user_provenance:
+        _turn_provenance = build_provenance(
+            persist_user_provenance.get("origin_kind"),
+            persist_user_provenance.get("turn_kind"),
+            persist_user_provenance.get("trust_kind"),
+            persist_user_provenance.get("provenance_metadata"),
+        )
+    else:
+        _turn_provenance = provenance_for_runtime_turn(
+            platform=_semantic_surface,
+            display_kind=persist_user_display_kind,
+            metadata=_provenance_metadata,
+        )
+    user_msg.update(_turn_provenance.as_message_fields())
+    agent._current_turn_user_provenance = _turn_provenance.as_message_fields()
+    _current_turn_is_human = is_human_intent(user_msg)
+
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
     # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    if _current_turn_is_human:
+        agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
-    agent._is_user_initiated_turn = True
+    agent._is_user_initiated_turn = _current_turn_is_human
 
     # Reset the streaming context scrubber at the top of each turn.
     scrubber = getattr(agent, "_stream_context_scrubber", None)
@@ -737,7 +779,8 @@ def build_turn_context(
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (_current_turn_is_human
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -749,7 +792,7 @@ def build_turn_context(
     # and notify the host so it can play hearts. Token-free, never touches the
     # conversation, and never fatal — a purely optional UI beat.
     reaction_callback = getattr(agent, "reaction_callback", None)
-    if reaction_callback is not None:
+    if _current_turn_is_human and reaction_callback is not None:
         try:
             from agent.reactions import detect_reaction
 
