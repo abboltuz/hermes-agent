@@ -368,6 +368,7 @@ def _provision_libpython(
     dst_lib = venv_dir / "lib"
     staged: list[tuple[Path, Path]] = []
     snapshots: list[_PathSnapshot] = []
+    committed = False
     try:
         dst_lib.mkdir(parents=True, exist_ok=True)
         snapshots = _snapshot_paths([dst for _src, dst in pairs])
@@ -385,9 +386,14 @@ def _provision_libpython(
                 shutil.copy2(src, staging)
         for staging, dst in staged:
             os.replace(staging, dst)
+        committed = True
         _discard_snapshots(snapshots)
         return True
     except OSError as exc:
+        if committed:
+            logger.debug("libpython backup cleanup was incomplete: %s", exc)
+            _discard_snapshots(snapshots)
+            return True
         logger.warning("libpython provision failed", exc_info=True)
         if not _restore_snapshots(snapshots):
             raise _AnchorInstallFailed(
@@ -395,6 +401,12 @@ def _provision_libpython(
             ) from exc
         return False
     except BaseException as exc:
+        if committed:
+            try:
+                _discard_snapshots(snapshots)
+            except BaseException:
+                pass
+            raise
         if not _restore_snapshots(snapshots):
             raise _AnchorInstallFailed(
                 "libpython provisioning was interrupted and rollback was incomplete"
@@ -541,6 +553,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
     snapshots = _snapshot_paths([venv_py, *aliases, *dylibs])
     tmp_path: Path | None = None
     alias_stage_dir: Path | None = None
+    committed = False
     try:
         marker.unlink(missing_ok=True)
         if not _provision_libpython(venv_dir, source_file, refresh=True):
@@ -593,8 +606,18 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
         # Marker is the activation record for the complete canonical + alias
         # layout.  It is written atomically and strictly last.
         _write_marker(venv_bin, source_file)
+        committed = True
         _discard_snapshots(snapshots)
     except BaseException as exc:
+        if committed:
+            try:
+                _discard_snapshots(snapshots)
+            except BaseException:
+                pass
+            if isinstance(exc, OSError):
+                logger.debug("TCC anchor backup cleanup was incomplete: %s", exc)
+                return
+            raise
         try:
             marker.unlink(missing_ok=True)
         except OSError:

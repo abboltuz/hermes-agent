@@ -930,6 +930,38 @@ class TestAnchoredAliasesBootE2E:
         assert tcc.tcc_anchor_state(root)[0] == "active"
         _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
 
+    def test_interrupted_committed_anchor_cleanup_keeps_active_generation(
+        self, tmp_path, monkeypatch
+    ):
+        root, venv_bin, minor, console_script = _real_macos_venv(tmp_path)
+        assert tcc.ensure_tcc_anchor(root) is not None
+        marker = venv_bin / ".tcc-anchor-source"
+        source_file = Path(marker.read_text(encoding="utf-8").strip())
+        original_discard = tcc._discard_snapshots
+        interrupted = False
+
+        def interrupt_outer_discard(snapshots):
+            nonlocal interrupted
+            if not interrupted and any(
+                snapshot.path == venv_bin / "python" for snapshot in snapshots
+            ):
+                interrupted = True
+                victim = next(
+                    snapshot for snapshot in snapshots if snapshot.backup is not None
+                )
+                victim.backup.unlink()
+                victim.backup = None
+                raise SystemExit("interrupted committed anchor cleanup")
+            return original_discard(snapshots)
+
+        monkeypatch.setattr(tcc, "_discard_snapshots", interrupt_outer_discard)
+        with pytest.raises(SystemExit, match="committed anchor cleanup"):
+            tcc._install_anchor(root / ".venv", source_file)
+
+        assert marker.is_file()
+        assert tcc.tcc_anchor_state(root)[0] == "active"
+        _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
+
     def test_libpython_refresh_failure_preserves_live_dependent_process(
         self, tmp_path, monkeypatch
     ):
@@ -1057,6 +1089,50 @@ class TestAnchoredAliasesBootE2E:
         assert {
             name: (venv_lib / name).read_bytes() for name in names
         } == {name: f"new-{name}".encode() for name in names}
+
+    def test_interrupted_committed_libpython_cleanup_keeps_new_generation(
+        self, tmp_path, monkeypatch
+    ):
+        venv = tmp_path / "venv"
+        venv_lib = venv / "lib"
+        store = tmp_path / "uv" / "python" / _STORE_ROOT
+        store_bin = store / "bin"
+        store_lib = store / "lib"
+        venv_lib.mkdir(parents=True)
+        store_bin.mkdir(parents=True)
+        store_lib.mkdir()
+        source_python = store_bin / "python3.11"
+        source_python.write_bytes(b"source")
+        names = ("libpython3.11.dylib", "libpython3.dylib")
+        for name in names:
+            (venv_lib / name).write_bytes(f"old-{name}".encode())
+            (store_lib / name).write_bytes(f"new-{name}".encode())
+
+        original_discard = tcc._discard_snapshots
+        interrupted = False
+
+        def interrupt_partial_discard(snapshots):
+            nonlocal interrupted
+            if interrupted:
+                return original_discard(snapshots)
+            interrupted = True
+            victim = next(
+                snapshot for snapshot in snapshots if snapshot.backup is not None
+            )
+            victim.backup.unlink()
+            victim.backup = None
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(tcc, "_discard_snapshots", interrupt_partial_discard)
+        with pytest.raises(KeyboardInterrupt):
+            tcc._provision_libpython(venv, source_python, refresh=True)
+
+        assert {
+            name: (venv_lib / name).read_bytes() for name in names
+        } == {name: f"new-{name}".encode() for name in names}
+
+        monkeypatch.setattr(tcc, "_discard_snapshots", original_discard)
+        assert tcc._provision_libpython(venv, source_python, refresh=True)
 
     def test_concurrent_ensure_calls_are_transaction_serialized(
         self, tmp_path, monkeypatch
