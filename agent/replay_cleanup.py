@@ -294,11 +294,14 @@ def strip_stale_dangerous_confirmations(
     if not agent_history:
         return agent_history
 
+    from agent.message_provenance import may_authorize_control
+
     cleaned: List[Dict[str, Any]] = []
     for msg in agent_history:
         if (
             isinstance(msg, dict)
             and msg.get("role") == "user"
+            and may_authorize_control(msg)
             and is_dangerous_confirmation(msg.get("content", ""))
         ):
             ts = msg.get("timestamp")

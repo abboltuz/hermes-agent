@@ -18,6 +18,7 @@ Two compounding defects:
 """
 
 import pytest
+from agent.message_provenance import stamp_provenance
 
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -113,7 +114,12 @@ def test_real_user_messages_still_extracted_alongside_summary(tmp_path):
     provider.on_session_end(
         [
             _user(SUMMARY_MSG),
-            _user("I prefer tabs over spaces for indentation"),
+            stamp_provenance(
+                _user("I prefer tabs over spaces for indentation"),
+                "human_user",
+                "prompt",
+                "user_authorized",
+            ),
         ]
     )
     facts = _fact_contents(provider)

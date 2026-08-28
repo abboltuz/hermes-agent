@@ -670,6 +670,10 @@ def _is_real_user_turn(message: Any) -> bool:
     """
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
+    from agent.message_provenance import is_human_intent
+
+    if not is_human_intent(message):
+        return False
     content = message.get("content")
 
     return is_titleable_user_message(

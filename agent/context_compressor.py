@@ -302,6 +302,13 @@ def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if isinstance(msg, dict) and msg.get("role") == "user":
+            from agent.message_provenance import (
+                is_actionable_continuation,
+                is_human_intent,
+            )
+
+            if not (is_human_intent(msg) or is_actionable_continuation(msg)):
+                continue
             last_user_idx = i
             break
     if last_user_idx < 0:
@@ -921,6 +928,10 @@ def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
     for msg in reversed(turns):
         if msg.get("role") != "user":
             continue
+        from agent.message_provenance import is_human_intent
+
+        if not is_human_intent(msg):
+            continue
         content = msg.get("content")
         if not isinstance(content, str):
             content = _content_text_for_contains(content)
@@ -1169,6 +1180,10 @@ def _collect_protected_skill_names(
     tail_user_texts: list[str] = []
     for msg in messages[tail_start:]:
         if msg.get("role") != "user":
+            continue
+        from agent.message_provenance import is_human_intent
+
+        if not is_human_intent(msg):
             continue
         content = msg.get("content")
         if isinstance(content, str) and content:
@@ -1768,6 +1783,10 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         if not isinstance(msg, dict):
             continue
         if msg.get("role") != "user":
+            continue
+        from agent.message_provenance import is_human_intent
+
+        if not is_human_intent(msg):
             continue
         if _content_has_images(msg.get("content")):
             anchor = i
@@ -4183,11 +4202,23 @@ class ContextCompressor(ContextEngine):
 
         parts = []
         for msg in turns:
-            if msg.get("role") == "user" and msg.get("display_kind"):
-                # Typed timeline events are operational context, not user input.
-                # Do not flatten them back into a misleading ``[USER]`` line.
-                continue
             role = msg.get("role", "unknown")
+            if role == "user":
+                from agent.message_provenance import (
+                    TurnKind,
+                    classify_legacy_message,
+                    decode_message_provenance,
+                    display_actor,
+                )
+
+                provenance = decode_message_provenance(msg) or classify_legacy_message(msg)
+                if provenance.turn_kind in {
+                    TurnKind.NOTIFICATION,
+                    TurnKind.DELIVERY_MIRROR,
+                }:
+                    continue
+
+                role = display_actor(msg)
             content = msg.get("content")
             if isinstance(content, list):
                 text_parts: list[str] = []
@@ -4328,8 +4359,10 @@ class ContextCompressor(ContextEngine):
             role = msg.get("role", "unknown")
             text = _compact_fallback_turn(msg.get("content"))
             _collect_path_mentions(text, relevant_files)
+            semantic_role = msg.get("role", "unknown")
             synthetic_user = (
-                role == "user" and self._is_synthetic_compression_user_turn(msg)
+                semantic_role == "user"
+                and self._is_synthetic_compression_user_turn(msg)
             )
 
             turn_text = text
@@ -4341,15 +4374,25 @@ class ContextCompressor(ContextEngine):
                 if turn_tool_names:
                     prefix = "tool calls: " + ", ".join(turn_tool_names[:6])
                     turn_text = f"{prefix}; {turn_text}" if turn_text else prefix
-            turn_label = "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
+            if semantic_role == "user" and not synthetic_user:
+                from agent.message_provenance import display_actor
+
+                actor_label = display_actor(msg).upper()
+            else:
+                actor_label = str(semantic_role).upper()
+            turn_label = "INTERNAL CONTEXT" if synthetic_user else actor_label
             _remember_dropped_turn(turn_label, turn_text)
 
             if len(text) > 600:
                 text = text[:420].rstrip() + " ... " + text[-160:].lstrip()
 
-            if role == "user" and text and not synthetic_user:
+            if semantic_role == "user" and text and not synthetic_user:
+                from agent.message_provenance import is_human_intent
+
+                if not is_human_intent(msg):
+                    continue
                 user_asks.append(text)
-            elif role == "assistant":
+            elif semantic_role == "assistant":
                 tool_names: list[str] = []
                 for tc in msg.get("tool_calls") or []:
                     name, _args = _extract_tool_call_name_and_args(tc)
@@ -4360,7 +4403,7 @@ class ContextCompressor(ContextEngine):
                     )
                 elif text:
                     assistant_actions.append(text)
-            elif role == "tool":
+            elif semantic_role == "tool":
                 call_id = str(msg.get("tool_call_id") or "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
                 tool_actions.append(
@@ -5385,9 +5428,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         for message in messages:
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
-            if cls._is_synthetic_compression_user_turn(message):
-                continue
-            return True
+            from agent.message_provenance import is_human_intent
+
+            if is_human_intent(message):
+                return True
         return False
 
     @classmethod
@@ -5401,7 +5445,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
-        if message.get("display_kind"):
+        from agent.message_provenance import is_human_intent
+
+        if not is_human_intent(message):
             return True
         if cls._has_compressed_summary_metadata(message):
             return True
@@ -5510,17 +5556,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Return whether *message* contains user input worth anchoring."""
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
-        # Timeline sidecars identify operational rows that occupy the user
-        # protocol slot but were not authored by the human. They must never
-        # anchor the compaction tail or become the inferred user objective.
-        if message.get("display_kind"):
-            return False
-        if cls._has_compressed_summary_metadata(message):
-            return False
-        content = message.get("content")
-        if cls._is_context_summary_content(content):
-            return False
-        return not cls._is_blank_user_turn(message)
+        from agent.message_provenance import is_human_intent
+
+        return is_human_intent(message) and not cls._is_blank_user_turn(message)
 
     @classmethod
     def _blank_echo_indices_after(
@@ -7261,6 +7299,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                     if prev_content and new_content
                     else (prev_content or new_content)
                 )
+                from agent.message_provenance import merge_same_role_carrier_provenance
+
+                merge_same_role_carrier_provenance(prev, msg)
                 # Merged content invalidates the api_content sidecar (exact
                 # bytes previously sent for the pre-merge message).
                 drop_stale_api_content(prev)
@@ -8246,6 +8287,10 @@ def split_user_originated_turn(
     stale API-content or physical persistence identity.
     """
     if not isinstance(message, dict) or message.get("role") != "user":
+        return None, None
+    from agent.message_provenance import is_human_intent
+
+    if not is_human_intent(message):
         return None, None
 
     is_summary = is_compaction_summary_message(message)

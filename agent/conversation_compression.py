@@ -1986,15 +1986,6 @@ def conversation_history_after_compression(
     return None
 
 
-_SYNTHETIC_USER_PREFIXES = (
-    "[System: Your previous response was truncated",
-    "[System: The previous response was cut off",
-    "[System: Your previous tool call",
-    "[Your active task list was preserved across context compression]",
-    "[IMPORTANT: Background process ",
-)
-
-
 def _message_text(message: Any) -> str:
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
@@ -2028,16 +2019,13 @@ def _is_real_user_message(message: Any) -> bool:
     """
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
-    if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
-        return False
-    text = _message_text(message).strip()
-    if not text:
-        return False
-    if text.startswith(_SYNTHETIC_USER_PREFIXES):
+    from agent.message_provenance import is_human_intent
+
+    if not is_human_intent(message):
         return False
     from agent.context_compressor import ContextCompressor
 
-    return not ContextCompressor._is_synthetic_compression_user_turn(message)
+    return not ContextCompressor._is_blank_user_turn(message)
 
 
 def _strip_stale_todo_snapshot(content: Any) -> Any:
@@ -2148,6 +2136,20 @@ def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
         target["content"] = merged
     for flag in _SYNTHETIC_USER_FLAGS:
         target.pop(flag, None)
+    # The carrier is no longer synthetic-only: rendering it as hidden would
+    # make the restored human task disappear after compression.  Semantic
+    # provenance follows the human anchor, while the todo/scaffolding bytes
+    # remain in content solely to preserve provider continuity.
+    from agent.message_provenance import SEMANTIC_FIELDS
+
+    if target.get("display_kind") == "hidden":
+        target.pop("display_kind", None)
+        target.pop("display_metadata", None)
+    for field in SEMANTIC_FIELDS:
+        target.pop(field, None)
+    for field in SEMANTIC_FIELDS:
+        if field in anchor:
+            target[field] = copy.deepcopy(anchor[field])
 
 
 def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
@@ -3444,12 +3446,14 @@ def compress_context(
                     # The tail was nothing but an earlier snapshot row —
                     # refresh it in place instead of stacking a duplicate.
                     _tail["content"] = todo_snapshot
+                    _tail["display_kind"] = "hidden"
                     _tail["_todo_snapshot_synthetic"] = True
                     merged = True
             if not merged:
                 compressed.append({
                     "role": "user",
                     "content": todo_snapshot,
+                    "display_kind": "hidden",
                     "_todo_snapshot_synthetic": True,
                 })
         _ensure_compressed_has_user_turn(messages, compressed)

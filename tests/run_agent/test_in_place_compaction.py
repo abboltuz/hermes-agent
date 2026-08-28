@@ -16,6 +16,35 @@ from unittest.mock import patch
 
 import pytest
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+SCAFFOLD_PROVENANCE = {
+    "origin_kind": "internal_system",
+    "turn_kind": "runtime_scaffolding",
+    "trust_kind": "no_control",
+}
+
+
+def _runtime_messages(count=8):
+    messages = []
+    for i in range(count):
+        if i % 2 == 0:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"message {i} " + ("x" * 200),
+                    **HUMAN_PROVENANCE,
+                }
+            )
+        else:
+            messages.append(
+                {"role": "assistant", "content": f"reply {i} " + ("y" * 200)}
+            )
+    return messages
+
 
 def _make_agent(session_db, session_id, *, in_place):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -36,7 +65,11 @@ def _make_agent(session_db, session_id, *, in_place):
     # test exercises the DB-mutation path, not summarization quality.
     def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
         return [
-            {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
+            {
+                "role": "user",
+                "content": "[CONTEXT COMPACTION] summary of prior turns",
+                **SCAFFOLD_PROVENANCE,
+            },
             {"role": "assistant", "content": "recent reply"},
         ]
 
@@ -55,6 +88,7 @@ def _seed(db, sid, title, n=8):
             session_id=sid,
             role="user" if i % 2 == 0 else "assistant",
             content=f"msg {i}",
+            **(HUMAN_PROVENANCE if i % 2 == 0 else {}),
         )
 
 
@@ -71,7 +105,7 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _runtime_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -94,16 +128,17 @@ class TestInPlaceCompaction:
             # compacted set so compaction actually shrinks the live session and
             # doesn't immediately re-compact (#38763).
             reloaded = db.get_messages_as_conversation(sid)
-            assert len(reloaded) == 2
+            assert len(reloaded) == 3
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                _runtime_messages()[6]["content"],
             ]
-            assert row["message_count"] == 2  # live (active) count
+            assert row["message_count"] == 3  # live (active) count
             # NON-DESTRUCTIVE: the 8 seeded originals survive at active=0
-            # alongside the 2 compacted rows — nothing was DELETEd.
+            # alongside the 3 compacted rows — nothing was DELETEd.
             all_rows = db.get_messages(sid, include_inactive=True)
-            assert len(all_rows) == 10
+            assert len(all_rows) == 11
             archived = [m for m in all_rows if not m.get("active", 1)]
             assert len(archived) == 8
             # The originals remain FTS-searchable (active=0 is a content-
@@ -122,7 +157,7 @@ class TestInPlaceCompaction:
             # Rotation-independent in-place signal set for the gateway.
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
-            assert len(compressed) == 2
+            assert len(compressed) == 3
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
@@ -134,7 +169,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _runtime_messages()
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -157,7 +192,7 @@ class TestInPlaceCompaction:
                 "n", calls["n"] + 1
             )
             compress_context(
-                agent, [{"role": "user", "content": "x"}] * 8,
+                agent, _runtime_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert calls["n"] == 1
@@ -178,7 +213,7 @@ class TestRotationFallbackWhenFlagOff:
             agent = _make_agent(db, sid, in_place=False)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _runtime_messages()
             compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -198,10 +233,11 @@ class TestRotationFallbackWhenFlagOff:
             # The compacted child is persisted atomically at the rotation
             # boundary, so a headless process killed before finalization can
             # still resume it without duplicating the two handoff messages.
-            assert agent._last_flushed_db_idx == 2
+            assert agent._last_flushed_db_idx == 3
             assert [m.get("content") for m in db.get_messages_as_conversation(agent.session_id)] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                _runtime_messages()[6]["content"],
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
@@ -221,7 +257,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, _runtime_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True
@@ -230,7 +266,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_rot", "rot")
             a_rot = _make_agent(db, "s_rot", in_place=False)
             compress_context(
-                a_rot, [{"role": "user", "content": "x"}] * 8,
+                a_rot, _runtime_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_rot._last_compaction_in_place is False
@@ -273,7 +309,7 @@ class TestInPlaceAntiGrowthGuard:
                 ]
 
             agent.context_compressor.compress = _growing_compress
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _runtime_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -362,7 +398,7 @@ class TestInPlaceAntiGrowthGuard:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _runtime_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -373,6 +409,7 @@ class TestInPlaceAntiGrowthGuard:
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                _runtime_messages()[6]["content"],
             ]
 
 
@@ -427,7 +464,14 @@ class TestCompactedTurnsStaySearchable:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_undo"
             db.create_session(sid, "cli", model="test/model")
-            db.append_message(session_id=sid, role="user", content="ZEBRAWORD remember this")
+            db.append_message(
+                session_id=sid,
+                role="user",
+                content="ZEBRAWORD remember this",
+                origin_kind="human_user",
+                turn_kind="prompt",
+                trust_kind="user_authorized",
+            )
             db.append_message(session_id=sid, role="assistant", content="noted")
             db.rewind_to_message(sid, db.get_messages(sid)[0]["id"])
 

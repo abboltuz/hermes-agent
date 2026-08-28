@@ -189,7 +189,9 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
 
 
 def _restore_user_after_reference_handoff(
-    messages: List[Dict[str, Any]], user_message: Any
+    messages: List[Dict[str, Any]],
+    user_message: Any,
+    provenance_fields: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Re-append this turn's real user ask when compaction left only a handoff.
 
@@ -216,19 +218,26 @@ def _restore_user_after_reference_handoff(
         and messages[-1].get("content") == content
     ):
         return False
-    append_message(messages, {"role": "user", "content": content})
+    restored = {"role": "user", "content": content}
+    if provenance_fields:
+        restored.update(provenance_fields)
+    append_message(messages, restored)
     return True
 
 
 def _should_skip_model_call_for_reference_handoff(
-    messages: List[Dict[str, Any]], user_message: Any
+    messages: List[Dict[str, Any]],
+    user_message: Any,
+    provenance_fields: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Guard post-compaction continues against sole-handoff active turns (#80622)."""
     from agent.context_compressor import reference_handoff_would_drive_next_model_call
 
     if not reference_handoff_would_drive_next_model_call(messages):
         return False
-    if _restore_user_after_reference_handoff(messages, user_message):
+    if _restore_user_after_reference_handoff(
+        messages, user_message, provenance_fields
+    ):
         # The restored ask is an actionable non-synthetic user row appended
         # after the handoff — by construction the handoff no longer drives.
         return False
@@ -422,6 +431,16 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         f"{checkpoint}\n\n"
         f"{text}"
     )
+    interrupt_provenance = getattr(
+        agent, "_pending_interrupt_provenance", None
+    ) or getattr(agent, "_current_turn_user_provenance", None)
+    agent._pending_interrupt_provenance = None
+    correction_message = {
+        "role": "user",
+        "content": text,
+        "api_content": correction,
+        **(interrupt_provenance or {}),
+    }
 
     # The normal live tail is user or tool, so an assistant placeholder
     # followed by the correction preserves strict alternation. If a transport
@@ -432,7 +451,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         # scaffolded form so it still sees the interrupted context.
         append_message(
             messages,
-            {"role": "user", "content": text, "api_content": correction},
+            correction_message,
         )
     else:
         # Placeholder preserves role alternation only. Scaffold bytes must
@@ -461,7 +480,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         append_message(messages, placeholder)
         append_message(
             messages,
-            {"role": "user", "content": text, "api_content": correction},
+            correction_message,
         )
 
     agent._current_streamed_assistant_text = ""
@@ -1830,6 +1849,7 @@ def run_conversation(
     persist_user_timestamp: Optional[float] = None,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    persist_user_provenance: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -1907,6 +1927,7 @@ def run_conversation(
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
+        persist_user_provenance=persist_user_provenance,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -2368,6 +2389,9 @@ def run_conversation(
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
+            from agent.message_provenance import strip_provenance_for_provider
+
+            api_msg = strip_provenance_for_provider(api_msg)
             api_messages.append(api_msg)
 
         # Build the final system message: cached prompt + ephemeral system prompt.
@@ -2779,7 +2803,9 @@ def run_conversation(
                 agent._api_call_count = api_call_count
                 agent.iteration_budget.refund()
                 if _should_skip_model_call_for_reference_handoff(
-                    messages, user_message
+                    messages,
+                    user_message,
+                    getattr(agent, "_current_turn_user_provenance", None),
                 ):
                     # Reference-only handoff must not become the active turn
                     # after a completed assistant response (#80622).
@@ -6683,7 +6709,9 @@ def run_conversation(
             retry_count += 1
             _retry.restart_with_compressed_messages = False
             if _should_skip_model_call_for_reference_handoff(
-                messages, user_message
+                messages,
+                user_message,
+                getattr(agent, "_current_turn_user_provenance", None),
             ):
                 logger.info(
                     "Skipping compressed-restart model call: reference-only "
@@ -6998,6 +7026,7 @@ def run_conversation(
                             append_message(messages, {
                                 "role": "user",
                                 "content": _CODEX_INCOMPLETE_NUDGE,
+                                "_runtime_continuation_synthetic": True,
                             })
                     if not agent.quiet_mode:
                         agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
@@ -7576,7 +7605,9 @@ def run_conversation(
                             agent, messages, conversation_history
                         )
                         if _should_skip_model_call_for_reference_handoff(
-                            messages, user_message
+                            messages,
+                            user_message,
+                            getattr(agent, "_current_turn_user_provenance", None),
                         ):
                             logger.info(
                                 "Skipping post-tool compaction model call: "
@@ -8121,6 +8152,7 @@ def run_conversation(
                     continue_msg = {
                         "role": "user",
                         "content": _CODEX_ACK_CONTINUATION_NUDGE,
+                        "_runtime_continuation_synthetic": True,
                     }
                     append_message(messages, continue_msg)
                     agent._session_messages = messages

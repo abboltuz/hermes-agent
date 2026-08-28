@@ -16,8 +16,16 @@ from agent.context_compressor import (
     ContextCompressor,
     _NO_USER_TASK_SENTINEL,
 )
+from agent.message_provenance import (
+    OriginKind,
+    TrustKind,
+    TurnKind,
+    is_human_intent,
+    stamp_provenance,
+)
 from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
+    _is_real_user_message,
     compress_context,
 )
 from hermes_state import SessionDB
@@ -28,6 +36,15 @@ from tools.todo_tool import TODO_INJECTION_HEADER
 def _response(content: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+
+
+def _human(content: str) -> dict:
+    return stamp_provenance(
+        {"role": "user", "content": content},
+        OriginKind.HUMAN_USER,
+        TurnKind.PROMPT,
+        TrustKind.USER_AUTHORIZED,
     )
 
 
@@ -214,7 +231,7 @@ def test_max_iterations_nudge_is_synthetic_not_actionable():
 
     assert ContextCompressor._is_synthetic_compression_user_turn(nudge) is True
     # A real human turn with the same shape stays actionable.
-    human = {"role": "user", "content": "Ship the release notes for v2."}
+    human = _human("Ship the release notes for v2.")
     assert ContextCompressor._is_synthetic_compression_user_turn(human) is False
     assert ContextCompressor._transcript_has_real_user_turn([nudge]) is False
     assert ContextCompressor._transcript_has_real_user_turn([human, nudge]) is True
@@ -223,7 +240,7 @@ def test_max_iterations_nudge_is_synthetic_not_actionable():
 def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
     """The tail anchor must resolve to the human task, not the nudge that the
     runtime appended after it when iterations were exhausted."""
-    human = {"role": "user", "content": "Refactor the auth module and add tests."}
+    human = _human("Refactor the auth module and add tests.")
     messages = [
         human,
         {"role": "assistant", "content": "Working on it.", "tool_calls": [
@@ -269,7 +286,7 @@ def test_background_process_notifications_do_not_become_compaction_anchors(
     notification = format_process_notification(event)
     assert notification is not None
     process_turn = {"role": "user", "content": notification}
-    human = {"role": "user", "content": "Refactor the auth module and add tests."}
+    human = _human("Refactor the auth module and add tests.")
     messages = [
         human,
         {"role": "assistant", "content": "Working on it."},
@@ -346,7 +363,7 @@ def test_conversation_loop_retry_nudges_are_synthetic(content):
     nudge = {"role": "user", "content": content}
     assert ContextCompressor._is_synthetic_compression_user_turn(nudge) is True
 
-    human = {"role": "user", "content": "Ship the release notes for v2."}
+    human = _human("Ship the release notes for v2.")
     assert ContextCompressor._is_synthetic_compression_user_turn(human) is False
 
 
@@ -355,7 +372,7 @@ def test_real_task_wins_over_trailing_dropped_tools_continuation_nudge(compresso
     so it can only be recognized by a stable prefix (unlike the other nudges,
     which are exact-matched) — this proves that prefix path actually wires
     into anchor selection, not just the classifier in isolation."""
-    human = {"role": "user", "content": "Refactor the auth module and add tests."}
+    human = _human("Refactor the auth module and add tests.")
     messages = [
         human,
         {"role": "assistant", "content": "Working on it.", "tool_calls": [
@@ -410,13 +427,23 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     )
     assert first_handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
     assert "First boundary" in first_handoff["content"]
-    assert any(
-        message.get("role") == "user"
-        and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
+    first_todo_snapshot = next(
+        message
         for message in first
+        if message.get("role") == "user"
+        and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
     )
+    assert first_todo_snapshot["_todo_snapshot_synthetic"] is True
+    assert first_todo_snapshot["display_kind"] == "hidden"
     projected = db.get_messages_as_conversation(session_id)
     assert projected
+    projected_todo_snapshot = next(
+        message
+        for message in projected
+        if message.get("role") == "user"
+        and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
+    )
+    assert projected_todo_snapshot["display_kind"] == "hidden"
     assert all(
         COMPRESSED_SUMMARY_METADATA_KEY not in message
         and COMPRESSED_SUMMARY_HAS_USER_TURN_KEY not in message
@@ -447,8 +474,51 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     db.close()
 
 
+def test_compaction_commit_preserves_private_todo_snapshot_provenance(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "synthetic-todo-persistence"
+    db.create_session(session_id, source="cron", model="test/model")
+    db.append_message(session_id, role="assistant", content="prior output")
+
+    db.archive_and_compact(
+        session_id,
+        [
+            {
+                "role": "user",
+                "content": f"{TODO_INJECTION_HEADER}\n- [>] keep working",
+                "_todo_snapshot_synthetic": True,
+            }
+        ],
+    )
+
+    persisted = db.get_messages_as_conversation(session_id)
+    assert len(persisted) == 1
+    assert persisted[0]["display_kind"] == "hidden"
+    db.close()
 
 
+def test_restored_human_anchor_does_not_remain_hidden_in_todo_snapshot():
+    human = _human("Ship the provenance contract.")
+    compressed = [
+        {
+            "role": "user",
+            "content": f"{TODO_INJECTION_HEADER}\n- [>] keep working",
+            "display_kind": "hidden",
+            "_todo_snapshot_synthetic": True,
+        }
+    ]
+
+    _ensure_compressed_has_user_turn([human], compressed)
+
+    assert len(compressed) == 1
+    merged = compressed[0]
+    assert human["content"] in merged["content"]
+    assert TODO_INJECTION_HEADER in merged["content"]
+    assert merged.get("display_kind") != "hidden"
+    assert "_todo_snapshot_synthetic" not in merged
+    assert _is_real_user_message(merged) is True
+    assert is_human_intent(merged) is True
+    assert [message["role"] for message in compressed] == ["user"]
 
 
 

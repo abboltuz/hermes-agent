@@ -618,6 +618,10 @@ def _extract_last_user_message(messages: Any) -> Any:
         return None
     for message in reversed(messages):
         if isinstance(message, dict) and message.get("role") == "user":
+            from agent.message_provenance import is_human_intent
+
+            if not is_human_intent(message):
+                continue
             return {
                 "role": "user",
                 "content": _capture_content(message.get("content")),

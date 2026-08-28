@@ -10,7 +10,17 @@ from agent.title_generator import (
     maybe_auto_title,
     _title_language,
 )
+from agent.message_provenance import stamp_provenance
 from hermes_state import SessionDB
+
+
+def _human(content):
+    return stamp_provenance(
+        {"role": "user", "content": content},
+        "human_user",
+        "prompt",
+        "user_authorized",
+    )
 
 
 class TestGenerateTitle:
@@ -249,11 +259,11 @@ class TestMaybeAutoTitle:
         """Should not fire once the conversation is past its opening turn."""
         db = MagicMock()
         history = [
-            {"role": "user", "content": "first"},
+            _human("first"),
             {"role": "assistant", "content": "response 1"},
-            {"role": "user", "content": "second"},
+            _human("second"),
             {"role": "assistant", "content": "response 2"},
-            {"role": "user", "content": "third"},
+            _human("third"),
             {"role": "assistant", "content": "response 3"},
         ]
 
@@ -269,7 +279,7 @@ class TestMaybeAutoTitle:
         db = MagicMock()
         db.get_session_title.return_value = None
         history = [
-            {"role": "user", "content": "hello"},
+            _human("hello"),
         ]
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:
@@ -343,17 +353,16 @@ class TestMaybeAutoTitle:
         from agent.title_generator import _is_real_user_turn
 
         assert _is_real_user_turn(
-            {
-                "role": "user",
-                "content": [
+            _human(
+                [
                     {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
                     {"type": "text", "text": "fix the login button"},
-                ],
-            }
+                ]
+            )
         )
         # An image with no words is not a question we can name anything after.
         assert not _is_real_user_turn(
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}
+            _human([{"type": "image_url", "image_url": {"url": "x"}}])
         )
 
     def test_titles_on_a_later_turn_when_the_opener_was_not_titleable(self, tmp_path):
@@ -368,7 +377,7 @@ class TestMaybeAutoTitle:
         history = [
             {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] x"},
             {"role": "assistant", "content": "ok"},
-            {"role": "user", "content": "thanks"},
+            _human("thanks"),
             {"role": "assistant", "content": "sure"},
         ]
         with patch("agent.title_generator.auto_title_session"):
@@ -381,9 +390,9 @@ class TestMaybeAutoTitle:
         db.create_session(session_id="sess-1", source="cli")
         db.set_session_title("sess-1", "Existing name")
         history = [
-            {"role": "user", "content": "hello"},
+            _human("hello"),
             {"role": "assistant", "content": "hi"},
-            {"role": "user", "content": "thanks"},
+            _human("thanks"),
             {"role": "assistant", "content": "sure"},
         ]
         with patch("agent.title_generator.auto_title_session") as mock_auto:

@@ -434,7 +434,15 @@ def _title_turn(platform, message="Fix the login button"):
     with patch("agent.title_generator.maybe_auto_title") as titler:
         turn_context._maybe_title_session_at_turn_start(
             _TitlingAgent(platform),
-            [{"role": "user", "content": message}],
+            [
+                {
+                    "role": "user",
+                    "content": message,
+                    "origin_kind": "human_user",
+                    "turn_kind": "prompt",
+                    "trust_kind": "user_authorized",
+                }
+            ],
         )
     return titler
 

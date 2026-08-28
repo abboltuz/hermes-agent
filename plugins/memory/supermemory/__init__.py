@@ -757,6 +757,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
             role = message.get("role")
             if role not in {"user", "assistant"}:
                 continue
+            if role == "user":
+                from agent.message_provenance import is_human_intent
+
+                if not is_human_intent(message):
+                    continue
             content = _clean_text_for_capture(str(message.get("content", "")))
             if content:
                 cleaned.append({"role": role, "content": content})

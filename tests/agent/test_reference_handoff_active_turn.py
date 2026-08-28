@@ -37,6 +37,22 @@ from agent.agent_runtime_helpers import repair_message_sequence
 from agent.turn_context import reanchor_current_turn_user_idx
 
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+SCAFFOLD_PROVENANCE = {
+    "origin_kind": "internal_system",
+    "turn_kind": "runtime_scaffolding",
+    "trust_kind": "no_control",
+}
+
+
+def _human(content: str) -> dict:
+    return {"role": "user", "content": content, **HUMAN_PROVENANCE}
+
+
 def _standalone_handoff(task: str = "finish the already-done refactor") -> dict:
     return {
         "role": "user",
@@ -46,12 +62,14 @@ def _standalone_handoff(task: str = "finish the already-done refactor") -> dict:
         ),
         COMPRESSED_SUMMARY_METADATA_KEY: True,
         COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: True,
+        **SCAFFOLD_PROVENANCE,
     }
 
 
 def _composite_handoff(ask: str = "REAL ASK") -> dict:
     handoff = _standalone_handoff()
     handoff["content"] += f"\n\n{ask}"
+    handoff.update(HUMAN_PROVENANCE)
     return handoff
 
 
@@ -86,7 +104,7 @@ class TestReferenceHandoffWouldDriveNextModelCall:
     def test_handoff_after_completed_stop_drives(self):
         """The reported sequence: assistant stop, then synthetic handoff."""
         messages = [
-            {"role": "user", "content": "please finish the refactor"},
+            _human("please finish the refactor"),
             {
                 "role": "assistant",
                 "content": "Refactor complete.",
@@ -99,7 +117,7 @@ class TestReferenceHandoffWouldDriveNextModelCall:
     def test_real_user_after_handoff_does_not_drive(self):
         messages = [
             _standalone_handoff(),
-            {"role": "user", "content": "what's the capital of France?"},
+            _human("what's the capital of France?"),
         ]
         assert reference_handoff_would_drive_next_model_call(messages) is False
 
@@ -119,7 +137,7 @@ class TestReferenceHandoffWouldDriveNextModelCall:
         """The carrier's own stop marks preserved assistant prose as completed."""
         messages = [
             {"role": "system", "content": "system"},
-            {"role": "user", "content": "please finish the refactor"},
+            _human("please finish the refactor"),
             _merged_assistant_carrier(),
         ]
         assert reference_handoff_would_drive_next_model_call(messages) is True
@@ -163,7 +181,7 @@ class TestReferenceHandoffWouldDriveNextModelCall:
                 "finish_reason": "stop",
             },
             _merged_assistant_carrier(),
-            {"role": "user", "content": "start a different task"},
+            _human("start a different task"),
         ]
         assert reference_handoff_would_drive_next_model_call(messages) is False
 
@@ -192,6 +210,7 @@ class TestReferenceHandoffWouldDriveNextModelCall:
                     f"{_SUMMARY_END_MARKER}\n\nwhat's the capital of France?"
                 ),
                 COMPRESSED_SUMMARY_METADATA_KEY: True,
+                **HUMAN_PROVENANCE,
             }
         ]
         assert reference_handoff_would_drive_next_model_call(messages) is False
@@ -241,7 +260,7 @@ class TestUserOriginatedTurnPredicate:
         assert is_user_originated_turn(handoff) is False
 
     def test_plain_user_is_originated(self):
-        assert is_user_originated_turn({"role": "user", "content": "hello"}) is True
+        assert is_user_originated_turn(_human("hello")) is True
 
     def test_force_user_leading_carrier_is_originated_via_live_view(self):
         carrier = _composite_handoff()
@@ -256,7 +275,13 @@ class TestUserOriginatedTurnPredicate:
 
     def test_hidden_legacy_carrier_still_projects_but_typed_carrier_does_not(self):
         hidden = {**_composite_handoff(), "display_kind": "hidden"}
-        typed = {**_composite_handoff(), "display_kind": "auto_continue"}
+        typed = {
+            **_composite_handoff(),
+            "display_kind": "auto_continue",
+            "origin_kind": "internal_system",
+            "turn_kind": "continuation",
+            "trust_kind": "trusted_internal",
+        }
 
         assert user_originated_turn_view(hidden)["content"] == "REAL ASK"
         assert user_originated_turn_view(typed) is None
@@ -313,13 +338,13 @@ class TestReanchorSkipsHandoffFallback:
     def test_exact_match_still_wins(self):
         messages = [
             _standalone_handoff(),
-            {"role": "user", "content": "live ask"},
+            _human("live ask"),
         ]
         assert reanchor_current_turn_user_idx(messages, "live ask") == 1
 
     def test_fallback_prefers_real_user_over_handoff(self):
         messages = [
-            {"role": "user", "content": "original ask"},
+            _human("original ask"),
             _standalone_handoff(),
         ]
         # Exact content rewritten by merge — fall back must not land on handoff.
@@ -327,7 +352,7 @@ class TestReanchorSkipsHandoffFallback:
 
     def test_exact_live_projection_reanchors_to_composite_carrier(self):
         messages = [
-            {"role": "user", "content": "older ask"},
+            _human("older ask"),
             _composite_handoff("rewritten ask"),
         ]
 
@@ -366,7 +391,7 @@ class TestCarrierAlternationRepair:
     def test_fresh_user_does_not_mutate_persisted_carrier_dict(self):
         carrier = _composite_handoff()
         original = carrier.copy()
-        fresh = {"role": "user", "content": "NEXT ASK"}
+        fresh = _human("NEXT ASK")
         messages = [carrier, fresh]
 
         assert repair_message_sequence(None, messages) == 0

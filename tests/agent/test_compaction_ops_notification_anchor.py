@@ -11,6 +11,7 @@ operational rows remain invisible to the anchor/focus logic.
 """
 
 from agent.context_compressor import ContextCompressor
+from agent.message_provenance import stamp_provenance
 
 
 def _compressor() -> ContextCompressor:
@@ -36,7 +37,12 @@ def _ops_notice(text: str) -> dict:
 
 
 def _human(text: str) -> dict:
-    return {"role": "user", "content": text}
+    return stamp_provenance(
+        {"role": "user", "content": text},
+        "human_user",
+        "prompt",
+        "user_authorized",
+    )
 
 
 def _assistant(text: str) -> dict:

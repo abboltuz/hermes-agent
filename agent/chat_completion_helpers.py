@@ -2934,7 +2934,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
 
     summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
-    append_message(messages, {"role": "user", "content": summary_request})
+    append_message(
+        messages,
+        {
+            "role": "user",
+            "content": summary_request,
+            "display_kind": "hidden",
+        },
+    )
 
     try:
         # Build API messages, stripping internal-only fields
@@ -2967,6 +2974,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # sidecar-carrying message and re-prefilling the whole transcript
             # at exactly the moment the context is largest.
             substitute_api_content(api_msg)
+            from agent.message_provenance import strip_provenance_for_provider
+
+            api_msg = strip_provenance_for_provider(api_msg)
             if _needs_sanitize:
                 # In MoA mode, agent.model is the virtual preset name,
                 # not the actual aggregator model.  Resolve the real

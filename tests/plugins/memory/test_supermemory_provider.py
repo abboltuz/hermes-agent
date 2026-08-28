@@ -4,6 +4,7 @@ import stat
 import threading
 
 import pytest
+from agent.message_provenance import stamp_provenance
 
 from plugins.memory.supermemory import (
     SupermemoryMemoryProvider,
@@ -123,7 +124,12 @@ def test_sync_turn_buffers_short_messages(provider):
 def test_on_session_end_ingests_clean_messages(provider):
     messages = [
         {"role": "system", "content": "skip"},
-        {"role": "user", "content": "hello"},
+        stamp_provenance(
+            {"role": "user", "content": "hello"},
+            "human_user",
+            "prompt",
+            "user_authorized",
+        ),
         {"role": "assistant", "content": "hi there"},
     ]
     provider.on_session_end(messages)

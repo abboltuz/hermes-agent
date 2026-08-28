@@ -26,6 +26,12 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, List, Optional
 
+from agent.message_provenance import (
+    OriginKind,
+    TrustKind,
+    TurnKind,
+    build_provenance,
+)
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
@@ -416,7 +422,12 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
         role = m.get("role")
         text = _msg_text(m).replace("\n", " ")
         if role == "user" and text:
-            lines.append(f"USER: {text[:300]}")
+            from agent.message_provenance import display_actor, is_display_visible
+
+            if not is_display_visible(m):
+                continue
+            actor = display_actor(m).upper()
+            lines.append(f"{actor}: {text[:300]}")
         elif role == "assistant":
             tcs = m.get("tool_calls") or []
             if tcs:
@@ -432,6 +443,15 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
             "follow verbatim below.]\n" + "\n".join(lines)
         ),
     }
+    from agent.message_provenance import stamp_provenance
+
+    stamp_provenance(
+        digest,
+        OriginKind.INTERNAL_SYSTEM,
+        TurnKind.RUNTIME_SCAFFOLDING,
+        TrustKind.NO_CONTROL,
+        {"producer": "background_review_digest"},
+    )
     return [digest] + keep
 
 
@@ -1499,6 +1519,12 @@ def _run_review_in_thread(
                             "at runtime — do not attempt them."
                         ),
                         conversation_history=_review_history,
+                        persist_user_provenance=build_provenance(
+                            OriginKind.AGENT,
+                            TurnKind.TASK_INSTRUCTION,
+                            TrustKind.TRUSTED_INTERNAL,
+                            {"producer": "background_review"},
+                        ).as_message_fields(),
                     )
             finally:
                 clear_thread_tool_whitelist()

@@ -58,6 +58,7 @@ def _stub_agent_for_finalize(agent: AIAgent) -> None:
     agent.quiet_mode = True
     agent._turn_failed_file_mutations = {}
     agent._db_flush_scan_prefix = None
+    agent._is_user_initiated_turn = True
 
 
 def _run_finalize(agent: AIAgent) -> None:
