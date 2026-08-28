@@ -124,6 +124,19 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
             "kind": "process_notification",
             "event_id": "proc-42",
         },
+        "provenance": {
+            "origin_kind": "internal_system",
+            "turn_kind": "notification",
+            "trust_kind": "trusted_internal",
+            "provenance_metadata": {
+                "producer": "gateway_wake",
+                "source": "process",
+                "event_kind": "process_notification",
+                "platform": "api_server",
+                "event_id": "proc-42",
+                "session_id": "raw-sid-42",
+            },
+        },
     }
 
 
@@ -256,3 +269,62 @@ def test_wake_retry_after_lost_response_executes_agent_once(monkeypatch):
     assert calls["keys"][0]
     assert calls["keys"][0] == calls["keys"][1]
     assert len(calls["keys"][0]) <= 128
+
+
+def test_kanban_wake_self_post_reaches_api_as_agent_continuation():
+    """Exercise the authenticated self-post and API envelope parser together."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    api_adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "wake-key"})
+    )
+    result = {"final_response": "ok", "messages": [], "api_calls": 1}
+    usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+    async def run():
+        runner, port = await _serve(api_adapter._handle_chat_completions)
+        api_adapter._host = "127.0.0.1"
+        api_adapter._port = port
+        try:
+            with patch.object(
+                api_adapter,
+                "_run_agent",
+                new=AsyncMock(return_value=(result, usage)),
+            ) as run_agent:
+                await deliver_wake(
+                    api_adapter,
+                    text="worker completed",
+                    session_id="creator-session",
+                    display_metadata={
+                        "source": "kanban",
+                        "internal": True,
+                        "kind": "kanban_wake",
+                        "event_id": 17,
+                        "event_kind": "completed",
+                        "task_id": "task-17",
+                        "run_id": 23,
+                    },
+                )
+                kwargs = run_agent.await_args.kwargs
+        finally:
+            await runner.cleanup()
+        return kwargs
+
+    kwargs = asyncio.run(run())
+    assert kwargs["session_id"] == "creator-session"
+    assert kwargs["persist_user_provenance"] == {
+        "origin_kind": "agent",
+        "turn_kind": "continuation",
+        "trust_kind": "trusted_internal",
+        "provenance_metadata": {
+            "producer": "gateway_wake",
+            "source": "kanban",
+            "event_kind": "kanban_wake",
+            "platform": "api_server",
+            "event_id": 17,
+            "task_id": "task-17",
+            "run_id": 23,
+            "session_id": "creator-session",
+        },
+    }

@@ -232,6 +232,30 @@ def test_runtime_display_markers_have_structural_provenance(
             "untrusted_external",
             False,
         ),
+        (
+            {
+                "platform": "msgraph_webhook",
+                "internal": True,
+                "internal_source": "external_webhook",
+                "event_kind": "msgraph_notification",
+            },
+            "external_actor",
+            "notification",
+            "untrusted_external",
+            False,
+        ),
+        (
+            {
+                "platform": "raft",
+                "internal": True,
+                "internal_source": "raft_bridge",
+                "event_kind": "raft_wake",
+            },
+            "external_actor",
+            "notification",
+            "untrusted_external",
+            False,
+        ),
     ],
 )
 def test_gateway_ingress_uses_adapter_facts_not_caller_text(

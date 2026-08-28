@@ -246,6 +246,19 @@ def provenance_for_runtime_turn(
     metadata_map = metadata if isinstance(metadata, Mapping) else {}
     source_value = str(metadata_map.get("source") or "").strip().lower()
     event_value = str(metadata_map.get("event_kind") or "").strip().lower()
+    if source_value in {
+        "external_actor",
+        "external_webhook",
+        "msgraph_webhook",
+        "raft_bridge",
+        "webhook",
+    }:
+        return build_provenance(
+            OriginKind.EXTERNAL_ACTOR,
+            TurnKind.NOTIFICATION,
+            TrustKind.UNTRUSTED_EXTERNAL,
+            metadata,
+        )
     if source_value in {"kanban", "delegation", "subagent"} or event_value in {
         "kanban_wake",
         "async_delegation_complete",
@@ -346,6 +359,19 @@ def provenance_for_gateway_ingress(
     if internal:
         source_value = str(internal_source or "").strip().lower()
         event_value = str(event_kind or "").strip().lower()
+        if source_value in {
+            "external_actor",
+            "external_webhook",
+            "msgraph_webhook",
+            "raft_bridge",
+            "webhook",
+        }:
+            return build_provenance(
+                OriginKind.EXTERNAL_ACTOR,
+                TurnKind.NOTIFICATION,
+                TrustKind.UNTRUSTED_EXTERNAL,
+                metadata,
+            )
         if source_value in {"plugin", "plugin_injection"}:
             return build_provenance(
                 OriginKind.AUTOMATION,
@@ -376,6 +402,7 @@ def provenance_for_gateway_ingress(
             )
         if event_value in {
             "crash_recovery",
+            "recall_interrupt",
             "resume",
             "session_handoff",
         }:

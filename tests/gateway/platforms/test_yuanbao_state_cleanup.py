@@ -18,7 +18,13 @@ import time
 from types import SimpleNamespace
 
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.yuanbao import MessageSender, YuanbaoAdapter
+from gateway.config import Platform
+from gateway.platforms.yuanbao import (
+    MessageSender,
+    RecallGuardMiddleware,
+    YuanbaoAdapter,
+)
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +132,40 @@ def test_overwritten_entry_not_erased_by_outdated_turn(monkeypatch):
 
     assert adapter._processing_msg_ids.get(sk) == "m2"
     assert adapter._processing_msg_texts.get(sk) == "second"
+
+
+def test_recall_interrupt_is_typed_as_internal_continuation():
+    session_key = "yuanbao:group:G:user:U"
+    signal = asyncio.Event()
+    adapter = SimpleNamespace(
+        name="yuanbao",
+        build_source=lambda **kwargs: SessionSource(
+            platform=Platform.YUANBAO,
+            chat_id=kwargs["chat_id"],
+            chat_type=kwargs["chat_type"],
+            user_id=kwargs["user_id"],
+            thread_id=kwargs["thread_id"],
+        ),
+        _pending_messages={},
+        _active_sessions={session_key: signal},
+        _processing_msg_texts={},
+    )
+
+    RecallGuardMiddleware._interrupt_for_recall(
+        adapter, session_key, "message-7", "group-1", "user-1"
+    )
+
+    event = adapter._pending_messages[session_key]
+    assert event.metadata == {
+        "source": "session",
+        "internal": True,
+        "kind": "recall_interrupt",
+        "event_id": "message-7",
+    }
+    assert event.allow_gateway_control is False
+    assert event.semantic_provenance()["origin_kind"] == "internal_system"
+    assert event.semantic_provenance()["turn_kind"] == "continuation"
+    assert signal.is_set()
 
 
 # ---------------------------------------------------------------------------

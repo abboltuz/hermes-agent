@@ -118,6 +118,38 @@ class TestRaftWakeHttp:
         assert body == {"ok": False, "error": "content_not_allowed"}
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_authenticated_wake_remains_untrusted_external_provenance(self):
+        adapter = _make_adapter()
+        adapter.set_message_handler(AsyncMock())
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                DEFAULT_PATH,
+                json={"eventId": "wake-7", "schema": RAFT_CHANNEL_SCHEMA},
+                headers={BRIDGE_TOKEN_HEADER: "bridge-secret"},
+            )
+
+        assert response.status == 202
+        assert len(captured) == 1
+        event = captured[0]
+        assert event.internal is True
+        assert event.allow_gateway_control is False
+        assert event.metadata == {
+            "source": "raft_bridge",
+            "internal": True,
+            "kind": "raft_wake",
+            "event_id": "wake-7",
+        }
+        assert event.semantic_provenance()["origin_kind"] == "external_actor"
+        assert event.semantic_provenance()["trust_kind"] == "untrusted_external"
+
 
 class TestRaftActivityHttp:
     @pytest.mark.asyncio
@@ -217,4 +249,3 @@ class TestRaftConfig:
         assert env_path.read_text(encoding="utf-8") == "RAFT_PROFILE=existing\n"
         assert os.environ["RAFT_PROFILE"] == "existing"
         assert "Keeping RAFT_PROFILE=existing" in capsys.readouterr().out
-

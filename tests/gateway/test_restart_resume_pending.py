@@ -702,6 +702,14 @@ async def test_reconnect_reschedule_is_platform_scoped():
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source == tg_source
+    assert event.metadata == {
+        "source": "session",
+        "internal": True,
+        "kind": "resume",
+        "session_id": "sid-tg",
+    }
+    assert event.semantic_provenance()["origin_kind"] == "internal_system"
+    assert event.semantic_provenance()["turn_kind"] == "continuation"
 
 
 @pytest.mark.asyncio
@@ -1164,5 +1172,4 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
 
