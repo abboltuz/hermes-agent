@@ -297,6 +297,55 @@ class TestRunAgentViaProxy:
             },
         }
 
+    @pytest.mark.asyncio
+    async def test_untrusted_actor_provenance_crosses_proxy_without_authority_upgrade(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        source = _make_source()
+        provenance = {
+            "origin_kind": "external_actor",
+            "turn_kind": "notification",
+            "trust_kind": "untrusted_external",
+            "provenance_metadata": {
+                "producer": "gateway_ingress",
+                "platform": "matrix",
+                "event_id": "bot-7",
+            },
+        }
+        session = _FakeSession(
+            _FakeSSEResponse(
+                status=200,
+                sse_chunks=[
+                    b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+                    b"data: [DONE]\n\n",
+                ],
+            )
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="bot event",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="external-session",
+                        persist_user_provenance=provenance,
+                    )
+
+        assert session.captured_json["_hermes_internal_turn"] == {
+            "provenance": provenance
+        }
+        assert result["messages"][0] == {
+            "role": "user",
+            "content": "bot event",
+            **provenance,
+        }
+
 
     @pytest.mark.asyncio
     async def test_handles_connection_error(self, monkeypatch):
@@ -369,4 +418,3 @@ class TestEnvVarRegistration:
         info = OPTIONAL_ENV_VARS["GATEWAY_PROXY_URL"]
         assert info["category"] == "messaging"
         assert info["password"] is False
-

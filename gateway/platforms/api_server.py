@@ -5187,15 +5187,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=403,
                 )
             try:
-                display_kind, display_metadata = parse_internal_turn_envelope(
+                (
+                    display_kind,
+                    display_metadata,
+                    semantic_provenance,
+                ) = parse_internal_turn_envelope(
                     body[INTERNAL_TURN_FIELD]
                 )
             except ValueError as exc:
                 return web.json_response(_openai_error(str(exc)), status=400)
-            internal_turn_kwargs = {
-                "persist_user_display_kind": display_kind,
-                "persist_user_display_metadata": display_metadata,
-            }
+            if display_kind is not None:
+                internal_turn_kwargs["persist_user_display_kind"] = display_kind
+                internal_turn_kwargs["persist_user_display_metadata"] = (
+                    display_metadata
+                )
+            if semantic_provenance is not None:
+                internal_turn_kwargs["persist_user_provenance"] = (
+                    semantic_provenance
+                )
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -7400,6 +7409,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_provenance: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7521,7 +7531,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         provenance_for_runtime_turn,
                     )
 
-                    if persist_user_display_kind:
+                    if persist_user_provenance is not None:
+                        current_provenance = build_provenance(
+                            persist_user_provenance.get("origin_kind"),
+                            persist_user_provenance.get("turn_kind"),
+                            persist_user_provenance.get("trust_kind"),
+                            persist_user_provenance.get("provenance_metadata"),
+                        )
+                    elif persist_user_display_kind:
                         current_provenance = provenance_for_runtime_turn(
                             platform="api_server",
                             display_kind=persist_user_display_kind,

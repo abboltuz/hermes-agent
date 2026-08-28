@@ -285,3 +285,22 @@ def test_unknown_runtime_surface_fails_closed_without_ingress_envelope():
     assert provenance.origin_kind == OriginKind.EXTERNAL_ACTOR
     assert provenance.turn_kind == TurnKind.NOTIFICATION
     assert provenance.trust_kind == TrustKind.UNTRUSTED_EXTERNAL
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["_length_continuation_nudge", "_runtime_continuation_synthetic"],
+)
+def test_provider_retry_nudges_are_hidden_runtime_scaffolding(marker):
+    message = {
+        "role": "user",
+        "content": "continue",
+        marker: True,
+    }
+
+    provenance = classify_legacy_message(message)
+
+    assert provenance.origin_kind == OriginKind.INTERNAL_SYSTEM
+    assert provenance.turn_kind == TurnKind.RUNTIME_SCAFFOLDING
+    assert provenance.trust_kind == TrustKind.NO_CONTROL
+    assert is_display_visible(message) is False

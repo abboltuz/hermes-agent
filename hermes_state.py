@@ -4378,7 +4378,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+                try:
+                    self._init_schema()
+                except BaseException:
+                    if self._conn.in_transaction:
+                        self._conn.rollback()
+                    raise
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
