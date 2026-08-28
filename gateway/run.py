@@ -3871,11 +3871,34 @@ def _parse_session_key(session_key: str) -> "dict | None":
     """
     parts = session_key.split(":")
     if len(parts) >= 5 and parts[0] == "agent" and parts[1]:
+        namespace = parts[1]
+        profile = ""
+        if namespace != "main":
+            # ``default`` is encoded as the historical ``main`` namespace;
+            # accepting agent:default would create an alternate spelling that
+            # silently falls back to the default adapter. Named namespaces are
+            # canonical on-disk profile ids.
+            if namespace == "default":
+                return None
+            try:
+                from hermes_cli.profiles import (
+                    normalize_profile_name,
+                    validate_profile_name,
+                )
+
+                profile = normalize_profile_name(namespace)
+                validate_profile_name(profile)
+            except (TypeError, ValueError):
+                return None
+            if profile != namespace:
+                return None
         result = {
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
+        if profile:
+            result["profile"] = profile
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
@@ -25479,12 +25502,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
+        parsed_session_key = _parse_session_key(session_key) if session_key else None
+        typed_api_origin = (
+            stamped_platform == Platform.API_SERVER.value
+            and bool(raw_api_session_id)
+        )
+        if (
+            not typed_api_origin
+            and session_key.startswith("agent:")
+            and parsed_session_key is None
+        ):
+            logger.warning(
+                "Rejecting synthetic event with invalid structured session key"
+            )
+            return None
+        key_profile = str(
+            (parsed_session_key or {}).get("profile") or ""
+        ).strip()
+        if (
+            not typed_api_origin
+            and origin_profile
+            and key_profile
+            and origin_profile != key_profile
+        ):
+            logger.warning(
+                "Rejecting synthetic event whose session namespace conflicts "
+                "with explicit profile provenance"
+            )
+            return None
+        source_profile = origin_profile or (
+            "" if typed_api_origin else key_profile
+        )
+
         def _bind_event_profile(source):
             """Reconcile a persisted source with authoritative event provenance."""
-            if not origin_profile:
+            if not source_profile:
                 return source
             stored_profile = str(getattr(source, "profile", None) or "").strip()
-            if stored_profile and stored_profile != origin_profile:
+            if stored_profile and stored_profile != source_profile:
                 logger.warning(
                     "Rejecting synthetic event whose stored source profile "
                     "conflicts with explicit event provenance"
@@ -25497,7 +25552,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # named adapter without mutating the cached/persisted source.
             from dataclasses import replace
 
-            return replace(source, profile=origin_profile)
+            return replace(source, profile=source_profile)
 
         # API requests use a raw X-Hermes-Session-Id as their continuation
         # address. A caller may also supply X-Hermes-Session-Key for memory
@@ -25505,9 +25560,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # push-channel session. It is never routing authority for an event that
         # was explicitly stamped as api_server: consulting the session store
         # first would redirect the completion to that push chat.
-        if stamped_platform == Platform.API_SERVER.value and raw_api_session_id:
-            parsed_key = _parse_session_key(session_key) if session_key else None
-            if parsed_key and parsed_key.get("platform") != Platform.API_SERVER.value:
+        if typed_api_origin:
+            if (
+                parsed_session_key
+                and parsed_session_key.get("platform")
+                != Platform.API_SERVER.value
+            ):
                 logger.warning(
                     "Ignoring contradictory structured session key on typed "
                     "api_server completion for raw session %s",
@@ -25541,7 +25599,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if cached_source is not None:
                 return _bind_event_profile(cached_source)
 
-            _parsed = _parse_session_key(session_key)
+            _parsed = parsed_session_key
             if _parsed:
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
@@ -25602,7 +25660,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
             scope_id=scope_id,
-            profile=str(evt.get("origin_profile") or "").strip() or None,
+            profile=source_profile or None,
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -25650,7 +25708,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raw_sid = str(evt.get("origin_session_id") or "").strip()
             if not raw_sid:
                 _sk = str(evt.get("session_key") or "").strip()
-                if _sk and _parse_session_key(_sk) is None:
+                if (
+                    _sk
+                    and not _sk.startswith("agent:")
+                    and _parse_session_key(_sk) is None
+                ):
                     raw_sid = _sk
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
