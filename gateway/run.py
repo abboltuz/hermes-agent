@@ -28655,19 +28655,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "messages": api_messages,
             "stream": True,
         }
+        proxy_turn_envelope: Dict[str, Any] = {}
         if (
             persist_user_display_kind is not None
             or persist_user_display_metadata is not None
+            or persist_user_provenance is not None
         ):
             from gateway.internal_turn import (
                 INTERNAL_TURN_FIELD,
                 build_internal_turn_envelope,
             )
 
-            body[INTERNAL_TURN_FIELD] = build_internal_turn_envelope(
+            proxy_turn_envelope = build_internal_turn_envelope(
                 persist_user_display_kind,
                 persist_user_display_metadata,
+                persist_user_provenance,
             )
+            body[INTERNAL_TURN_FIELD] = proxy_turn_envelope
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -28842,10 +28846,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
+        user_entry: Dict[str, Any] = {"role": "user", "content": message}
+        if proxy_turn_envelope.get("display_kind") is not None:
+            user_entry["display_kind"] = proxy_turn_envelope["display_kind"]
+        if proxy_turn_envelope.get("display_metadata") is not None:
+            user_entry["display_metadata"] = proxy_turn_envelope[
+                "display_metadata"
+            ]
+        if proxy_turn_envelope.get("provenance") is not None:
+            user_entry.update(proxy_turn_envelope["provenance"])
+
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
-                {"role": "user", "content": message},
+                user_entry,
                 {"role": "assistant", "content": full_response},
             ],
             "api_calls": 1,

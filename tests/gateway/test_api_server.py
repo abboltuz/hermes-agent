@@ -1182,6 +1182,42 @@ class TestChatCompletionsEndpoint:
         assert kwargs["persist_user_display_metadata"] == envelope["display_metadata"]
 
     @pytest.mark.asyncio
+    async def test_authenticated_proxy_provenance_reaches_agent_without_upgrade(self):
+        adapter = _make_adapter(api_key="api-secret")
+        app = _create_app(adapter)
+        provenance = {
+            "origin_kind": "external_actor",
+            "turn_kind": "notification",
+            "trust_kind": "untrusted_external",
+            "provenance_metadata": {
+                "producer": "gateway_ingress",
+                "platform": "matrix",
+                "event_id": "bot-7",
+            },
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=({"final_response": "ok", "messages": []}, {}),
+            ) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer api-secret"},
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "bot event"}],
+                        "stream": False,
+                        INTERNAL_TURN_FIELD: {"provenance": provenance},
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["persist_user_provenance"] == provenance
+
+    @pytest.mark.asyncio
     async def test_streaming_internal_turn_reaches_agent_persistence_sidecar(self):
         adapter = _make_adapter(api_key="api-secret")
         app = _create_app(adapter)

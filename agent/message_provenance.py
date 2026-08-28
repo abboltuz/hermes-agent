@@ -507,16 +507,6 @@ def classify_legacy_message(message: Mapping[str, Any]) -> MessageProvenance:
         for flag in (
             "_length_continuation_nudge",
             "_runtime_continuation_synthetic",
-        )
-    ):
-        return build_provenance(
-            OriginKind.INTERNAL_SYSTEM,
-            TurnKind.CONTINUATION,
-            TrustKind.TRUSTED_INTERNAL,
-        )
-    if any(
-        message.get(flag)
-        for flag in (
             "_todo_snapshot_synthetic",
             "_empty_recovery_synthetic",
             "_verification_stop_synthetic",

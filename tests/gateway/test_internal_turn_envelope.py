@@ -28,3 +28,16 @@ def test_internal_turn_envelope_rejects_malformed_typed_fields(invalid_field):
                 "display_metadata": metadata,
             }
         )
+
+
+def test_internal_turn_envelope_rejects_local_human_authority_claim():
+    with pytest.raises(ValueError, match="not allowed for proxy ingress"):
+        parse_internal_turn_envelope(
+            {
+                "provenance": {
+                    "origin_kind": "human_user",
+                    "turn_kind": "prompt",
+                    "trust_kind": "user_authorized",
+                }
+            }
+        )

@@ -3,6 +3,7 @@
 import queue
 
 from cli import HermesCLI
+from agent.context_compressor import ContextCompressor
 
 
 def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
@@ -45,6 +46,46 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     assert cli._pending_input.get_nowait() == "completion payload"
     assert claimed == [(event, "cli-idle")]
     assert completed == [(event, "claim-token")]
+
+
+def test_cli_async_delegation_is_an_actionable_compression_safe_continuation(
+    monkeypatch,
+):
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_visible",
+        "event_id": "event-7",
+        "session_key": "visible-session",
+    }
+
+    class FakeRegistry:
+        def drain_notifications(self, *, session_key="", owns_event=None):
+            return [(event, "full delegation result")]
+
+    monkeypatch.setattr("tools.process_registry.process_registry", FakeRegistry())
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _evt, _consumer: "claim-token",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda _evt, _token: None,
+    )
+
+    cli._drain_process_notifications("cli-idle")
+    queued = cli._pending_input.get_nowait()
+
+    assert queued.provenance["origin_kind"] == "agent"
+    assert queued.provenance["turn_kind"] == "continuation"
+    assert queued.provenance["trust_kind"] == "trusted_internal"
+    compressor = ContextCompressor.__new__(ContextCompressor)
+    summary_input = compressor._serialize_for_summary(
+        [{"role": "user", "content": str(queued), **queued.provenance}]
+    )
+    assert "full delegation result" in summary_input
 
 
 def test_cli_completion_ownership_rejects_foreign_session():

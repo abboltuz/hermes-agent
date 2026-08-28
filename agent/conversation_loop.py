@@ -40,6 +40,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.message_provenance import stamp_provenance
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
@@ -103,6 +104,24 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _runtime_scaffolding_nudge(content: str, marker: str) -> Dict[str, Any]:
+    """Build an alternation-safe provider user row with non-user semantics."""
+    message: Dict[str, Any] = {
+        "role": "user",
+        "content": content,
+        marker: True,
+        "display_kind": "hidden",
+    }
+    stamp_provenance(
+        message,
+        "internal_system",
+        "runtime_scaffolding",
+        "no_control",
+        {"producer": marker.lstrip("_")},
+    )
+    return message
 
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
@@ -3980,11 +3999,10 @@ def run_conversation(
                                 _continue_content = _get_continuation_prompt(
                                     _is_partial_stream_stub, _dropped_tools
                                 )
-                                continue_msg = {
-                                    "role": "user",
-                                    "content": _continue_content,
-                                    "_length_continuation_nudge": True,
-                                }
+                                continue_msg = _runtime_scaffolding_nudge(
+                                    _continue_content,
+                                    "_length_continuation_nudge",
+                                )
                                 append_message(messages, continue_msg)
                                 agent._session_messages = messages
                                 _retry.restart_with_length_continuation = True
@@ -7023,11 +7041,13 @@ def run_conversation(
                             and _last_msg.get("role") == "assistant"
                         )
                         if not _already_nudged and _last_is_assistant:
-                            append_message(messages, {
-                                "role": "user",
-                                "content": _CODEX_INCOMPLETE_NUDGE,
-                                "_runtime_continuation_synthetic": True,
-                            })
+                            append_message(
+                                messages,
+                                _runtime_scaffolding_nudge(
+                                    _CODEX_INCOMPLETE_NUDGE,
+                                    "_runtime_continuation_synthetic",
+                                ),
+                            )
                     if not agent.quiet_mode:
                         agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
                     # Surface the continuation on the live spinner/status line
@@ -8149,11 +8169,10 @@ def run_conversation(
                     append_message(messages, interim_msg)
                     agent._emit_interim_assistant_message(interim_msg)
 
-                    continue_msg = {
-                        "role": "user",
-                        "content": _CODEX_ACK_CONTINUATION_NUDGE,
-                        "_runtime_continuation_synthetic": True,
-                    }
+                    continue_msg = _runtime_scaffolding_nudge(
+                        _CODEX_ACK_CONTINUATION_NUDGE,
+                        "_runtime_continuation_synthetic",
+                    )
                     append_message(messages, continue_msg)
                     agent._session_messages = messages
                     # An acknowledgment is explicitly non-final. Do not let its

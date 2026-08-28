@@ -13064,14 +13064,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
+            is_delegation = event.get("type") == "async_delegation"
             self._pending_input.put(
                 _ProvenanceInputMessage(
                     synthetic_message,
                     origin="agent",
-                    turn="notification",
+                    turn="continuation" if is_delegation else "notification",
                     trust="trusted_internal",
                     metadata={
-                        "producer": "cli_process_notification",
+                        "producer": (
+                            "cli_async_delegation"
+                            if is_delegation
+                            else "cli_process_notification"
+                        ),
+                        "source": "delegation" if is_delegation else "process",
+                        "event_kind": str(event.get("type") or "notification"),
                         "session_id": self.session_id,
                         "event_id": str(event.get("event_id") or ""),
                         "process_id": str(event.get("process_id") or ""),

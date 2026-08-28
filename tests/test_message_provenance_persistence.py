@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from agent.message_provenance import (
@@ -257,3 +259,50 @@ def test_rewind_and_default_reaction_target_ignore_machine_user_roles(tmp_path):
     result = db.rewind_to_message("s", human_id)
     assert result["target_message"]["content"] == "real ask"
     db.close()
+
+
+def test_v27_backfill_rolls_back_as_one_unit_and_restarts_idempotently(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s", source="api", model="test/model")
+    db.append_message("s", role="assistant", content="answer")
+    db.append_message("s", role="user", content="explode")
+    with db._lock:
+        db._conn.execute(
+            "UPDATE messages SET origin_kind=NULL, turn_kind=NULL, trust_kind=NULL"
+        )
+        db._conn.execute(
+            "UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,)
+        )
+        db._conn.execute(
+            """CREATE TRIGGER fail_v27_backfill
+               BEFORE UPDATE OF origin_kind ON messages
+               WHEN OLD.content = 'explode'
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected v27 failure');
+               END"""
+        )
+    db.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected v27 failure"):
+        SessionDB(db_path=path)
+
+    raw = sqlite3.connect(path)
+    try:
+        rows = raw.execute(
+            "SELECT origin_kind, turn_kind, trust_kind FROM messages ORDER BY id"
+        ).fetchall()
+        version = raw.execute("SELECT version FROM schema_version").fetchone()[0]
+        assert rows == [(None, None, None), (None, None, None)]
+        assert version == SCHEMA_VERSION - 1
+        raw.execute("DROP TRIGGER fail_v27_backfill")
+        raw.commit()
+    finally:
+        raw.close()
+
+    migrated = SessionDB(db_path=path)
+    first = migrated.get_messages_as_conversation("s")
+    migrated.close()
+    reopened = SessionDB(db_path=path)
+    assert reopened.get_messages_as_conversation("s") == first
+    reopened.close()

@@ -1023,6 +1023,12 @@ class SessionSchemaMixin:
             self._drop_fts_triggers(cursor)
 
         # ── Schema version bookkeeping ─────────────────────────────────
+        # The connection runs in autocommit mode. Versioned data migrations
+        # must nevertheless publish atomically with their schema-version
+        # stamp: otherwise a crash can expose a partially classified message
+        # table while the old version remains durable. Declarative column
+        # reconciliation above is additive and restart-safe on its own.
+        cursor.execute("BEGIN IMMEDIATE")
         # Bump to current so future data migrations (if any) can gate on
         # version.  No version-gated column additions remain.
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
