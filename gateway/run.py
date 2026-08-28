@@ -25466,6 +25466,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key = str(evt.get("session_key") or "").strip()
         stamped_platform = str(evt.get("platform") or "").strip().lower()
         raw_api_session_id = str(evt.get("origin_session_id") or "").strip()
+        origin_profile = str(evt.get("origin_profile") or "").strip()
+        route_profile = str(
+            evt.get("origin_api_route_profile") or ""
+        ).strip()
+
+        if route_profile and origin_profile and route_profile != origin_profile:
+            logger.warning(
+                "Rejecting synthetic event with contradictory profile provenance"
+            )
+            return None
+
+        def _bind_event_profile(source):
+            """Reconcile a persisted source with authoritative event provenance."""
+            if not origin_profile:
+                return source
+            stored_profile = str(getattr(source, "profile", None) or "").strip()
+            if stored_profile and stored_profile != origin_profile:
+                logger.warning(
+                    "Rejecting synthetic event whose stored source profile "
+                    "conflicts with explicit event provenance"
+                )
+                return None
+            if stored_profile:
+                return source
+            # Historical session-store entries predate per-source profile
+            # stamping. Bind a copy so explicit event provenance selects the
+            # named adapter without mutating the cached/persisted source.
+            from dataclasses import replace
+
+            return replace(source, profile=origin_profile)
 
         # API requests use a raw X-Hermes-Session-Id as their continuation
         # address. A caller may also supply X-Hermes-Session-Key for memory
@@ -25474,17 +25504,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # was explicitly stamped as api_server: consulting the session store
         # first would redirect the completion to that push chat.
         if stamped_platform == Platform.API_SERVER.value and raw_api_session_id:
-            origin_profile = str(evt.get("origin_profile") or "").strip()
-            route_profile = str(
-                evt.get("origin_api_route_profile") or ""
-            ).strip()
-            if route_profile and origin_profile and route_profile != origin_profile:
-                logger.warning(
-                    "Rejecting synthetic API event with contradictory profile "
-                    "provenance for session %s",
-                    raw_api_session_id,
-                )
-                return None
             parsed_key = _parse_session_key(session_key) if session_key else None
             if parsed_key and parsed_key.get("platform") != Platform.API_SERVER.value:
                 logger.warning(
@@ -25508,7 +25527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _bind_event_profile(entry.origin)
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -25518,7 +25537,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _bind_event_profile(cached_source)
 
             _parsed = _parse_session_key(session_key)
             if _parsed:

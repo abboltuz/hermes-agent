@@ -175,8 +175,12 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
-def test_api_profile_route_provenance_survives_durable_delegation():
+def test_api_profile_route_provenance_survives_durable_delegation(
+    monkeypatch, tmp_path
+):
     from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setattr(ad, "_db_path", lambda profile="": tmp_path / "state.db")
 
     tokens = set_session_vars(
         platform="api_server",
@@ -391,6 +395,26 @@ def test_recover_drops_malformed_task_and_continues_later_rows(
 def test_recovery_rejects_profile_traversal_before_path_resolution():
     with pytest.raises(ValueError, match="Invalid profile name"):
         ad.restore_undelivered_completions(queue.Queue(), profile="../escape")
+
+
+def test_recovery_rejects_unserved_profile_before_path_resolution(monkeypatch):
+    """A safe-shaped unknown name must not create a new profile ledger."""
+    from hermes_cli import profiles
+
+    path_resolution_attempted = False
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: False)
+
+    def forbidden_path_resolution(_name):
+        nonlocal path_resolution_attempted
+        path_resolution_attempted = True
+        raise AssertionError("unserved profile reached get_profile_dir")
+
+    monkeypatch.setattr(profiles, "get_profile_dir", forbidden_path_resolution)
+
+    with pytest.raises(ValueError, match="not served"):
+        ad._db_path("definitely-unserved-review-profile")
+    assert path_resolution_attempted is False
 
 
 def test_rich_reinjection_block_is_self_contained():

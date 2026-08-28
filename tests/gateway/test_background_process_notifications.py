@@ -706,6 +706,90 @@ async def test_named_profile_push_completion_uses_profile_adapter(monkeypatch, t
     writer_adapter.handle_message.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_named_profile_push_completion_stamps_legacy_stored_source(
+    monkeypatch, tmp_path
+):
+    """Explicit event provenance upgrades an otherwise matching legacy source."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    default_adapter = runner.adapters[Platform.TELEGRAM]
+    writer_adapter = SimpleNamespace(
+        send=AsyncMock(),
+        handle_message=AsyncMock(),
+    )
+    runner._profile_adapters = {
+        "writer": {Platform.TELEGRAM: writer_adapter},
+    }
+    key = "agent:main:telegram:dm:writer-chat"
+    runner.session_store._entries[key] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="writer-chat",
+            chat_type="dm",
+            profile=None,
+        )
+    )
+
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-writer-legacy",
+            "session_key": key,
+            "origin_profile": "writer",
+        },
+    )
+
+    assert result is True
+    default_adapter.handle_message.assert_not_awaited()
+    writer_adapter.handle_message.assert_awaited_once()
+    delivered = writer_adapter.handle_message.await_args.args[0]
+    assert delivered.source.profile == "writer"
+
+
+@pytest.mark.asyncio
+async def test_named_profile_push_completion_rejects_conflicting_stored_profile(
+    monkeypatch, tmp_path
+):
+    """Stored source metadata cannot override an explicit event profile."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    default_adapter = runner.adapters[Platform.TELEGRAM]
+    writer_adapter = SimpleNamespace(
+        send=AsyncMock(),
+        handle_message=AsyncMock(),
+    )
+    runner._profile_adapters = {
+        "writer": {Platform.TELEGRAM: writer_adapter},
+    }
+    key = "agent:main:telegram:dm:writer-chat"
+    runner.session_store._entries[key] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="writer-chat",
+            chat_type="dm",
+            profile="default",
+        )
+    )
+
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-writer-conflict",
+            "session_key": key,
+            "origin_profile": "writer",
+        },
+    )
+
+    assert result is None
+    default_adapter.handle_message.assert_not_awaited()
+    writer_adapter.handle_message.assert_not_awaited()
+
+
 def test_gateway_drain_retains_and_formats_overflow_events():
     """watch_overflow_* events must survive the gateway drain and render
     their summary — previously they were discarded at the drain (only
