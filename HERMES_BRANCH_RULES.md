@@ -125,6 +125,25 @@ Additional rules:
 - Do not build installers, sign, notarize, publish, push, deploy, or modify production without separate explicit approval.
 - A locally running unsigned/unnotarized app is not evidence of a distributable release.
 
+### macOS Desktop TCC identity gate
+
+This gate applies when producing or promoting a packaged macOS Desktop `.app` intended for local launch. Normal renderer development and tests do not require signing.
+
+- The packaged Electron Desktop bundle itself must have a stable macOS Designated Requirement (DR). A stable signature on `/Applications/Hermes.app`—the separate setup launcher with bundle identifier `com.nousresearch.hermes.setup`—does not prove that the separately built Electron bundle has a stable identity.
+- The packaged Desktop bundle must have bundle identifier `com.nousresearch.hermes` and satisfy one of these postconditions:
+  - **Preferred:** a certificate-anchored DR using the persistent identity configured by `desktop.macos_signing_identity`.
+  - **Fallback:** an identifier-pinned ad-hoc DR for `com.nousresearch.hermes` with no `cdhash` anchor.
+- A plain cdhash-pinned ad-hoc signature is not promotable because every rebuild changes the cdhash and invalidates TCC grants.
+- Produce a launchable or promotable macOS bundle through the repository-supported Desktop packaging path that invokes `_desktop_macos_relaunchable_fixup`, such as the repository-local `hermes desktop --build-only` or `hermes desktop --force-build` flow. Raw `npm run pack` alone is insufficient unless the same signing fixup is subsequently applied and verified.
+- Existing authorization boundaries still apply. Creating, importing, or trusting a signing identity; changing `desktop.macos_signing_identity`; running `tccutil`; re-signing the installed bundle; rebuilding the installed package; or restarting Desktop, the gateway, or the backend always requires Artem's explicit current-turn authorization. Approval to edit, test, or prepare a source artifact does not authorize those actions.
+- After a signing identity changes, macOS may require one final permission grant. Artem performs that grant and the final quit/relaunch.
+- Before local launch or promotion, verify the actual packaged Electron bundle:
+  - `/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' <Hermes.app>/Contents/Info.plist` prints `com.nousresearch.hermes`.
+  - `codesign -d -r- <Hermes.app>` shows either the configured persistent certificate anchor or an identifier-only DR for `com.nousresearch.hermes`, and does not contain `cdhash`.
+  - `codesign --verify --deep --strict <Hermes.app>` passes.
+  - `hermes doctor` no longer reports that Desktop TCC grants reset after every update.
+- If an identity postcondition or verification is missing, stop before launch or promotion and report the exact failing command and output. Never silently fall back to a cdhash-pinned artifact.
+
 ## 10. Secrets and private artifacts
 
 - Never print, persist in rules/memory, commit, or report credentials, API keys, tokens, passwords, connection strings, or raw private identifiers.
