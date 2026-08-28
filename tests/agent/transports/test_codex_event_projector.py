@@ -215,9 +215,10 @@ class TestUserAndOpaqueProjection:
         msgs = CodexEventProjector().project(
             {"method": "item/completed", "params": {"item": item}}
         ).messages
-        assert msgs[0]["role"] == "user"
-        assert "hello" in msgs[0]["content"]
-        assert "world" in msgs[0]["content"]
+        assert msgs == [], (
+            "Codex userMessage is a provider echo of the current Hermes turn; "
+            "materializing it would duplicate the already-durable user row"
+        )
 
     def test_opaque_item_recorded_without_fabricated_tool_calls(self) -> None:
         item = {"type": "plan", "id": "p1", "text": "do the thing"}

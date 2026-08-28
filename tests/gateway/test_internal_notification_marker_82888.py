@@ -137,6 +137,12 @@ async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_pat
                 "source": "delegation",
                 "kind": "async_delegation_complete",
                 "event_id": "deleg_123",
+                "task_id": "task-123",
+                "job_id": "job-123",
+                "process_id": "proc-123",
+                "delegation_id": "delegation-123",
+                "run_id": 17,
+                "generation_id": 3,
                 "raw_payload": {"must": "not be copied"},
             },
         ),
@@ -151,7 +157,47 @@ async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_pat
         "kind": "async_delegation_complete",
         "platform": "telegram",
         "event_id": "deleg_123",
+        "task_id": "task-123",
+        "job_id": "job-123",
+        "process_id": "proc-123",
+        "delegation_id": "delegation-123",
+        "run_id": 17,
+        "generation_id": 3,
     }
+    provenance = kwargs["persist_user_provenance"]
+    assert provenance["origin_kind"] == "agent"
+    assert provenance["turn_kind"] == "continuation"
+    assert provenance["trust_kind"] == "trusted_internal"
+    for key, value in {
+        "event_id": "deleg_123",
+        "task_id": "task-123",
+        "job_id": "job-123",
+        "process_id": "proc-123",
+        "delegation_id": "delegation-123",
+        "run_id": 17,
+        "generation_id": 3,
+    }.items():
+        assert provenance["provenance_metadata"][key] == value
+
+    # The exact semantic sidecar handed to the push-path agent must survive
+    # the real durable codec and reload, independently of display metadata.
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "push-wake.db")
+    db.create_session("push-wake", source="telegram")
+    try:
+        db.append_message(
+            "push-wake",
+            "user",
+            "[ASYNC DELEGATION BATCH COMPLETE]",
+            **provenance,
+        )
+        reloaded = db.get_messages_as_conversation("push-wake")[0]
+        assert reloaded["provenance_metadata"] == provenance[
+            "provenance_metadata"
+        ]
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

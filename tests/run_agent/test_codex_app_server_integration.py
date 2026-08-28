@@ -19,6 +19,7 @@ import pytest
 
 import run_agent
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+from agent.transports.codex_event_projector import CodexEventProjector
 
 
 @pytest.fixture
@@ -242,6 +243,65 @@ class TestRunConversationCodexPath:
             if m.get("role") == "user" and m.get("content") == "ping unique 12345"
         )
         assert user_count == 1, f"user message appeared {user_count}× in {result['messages']}"
+
+    def test_projected_user_echo_is_not_persisted_or_reloaded(
+        self, monkeypatch, tmp_path
+    ):
+        """The real projector sees Codex's userMessage echo, but the runtime
+        already persisted the trusted inbound turn before calling Codex."""
+        from hermes_state import SessionDB
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            projector = CodexEventProjector()
+            projected = projector.project(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "id": "echo-1",
+                            "content": [{"type": "text", "text": user_input}],
+                        }
+                    },
+                }
+            ).messages
+            projected.append({"role": "assistant", "content": "done"})
+            return TurnResult(
+                final_text="done",
+                projected_messages=projected,
+                turn_id="turn-echo-1",
+                thread_id="thread-echo-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-echo-1",
+        )
+        db = SessionDB(tmp_path / "state.db")
+        agent = _make_codex_agent(
+            session_db=db,
+            session_id="codex-echo-session",
+        )
+        try:
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation("one durable prompt")
+
+            live_users = [m for m in result["messages"] if m.get("role") == "user"]
+            assert len(live_users) == 1
+            assert live_users[0]["origin_kind"] == "human_user"
+
+            reloaded = db.get_messages_as_conversation("codex-echo-session")
+            durable_users = [m for m in reloaded if m.get("role") == "user"]
+            assert len(durable_users) == 1
+            assert durable_users[0]["content"] == "one durable prompt"
+            assert durable_users[0]["origin_kind"] == "human_user"
+            assert all(
+                m.get("origin_kind") != "legacy_unknown" for m in reloaded
+            )
+        finally:
+            agent.close()
 
     def test_background_review_NOT_invoked_below_threshold(self, fake_session):
         """A single turn shouldn't trigger background review — counters
