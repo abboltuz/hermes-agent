@@ -1,5 +1,11 @@
 # Hermes Agent - Development Guide
 
+> [!IMPORTANT]
+> This checkout is also governed by `HERMES_BRANCH_RULES.md`, Cekasha's
+> project-specific working agreement for custom-branch development. Read it
+> before planning or editing. It supplements this guide; if the two appear to
+> conflict, stop and ask Artem rather than choosing silently.
+
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
 **Never give up on the right solution.**
