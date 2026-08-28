@@ -3568,6 +3568,11 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    correction_provenance = _prompt_provenance_fields(
+        session,
+        str(params.get("session_id") or ""),
+        message_id=params.get("message_id"),
+    )
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
@@ -3581,7 +3586,9 @@ def _(rid, params: dict) -> dict:
         # rebuilds the transcript from the inflight snapshot and the steered
         # text has no user bubble — the "my message vanished on reload" loss.
         with session["history_lock"]:
-            _record_inflight_correction(session, text)
+            _record_inflight_correction(
+                session, text, provenance=correction_provenance
+            )
             # #84417: steer does not cancel the live original, but a server
             # queue self-copy of that original must still not re-fire after
             # settle (same class as redirect).
@@ -3599,6 +3606,11 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    correction_provenance = _prompt_provenance_fields(
+        session,
+        str(params.get("session_id") or ""),
+        message_id=params.get("message_id"),
+    )
     agent = session.get("agent")
     # Turn-build window: a fresh turn flips running=True and kicks off an async
     # agent build, so session["agent"] is briefly None. That is not an
@@ -3606,7 +3618,12 @@ def _(rid, params: dict) -> dict:
     # model as the next turn, instead of a misleading 4010 the client silently
     # swallows into a lost follow-up.
     if agent is None and session.get("running"):
-        _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+        _enqueue_prompt(
+            session,
+            text,
+            current_transport() or _stdio_transport,
+            provenance=correction_provenance,
+        )
         session["last_active"] = time.time()
         return _ok(rid, {"status": "queued", "text": text})
     if (
@@ -3621,7 +3638,9 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:
         with session["history_lock"]:
-            _record_inflight_correction(session, text)
+            _record_inflight_correction(
+                session, text, provenance=correction_provenance
+            )
             # #84417: purge server-queue self-duplicates of the live original
             # so post-turn drain cannot restart the pre-correction prompt.
             _drop_queued_duplicates_of_inflight_user(session)

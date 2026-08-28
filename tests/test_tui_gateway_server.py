@@ -11295,13 +11295,21 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
         def interrupt(self, *args, **kwargs):
             calls["interrupt_called"] = True
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    session = _session(agent=_Agent())
+    server._start_inflight_turn(
+        session, "original prompt", provenance=HUMAN_PROVENANCE
+    )
+    server._sessions["sid"] = session
     try:
         resp = server.handle_request(
             {
                 "id": "1",
                 "method": "session.steer",
-                "params": {"session_id": "sid", "text": "also check auth.log"},
+                "params": {
+                    "session_id": "sid",
+                    "text": "also check auth.log",
+                    "message_id": "desktop:steer-1",
+                },
             }
         )
     finally:
@@ -11312,6 +11320,10 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert resp["result"]["text"] == "also check auth.log"
     assert calls["steer_text"] == "also check auth.log"
     assert "interrupt_called" not in calls  # must NOT interrupt
+    correction = server._inflight_snapshot(session)
+    assert correction["correction_provenance"][0]["provenance_metadata"][
+        "message_id"
+    ] == "desktop:steer-1"
 
 
 def test_session_steer_rejects_empty_text():
@@ -11365,7 +11377,11 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
             {
                 "id": "1",
                 "method": "session.redirect",
-                "params": {"session_id": "sid", "text": "use Postgres"},
+                "params": {
+                    "session_id": "sid",
+                    "text": "use Postgres",
+                    "message_id": "desktop:redirect-1",
+                },
             }
         )
     finally:
@@ -11380,6 +11396,19 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
     # never over it — resume must be able to rebuild both bubbles.
     assert session["inflight_turn"]["user"] == "original request"
     assert session["inflight_turn"]["corrections"] == ["use Postgres"]
+    assert session["inflight_turn"]["correction_provenance"] == [
+        {
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+            "provenance_metadata": {
+                "message_id": "desktop:redirect-1",
+                "platform": "tui",
+                "producer": "tui_gateway_prompt",
+                "session_id": "session-key",
+            },
+        }
+    ]
     assert session.get("last_active") is not None
     assert before is None or session["last_active"] >= before
 
@@ -11485,6 +11514,58 @@ def test_session_redirect_records_correction_without_erasing_prompt():
 
     assert snapshot["user"] == "remove the session counts"
     assert snapshot["corrections"] == ["hurry up", "and the worktree ones"]
+
+
+def test_inflight_and_queued_snapshots_preserve_semantic_identity():
+    """Reconnect payloads must not turn typed machine data into a human row."""
+    semantic = {
+        "origin_kind": "agent",
+        "turn_kind": "continuation",
+        "trust_kind": "trusted_internal",
+        "provenance_metadata": {
+            "producer": "tui_gateway_prompt",
+            "source": "kanban",
+            "message_id": "kanban:route:event-17",
+        },
+    }
+    correction = {
+        "origin_kind": "human_user",
+        "turn_kind": "prompt",
+        "trust_kind": "user_authorized",
+        "provenance_metadata": {"message_id": "desktop:correction-1"},
+    }
+    session = {}
+
+    server._start_inflight_turn(
+        session,
+        "internal wake",
+        provenance=semantic,
+        display_kind="internal_notification",
+        display_metadata={"source": "kanban", "display_text": "Task finished"},
+    )
+    server._record_inflight_correction(session, "actually, wait", provenance=correction)
+    server._enqueue_prompt(session, "next prompt", "ws", provenance=correction)
+    second_correction = {
+        **correction,
+        "provenance_metadata": {"message_id": "desktop:correction-2"},
+    }
+    server._enqueue_prompt(session, "next prompt", "ws", provenance=second_correction)
+
+    inflight = server._inflight_snapshot(session)
+    queued = server._queued_prompt_snapshot(session)
+    queued_prompts = server._queued_prompt_snapshots(session)
+
+    assert inflight is not None
+    assert {key: inflight[key] for key in semantic} == semantic
+    assert inflight["display_kind"] == "internal_notification"
+    assert inflight["display_metadata"]["display_text"] == "Task finished"
+    assert inflight["correction_provenance"] == [correction]
+    assert queued is not None
+    assert {key: queued[key] for key in correction} == correction
+    assert [item["provenance_metadata"]["message_id"] for item in queued_prompts] == [
+        "desktop:correction-1",
+        "desktop:correction-2",
+    ]
 
 
 def test_inflight_snapshot_carries_arrival_order_offsets():
@@ -15697,7 +15778,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_args: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -15725,11 +15806,14 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
 
         inflight = resp["result"].get("inflight")
-        assert inflight == {
-            "assistant": "partial answer",
-            "streaming": True,
-            "user": "write a long answer",
-        }
+        assert inflight is not None
+        assert inflight["assistant"] == "partial answer"
+        assert inflight["streaming"] is True
+        assert inflight["user"] == "write a long answer"
+        assert inflight["origin_kind"] == "human_user"
+        assert inflight["turn_kind"] == "prompt"
+        assert inflight["trust_kind"] == "user_authorized"
+        assert inflight["provenance_metadata"]["message_id"].startswith("turn:")
         turn_started_at = resp["result"]["turn_started_at"]
         assert turn_started_at == server._sessions["sid-live"]["inflight_turn"]["started_at"]
         assert turn_started_at > 0
@@ -15756,6 +15840,84 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         server._sessions.pop("sid-live", None)
 
 
+def test_active_internal_wake_keeps_identity_through_live_and_durable_projection(monkeypatch):
+    """A Desktop reconnect must never repaint a running Kanban wake as human."""
+    started = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    metadata = {
+        "source": "kanban",
+        "internal": True,
+        "kind": "kanban_wake",
+        "message_id": "kanban-wake:route:event-17",
+        "display_text": "Task finished",
+    }
+
+    class _Agent:
+        model = "model-live"
+
+        def run_conversation(self, prompt, persist_user_provenance=None, **kwargs):
+            provenance = persist_user_provenance
+            assert provenance is not None
+            started.set()
+            assert release.wait(2)
+            return {
+                "final_response": "continued",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "display_kind": "internal_notification",
+                        "display_metadata": metadata,
+                        **provenance,
+                    },
+                    {"role": "assistant", "content": "continued"},
+                ],
+            }
+
+    session = _session(agent=_Agent(), running=True, session_key="stored-kanban")
+    server._sessions["sid-kanban"] = session
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_args: {"model": agent.model})
+
+    def _emit(event, _sid, _payload=None):
+        if event == "message.complete":
+            done.set()
+
+    monkeypatch.setattr(server, "_emit", _emit)
+    try:
+        server._run_prompt_submit(
+            "rid",
+            "sid-kanban",
+            session,
+            "internal model payload",
+            display_kind="internal_notification",
+            display_metadata=metadata,
+        )
+        assert started.wait(2)
+
+        live = server._live_session_payload("sid-kanban", session)
+        assert live["inflight"]["origin_kind"] == "agent"
+        assert live["inflight"]["turn_kind"] == "continuation"
+        assert live["inflight"]["trust_kind"] == "trusted_internal"
+        assert live["inflight"]["provenance_metadata"]["message_id"] == metadata["message_id"]
+        assert live["inflight"]["display_metadata"]["display_text"] == "Task finished"
+
+        release.set()
+        assert done.wait(2)
+        settled = server._live_session_payload("sid-kanban", session)
+        assert settled.get("inflight") is None
+        (durable_user,) = [row for row in settled["messages"] if row["role"] == "user"]
+        assert durable_user["origin_kind"] == "agent"
+        assert durable_user["provenance_metadata"]["message_id"] == metadata["message_id"]
+    finally:
+        release.set()
+        done.wait(2)
+        server._sessions.pop("sid-kanban", None)
+
+
 def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     """A full client restart must recover an accepted next-turn prompt.
 
@@ -15764,7 +15926,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_args: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -15778,9 +15940,35 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     server._sessions["sid-live"] = session
     try:
         queued = server._handle_busy_submit(
-            "submit", "sid-live", session, "newest prompt", object()
+            "submit",
+            "sid-live",
+            session,
+            "newest prompt",
+            object(),
+            provenance={
+                **HUMAN_PROVENANCE,
+                "provenance_metadata": {
+                    "message_id": "desktop:queued-live-1",
+                    "producer": "desktop_renderer",
+                },
+            },
         )
         assert queued["result"]["status"] == "queued"
+        queued_again = server._handle_busy_submit(
+            "submit-2",
+            "sid-live",
+            session,
+            "newest prompt",
+            object(),
+            provenance={
+                **HUMAN_PROVENANCE,
+                "provenance_metadata": {
+                    "message_id": "desktop:queued-live-2",
+                    "producer": "desktop_renderer",
+                },
+            },
+        )
+        assert queued_again["result"]["status"] == "queued"
 
         activated = server.handle_request(
             {
@@ -15790,7 +15978,18 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
             }
         )
 
-        assert activated["result"]["queued"] == {"user": "newest prompt"}
+        queued_snapshot = activated["result"]["queued"]
+        assert queued_snapshot["user"] == "newest prompt"
+        assert queued_snapshot["origin_kind"] == "human_user"
+        assert queued_snapshot["trust_kind"] == "user_authorized"
+        assert (
+            queued_snapshot["provenance_metadata"]["message_id"]
+            == "desktop:queued-live-1"
+        )
+        assert [
+            item["provenance_metadata"]["message_id"]
+            for item in activated["result"]["queued_prompts"]
+        ] == ["desktop:queued-live-1", "desktop:queued-live-2"]
         assert "transport" not in activated["result"]["queued"]
     finally:
         server._sessions.pop("sid-live", None)

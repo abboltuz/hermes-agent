@@ -127,6 +127,7 @@ def test_marker_roundtrip_preserves_only_bounded_provenance(tmp_path):
             "source": "kanban",
             "internal": True,
             "kind": "kanban_wake",
+            "message_id": "kanban-wake:route:event-17",
             "display_text": "task completed",
             "events": [
                 {
@@ -136,6 +137,9 @@ def test_marker_roundtrip_preserves_only_bounded_provenance(tmp_path):
                     "run_id": 9,
                     "event_kind": "completed",
                     "occurred_at": 1234,
+                    "platform": "tui",
+                    "chat_id": "session-key",
+                    "thread_id": "",
                     "arbitrary": "drop me",
                 }
             ],
@@ -151,6 +155,7 @@ def test_marker_roundtrip_preserves_only_bounded_provenance(tmp_path):
         "source": "kanban",
         "internal": True,
         "kind": "kanban_wake",
+        "message_id": "kanban-wake:route:event-17",
         "display_text": "task completed",
         "events": [
             {
@@ -160,6 +165,9 @@ def test_marker_roundtrip_preserves_only_bounded_provenance(tmp_path):
                 "run_id": 9,
                 "event_kind": "completed",
                 "occurred_at": 1234,
+                "platform": "tui",
+                "chat_id": "session-key",
+                "thread_id": "",
             }
         ],
     }
@@ -214,6 +222,7 @@ def test_internal_turn_marker_records_provenance(emits, turn_env, marker_home):
         "source": "kanban",
         "internal": True,
         "kind": "kanban_wake",
+        "message_id": "kanban-wake:route:event-17",
         "events": [
             {
                 "board": "hermes-agent-source",
@@ -236,7 +245,8 @@ def test_internal_turn_marker_records_provenance(emits, turn_env, marker_home):
     )
 
     assert seen_mid_turn[0]["display_kind"] == "internal_notification"
-    assert seen_mid_turn[0]["display_metadata"] == metadata
+    recorded_metadata = seen_mid_turn[0]["display_metadata"]
+    assert recorded_metadata == metadata
 
 
 def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
@@ -300,7 +310,11 @@ def test_continuation_turn_records_attempt_and_original_prompt(
 
     assert [(m["attempts"], m["prompt"]) for m in seen] == [(2, "the original prompt")]
     assert seen[0]["display_kind"] == "internal_notification"
-    assert seen[0]["display_metadata"] == original_metadata
+    recorded_metadata = seen[0]["display_metadata"]
+    assert {
+        key: value for key, value in recorded_metadata.items() if key != "message_id"
+    } == original_metadata
+    assert recorded_metadata["message_id"].startswith("turn:")
     # Consumed, so the NEXT user turn starts from a clean slate.
     assert "_auto_continue_attempt" not in session
     assert "_auto_continue_prompt" not in session
@@ -509,6 +523,7 @@ def test_internal_marker_recovery_preserves_provenance(
         "source": "kanban",
         "internal": True,
         "kind": "kanban_wake",
+        "message_id": "kanban-wake:route:event-17",
         "events": [
             {
                 "board": "hermes-agent-source",
@@ -679,5 +694,3 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 
 # ── End to end: continuation runs a real turn and clears the marker ────
-
-

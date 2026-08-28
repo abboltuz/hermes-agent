@@ -132,7 +132,14 @@ def test_healthy_snapshot_carries_no_error_keys():
     server._append_inflight_delta(session, "hello")
 
     snapshot = server._inflight_snapshot(session)
-    assert snapshot == {"assistant": "hello", "streaming": True, "user": "hi"}
+    assert snapshot == {
+        "assistant": "hello",
+        "streaming": True,
+        "user": "hi",
+        "origin_kind": "legacy_unknown",
+        "turn_kind": "legacy_unknown",
+        "trust_kind": "legacy_unknown",
+    }
 
 
 # ── Returned-error path (run_conversation returns an error result) ────

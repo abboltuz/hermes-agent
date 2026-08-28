@@ -869,8 +869,15 @@ def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monk
 
     active_turn = {
         "assistant": "partial answer",
+        "origin_kind": "human_user",
+        "provenance_metadata": {
+            "message_id": "desktop:active-turn-1",
+            "producer": "desktop_renderer",
+        },
         "started_at": fixture["turn_started_at"],
         "streaming": True,
+        "trust_kind": "user_authorized",
+        "turn_kind": "prompt",
         "user": "current prompt",
     }
     server._sessions[fixture["session_id"]] = {
