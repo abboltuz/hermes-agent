@@ -11433,10 +11433,28 @@ def test_session_redirect_rpc_drops_queued_duplicate_of_inflight_user():
         "assistant": "partial",
         "streaming": True,
         "error": "",
+        "origin_kind": "human_user",
+        "turn_kind": "prompt",
+        "trust_kind": "user_authorized",
+        "provenance_metadata": {"message_id": "desktop:original"},
     }
-    session["queued_prompt"] = {"text": original, "transport": "ws-1"}
+    original_provenance = {
+        "origin_kind": "human_user",
+        "turn_kind": "prompt",
+        "trust_kind": "user_authorized",
+        "provenance_metadata": {"message_id": "desktop:original"},
+    }
+    session["queued_prompt"] = {
+        "text": original,
+        "transport": "ws-1",
+        "provenance": original_provenance,
+    }
     session["queued_prompts"] = [
-        {"text": original, "transport": "ws-1"},
+        {
+            "text": original,
+            "transport": "ws-1",
+            "provenance": original_provenance,
+        },
         {"text": "unrelated later task", "transport": "ws-1"},
     ]
     server._sessions["sid"] = session
@@ -11477,8 +11495,21 @@ def test_session_redirect_build_window_scrubs_stale_p_when_queuing_q():
         "assistant": "",
         "streaming": True,
         "error": "",
+        "origin_kind": "human_user",
+        "turn_kind": "prompt",
+        "trust_kind": "user_authorized",
+        "provenance_metadata": {"message_id": "desktop:original"},
     }
-    session["queued_prompt"] = {"text": original, "transport": "ws-1"}
+    session["queued_prompt"] = {
+        "text": original,
+        "transport": "ws-1",
+        "provenance": {
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+            "provenance_metadata": {"message_id": "desktop:original"},
+        },
+    }
     server._sessions["sid"] = session
     try:
         resp = server.handle_request(
