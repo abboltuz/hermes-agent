@@ -121,15 +121,23 @@ _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
 
 
-def _validated_profile(profile: str) -> str:
+def _validated_profile(profile: str, *, require_existing: bool = True) -> str:
     """Return a safe canonical ledger profile before any path resolution."""
     profile_name = str(profile or "").strip()
     if not profile_name or profile_name == "custom":
         return profile_name
-    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+    from hermes_cli.profiles import (
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
 
     canonical = normalize_profile_name(profile_name)
     validate_profile_name(canonical)
+    if require_existing and not profile_exists(canonical):
+        raise ValueError(
+            f"profile {canonical!r} is not served or does not exist"
+        )
     return canonical
 
 
@@ -168,8 +176,14 @@ def _connect(*, profile: str = "") -> sqlite3.Connection:
 def _event_ledger_profile(evt: Dict[str, Any]) -> str:
     """Return the immutable physical ledger stamped during recovery."""
     if "_durable_profile" in evt:
-        return _validated_profile(str(evt.get("_durable_profile") or ""))
-    return _validated_profile(str(evt.get("origin_profile") or ""))
+        return _validated_profile(
+            str(evt.get("_durable_profile") or ""),
+            require_existing=False,
+        )
+    return _validated_profile(
+        str(evt.get("origin_profile") or ""),
+        require_existing=False,
+    )
 
 
 def _bind_physical_profile(
@@ -182,14 +196,18 @@ def _bind_physical_profile(
 
     Returns True when conflicting or legacy metadata was corrected.
     """
-    ledger_profile = _validated_profile(profile)
+    # The surrounding transaction has already opened this physical ledger via
+    # _db_path(), including existence validation. Revalidate syntax here, but
+    # do not re-query the filesystem after the ledger is open.
+    ledger_profile = _validated_profile(profile, require_existing=False)
     physical = ledger_profile
     if not physical:
         try:
             from hermes_cli.profiles import get_active_profile_name
 
             physical = _validated_profile(
-                get_active_profile_name() or "default"
+                get_active_profile_name() or "default",
+                require_existing=False,
             )
         except Exception:
             physical = "default"
