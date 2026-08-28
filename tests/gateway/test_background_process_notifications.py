@@ -857,11 +857,49 @@ async def test_named_profile_key_without_stored_source_uses_profile_adapter(
 
 
 @pytest.mark.asyncio
+async def test_served_profile_api_key_self_posts_profile_qualified(
+    monkeypatch, tmp_path
+):
+    """The shared API listener must retain a valid named key's profile route."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._profile_adapters = {"writer": {}}
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    wakes = []
+
+    async def capture_wake(adapter, **kwargs):
+        wakes.append((adapter, kwargs))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", capture_wake)
+
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-writer-api-key",
+            "session_key": "agent:writer:api_server:dm:raw-writer-session",
+        },
+    )
+
+    assert result is True
+    api_adapter.handle_message.assert_not_awaited()
+    assert len(wakes) == 1
+    assert wakes[0][0] is api_adapter
+    assert wakes[0][1]["session_id"] == "raw-writer-session"
+    assert wakes[0][1]["profile"] == "writer"
+    assert wakes[0][1]["route_profile"] == "writer"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "key",
     [
         "agent:../escape:telegram:dm:victim",
         "agent:definitely-unserved-review-profile:telegram:dm:victim",
+        "agent:definitely-unserved-review-profile:api_server:dm:victim",
     ],
 )
 async def test_invalid_or_unserved_profile_key_cannot_fall_back(
