@@ -121,6 +121,18 @@ _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
 
 
+def _validated_profile(profile: str) -> str:
+    """Return a safe canonical ledger profile before any path resolution."""
+    profile_name = str(profile or "").strip()
+    if not profile_name or profile_name == "custom":
+        return profile_name
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    canonical = normalize_profile_name(profile_name)
+    validate_profile_name(canonical)
+    return canonical
+
+
 def _db_path(profile: str = ""):
     """Return the durable ledger path for an explicit originating profile.
 
@@ -129,7 +141,7 @@ def _db_path(profile: str = ""):
     profile's ledger, so a claim can look like a legacy/non-durable event while
     the real named-profile row remains pending forever.
     """
-    profile_name = str(profile or "").strip()
+    profile_name = _validated_profile(profile)
     if profile_name and profile_name != "custom":
         from hermes_cli.profiles import get_profile_dir
 
@@ -151,6 +163,73 @@ def _connect(*, profile: str = "") -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def _event_ledger_profile(evt: Dict[str, Any]) -> str:
+    """Return the immutable physical ledger stamped during recovery."""
+    if "_durable_profile" in evt:
+        return _validated_profile(str(evt.get("_durable_profile") or ""))
+    return _validated_profile(str(evt.get("origin_profile") or ""))
+
+
+def _bind_physical_profile(
+    evt: Dict[str, Any],
+    *,
+    profile: str,
+    stamp_ledger: bool,
+) -> bool:
+    """Make the physical database authoritative over persisted metadata.
+
+    Returns True when conflicting or legacy metadata was corrected.
+    """
+    ledger_profile = _validated_profile(profile)
+    physical = ledger_profile
+    if not physical:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            physical = _validated_profile(
+                get_active_profile_name() or "default"
+            )
+        except Exception:
+            physical = "default"
+    persisted = str(evt.get("origin_profile") or "").strip()
+    route_profile = str(
+        evt.get("origin_api_route_profile") or ""
+    ).strip()
+    changed = persisted != physical
+    if physical:
+        evt["origin_profile"] = physical
+        if route_profile and route_profile != physical:
+            evt["origin_api_route_profile"] = physical
+            changed = True
+    if stamp_ledger:
+        # Keep the empty ledger selector for the active/default/custom DB so
+        # claims reuse get_hermes_home(); named secondary ledgers stay explicit.
+        evt["_durable_profile"] = ledger_profile
+    return changed
+
+
+def _drop_malformed_recovery_row(
+    conn: sqlite3.Connection,
+    delegation_id: str,
+    *,
+    now: float,
+    stage: str,
+) -> None:
+    """Terminally quarantine one unreadable row without logging its payload."""
+    conn.execute(
+        """UPDATE async_delegations SET state='unknown', delivery_state='dropped',
+                  delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+           WHERE delegation_id=?""",
+        (now, delegation_id),
+    )
+    logger.warning(
+        "Async delegation %s has malformed %s metadata; terminally dropping "
+        "recovery for this row",
+        delegation_id,
+        stage,
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -383,7 +462,24 @@ def recover_abandoned_delegations(*, profile: str = "") -> int:
                     live = get_process_start_time(int(pid)) == int(started)
             if live:
                 continue
-            task = json.loads(task_json or "{}")
+            try:
+                task = json.loads(task_json or "{}")
+            except (TypeError, ValueError):
+                _drop_malformed_recovery_row(
+                    conn,
+                    delegation_id,
+                    now=now,
+                    stage="task",
+                )
+                continue
+            if not isinstance(task, dict):
+                _drop_malformed_recovery_row(
+                    conn,
+                    delegation_id,
+                    now=now,
+                    stage="task",
+                )
+                continue
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -410,10 +506,17 @@ def recover_abandoned_delegations(*, profile: str = "") -> int:
             ):
                 if task.get(_k):
                     event[_k] = task[_k]
-            if profile and not event.get("origin_profile"):
-                # Older durable rows predate the explicit provenance field,
-                # but their physical profile ledger is itself authoritative.
-                event["origin_profile"] = profile
+            corrected_profile = _bind_physical_profile(
+                event,
+                profile=profile,
+                stamp_ledger=False,
+            )
+            if corrected_profile:
+                logger.warning(
+                    "Async delegation %s recovery corrected profile provenance "
+                    "from its physical ledger",
+                    delegation_id,
+                )
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -472,11 +575,44 @@ def restore_undelivered_completions(target_queue, *, profile: str = "") -> int:
                     _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
                 )
                 continue
-            evt = json.loads(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
-                if profile and not evt.get("origin_profile"):
-                    evt["origin_profile"] = profile
+            try:
+                evt = json.loads(payload)
+            except (TypeError, ValueError):
+                _drop_malformed_recovery_row(
+                    conn,
+                    delegation_id,
+                    now=now,
+                    stage="event",
+                )
+                continue
+            if not isinstance(evt, dict):
+                _drop_malformed_recovery_row(
+                    conn,
+                    delegation_id,
+                    now=now,
+                    stage="event",
+                )
+                continue
+            corrected_profile = _bind_physical_profile(
+                evt,
+                profile=profile,
+                stamp_ledger=False,
+            )
+            if corrected_profile:
+                # Persist only the corrected public provenance. Recovery-only
+                # markers stay in memory and cannot leak into provider history.
+                conn.execute(
+                    "UPDATE async_delegations SET event_json=?, updated_at=? "
+                    "WHERE delegation_id=?",
+                    (json.dumps(evt), now, delegation_id),
+                )
+                logger.warning(
+                    "Async delegation %s restore corrected profile provenance "
+                    "from its physical ledger",
+                    delegation_id,
+                )
+            evt["restored"] = True
+            _bind_physical_profile(evt, profile=profile, stamp_ledger=True)
             target_queue.put(evt)
             restored += 1
     return restored
@@ -495,7 +631,11 @@ def mark_completion_delivered(delegation_id: str, *, profile: str = "") -> bool:
 
 
 def claim_completion_delivery(
-    delegation_id: str, claim_id: str, *, profile: str = ""
+    delegation_id: str,
+    claim_id: str,
+    *,
+    profile: str = "",
+    require_existing: bool = False,
 ) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
@@ -505,7 +645,10 @@ def claim_completion_delivery(
             (delegation_id,),
         ).fetchone()
         if row is None:
-            return True  # legacy event created before durable dispatch
+            # Legacy in-memory events created before durable dispatch may have
+            # no row. Restored events, however, are stamped with their physical
+            # ledger and must never turn a wrong-ledger miss into a fake claim.
+            return not require_existing
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
@@ -524,10 +667,15 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    profile = str(evt.get("origin_profile") or "")
+    profile = _event_ledger_profile(evt)
     return (
         claim_id
-        if claim_completion_delivery(delegation_id, claim_id, profile=profile)
+        if claim_completion_delivery(
+            delegation_id,
+            claim_id,
+            profile=profile,
+            require_existing="_durable_profile" in evt,
+        )
         else None
     )
 
@@ -616,7 +764,7 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         complete_completion_delivery(
             str(evt.get("delegation_id") or ""),
             claim_id,
-            profile=str(evt.get("origin_profile") or ""),
+            profile=_event_ledger_profile(evt),
         )
 
 
@@ -625,7 +773,7 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         release_completion_delivery(
             str(evt.get("delegation_id") or ""),
             claim_id,
-            profile=str(evt.get("origin_profile") or ""),
+            profile=_event_ledger_profile(evt),
         )
 
 

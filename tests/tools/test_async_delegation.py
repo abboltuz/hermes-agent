@@ -216,6 +216,183 @@ def test_api_profile_route_provenance_survives_durable_delegation():
     assert durable["origin_api_route_profile"] == "writer"
 
 
+def _persist_profile_completion(delegation_id: str, *, profile: str) -> dict:
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": "memory-scope",
+        "origin_session_id": "raw-session",
+        "parent_session_id": "parent-session",
+        "origin_profile": profile,
+        "origin_api_route_profile": profile,
+        "goal": "recover",
+        "status": "completed",
+        "summary": "done",
+        "dispatched_at": time.time() - 1,
+        "completed_at": time.time(),
+    }
+    ad._persist_dispatch({**event, "role": "leaf", "model": "m"})
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    return event
+
+
+def test_restore_uses_physical_profile_for_conflicting_current_schema(
+    monkeypatch, tmp_path
+):
+    """Persisted profile text cannot redirect claims away from its ledger."""
+    monkeypatch.setattr(
+        ad,
+        "_db_path",
+        lambda profile="": tmp_path / f"{profile or 'default'}.db",
+    )
+    event = _persist_profile_completion("deleg-conflict", profile="writer")
+    conflicting = {
+        **event,
+        "origin_profile": "default",
+        "origin_api_route_profile": "default",
+    }
+    with ad._DB_LOCK, ad._transaction(profile="writer") as conn:
+        task = json.loads(
+            conn.execute(
+                "SELECT task_json FROM async_delegations WHERE delegation_id=?",
+                (event["delegation_id"],),
+            ).fetchone()[0]
+        )
+        task["origin_profile"] = "default"
+        task["origin_api_route_profile"] = "default"
+        conn.execute(
+            "UPDATE async_delegations SET event_json=?, task_json=? WHERE delegation_id=?",
+            (json.dumps(conflicting), json.dumps(task), event["delegation_id"]),
+        )
+
+    restored_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(
+        restored_queue, profile="writer"
+    ) == 1
+    restored = restored_queue.get_nowait()
+    assert restored["origin_profile"] == "writer"
+    assert restored["origin_api_route_profile"] == "writer"
+    assert restored["_durable_profile"] == "writer"
+    claim_id = ad.claim_event_delivery(restored, "test")
+    assert claim_id
+    ad.complete_event_delivery(restored, claim_id)
+    row = ad.get_durable_delegation(
+        event["delegation_id"], profile="writer"
+    )
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == 1
+
+
+def test_restore_legacy_event_without_profile_binds_physical_ledger(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        ad,
+        "_db_path",
+        lambda profile="": tmp_path / f"{profile or 'default'}.db",
+    )
+    event = _persist_profile_completion("deleg-legacy", profile="writer")
+    legacy = dict(event)
+    legacy.pop("origin_profile")
+    with ad._DB_LOCK, ad._transaction(profile="writer") as conn:
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            (json.dumps(legacy), event["delegation_id"]),
+        )
+
+    restored_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(
+        restored_queue, profile="writer"
+    ) == 1
+    restored = restored_queue.get_nowait()
+    assert restored["origin_profile"] == "writer"
+    assert restored["_durable_profile"] == "writer"
+
+
+def test_restore_drops_malformed_event_and_continues_later_rows(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        ad,
+        "_db_path",
+        lambda profile="": tmp_path / f"{profile or 'default'}.db",
+    )
+    malformed = _persist_profile_completion("a-malformed", profile="writer")
+    good = _persist_profile_completion("z-good", profile="writer")
+    with ad._DB_LOCK, ad._transaction(profile="writer") as conn:
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            ("{not-json", malformed["delegation_id"]),
+        )
+
+    restored_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(
+        restored_queue, profile="writer"
+    ) == 1
+    assert restored_queue.get_nowait()["delegation_id"] == good["delegation_id"]
+    bad_row = ad.get_durable_delegation(
+        malformed["delegation_id"], profile="writer"
+    )
+    assert bad_row is not None
+    assert bad_row["delivery_state"] == "dropped"
+
+
+def test_recover_drops_malformed_task_and_continues_later_rows(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        ad,
+        "_db_path",
+        lambda profile="": tmp_path / f"{profile or 'default'}.db",
+    )
+    now = time.time()
+    base = {
+        "type": "async_delegation",
+        "session_key": "memory-scope",
+        "origin_profile": "writer",
+        "origin_api_route_profile": "writer",
+        "parent_session_id": "parent-session",
+        "goal": "recover abandoned",
+        "role": "leaf",
+        "model": "m",
+        "status": "running",
+        "dispatched_at": now - 1,
+    }
+    ad._persist_dispatch({**base, "delegation_id": "a-malformed-task"})
+    ad._persist_dispatch({**base, "delegation_id": "z-valid-task"})
+    with ad._DB_LOCK, ad._transaction(profile="writer") as conn:
+        conn.execute(
+            "UPDATE async_delegations SET task_json=?, owner_pid=? "
+            "WHERE delegation_id=?",
+            ("{not-json", 99999999, "a-malformed-task"),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (99999999, "z-valid-task"),
+        )
+
+    assert ad.recover_abandoned_delegations(profile="writer") == 1
+    with ad._DB_LOCK, ad._transaction(profile="writer") as conn:
+        states = dict(
+            conn.execute(
+                "SELECT delegation_id, delivery_state FROM async_delegations"
+            ).fetchall()
+        )
+        recovered_state = conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?",
+            ("z-valid-task",),
+        ).fetchone()[0]
+    assert states["a-malformed-task"] == "dropped"
+    assert states["z-valid-task"] == "pending"
+    assert recovered_state == "unknown"
+
+
+def test_recovery_rejects_profile_traversal_before_path_resolution():
+    with pytest.raises(ValueError, match="Invalid profile name"):
+        ad.restore_undelivered_completions(queue.Queue(), profile="../escape")
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",

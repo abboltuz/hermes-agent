@@ -3281,6 +3281,68 @@ def terminal_tool(
                 "EOF."
             )
 
+        # Resolve notification capability and routing BEFORE spawning. The
+        # registry writes its first process checkpoint inside spawn_local /
+        # spawn_via_env, so assigning these fields after the call leaves a
+        # crash window where the durable row cannot route the completion.
+        _spawn_routing_metadata: Dict[str, Any] = {}
+        _notify_unsupported_message = ""
+        conflict_note = None
+        if background and (notify_on_complete or watch_patterns):
+            from gateway.session_context import (
+                async_delivery_supported as _async_ok,
+                get_session_env as _gse,
+            )
+
+            _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+            _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
+            _api_self_post_ok = (
+                _gw_platform == "api_server" and bool(_gw_chat_id)
+            )
+            if not _async_ok() and not _api_self_post_ok:
+                notify_on_complete = False
+                watch_patterns = None
+                _notify_unsupported_message = (
+                    "notify_on_complete / watch_patterns are not available in "
+                    "this session — it cannot receive an async completion after "
+                    "the turn ends (a one-shot runner such as `hermes -z`, a "
+                    "cron job, a Kanban worker, or a stateless HTTP endpoint). "
+                    "The process is running in the background; retrieve its "
+                    "result with process(action='poll') or process(action='wait')."
+                )
+
+            watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+                notify_on_complete=bool(notify_on_complete),
+                watch_patterns=watch_patterns,
+                background=True,
+            )
+            _spawn_routing_metadata = {
+                "notify_on_complete": bool(notify_on_complete),
+                "watch_patterns": list(watch_patterns or []),
+                "watcher_interval": (
+                    5 if notify_on_complete and _gw_platform else 0
+                ),
+            }
+            if _gw_platform:
+                _spawn_routing_metadata.update(
+                    {
+                        "watcher_platform": _gw_platform,
+                        "watcher_chat_id": _gw_chat_id,
+                        "watcher_user_id": _gse("HERMES_SESSION_USER_ID", ""),
+                        "watcher_user_name": _gse("HERMES_SESSION_USER_NAME", ""),
+                        "watcher_thread_id": _gse("HERMES_SESSION_THREAD_ID", ""),
+                        "watcher_message_id": _gse("HERMES_SESSION_MESSAGE_ID", ""),
+                        "origin_profile": _gse("HERMES_SESSION_PROFILE", ""),
+                        "origin_api_route_profile": _gse(
+                            "HERMES_SESSION_API_ROUTE_PROFILE", ""
+                        ),
+                        "origin_session_id": (
+                            _gw_chat_id if _gw_platform == "api_server" else ""
+                        ),
+                        "parent_session_id": _gse("HERMES_SESSION_ID", ""),
+                    }
+                )
+
         # The session key is already computed above the gateway guard.
         if background:
             # Spawn a tracked background process via the process registry.
@@ -3303,6 +3365,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        routing_metadata=_spawn_routing_metadata,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3311,6 +3374,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        routing_metadata=_spawn_routing_metadata,
                     )
 
                 result_data = {
@@ -3433,88 +3497,15 @@ def terminal_tool(
                             else canonical_hint
                         )
 
-                # Populate routing metadata on the session so that
-                # watch-pattern and completion notifications can be
-                # routed back to the correct chat/thread.
-                if background and (notify_on_complete or watch_patterns):
-                    from gateway.session_context import (
-                        async_delivery_supported as _async_ok,
-                        get_session_env as _gse,
+                if _notify_unsupported_message:
+                    result_data["notify_on_complete"] = False
+                    result_data["notify_unsupported"] = _notify_unsupported_message
+                    logger.info(
+                        "background proc %s: async delivery unsupported on this "
+                        "session; notify_on_complete/watch_patterns disabled",
+                        proc_session.id,
                     )
 
-                    _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-                    _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
-                    # api_server cannot push, but its raw continuation id is a
-                    # durable return address: the gateway watcher self-posts
-                    # the completion through the exact profile-qualified HTTP
-                    # route. Other finite runtimes still have no wake path.
-                    _api_self_post_ok = (
-                        _gw_platform == "api_server" and bool(_gw_chat_id)
-                    )
-                    if not _async_ok() and not _api_self_post_ok:
-                        notify_on_complete = False
-                        watch_patterns = None
-                        result_data["notify_on_complete"] = False
-                        result_data["notify_unsupported"] = (
-                            "notify_on_complete / watch_patterns are not available in "
-                            "this session — it cannot receive an async completion after "
-                            "the turn ends (a one-shot runner such as `hermes -z`, a "
-                            "cron job, a Kanban worker, or a stateless HTTP endpoint). "
-                            "The process is "
-                            "running in the background; retrieve its result with "
-                            "process(action='poll') or process(action='wait')."
-                        )
-                        logger.info(
-                            "background proc %s: async delivery unsupported on this "
-                            "session; notify_on_complete/watch_patterns disabled",
-                            proc_session.id,
-                        )
-                    else:
-                        if _gw_platform:
-                            _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
-                            _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
-                            _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
-                            _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
-                            _gw_profile = _gse("HERMES_SESSION_PROFILE", "")
-                            _gw_api_route_profile = _gse(
-                                "HERMES_SESSION_API_ROUTE_PROFILE", ""
-                            )
-                            proc_session.watcher_platform = _gw_platform
-                            proc_session.watcher_chat_id = _gw_chat_id
-                            proc_session.watcher_user_id = _gw_user_id
-                            proc_session.watcher_user_name = _gw_user_name
-                            proc_session.watcher_thread_id = _gw_thread_id
-                            proc_session.watcher_message_id = _gw_message_id
-                            proc_session.origin_profile = _gw_profile
-                            proc_session.origin_api_route_profile = (
-                                _gw_api_route_profile
-                            )
-                            if _gw_platform == "api_server":
-                                # Raw continuation id, distinct from the
-                                # optional long-term-memory session_key.
-                                proc_session.origin_session_id = _gw_chat_id
-                            # Stamp the spawning conversation's session-db id
-                            # so the gateway's completion pre-flight
-                            # (_classify_completion_target) can drop the
-                            # notification when the user closes this session
-                            # (/new) before the process finishes, instead of
-                            # injecting it into the chat's NEW session.
-                            proc_session.parent_session_id = _gse(
-                                "HERMES_SESSION_ID", ""
-                            )
-
-                # Mutual exclusion: if both notify_on_complete and watch_patterns
-                # are set, drop watch_patterns. The combination produces duplicate
-                # notifications (one per match + one on exit) that deliver
-                # asynchronously and can spam the user long after the process ends.
-                # notify_on_complete is the more useful signal for "let me know
-                # when the task finishes"; watch_patterns should be reserved for
-                # standalone mid-process signals on long-lived processes.
-                watch_patterns, conflict_note = _resolve_notification_flag_conflict(
-                    notify_on_complete=bool(notify_on_complete),
-                    watch_patterns=watch_patterns,
-                    background=bool(background),
-                )
                 if conflict_note:
                     logger.warning("background proc %s: %s", proc_session.id, conflict_note)
                     result_data["watch_patterns_ignored"] = conflict_note
