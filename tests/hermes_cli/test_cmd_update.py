@@ -83,9 +83,18 @@ def _patch_gateway_discovery():
     Discovery returning nothing makes the phase a clean no-op for every test
     in this module (none of them assert on gateway restarts).
     """
+    from hermes_cli.update_inventory import UpdatePlan
+
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway.is_macos", return_value=False), \
+         patch(
+             "hermes_cli.update_inventory.collect_runtime_inventory",
+             return_value=UpdatePlan(),
+         ), \
+         patch("hermes_cli.main._purge_stale_hermes_modules"), \
+         patch("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", return_value=None):
         yield
 
 

@@ -44,6 +44,7 @@ _RUNTIME_DIR_NAME = ".hermes-runtime"
 _VENV_NAME = "venv"
 _ALT_VENV_NAME = ".venv"
 _REPAIR_LOCK_NAME = "runtime-repair.lock"
+_MACOS_MANAGED_PYTHON_IDENTIFIER = "com.nousresearch.hermes.managed-python"
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -114,6 +115,113 @@ def managed_python_env(
         "UV_PYTHON_INSTALL_REGISTRY": "0",
     })
     return env
+
+
+def _macos_managed_python_requirement_is_stable(output: str) -> bool:
+    """Return True only for the identifier-pinned managed-Python DR."""
+    designated = [
+        line.strip()
+        for line in output.splitlines()
+        if line.strip().lower().startswith("designated =>")
+    ]
+    if len(designated) != 1 or "cdhash" in output.lower():
+        return False
+    requirement = designated[0].split("=>", 1)[1].strip()
+    return requirement == (
+        f'identifier "{_MACOS_MANAGED_PYTHON_IDENTIFIER}"'
+    )
+
+
+def _macos_verify_managed_python_identity(
+    python: Path, *, codesign: str | None = None
+) -> bool:
+    """Verify the stable DR and strict signature of a managed interpreter."""
+    if platform.system() != "Darwin":
+        return False
+    codesign = codesign or shutil.which("codesign")
+    if not codesign:
+        return False
+    try:
+        requirement = subprocess.run(
+            [codesign, "-d", "-r-", str(python)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        requirement_output = "\n".join(
+            part for part in (requirement.stdout, requirement.stderr) if part
+        )
+        if requirement.returncode != 0 or not _macos_managed_python_requirement_is_stable(
+            requirement_output
+        ):
+            return False
+        verified = subprocess.run(
+            [codesign, "--verify", "--deep", "--strict", str(python)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return verified.returncode == 0
+    except Exception:
+        return False
+
+
+def _macos_sign_managed_python(python: Path) -> bool:
+    """Give a managed Python an identifier-pinned, strictly verified DR.
+
+    Runtime-generation repair remains best effort: callers may proceed when
+    this returns False.  The TCC anchor calls the same helper fail closed.
+    """
+    if platform.system() != "Darwin":
+        return False
+
+    codesign = shutil.which("codesign")
+    if not codesign:
+        logger.info(
+            "macOS codesign is unavailable; using the downloaded Python signature"
+        )
+        return False
+
+    requirement = (
+        "=designated => identifier "
+        f'"{_MACOS_MANAGED_PYTHON_IDENTIFIER}"'
+    )
+    try:
+        signed = subprocess.run(
+            [
+                codesign,
+                "--force",
+                "--deep",
+                "--sign",
+                "-",
+                "--timestamp=none",
+                "--identifier",
+                _MACOS_MANAGED_PYTHON_IDENTIFIER,
+                "--requirements",
+                requirement,
+                str(python),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if signed.returncode != 0:
+            logger.warning(
+                "could not stably sign managed Python %s: %s",
+                python,
+                (signed.stderr or signed.stdout or "codesign failed").strip(),
+            )
+            return False
+        if not _macos_verify_managed_python_identity(python, codesign=codesign):
+            logger.warning(
+                "managed Python signature lacks the required stable identity: %s",
+                python,
+            )
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("could not sign managed Python %s: %s", python, exc)
+        return False
 
 
 @dataclass(frozen=True)
@@ -595,6 +703,11 @@ def _attempt_install_generation(
         logger.warning("uv resolved Python outside the Hermes generation: %s", python)
         _remove_tree(generation, boundary=python_root)
         return None
+
+    # Stable identity is best effort for the general runtime-repair path: the
+    # SQLite security repair must still proceed if codesign is unavailable.
+    # The TCC anchor consumes the same helper fail closed before activation.
+    _macos_sign_managed_python(python)
 
     candidate = probe_sqlite_runtime(python)
     if candidate is None:
