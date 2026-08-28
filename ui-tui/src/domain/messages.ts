@@ -29,7 +29,18 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       continue
     }
 
-    const { context, display_kind, name, origin_kind, role, text, timestamp, trust_kind, turn_kind } =
+    const {
+      context,
+      display_kind,
+      name,
+      origin_kind,
+      provenance_metadata,
+      role,
+      text,
+      timestamp,
+      trust_kind,
+      turn_kind
+    } =
       row as TranscriptRow
 
     const createdAt =
@@ -107,7 +118,20 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
       const displayText = displayRole === 'system' && role === 'user' ? `[${actorLabel}] ${text}` : text
 
-      out.push({ role: displayRole, text: displayText, ...(createdAt !== undefined && { createdAt }) })
+      const messageId =
+        typeof provenance_metadata?.message_id === 'string' && provenance_metadata.message_id.trim()
+          ? provenance_metadata.message_id.trim()
+          : undefined
+
+      out.push({
+        role: displayRole,
+        text: displayText,
+        ...(createdAt !== undefined && { createdAt }),
+        ...(messageId && { messageId }),
+        ...(origin_kind && { originKind: origin_kind }),
+        ...(turn_kind && { turnKind: turn_kind }),
+        ...(trust_kind && { trustKind: trust_kind })
+      })
       pending = []
     }
   }
@@ -130,6 +154,7 @@ interface TranscriptRow {
   display_metadata?: { task_count?: number; [key: string]: unknown }
   name?: string
   origin_kind?: string
+  provenance_metadata?: Record<string, boolean | number | string>
   role?: string
   text?: string
   timestamp?: number

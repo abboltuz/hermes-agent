@@ -58,14 +58,102 @@ describe('live session activation in-flight state', () => {
   })
 
   it('keeps the in-flight user prompt in history and hydrates partial assistant text', () => {
-    const inflight = { assistant: 'partial answer', streaming: true, user: 'write a long answer' }
+    const inflight = {
+      assistant: 'partial answer',
+      streaming: true,
+      user: 'write a long answer',
+      origin_kind: 'human_user',
+      turn_kind: 'prompt',
+      trust_kind: 'user_authorized',
+      provenance_metadata: { message_id: 'tui:prompt-1' }
+    }
 
-    expect(liveSessionInflightMessages(inflight)).toEqual([{ role: 'user', text: 'write a long answer' }])
+    expect(liveSessionInflightMessages(inflight)).toEqual([
+      {
+        role: 'user',
+        text: 'write a long answer',
+        messageId: 'tui:prompt-1',
+        originKind: 'human_user',
+        turnKind: 'prompt',
+        trustKind: 'user_authorized'
+      }
+    ])
 
     hydrateLiveSessionInflight(inflight)
 
     expect(turnController.bufRef).toBe('partial answer')
     expect(getTurnState().streaming).toBe('partial answer')
+  })
+
+  it('fails closed when an older gateway omits transient provenance', () => {
+    expect(liveSessionInflightMessages({ assistant: '', streaming: true, user: 'ambiguous text' })).toEqual([
+      { role: 'system', text: '[Source unknown] ambiguous text' }
+    ])
+  })
+
+  it('projects an active internal wake as a system actor with semantic identity', () => {
+    const inflight = {
+      assistant: '',
+      streaming: true,
+      user: 'internal model payload',
+      display_kind: 'internal_notification',
+      display_metadata: { display_text: 'Task finished' },
+      origin_kind: 'agent',
+      turn_kind: 'continuation',
+      trust_kind: 'trusted_internal',
+      provenance_metadata: { message_id: 'kanban-wake:route:event-17' }
+    }
+
+    expect(liveSessionInflightMessages(inflight)).toEqual([
+      {
+        role: 'system',
+        text: '[agent] Task finished',
+        messageId: 'kanban-wake:route:event-17',
+        originKind: 'agent',
+        turnKind: 'continuation',
+        trustKind: 'trusted_internal'
+      }
+    ])
+  })
+
+  it('composes durable, in-flight, and queued copies by immutable identity', () => {
+    const semantic = {
+      origin_kind: 'agent',
+      turn_kind: 'continuation',
+      trust_kind: 'trusted_internal',
+      provenance_metadata: { message_id: 'kanban-wake:route:event-17' }
+    }
+
+    const transcript = [
+      {
+        role: 'system' as const,
+        text: '[agent] Task finished',
+        messageId: 'kanban-wake:route:event-17'
+      }
+    ]
+
+    expect(
+      liveSessionInflightMessages(
+        { assistant: '', streaming: true, user: 'internal payload', ...semantic },
+        { user: 'same queued payload', ...semantic },
+        transcript
+      )
+    ).toEqual([])
+  })
+
+  it('restores the complete queued FIFO and keeps repeated text identities distinct', () => {
+    const queued = (messageId: string) => ({
+      user: 'repeat this',
+      origin_kind: 'human_user',
+      turn_kind: 'prompt',
+      trust_kind: 'user_authorized',
+      provenance_metadata: { message_id: messageId }
+    })
+
+    expect(liveSessionInflightMessages(null, null, [], [queued('tui:q1'), queued('tui:q2')])).toEqual([
+      expect.objectContaining({ role: 'user', text: 'repeat this', messageId: 'tui:q1' }),
+      expect.objectContaining({ role: 'user', text: 'repeat this', messageId: 'tui:q2' })
+    ])
   })
 
   it('ignores empty in-flight payloads', () => {

@@ -21,8 +21,12 @@ export interface GatewayTranscriptMessage {
   display_kind?: string
   display_metadata?: Record<string, unknown>
   name?: string
+  origin_kind?: string
+  provenance_metadata?: Record<string, boolean | number | string>
   role: 'assistant' | 'system' | 'tool' | 'user'
   text?: string
+  trust_kind?: string
+  turn_kind?: string
 }
 
 // ── Commands / completion ────────────────────────────────────────────
@@ -186,6 +190,8 @@ export interface SessionResumeResponse {
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]
+  queued?: null | SessionSemanticEnvelope & { user?: string }
+  queued_prompts?: Array<SessionSemanticEnvelope & { user?: string }>
   resumed?: string
   running?: boolean
   session_id: string
@@ -214,8 +220,25 @@ export interface SessionActiveListResponse {
 
 export interface SessionInflightTurn {
   assistant?: string
+  correction_provenance?: SessionSemanticEnvelope[]
+  corrections?: string[]
+  display_kind?: string
+  display_metadata?: Record<string, unknown>
+  origin_kind?: string
+  provenance_metadata?: Record<string, boolean | number | string>
   streaming?: boolean
+  trust_kind?: string
+  turn_kind?: string
   user?: string
+}
+
+export interface SessionSemanticEnvelope {
+  display_kind?: string
+  display_metadata?: Record<string, unknown>
+  origin_kind?: string
+  provenance_metadata?: Record<string, boolean | number | string>
+  trust_kind?: string
+  turn_kind?: string
 }
 
 export interface SessionActivateResponse {
@@ -223,6 +246,8 @@ export interface SessionActivateResponse {
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]
+  queued?: null | SessionSemanticEnvelope & { user?: string }
+  queued_prompts?: Array<SessionSemanticEnvelope & { user?: string }>
   running?: boolean
   session_id: string
   session_key?: string

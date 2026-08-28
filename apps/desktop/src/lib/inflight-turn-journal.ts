@@ -525,6 +525,10 @@ function attachmentSignature(message: ChatMessage): string {
 }
 
 function userMessagesMatch(left: ChatMessage, right: ChatMessage): boolean {
+  if (left.semanticId || right.semanticId) {
+    return Boolean(left.semanticId) && left.semanticId === right.semanticId
+  }
+
   return (
     left.role === 'user' &&
     right.role === 'user' &&

@@ -477,6 +477,20 @@ describe('chatMessagesEquivalent', () => {
     expect(chatMessagesEquivalent(msg('msg-1', 'user', 'Hello'), msg('msg-2', 'user', 'Hello'))).toBe(false)
   })
 
+  it('returns false when provenance routing metadata changes', () => {
+    const before = msg('msg-1', 'system', 'Task finished', {
+      semanticId: 'kanban:wake-1',
+      provenanceMetadata: { message_id: 'kanban:wake-1', chat_id: 'chat-a' }
+    })
+
+    const after = {
+      ...before,
+      provenanceMetadata: { message_id: 'kanban:wake-1', chat_id: 'chat-b' }
+    }
+
+    expect(chatMessagesEquivalent(before, after)).toBe(false)
+  })
+
   it('compares large messages with embedded images structurally without JSON.stringify', () => {
     // Verifies that two structurally identical messages (that would be equal
     // via stringify) are also equal via the new cheap structural compare.
@@ -1263,6 +1277,99 @@ describe('preserveLocalPendingTurnMessages', () => {
 })
 
 describe('appendLiveSessionProjection', () => {
+  it('fails closed when an older gateway omits transient provenance', () => {
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-legacy',
+      inflight: { user: 'ambiguous text', assistant: '', streaming: true }
+    })
+
+    expect(restored[0]).toMatchObject({ role: 'system' })
+    expect(restored[0].parts).toEqual([{ type: 'text', text: '[Source unknown] ambiguous text' }])
+  })
+
+  it('renders an active Kanban wake as an agent event and reconciles it by semantic identity', () => {
+    const semantic = {
+      origin_kind: 'agent',
+      turn_kind: 'continuation',
+      trust_kind: 'trusted_internal',
+      provenance_metadata: { message_id: 'kanban-wake:route:event-17', source: 'kanban' }
+    }
+
+    const persisted = [
+      msg('persisted-kanban', 'system', '[agent] Task finished', {
+        semanticId: 'kanban-wake:route:event-17',
+        originKind: 'agent',
+        turnKind: 'continuation',
+        trustKind: 'trusted_internal',
+        provenanceMetadata: semantic.provenance_metadata
+      })
+    ]
+
+    const active = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      inflight: {
+        user: 'internal model payload',
+        assistant: '',
+        streaming: true,
+        display_kind: 'internal_notification',
+        display_metadata: { display_text: 'Task finished', source: 'kanban' },
+        ...semantic
+      }
+    })
+
+    expect(active[0]).toMatchObject({
+      role: 'system',
+      originKind: 'agent',
+      semanticId: 'kanban-wake:route:event-17'
+    })
+    expect(active[0].parts).toEqual([{ type: 'text', text: '[agent] Task finished' }])
+
+    const restored = appendLiveSessionProjection(persisted, {
+      session_id: 'runtime-1',
+      inflight: {
+        user: 'internal model payload',
+        assistant: '',
+        streaming: true,
+        display_kind: 'internal_notification',
+        display_metadata: { display_text: 'Task finished', source: 'kanban' },
+        ...semantic
+      }
+    })
+
+    expect(restored.filter(message => message.semanticId === 'kanban-wake:route:event-17')).toHaveLength(1)
+    expect(restored[0]).toMatchObject({ role: 'system', originKind: 'agent' })
+  })
+
+  it('keeps repeated human text distinct when semantic identities differ', () => {
+    const restored = appendLiveSessionProjection(
+      [
+        msg('first', 'user', 'repeat this', {
+          semanticId: 'desktop:human-1',
+          originKind: 'human_user',
+          turnKind: 'prompt',
+          trustKind: 'user_authorized'
+        })
+      ],
+      {
+        session_id: 'runtime-1',
+        inflight: {
+          user: 'repeat this',
+          streaming: true,
+          origin_kind: 'human_user',
+          turn_kind: 'prompt',
+          trust_kind: 'user_authorized',
+          provenance_metadata: { message_id: 'desktop:human-2' }
+        }
+      }
+    )
+
+    expect(restored.filter(message => message.role === 'user')).toHaveLength(2)
+    expect(restored.map(message => message.semanticId).filter(Boolean)).toEqual([
+      'desktop:human-1',
+      'desktop:human-2'
+    ])
+  })
+
   // Corrections typed while a turn ran are their own user bubbles on the same
   // turn, ordered by ARRIVAL. Without boundary offsets (older gateway) the
   // whole dump precedes them — never the old prompt → corrections → reply
@@ -1273,8 +1380,26 @@ describe('appendLiveSessionProjection', () => {
       inflight: {
         user: 'remove the session counts',
         corrections: ['hurry up', 'and the worktree ones'],
+        correction_provenance: [
+          {
+            origin_kind: 'human_user',
+            turn_kind: 'prompt',
+            trust_kind: 'user_authorized',
+            provenance_metadata: { message_id: 'desktop:correction-1' }
+          },
+          {
+            origin_kind: 'human_user',
+            turn_kind: 'prompt',
+            trust_kind: 'user_authorized',
+            provenance_metadata: { message_id: 'desktop:correction-2' }
+          }
+        ],
         assistant: 'Moving.',
-        streaming: true
+        streaming: true,
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized',
+        provenance_metadata: { message_id: 'desktop:prompt' }
       }
     })
 
@@ -1295,9 +1420,27 @@ describe('appendLiveSessionProjection', () => {
       inflight: {
         user: 'remove the session counts',
         corrections: ['hurry up', 'and the worktree ones'],
+        correction_provenance: [
+          {
+            origin_kind: 'human_user',
+            turn_kind: 'prompt',
+            trust_kind: 'user_authorized',
+            provenance_metadata: { message_id: 'desktop:correction-1' }
+          },
+          {
+            origin_kind: 'human_user',
+            turn_kind: 'prompt',
+            trust_kind: 'user_authorized',
+            provenance_metadata: { message_id: 'desktop:correction-2' }
+          }
+        ],
         correction_offsets: [7, 13],
         assistant: 'Moving.Still.Done soon.',
-        streaming: true
+        streaming: true,
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized',
+        provenance_metadata: { message_id: 'desktop:prompt' }
       }
     })
 
@@ -1329,9 +1472,21 @@ describe('appendLiveSessionProjection', () => {
       inflight: {
         user: 'prompt',
         corrections: ['nudge'],
+        correction_provenance: [
+          {
+            origin_kind: 'human_user',
+            turn_kind: 'prompt',
+            trust_kind: 'user_authorized',
+            provenance_metadata: { message_id: 'desktop:correction-1' }
+          }
+        ],
         correction_offsets: [4],
         assistant: 'text',
-        streaming: true
+        streaming: true,
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized',
+        provenance_metadata: { message_id: 'desktop:prompt' }
       }
     })
 
@@ -1408,9 +1563,19 @@ describe('appendLiveSessionProjection', () => {
       inflight: {
         user: 'current prompt',
         assistant: 'partial answer',
-        streaming: true
+        streaming: true,
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized',
+        provenance_metadata: { message_id: 'desktop:current' }
       },
-      queued: { user: 'newest prompt' }
+      queued: {
+        user: 'newest prompt',
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized',
+        provenance_metadata: { message_id: 'desktop:newest' }
+      }
     })
 
     expect(restored.map(message => message.role)).toEqual(['user', 'assistant', 'user', 'assistant', 'user'])
@@ -1422,6 +1587,25 @@ describe('appendLiveSessionProjection', () => {
       'newest prompt'
     ])
     expect(restored[3]).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
+  })
+
+  it('restores every queued prompt in FIFO order even when their text repeats', () => {
+    const queuedPrompt = (messageId: string) => ({
+      user: 'repeat this',
+      origin_kind: 'human_user' as const,
+      turn_kind: 'prompt' as const,
+      trust_kind: 'user_authorized' as const,
+      provenance_metadata: { message_id: messageId }
+    })
+
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      queued: queuedPrompt('desktop:queued-1'),
+      queued_prompts: [queuedPrompt('desktop:queued-1'), queuedPrompt('desktop:queued-2')]
+    })
+
+    expect(restored.map(message => message.semanticId)).toEqual(['desktop:queued-1', 'desktop:queued-2'])
+    expect(restored.map(chatMessageText)).toEqual(['repeat this', 'repeat this'])
   })
 
   it('does not duplicate a persisted inflight user after consecutive canceled user turns', () => {
@@ -1552,17 +1736,48 @@ const runningProjection = (user: string): SessionResumeResponse =>
     message_count: 2,
     messages: [],
     running: true,
-    inflight: { user, assistant: 'partial answer', streaming: true }
+    inflight: {
+      user,
+      assistant: 'partial answer',
+      streaming: true,
+      origin_kind: 'human_user',
+      turn_kind: 'prompt',
+      trust_kind: 'user_authorized',
+      provenance_metadata: { message_id: `desktop:${user}` }
+    }
   }) as SessionResumeResponse
 
 describe('dedupeInflightUserAgainstTranscript', () => {
+  it('does not use text to anchor an identified runtime row to an unidentified persisted row', () => {
+    const runtime = [msg('runtime-user', 'user', 'same words', { semanticId: 'desktop:runtime', timestamp: 1 })]
+
+    const persisted = [
+      msg('legacy-user', 'user', 'same words', { timestamp: 1 }),
+      msg('legacy-assistant', 'assistant', 'earlier answer', { timestamp: 2 }),
+      msg('persisted-current', 'user', 'current prompt', {
+        semanticId: 'desktop:current prompt',
+        timestamp: 3
+      })
+    ]
+
+    const projection = runningProjection('current prompt')
+
+    expect(dedupeInflightUserAgainstTranscript(persisted, runtime, projection)).toBe(projection)
+  })
+
   it('retains the in-flight user source only when it already exists after the runtime anchor', () => {
     const runtime = [
       msg('runtime-user', 'user', 'earlier prompt', { timestamp: 1 }),
       msg('runtime-assistant', 'assistant', 'earlier answer', { timestamp: 2 })
     ]
 
-    const persisted = [...runtime, msg('persisted-current', 'user', 'current prompt', { timestamp: 3 })]
+    const persisted = [
+      ...runtime,
+      msg('persisted-current', 'user', 'current prompt', {
+        timestamp: 3,
+        semanticId: 'desktop:current prompt'
+      })
+    ]
 
     const deduped = dedupeInflightUserAgainstTranscript(persisted, runtime, runningProjection('current prompt'))
 
@@ -1576,12 +1791,24 @@ describe('dedupeInflightUserAgainstTranscript', () => {
       msg('runtime-assistant', 'assistant', 'earlier answer', { timestamp: 2 })
     ]
 
-    const persisted = [...runtime, msg('persisted-current', 'user', 'current prompt', { timestamp: 3 })]
+    const persisted = [
+      ...runtime,
+      msg('persisted-current', 'user', 'current prompt', {
+        timestamp: 3,
+        semanticId: 'desktop:current prompt'
+      })
+    ]
 
     const projection = {
       ...runningProjection('current prompt'),
-      inflight: { user: 'current prompt', assistant: '', streaming: false },
-      queued: { user: 'queued prompt' }
+      inflight: { ...runningProjection('current prompt').inflight, assistant: '', streaming: false },
+      queued: {
+        user: 'queued prompt',
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized',
+        provenance_metadata: { message_id: 'desktop:queued' }
+      }
     }
 
     const deduped = dedupeInflightUserAgainstTranscript(persisted, runtime, projection)
@@ -1628,19 +1855,46 @@ describe('dedupeInflightUserAgainstTranscript', () => {
 })
 
 describe('removeRepresentedLocalLiveProjection', () => {
+  it('removes only the optimistic row with the matching semantic id when text repeats', () => {
+    const previous = [
+      msg('user-old', 'user', 'repeat this', { semanticId: 'desktop:old' }),
+      msg('assistant-old', 'assistant', 'done'),
+      msg('user-current', 'user', 'repeat this', { semanticId: 'desktop:current' }),
+      msg('assistant-stream-current', 'assistant', 'partial', { pending: true })
+    ]
+
+    const projection = {
+      ...runningProjection('repeat this'),
+      inflight: {
+        ...runningProjection('repeat this').inflight,
+        provenance_metadata: { message_id: 'desktop:current' }
+      }
+    }
+
+    const remaining = removeRepresentedLocalLiveProjection(previous, projection)
+
+    expect(remaining.map(message => message.id)).toEqual(['user-old', 'assistant-old'])
+  })
+
   it('removes only matched synthetic rows from the open local tail', () => {
     const previous = [
       msg('user-old-optimistic', 'user', 'current prompt'),
       msg('assistant-complete', 'assistant', 'finished answer'),
-      msg('user-current', 'user', 'current prompt'),
+      msg('user-current', 'user', 'current prompt', { semanticId: 'desktop:current prompt' }),
       msg('assistant-stream-current', 'assistant', 'partial answer', { pending: true }),
-      msg('user-queued-runtime', 'user', 'queued prompt'),
+      msg('user-queued-runtime', 'user', 'queued prompt', { semanticId: 'desktop:queued' }),
       msg('user-racing', 'user', 'new racing prompt')
     ]
 
     const projection = {
       ...runningProjection('current prompt'),
-      queued: { user: 'queued prompt' }
+      queued: {
+        user: 'queued prompt',
+        origin_kind: 'human_user',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized',
+        provenance_metadata: { message_id: 'desktop:queued' }
+      }
     }
 
     const remaining = removeRepresentedLocalLiveProjection(previous, projection)
@@ -1662,7 +1916,7 @@ describe('removeRepresentedLocalLiveProjection', () => {
   it('does not consume a generic racing user as the activation-owned queued row', () => {
     const previous = [
       msg('runtime-assistant', 'assistant', 'finished answer'),
-      msg('user-current', 'user', 'current prompt'),
+      msg('user-current', 'user', 'current prompt', { semanticId: 'desktop:current prompt' }),
       msg('assistant-stream-current', 'assistant', 'partial answer', { pending: true }),
       msg('user-racing', 'user', 'repeat this')
     ]

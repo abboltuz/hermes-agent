@@ -59,6 +59,7 @@ export function submitPrompt(
 
   // Close the async-busy gap up front, before the detect_drop round-trip.
   markSubmitting()
+  const messageId = `tui:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`
 
   const startSubmit = (displayText: string, submitText: string, show = true) => {
     const liveSid = getUiState().sid
@@ -71,7 +72,14 @@ export function submitPrompt(
     deps.setLastUserMsg(text)
 
     if (show) {
-      deps.appendMessage({ role: 'user', text: displayOverride || displayText })
+      deps.appendMessage({
+        role: 'user',
+        text: displayOverride || displayText,
+        messageId,
+        originKind: 'human_user',
+        turnKind: 'prompt',
+        trustKind: 'user_authorized'
+      })
     }
 
     patchUiState({ busy: true, status: 'running…' })
@@ -79,7 +87,11 @@ export function submitPrompt(
     turnController.interrupted = false
 
     deps.gw
-      .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .request<PromptSubmitResponse>('prompt.submit', {
+        session_id: liveSid,
+        text: submitText,
+        message_id: messageId
+      })
       .then(r => {
         // The gateway consumed a typed voice stop phrase server-side (voice
         // chat ended, no turn started) — release the busy latch; the

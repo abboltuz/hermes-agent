@@ -16,8 +16,14 @@ import type { SessionMessage } from '@/types/hermes'
 
 import { chatMessageText, toChatMessages } from './chat-messages'
 
+const humanPrompt = {
+  origin_kind: 'human_user' as const,
+  turn_kind: 'prompt' as const,
+  trust_kind: 'user_authorized' as const
+}
+
 const steeredTurnRows: SessionMessage[] = [
-  { content: 'run the build', role: 'user', row_id: 731378, timestamp: 100 },
+  { content: 'run the build', role: 'user', row_id: 731378, timestamp: 100, ...humanPrompt },
   {
     content: 'Kicking off the build:',
     reasoning: 'The build has to pass before docs are worth writing.',
@@ -46,7 +52,13 @@ const steeredTurnRows: SessionMessage[] = [
   // Redirect checkpoint: content keeps the visible words; the provider
   // scaffolding rides api_content (never shipped to the client).
   { content: 'Now the ladder in the resolver:', role: 'assistant', row_id: 731382, timestamp: 104 },
-  { content: 'actually skip docs, fix the tests instead', role: 'user', row_id: 731383, timestamp: 104.1 },
+  {
+    content: 'actually skip docs, fix the tests instead',
+    role: 'user',
+    row_id: 731383,
+    timestamp: 104.1,
+    ...humanPrompt
+  },
   {
     content: 'Got it — tests first.',
     role: 'assistant',
@@ -105,7 +117,7 @@ describe('toChatMessages on a persisted steered turn', () => {
     // RESULT row (accepted at the tool boundary). The result must attach to
     // the call above the correction, not materialize a new row below it.
     const rows: SessionMessage[] = [
-      { content: 'go', role: 'user', timestamp: 100 },
+      { content: 'go', role: 'user', timestamp: 100, ...humanPrompt },
       {
         content: '',
         role: 'assistant',
@@ -114,7 +126,7 @@ describe('toChatMessages on a persisted steered turn', () => {
           { function: { arguments: '{"command":"sleep 60"}', name: 'terminal' }, id: 'call-9', type: 'function' }
         ]
       },
-      { content: 'never mind, stop that', role: 'user', timestamp: 101.5 },
+      { content: 'never mind, stop that', role: 'user', timestamp: 101.5, ...humanPrompt },
       {
         content: '{"output":"interrupted"}',
         role: 'tool',

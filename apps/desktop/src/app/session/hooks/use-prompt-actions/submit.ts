@@ -363,7 +363,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         role: 'user',
         parts: [textPart(bubbleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
         timestamp: submittedAt,
-        attachmentRefs
+        attachmentRefs,
+        semanticId: optimisticId,
+        originKind: 'human_user',
+        turnKind: 'prompt',
+        trustKind: 'user_authorized',
+        provenanceMetadata: { message_id: optimisticId, producer: 'desktop_renderer' }
       })
 
       const releaseBusy = () => {
@@ -736,6 +741,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
+          message_id: optimisticId,
           ...(interrupted && { interrupted }),
           // Off-screen widget intent: the gateway types the persisted user
           // row display_kind=hidden so no client renders it as a bubble.

@@ -38,7 +38,13 @@ import type { SessionProfileRoute } from '@/store/session-request-router'
 // it from here; the canonical definition lives in @/store/session.
 export { sessionMatchesStoredId }
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionResumeResponse,
+  SessionRuntimeInfo,
+  SessionSemanticEnvelope
+} from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -161,12 +167,16 @@ const COMPARED_FIELDS = [
   'reactions',
   'timestamp',
   'completedAt',
+  'semanticId',
+  'originKind',
+  'turnKind',
+  'trustKind',
   // Turn wall-clock duration — stamps the visible "⏱ 38s" badge, so a change
   // must re-render (set once at completion; stable afterwards).
   'durationS'
 ] as const
 
-const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId'] as const
+const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId', 'provenanceMetadata'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.
@@ -257,6 +267,20 @@ export function chatReactionsEquivalent(a: ChatMessage['reactions'], b: ChatMess
   )
 }
 
+function provenanceMetadataEquivalent(
+  a: ChatMessage['provenanceMetadata'],
+  b: ChatMessage['provenanceMetadata']
+): boolean {
+  if (a === b) {
+    return true
+  }
+
+  const aKeys = Object.keys(a ?? {})
+  const bKeys = Object.keys(b ?? {})
+
+  return aKeys.length === bKeys.length && aKeys.every(key => a?.[key] === b?.[key])
+}
+
 export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
   if (
     a.id !== b.id ||
@@ -272,6 +296,11 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     a.branchGroupId !== b.branchGroupId ||
     a.timestamp !== b.timestamp ||
     a.completedAt !== b.completedAt ||
+    a.semanticId !== b.semanticId ||
+    a.originKind !== b.originKind ||
+    a.turnKind !== b.turnKind ||
+    a.trustKind !== b.trustKind ||
+    !provenanceMetadataEquivalent(a.provenanceMetadata, b.provenanceMetadata) ||
     // Interim gates the action footer, so flipping it must repaint (e.g. a
     // previewed final settling onto a sealed interim bubble restores the bar).
     (a.interim ?? false) !== (b.interim ?? false) ||
@@ -302,9 +331,14 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
   }
 
   const previousByRoleOrdinal = new Map<string, ChatMessage>()
+  const previousBySemanticId = new Map<string, ChatMessage>()
   const previousRoleCounts = new Map<string, number>()
 
   for (const message of previousMessages) {
+    if (message.semanticId) {
+      previousBySemanticId.set(message.semanticId, message)
+    }
+
     const ordinal = previousRoleCounts.get(message.role) ?? 0
     previousRoleCounts.set(message.role, ordinal + 1)
     previousByRoleOrdinal.set(`${message.role}:${ordinal}`, message)
@@ -316,7 +350,9 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     const ordinal = nextRoleCounts.get(message.role) ?? 0
     nextRoleCounts.set(message.role, ordinal + 1)
 
-    const previous = previousByRoleOrdinal.get(`${message.role}:${ordinal}`)
+    const previous = message.semanticId
+      ? previousBySemanticId.get(message.semanticId)
+      : previousByRoleOrdinal.get(`${message.role}:${ordinal}`)
 
     if (!previous) {
       return message
@@ -558,6 +594,18 @@ export function preserveLocalPendingTurnMessages(
   }
 
   const latestAuthoritativeUser = [...nextMessages].reverse().find(message => message.role === 'user')
+
+  const sameUserTurn = (left: ChatMessage, right: ChatMessage): boolean => {
+    if (left.semanticId || right.semanticId) {
+      return Boolean(left.semanticId) && left.semanticId === right.semanticId
+    }
+
+    return (
+      textWithoutReferenceLines(chatMessageText(left)) ===
+      textWithoutReferenceLines(chatMessageText(right))
+    )
+  }
+
   const preserved: ChatMessage[] = []
   // Authoritative id → richer local pending row. Replacing (not appending)
   // avoids painting both the empty inflight shell and the full stream bubble.
@@ -601,8 +649,7 @@ export function preserveLocalPendingTurnMessages(
     if (
       isOptimisticUser &&
       latestAuthoritativeUser &&
-      textWithoutReferenceLines(chatMessageText(latestAuthoritativeUser)) ===
-        textWithoutReferenceLines(chatMessageText(message))
+      sameUserTurn(latestAuthoritativeUser, message)
     ) {
       continue
     }
@@ -641,10 +688,7 @@ export function preserveLocalPendingTurnMessages(
         continue
       }
 
-      if (
-        textWithoutReferenceLines(chatMessageText(authoritative)) ===
-        textWithoutReferenceLines(chatMessageText(message))
-      ) {
+      if (sameUserTurn(authoritative, message)) {
         continue
       }
     }
@@ -721,12 +765,76 @@ export function preserveLocalPendingTurnMessages(
  */
 const safelyPersistedInflightUser = Symbol('safelyPersistedInflightUser')
 
-type LiveSessionProjection = Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'> & {
+type LiveSessionProjection = Pick<SessionResumeResponse, 'inflight' | 'queued' | 'queued_prompts' | 'session_id'> & {
   [safelyPersistedInflightUser]?: true
 }
 
 type ReconciledSessionResumeResponse = SessionResumeResponse & {
   [safelyPersistedInflightUser]?: true
+}
+
+function semanticMessageId(value?: null | SessionSemanticEnvelope): string | undefined {
+  const raw = value?.provenance_metadata?.message_id
+
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
+}
+
+function isLocalHumanEnvelope(value?: null | SessionSemanticEnvelope): boolean {
+  return (
+    value?.origin_kind === 'human_user' &&
+    (value.turn_kind === 'prompt' || value.turn_kind === 'task_instruction' || value.turn_kind === 'ui_action') &&
+    value.trust_kind === 'user_authorized'
+  )
+}
+
+function semanticActorLabel(value?: null | SessionSemanticEnvelope): string {
+  if (!value?.origin_kind || value.origin_kind === 'legacy_unknown') {
+    return 'Source unknown'
+  }
+
+  return value.origin_kind === 'external_actor' ? 'External actor' : value.origin_kind.replaceAll('_', ' ')
+}
+
+function transientDisplayText(text: string, value?: null | SessionSemanticEnvelope): string {
+  const metadata = value?.display_metadata
+
+  const displayText =
+    metadata && typeof metadata === 'object' && typeof metadata.display_text === 'string'
+      ? metadata.display_text.trim()
+      : ''
+
+  const visible = displayText || text
+
+  return isLocalHumanEnvelope(value) ? visible : `[${semanticActorLabel(value)}] ${visible}`
+}
+
+function transientUserMessage(
+  id: string,
+  text: string,
+  semantic?: null | SessionSemanticEnvelope
+): ChatMessage {
+  const semanticId = semanticMessageId(semantic)
+
+  return {
+    id,
+    role: isLocalHumanEnvelope(semantic) ? 'user' : 'system',
+    parts: [textPart(transientDisplayText(text, semantic))],
+    ...(semanticId ? { semanticId } : {}),
+    ...(semantic?.origin_kind ? { originKind: semantic.origin_kind } : {}),
+    ...(semantic?.turn_kind ? { turnKind: semantic.turn_kind } : {}),
+    ...(semantic?.trust_kind ? { trustKind: semantic.trust_kind } : {}),
+    ...(semantic?.provenance_metadata ? { provenanceMetadata: semantic.provenance_metadata } : {})
+  }
+}
+
+function queuedSemanticEnvelopes(
+  projection: Pick<SessionResumeResponse, 'queued' | 'queued_prompts'>
+): Array<SessionSemanticEnvelope & { user?: string }> {
+  if (projection.queued_prompts?.length) {
+    return projection.queued_prompts
+  }
+
+  return projection.queued ? [projection.queued] : []
 }
 
 export function appendLiveSessionProjection(messages: ChatMessage[], projection: LiveSessionProjection): ChatMessage[] {
@@ -757,14 +865,15 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   // failure on the projected row instead of rendering the partial as healthy.
   const inflightError = projection.inflight?.error?.trim() ?? ''
   const inflightErrorSurface = parseErrorSurface(projection.inflight?.error_surface)
-  const queuedUser = projection.queued?.user?.trim() ?? ''
+  const queuedTurns = queuedSemanticEnvelopes(projection)
+  const hasQueuedUser = queuedTurns.some(queued => Boolean(queued.user?.trim()))
 
   if (
     !inflightUser &&
     !inflightAssistant &&
     !inflightStreaming &&
     !inflightError &&
-    !queuedUser &&
+    !hasQueuedUser &&
     !inflightCorrections.length
   ) {
     return messages
@@ -772,6 +881,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
 
   const sessionId = projection.session_id || 'session'
   const projected: ChatMessage[] = []
+  const inflightSemanticId = semanticMessageId(projection.inflight)
   // A turn normally persists its user row before inference begins. session.resume
   // then returns that stored row *and* the still-live inflight projection; adding
   // both makes a backgrounded prompt appear twice when its session is reopened.
@@ -807,14 +917,12 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
     )
 
   const inflightUserAlreadyPersisted =
-    projection[safelyPersistedInflightUser] === true || (Boolean(inflightUser) && persistedInLatestRun(inflightUser))
+    projection[safelyPersistedInflightUser] === true ||
+    (Boolean(inflightSemanticId) && messages.some(message => message.semanticId === inflightSemanticId)) ||
+    (!inflightSemanticId && Boolean(inflightUser) && persistedInLatestRun(inflightUser))
 
   if (inflightUser && !inflightUserAlreadyPersisted) {
-    projected.push({
-      id: `user-inflight-${sessionId}`,
-      role: 'user',
-      parts: [textPart(inflightUser)]
-    })
+    projected.push(transientUserMessage(`user-inflight-${sessionId}`, inflightUser, projection.inflight))
   }
 
   // Keep a pending assistant boundary even before the first delta when a
@@ -856,21 +964,25 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   )
 
   const wantsAssistantRow = Boolean(
-    inflightAssistant || inflightStreaming || inflightError || (inflightUser && queuedUser)
+    inflightAssistant || inflightStreaming || inflightError || (inflightUser && hasQueuedUser)
   )
 
   const projectAssistantDump = wantsAssistantRow && !(turnAlreadyStructured && !inflightError)
 
   const pushCorrection = (correction: string, index: number): void => {
-    if (persistedInLatestRun(correction)) {
+    const semantics = projection.inflight?.correction_provenance?.[index]
+    const semanticId = semanticMessageId(semantics)
+
+    if (
+      (semanticId && messages.some(message => message.semanticId === semanticId)) ||
+      (!semanticId && persistedInLatestRun(correction))
+    ) {
       return
     }
 
-    projected.push({
-      id: `user-inflight-correction-${index}-${sessionId}`,
-      role: 'user',
-      parts: [textPart(correction)]
-    })
+    projected.push(
+      transientUserMessage(`user-inflight-correction-${index}-${sessionId}`, correction, semantics)
+    )
   }
 
   // Corrections typed while the turn ran are ordered by ARRIVAL: each lands
@@ -929,12 +1041,14 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
     }
   }
 
-  if (queuedUser) {
-    projected.push({
-      id: `user-queued-${sessionId}`,
-      role: 'user',
-      parts: [textPart(queuedUser)]
-    })
+  for (const [index, queued] of queuedTurns.entries()) {
+    const queuedUser = queued.user?.trim() ?? ''
+    const queuedId = semanticMessageId(queued)
+
+    if (queuedUser && (!queuedId || ![...messages, ...projected].some(message => message.semanticId === queuedId))) {
+      const projectedId = index === 0 ? `user-queued-${sessionId}` : `user-queued-${index}-${sessionId}`
+      projected.push(transientUserMessage(projectedId, queuedUser, queued))
+    }
   }
 
   return projected.length ? [...messages, ...projected] : messages
@@ -945,6 +1059,10 @@ function normalizedMessageText(message: ChatMessage): string {
 }
 
 function transcriptAnchorMatches(a: ChatMessage, b: ChatMessage): boolean {
+  if (a.semanticId || b.semanticId) {
+    return Boolean(a.semanticId) && a.semanticId === b.semanticId
+  }
+
   if (a.role !== b.role) {
     return false
   }
@@ -1009,6 +1127,19 @@ export function dedupeInflightUserAgainstTranscript(
   }
 
   const persistedTail = persistedMessages.slice(suffixStart)
+  const inflightSemanticId = semanticMessageId(projection.inflight)
+
+  if (
+    inflightSemanticId &&
+    persistedTail.some(message => message.semanticId === inflightSemanticId)
+  ) {
+    return { ...projection, [safelyPersistedInflightUser]: true }
+  }
+
+  if (inflightSemanticId) {
+    return projection
+  }
+
   const lastPersistedMessage = persistedTail[persistedTail.length - 1]
 
   const persistedUserPresent =
@@ -1028,14 +1159,15 @@ export function dedupeInflightUserAgainstTranscript(
  */
 export function removeRepresentedLocalLiveProjection(
   previousMessages: ChatMessage[],
-  projection: Pick<SessionResumeResponse, 'inflight' | 'queued'>
+  projection: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'queued_prompts'>
 ): ChatMessage[] {
   const inflightUser = projection.inflight?.user?.replace(/\s+/g, ' ').trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant?.replace(/\s+/g, ' ').trim() ?? ''
-  const queuedUser = projection.queued?.user?.replace(/\s+/g, ' ').trim() ?? ''
+  const queuedTurns = queuedSemanticEnvelopes(projection)
+  const hasQueuedUser = queuedTurns.some(queued => Boolean(queued.user?.trim()))
 
   const hasAssistantProjection = Boolean(
-    projection.inflight?.assistant || projection.inflight?.streaming || (inflightUser && queuedUser)
+    projection.inflight?.assistant || projection.inflight?.streaming || (inflightUser && hasQueuedUser)
   )
 
   if (!inflightUser || !hasAssistantProjection) {
@@ -1059,36 +1191,47 @@ export function removeRepresentedLocalLiveProjection(
       index >= openTailStart &&
       message.role === 'user' &&
       message.id.startsWith('user-') &&
-      normalizedMessageText(message) === inflightUser
+      (semanticMessageId(projection.inflight)
+        ? message.semanticId === semanticMessageId(projection.inflight)
+        : normalizedMessageText(message) === inflightUser)
   )
 
   const assistantIndex = inflightUserIndex + 1
   const assistant = previousMessages[assistantIndex]
+  const inflightSemanticId = semanticMessageId(projection.inflight)
 
   const assistantMatches =
     inflightUserIndex >= openTailStart &&
     assistant?.role === 'assistant' &&
     assistant.id.startsWith('assistant-stream-') &&
-    normalizedMessageText(assistant) === inflightAssistant
+    (Boolean(inflightSemanticId) || normalizedMessageText(assistant) === inflightAssistant)
 
   if (!assistantMatches) {
     return previousMessages
   }
 
-  let queuedUserIndex = -1
+  const queuedUserIndices = new Set<number>()
 
-  if (queuedUser) {
-    queuedUserIndex = previousMessages.findIndex(
+  for (const queued of queuedTurns) {
+    const queuedUser = queued.user?.replace(/\s+/g, ' ').trim() ?? ''
+    const queuedId = semanticMessageId(queued)
+
+    const queuedUserIndex = previousMessages.findIndex(
       (message, index) =>
         index > assistantIndex &&
+        !queuedUserIndices.has(index) &&
         message.role === 'user' &&
         message.id.startsWith('user-queued-') &&
-        normalizedMessageText(message) === queuedUser
+        (queuedId ? message.semanticId === queuedId : normalizedMessageText(message) === queuedUser)
     )
+
+    if (queuedUserIndex >= 0) {
+      queuedUserIndices.add(queuedUserIndex)
+    }
   }
 
   return previousMessages.filter(
-    (_message, index) => index !== inflightUserIndex && index !== assistantIndex && index !== queuedUserIndex
+    (_message, index) => index !== inflightUserIndex && index !== assistantIndex && !queuedUserIndices.has(index)
   )
 }
 

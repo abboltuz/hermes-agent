@@ -308,7 +308,16 @@ export function usePromptActions({
           const message: ChatMessage = {
             id: messageId,
             role,
-            parts: [textPart(body)]
+            parts: [textPart(body)],
+            ...(role === 'user' && options.appendAfterActiveReply
+              ? {
+                  semanticId: messageId,
+                  originKind: 'human_user',
+                  turnKind: 'prompt',
+                  trustKind: 'user_authorized',
+                  provenanceMetadata: { message_id: messageId, producer: 'desktop_renderer' }
+                }
+              : {})
           }
 
           // Mid-turn correction: arrival order. The bubble lands after the
@@ -799,7 +808,11 @@ export function usePromptActions({
           })
 
         try {
-          const result = await requestGateway<SessionRedirectResponse>('session.redirect', { session_id: id, text })
+          const result = await requestGateway<SessionRedirectResponse>('session.redirect', {
+            session_id: id,
+            text,
+            message_id: messageId
+          })
 
           if (result?.status === 'redirected') {
             triggerHaptic('submit')

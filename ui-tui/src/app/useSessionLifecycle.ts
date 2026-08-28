@@ -14,6 +14,7 @@ import type {
   SessionCreateResponse,
   SessionInflightTurn,
   SessionResumeResponse,
+  SessionSemanticEnvelope,
   SessionTitleResponse,
   SetupStatusResponse
 } from '../gatewayTypes.js'
@@ -55,10 +56,89 @@ export const writeActiveSessionFile = (sessionId: null | string, file = process.
   }
 }
 
-export const liveSessionInflightMessages = (inflight?: null | SessionInflightTurn): Msg[] => {
+const semanticMessageId = (value?: null | SessionSemanticEnvelope) => {
+  const raw = value?.provenance_metadata?.message_id
+
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
+}
+
+const isLocalHuman = (value?: null | SessionSemanticEnvelope) =>
+  value?.origin_kind === 'human_user' &&
+    (value.turn_kind === 'prompt' || value.turn_kind === 'task_instruction' || value.turn_kind === 'ui_action') &&
+    value.trust_kind === 'user_authorized'
+
+const liveSemanticMessage = (text: string, value?: null | SessionSemanticEnvelope): Msg => {
+  const metadata = value?.display_metadata
+
+  const displayText =
+    metadata && typeof metadata.display_text === 'string' ? metadata.display_text.trim() : ''
+
+  const actor =
+    !value?.origin_kind || value.origin_kind === 'legacy_unknown'
+      ? 'Source unknown'
+      : value.origin_kind === 'external_actor'
+        ? 'External actor'
+        : value.origin_kind.replaceAll('_', ' ')
+
+  const localHuman = isLocalHuman(value)
+  const messageId = semanticMessageId(value)
+
+  return {
+    role: localHuman ? 'user' : 'system',
+    text: localHuman ? displayText || text : `[${actor}] ${displayText || text}`,
+    ...(messageId && { messageId }),
+    ...(value?.origin_kind && { originKind: value.origin_kind }),
+    ...(value?.turn_kind && { turnKind: value.turn_kind }),
+    ...(value?.trust_kind && { trustKind: value.trust_kind })
+  }
+}
+
+export const liveSessionInflightMessages = (
+  inflight?: null | SessionInflightTurn,
+  queued?: null | (SessionSemanticEnvelope & { user?: string }),
+  transcript: Msg[] = [],
+  queuedPrompts?: Array<SessionSemanticEnvelope & { user?: string }>
+): Msg[] => {
+  const candidates: Msg[] = []
   const user = String(inflight?.user ?? '').trim()
 
-  return user ? [{ role: 'user', text: user }] : []
+  if (user) {
+    candidates.push(liveSemanticMessage(user, inflight))
+  }
+
+  for (const [index, correction] of (inflight?.corrections ?? []).entries()) {
+    const text = String(correction ?? '').trim()
+
+    if (text) {
+      candidates.push(liveSemanticMessage(text, inflight?.correction_provenance?.[index]))
+    }
+  }
+
+  const queuedTurns = queuedPrompts?.length ? queuedPrompts : queued ? [queued] : []
+
+  for (const queuedTurn of queuedTurns) {
+    const queuedUser = String(queuedTurn.user ?? '').trim()
+
+    if (queuedUser) {
+      candidates.push(liveSemanticMessage(queuedUser, queuedTurn))
+    }
+  }
+
+  const existing = new Set(transcript.flatMap(message => (message.messageId ? [message.messageId] : [])))
+
+  return candidates.filter(message => {
+    if (!message.messageId) {
+      return true
+    }
+
+    if (existing.has(message.messageId)) {
+      return false
+    }
+
+    existing.add(message.messageId)
+
+    return true
+  })
 }
 
 export const hydrateLiveSessionInflight = (inflight?: null | SessionInflightTurn) => {
@@ -304,7 +384,14 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
           resetSession()
           setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
-          const transcript = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
+
+          const durable = toTranscriptMessages(r.messages)
+
+          const transcript = [
+            ...durable,
+            ...liveSessionInflightMessages(r.inflight, r.queued, durable, r.queued_prompts)
+          ]
+
           setHistoryItems(info ? [introMsg(info), ...transcript] : transcript)
           writeActiveSessionFile(r.session_key ?? r.session_id)
           patchUiState({
@@ -357,7 +444,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             resetSession()
             setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
-            const resumed = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
+            const durable = toTranscriptMessages(r.messages)
+
+            const resumed = [
+              ...durable,
+              ...liveSessionInflightMessages(r.inflight, r.queued, durable, r.queued_prompts)
+            ]
 
             setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
             writeActiveSessionFile(r.resumed ?? r.session_id)
