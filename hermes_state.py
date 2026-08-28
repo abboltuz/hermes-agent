@@ -35,6 +35,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
+from agent.message_provenance import (
+    normalize_message_for_durable_write,
+    normalize_provenance_metadata,
+)
 from agent.session_activity import ActivityProvenance
 from agent.message_sanitization import _sanitize_surrogates
 # Intrinsic persistence marker stamped on message dicts that are known-durable
@@ -10339,6 +10343,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return None
 
+    @staticmethod
+    def _encode_provenance_metadata(provenance_metadata: Any) -> Optional[str]:
+        metadata = normalize_provenance_metadata(provenance_metadata)
+        return json.dumps(metadata) if metadata else None
+
+    @staticmethod
+    def _decode_provenance_metadata(raw: Any) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
+        try:
+            metadata = normalize_provenance_metadata(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid durable provenance metadata")
+            return None
+        return metadata or None
+
     def _check_transcript_write_guards(
         self,
         conn,
@@ -10518,6 +10538,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
+        origin_kind: Optional[str] = None,
+        turn_kind: Optional[str] = None,
+        trust_kind: Optional[str] = None,
+        provenance_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
@@ -10542,9 +10566,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
         """
+        normalized_message = normalize_message_for_durable_write(
+            {
+                "role": role,
+                "content": content,
+                "tool_calls": tool_calls,
+                "display_kind": display_kind,
+                "display_metadata": display_metadata,
+                "origin_kind": origin_kind,
+                "turn_kind": turn_kind,
+                "trust_kind": trust_kind,
+                "provenance_metadata": provenance_metadata,
+            }
+        )
+        display_kind = normalized_message.get("display_kind")
+        origin_kind = normalized_message["origin_kind"]
+        turn_kind = normalized_message["turn_kind"]
+        trust_kind = normalized_message["trust_kind"]
+        provenance_metadata = normalized_message.get("provenance_metadata")
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
+        provenance_metadata_json = self._encode_provenance_metadata(
+            provenance_metadata
+        )
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = self._reasoning_json_text(reasoning_details)
         codex_items_json = self._reasoning_json_text(codex_reasoning_items)
@@ -10589,8 +10634,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata,
+                   origin_kind, turn_kind, trust_kind, provenance_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -10614,6 +10660,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    origin_kind,
+                    turn_kind,
+                    trust_kind,
+                    provenance_metadata_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -10939,13 +10989,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return row[0] if row else None
 
     def latest_user_message_row_id(self, session_id: str) -> Optional[int]:
-        """Row id of the most recent active user message, or ``None``.
+        """Row id of the latest authorized human-intent message, or ``None``.
 
         The agent's default reaction target: "the message that triggered me",
         so the model never has to thread row ids through a tool call (mirrors
         the photon adapter's ``_record_last_inbound``).
         """
-        return self.latest_message_row_id(session_id, role="user")
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                "AND content IS NOT NULL AND TRIM(content) != '' "
+                "AND origin_kind IN ('human_user', 'external_actor') "
+                "AND turn_kind IN ('prompt', 'task_instruction', 'ui_action') "
+                "AND trust_kind = 'user_authorized' "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row[0] if row else None
 
     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
         """Role of the active message at *row_id* in *session_id*, or ``None``.
@@ -10977,6 +11040,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         inserted = 0
         tool_calls_total = 0
         for msg in messages:
+            source_msg = msg
+            msg = normalize_message_for_durable_write(msg)
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
             message_timestamp = now_ts
@@ -11016,13 +11081,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
             api_content = msg.get("api_content")
+            display_kind = msg.get("display_kind")
+            if (
+                not display_kind
+                and role == "user"
+                and msg.get("_todo_snapshot_synthetic") is True
+            ):
+                # Compression keeps this row provider-visible under role=user
+                # to preserve alternation, but it is runtime scaffolding rather
+                # than a human-authored turn. Promote the private in-memory
+                # provenance marker into durable presentation metadata so every
+                # client hides it after a reload.
+                display_kind = "hidden"
 
             cur = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata,
+                   origin_kind, turn_kind, trust_kind, provenance_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -11044,12 +11122,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     1 if msg.get("_compressed_summary") else 0,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
-                    _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
+                    _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    msg["origin_kind"],
+                    msg["turn_kind"],
+                    msg["trust_kind"],
+                    self._encode_provenance_metadata(
+                        msg.get("provenance_metadata")
+                    ),
                 ),
             )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
-                msg["_row_id"] = cur.lastrowid
+            if isinstance(source_msg, dict) and cur.lastrowid is not None:
+                source_msg["_row_id"] = cur.lastrowid
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -11530,6 +11614,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("provenance_metadata") is not None:
+                msg["provenance_metadata"] = self._decode_provenance_metadata(
+                    msg["provenance_metadata"]
+                )
+            msg = normalize_message_for_durable_write(msg)
             result.append(msg)
         return result
 
@@ -11626,6 +11715,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("provenance_metadata") is not None:
+                msg["provenance_metadata"] = self._decode_provenance_metadata(
+                    msg["provenance_metadata"]
+                )
+            msg = normalize_message_for_durable_write(msg)
             result.append(msg)
 
         # before_rows includes the anchor itself; subtract 1 for the count of
@@ -11796,7 +11890,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
         "_compressed_summary, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, origin_kind, turn_kind, "
+        "trust_kind, provenance_metadata"
     )
 
     def _rows_to_conversation(
@@ -11861,6 +11956,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
                     msg["display_metadata"] = decoded
+            if row["origin_kind"]:
+                msg["origin_kind"] = row["origin_kind"]
+            if row["turn_kind"]:
+                msg["turn_kind"] = row["turn_kind"]
+            if row["trust_kind"]:
+                msg["trust_kind"] = row["trust_kind"]
+            if row["provenance_metadata"]:
+                decoded_provenance = self._decode_provenance_metadata(
+                    row["provenance_metadata"]
+                )
+                if decoded_provenance is not None:
+                    msg["provenance_metadata"] = decoded_provenance
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             if row["timestamp"]:
@@ -11914,6 +12021,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+            msg = normalize_message_for_durable_write(msg)
             if include_ancestors:
                 canonical_content, _is_composite = (
                     self._canonical_replayed_user_content(msg)
@@ -12460,6 +12568,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise ValueError(
                     f"rewind target must be a 'user' message (got role="
                     f"{target_row.get('role')!r}, id={target_message_id})"
+                )
+            from agent.message_provenance import (
+                is_human_intent,
+                may_authorize_control,
+            )
+
+            if not (
+                is_human_intent(target_row)
+                and may_authorize_control(target_row)
+            ):
+                raise ValueError(
+                    "rewind target must be an authorized human-intent turn "
+                    f"(id={target_message_id})"
                 )
 
             replacement_message_id: Optional[int] = None

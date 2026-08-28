@@ -22,7 +22,9 @@ class BedrockTransport(ProviderTransport):
     def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
         """Convert OpenAI messages to Bedrock Converse format."""
         from agent.bedrock_adapter import convert_messages_to_converse
-        return convert_messages_to_converse(messages)
+        from agent.message_provenance import strip_provenance_messages_for_provider
+        projected = strip_provenance_messages_for_provider(messages)
+        return convert_messages_to_converse(projected)
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
         """Convert OpenAI tool schemas to Bedrock Converse toolConfig."""
@@ -47,6 +49,9 @@ class BedrockTransport(ProviderTransport):
             region: str — AWS region (default 'us-east-1')
         """
         from agent.bedrock_adapter import build_converse_kwargs
+        from agent.message_provenance import strip_provenance_messages_for_provider
+
+        messages = strip_provenance_messages_for_provider(messages)
 
         region = params.get("region", "us-east-1")
         guardrail = params.get("guardrail_config")

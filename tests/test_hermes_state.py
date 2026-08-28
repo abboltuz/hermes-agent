@@ -14,6 +14,18 @@ from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+AUTOMATION_PROVENANCE = {
+    "origin_kind": "automation",
+    "turn_kind": "task_instruction",
+    "trust_kind": "trusted_internal",
+}
+
+
 class _NoFtsCursor(sqlite3.Cursor):
     """Simulate a SQLite build without the fts5 module."""
 
@@ -820,7 +832,11 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
+        # Borrow through the real pool seam, then return it before search.
+        # Calling _get_read_conn() directly leaks the checkout and causes the
+        # searches below to use a different untraced connection.
+        with db._read_ctx() as read_conn:
+            pass
         traced_connections = [db._conn]
         if read_conn is not db._conn:
             traced_connections.append(read_conn)
@@ -2254,7 +2270,12 @@ class TestListSessionsRich:
     def test_preview_from_first_user_message(self, db):
         db.create_session("s1", "cli")
         db.append_message("s1", "system", "You are a helpful assistant.")
-        db.append_message("s1", "user", "Help me refactor the auth module please")
+        db.append_message(
+            "s1",
+            "user",
+            "Help me refactor the auth module please",
+            **HUMAN_PROVENANCE,
+        )
         db.append_message("s1", "assistant", "Sure, let me look at it.")
         sessions = db.list_sessions_rich()
         assert len(sessions) == 1
@@ -2625,7 +2646,9 @@ class TestCompressionChainProjection:
         # Root that gets compressed
         db.create_session("root1", "cli")
         db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
-        db.append_message("root1", "user", "help me refactor auth")
+        db.append_message(
+            "root1", "user", "help me refactor auth", **HUMAN_PROVENANCE
+        )
 
         # Delegate subagent spawned while root1 was live (before it ended)
         db.create_session("delegate1", "cli", parent_session_id="root1")
@@ -2648,7 +2671,7 @@ class TestCompressionChainProjection:
             "UPDATE sessions SET started_at=? WHERE id=?",
             (t_compress_root + 1, "mid1"),
         )
-        db.append_message("mid1", "user", "continuing")
+        db.append_message("mid1", "user", "continuing", **HUMAN_PROVENANCE)
 
         # mid1 also compressed
         t_compress_mid = t_compress_root + 1800
@@ -2663,7 +2686,9 @@ class TestCompressionChainProjection:
             "UPDATE sessions SET started_at=? WHERE id=?",
             (t_compress_mid + 1, "tip1"),
         )
-        db.append_message("tip1", "user", "latest message")
+        db.append_message(
+            "tip1", "user", "latest message", **HUMAN_PROVENANCE
+        )
 
         db._conn.commit()
         return ("root1", "delegate1", "mid1", "tip1")
@@ -2685,7 +2710,7 @@ class TestCompressionChainProjection:
         self._build_compression_chain(db, _time.time() - 3600)
         # Add an uncompressed root for comparison.
         db.create_session("solo", "cli")
-        db.append_message("solo", "user", "standalone")
+        db.append_message("solo", "user", "standalone", **HUMAN_PROVENANCE)
         db._conn.commit()
 
         sessions = db.list_sessions_rich(source="cli", limit=20)
@@ -2720,14 +2745,21 @@ class TestCompressionChainProjection:
         # Second, independent chain — same shape, different ids/content.
         db.create_session("root2", "cli")
         db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "root2"))
-        db.append_message("root2", "user", "second conversation start")
+        db.append_message(
+            "root2", "user", "second conversation start", **HUMAN_PROVENANCE
+        )
         db._conn.execute(
             "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
             (t0 + 200, "compression", "root2"),
         )
         db.create_session("tip2", "cli", parent_session_id="root2")
         db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 201, "tip2"))
-        db.append_message("tip2", "user", "second conversation continuation")
+        db.append_message(
+            "tip2",
+            "user",
+            "second conversation continuation",
+            **HUMAN_PROVENANCE,
+        )
         db.update_session_cwd("tip2", "/tmp/workspaces/second")
         db._conn.commit()
 
@@ -4150,7 +4182,12 @@ class TestListCronJobRuns:
     def _seed_run(self, db, job_id: str, idx: int, started_at: float):
         sid = f"cron_{job_id}_{idx:08d}"
         db.create_session(session_id=sid, source="cron")
-        db.append_message(sid, role="user", content=f"run {idx} for {job_id}")
+        db.append_message(
+            sid,
+            role="user",
+            content=f"run {idx} for {job_id}",
+            **AUTOMATION_PROVENANCE,
+        )
         db.append_message(sid, role="assistant", content="done")
         db.end_session(sid, "completed")
         db._conn.execute(

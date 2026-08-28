@@ -1085,6 +1085,10 @@ class SessionSearchMixin:
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("provenance_metadata") is not None:
+                msg["provenance_metadata"] = self._decode_provenance_metadata(
+                    msg["provenance_metadata"]
+                )
             return msg
 
         return {
@@ -1120,7 +1124,15 @@ class SessionSearchMixin:
         By default only active messages are returned.
         """
         active_clause = "" if include_inactive else " AND active = 1"
-        # Match CLI/desktop: only real user turns, not timeline bookkeeping.
+        # Address only semantically user-authored turns. Provider role is an
+        # alternation constraint and cannot distinguish internal user-role
+        # scaffolding, automation, imports, or unresolved legacy rows.
+        provenance_clause = (
+            " AND origin_kind IN ('human_user', 'external_actor')"
+            " AND turn_kind IN ('prompt', 'task_instruction', 'ui_action')"
+            " AND trust_kind = 'user_authorized'"
+        )
+        # Match CLI/desktop: not timeline bookkeeping.
         display_clause = " AND (display_kind IS NULL OR display_kind = '')"
         # Legacy standalone compaction handoffs (persisted pre-#80622) are
         # durable role='user' rows with NO display_kind — SQL can't see them,
@@ -1133,7 +1145,7 @@ class SessionSearchMixin:
             cursor = self._conn.execute(
                 "SELECT id, timestamp, content FROM messages "
                 "WHERE session_id = ? AND role = 'user'"
-                f"{active_clause}{display_clause} "
+                f"{active_clause}{provenance_clause}{display_clause} "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, fetch_limit),
             )

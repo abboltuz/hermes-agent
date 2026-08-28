@@ -375,8 +375,10 @@ class ResponsesApiTransport(ProviderTransport):
     def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
         """Convert OpenAI chat messages to Responses API input items."""
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
+        from agent.message_provenance import strip_provenance_messages_for_provider
         issuer = self._resolve_issuer_kind(kwargs)
         self._last_issuer_kind = issuer
+        messages = strip_provenance_messages_for_provider(messages)
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=kwargs.get("is_xai_responses") is True,
@@ -434,10 +436,12 @@ class ResponsesApiTransport(ProviderTransport):
             _chat_messages_to_responses_input,
             _responses_tools,
         )
+        from agent.message_provenance import strip_provenance_messages_for_provider
 
         from run_agent import DEFAULT_AGENT_IDENTITY
 
         instructions = params.get("instructions", "")
+        messages = strip_provenance_messages_for_provider(messages)
         payload_messages = messages
         if not instructions:
             if messages and messages[0].get("role") == "system":

@@ -27,6 +27,17 @@ def _carrier(ask: str = "REAL ASK") -> str:
     )
 
 
+def _append_human(db: SessionDB, session_id: str, content) -> int:
+    return db.append_message(
+        session_id,
+        "user",
+        content,
+        origin_kind="human_user",
+        turn_kind="prompt",
+        trust_kind="user_authorized",
+    )
+
+
 @pytest.fixture()
 def db(tmp_path):
     state = SessionDB(db_path=tmp_path / "state.db")
@@ -66,7 +77,7 @@ def _active_ids(db: SessionDB, session_id: str) -> list[int]:
 def test_composite_rewind_archives_tail_and_inserts_its_hidden_scaffold(db):
     sid = "carrier-rewind"
     db.create_session(sid, source="tui")
-    db.append_message(sid, "user", "older ask")
+    _append_human(db, sid, "older ask")
     db.append_message(
         sid,
         "assistant",
@@ -74,7 +85,7 @@ def test_composite_rewind_archives_tail_and_inserts_its_hidden_scaffold(db):
         tool_calls=[{"id": "call-1", "function": {"name": "terminal"}}],
     )
     db.append_message(sid, "tool", "ok", tool_call_id="call-1")
-    target_id = db.append_message(sid, "user", _carrier())
+    target_id = _append_human(db, sid, _carrier())
     db.append_message(sid, "assistant", "failed")
     expected_active_ids = _active_ids(db, sid)
 
@@ -106,10 +117,10 @@ def test_lineage_display_prefers_tip_carrier_over_replayed_parent_ask(db):
     parent = "carrier-parent"
     child = "carrier-child"
     db.create_session(parent, source="tui")
-    db.append_message(parent, "user", "REAL ASK")
+    _append_human(db, parent, "REAL ASK")
     db.end_session(parent, "compression")
     db.create_session(child, source="tui", parent_session_id=parent)
-    carrier_id = db.append_message(child, "user", _carrier())
+    carrier_id = _append_human(db, child, _carrier())
 
     model_history, display_history = db.get_resume_conversations(child)
 
@@ -138,10 +149,10 @@ def test_lineage_display_dedupes_multimodal_ask_in_tip_carrier(db):
         *ask,
     ]
     db.create_session(parent, source="tui")
-    db.append_message(parent, "user", ask)
+    _append_human(db, parent, ask)
     db.end_session(parent, "compression")
     db.create_session(child, source="tui", parent_session_id=parent)
-    carrier_id = db.append_message(child, "user", carrier)
+    carrier_id = _append_human(db, child, carrier)
 
     _, display_history = db.get_resume_conversations(child)
 
@@ -159,9 +170,9 @@ def test_lineage_display_dedupes_multimodal_ask_in_tip_carrier(db):
 def test_default_rewind_return_shape_and_active_counters_remain_compatible(db):
     sid = "default-rewind"
     db.create_session(sid, source="cli")
-    db.append_message(sid, "user", "first")
+    _append_human(db, sid, "first")
     db.append_message(sid, "assistant", "answer")
-    target_id = db.append_message(sid, "user", "second")
+    target_id = _append_human(db, sid, "second")
     db.append_message(
         sid,
         "assistant",
@@ -179,9 +190,9 @@ def test_default_rewind_return_shape_and_active_counters_remain_compatible(db):
 def test_guarded_composite_rewind_rejects_append_without_inserting_scaffold(db):
     sid = "guarded-rewind-append"
     db.create_session(sid, source="cli")
-    db.append_message(sid, "user", "first")
+    _append_human(db, sid, "first")
     db.append_message(sid, "assistant", "answer")
-    target_id = db.append_message(sid, "user", _carrier())
+    target_id = _append_human(db, sid, _carrier())
     db.append_message(sid, "assistant", "failed")
     snapshot = db.get_messages_as_conversation(sid, include_row_ids=True)
     expected_active_ids = [int(message["_row_id"]) for message in snapshot]
@@ -210,9 +221,9 @@ def test_guarded_composite_rewind_rejects_append_without_inserting_scaffold(db):
 def test_guarded_rewind_rejects_selected_target_content_change(db):
     sid = "guarded-rewind-in-place"
     db.create_session(sid, source="cli")
-    db.append_message(sid, "user", "first")
+    _append_human(db, sid, "first")
     db.append_message(sid, "assistant", "answer")
-    target_id = db.append_message(sid, "user", "second")
+    target_id = _append_human(db, sid, "second")
     db.append_message(sid, "assistant", "failed")
     expected_active_ids = _active_ids(db, sid)
 
@@ -242,7 +253,7 @@ def test_guarded_rewind_rejects_selected_target_content_change(db):
 def test_guarded_rewind_ignores_reaction_metadata_change(db):
     sid = "guarded-rewind-reaction"
     db.create_session(sid, source="cli")
-    target_id = db.append_message(sid, "user", "second")
+    target_id = _append_human(db, sid, "second")
     db.append_message(sid, "assistant", "failed")
     expected_active_ids = _active_ids(db, sid)
 
@@ -262,7 +273,7 @@ def test_guarded_rewind_ignores_reaction_metadata_change(db):
 def test_rewind_guard_rejects_foreign_live_compression_without_any_change(db):
     sid = "locked-rewind"
     db.create_session(sid, source="tui")
-    target_id = db.append_message(sid, "user", _carrier())
+    target_id = _append_human(db, sid, _carrier())
     db.append_message(sid, "assistant", "failed")
     assert db.try_acquire_compression_lock(sid, "foreign-writer", ttl_seconds=60)
     before_rows = _row_state(db, sid)
@@ -280,7 +291,7 @@ def test_rewind_guard_rejects_foreign_live_compression_without_any_change(db):
 def test_rewind_guard_rejects_foreign_turn_lease_without_any_change(db):
     sid = "leased-rewind"
     db.create_session(sid, source="tui")
-    target_id = db.append_message(sid, "user", _carrier())
+    target_id = _append_human(db, sid, _carrier())
     expected_active_ids = _active_ids(db, sid)
     holder = f"pid={os.getpid()}:turn=active"
     assert db.try_acquire_session_turn_lease(sid, holder, ttl_seconds=60)
@@ -313,7 +324,7 @@ def test_rewind_guard_rejects_foreign_turn_lease_without_any_change(db):
 def test_guarded_replace_rejects_foreign_turn_lease_without_any_change(db):
     sid = "leased-replace"
     db.create_session(sid, source="tui")
-    db.append_message(sid, "user", "old ask")
+    _append_human(db, sid, "old ask")
     holder = f"pid={os.getpid()}:turn=active"
     assert db.try_acquire_session_turn_lease(sid, holder, ttl_seconds=60)
     before_rows = _row_state(db, sid)
@@ -345,7 +356,7 @@ def test_guarded_replace_rejects_foreign_turn_lease_without_any_change(db):
 def test_guarded_replace_rejects_foreign_live_compression_without_any_change(db):
     sid = "compression-locked-replace"
     db.create_session(sid, source="tui")
-    db.append_message(sid, "user", "old ask")
+    _append_human(db, sid, "old ask")
     assert db.try_acquire_compression_lock(sid, "foreign-writer", ttl_seconds=60)
     before_rows = _row_state(db, sid)
     before_counts = _session_counts(db, sid)
@@ -366,7 +377,7 @@ def test_guarded_replace_rejects_foreign_live_compression_without_any_change(db)
 def test_rewind_guard_rejects_compression_ended_parent_without_any_change(db):
     sid = "closed-rewind"
     db.create_session(sid, source="tui")
-    target_id = db.append_message(sid, "user", _carrier())
+    target_id = _append_human(db, sid, _carrier())
     db.append_message(sid, "assistant", "failed")
     db.end_session(sid, "compression")
     before_rows = _row_state(db, sid)

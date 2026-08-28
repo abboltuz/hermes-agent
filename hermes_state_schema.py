@@ -1266,6 +1266,220 @@ class SessionSchemaMixin:
                 # one large prompt copy per session.
                 self._dedupe_legacy_system_prompts(cursor)
 
+            if current_version < 27:
+                # v27: provider roles no longer stand in for message authorship,
+                # semantic purpose, or control authorization.  Backfill only
+                # deterministic structural/display evidence; ambiguous legacy
+                # user rows fail closed as legacy_unknown.  Each UPDATE is
+                # idempotent and the surrounding schema transaction makes the
+                # migration restart-safe.
+                missing = (
+                    "origin_kind IS NULL OR turn_kind IS NULL "
+                    "OR trust_kind IS NULL"
+                )
+                # Older typed internal rows sometimes carried their producer
+                # only in display_metadata. Recover those allow-listed source
+                # labels before the generic display_kind mapping below.
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'agent',
+                            turn_kind = 'continuation',
+                            trust_kind = 'trusted_internal'
+                        WHERE display_kind = 'internal_notification'
+                          AND json_valid(display_metadata)
+                          AND lower(json_extract(display_metadata, '$.source'))
+                              IN ('kanban', 'delegation', 'subagent')
+                          AND ({missing})"""
+                )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'automation',
+                            turn_kind = 'continuation',
+                            trust_kind = 'trusted_internal'
+                        WHERE display_kind = 'internal_notification'
+                          AND json_valid(display_metadata)
+                          AND lower(json_extract(display_metadata, '$.source'))
+                              IN ('heartbeat', 'loop', 'goal', 'cron')
+                          AND ({missing})"""
+                )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'automation',
+                            turn_kind = 'task_instruction',
+                            trust_kind = 'untrusted_external'
+                        WHERE display_kind = 'internal_notification'
+                          AND json_valid(display_metadata)
+                          AND lower(json_extract(display_metadata, '$.source'))
+                              IN ('plugin', 'plugin_injection')
+                          AND ({missing})"""
+                )
+                for display_kind, origin_kind, turn_kind, trust_kind in (
+                    ('hidden', 'internal_system', 'runtime_scaffolding', 'no_control'),
+                    ('internal_notification', 'internal_system', 'notification', 'trusted_internal'),
+                    ('async_delegation_complete', 'agent', 'continuation', 'trusted_internal'),
+                    ('auto_continue', 'internal_system', 'continuation', 'trusted_internal'),
+                    ('model_switch', 'internal_system', 'notification', 'no_control'),
+                    ('personality_switch', 'internal_system', 'notification', 'no_control'),
+                ):
+                    cursor.execute(
+                        f"""UPDATE messages
+                            SET origin_kind = ?, turn_kind = ?, trust_kind = ?
+                            WHERE display_kind = ? AND ({missing})""",
+                        (origin_kind, turn_kind, trust_kind, display_kind),
+                    )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'internal_system',
+                            turn_kind = 'runtime_scaffolding',
+                            trust_kind = 'no_control'
+                        WHERE _compressed_summary = 1 AND ({missing})"""
+                )
+                from agent.context_compressor import (
+                    COMPRESSION_CONTINUATION_USER_CONTENT,
+                    MAX_ITERATIONS_SUMMARY_REQUEST,
+                    _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
+                )
+                from tools.todo_tool import TODO_INJECTION_HEADER
+
+                for exact_content in (
+                    COMPRESSION_CONTINUATION_USER_CONTENT,
+                    _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
+                    MAX_ITERATIONS_SUMMARY_REQUEST,
+                ):
+                    cursor.execute(
+                        f"""UPDATE messages
+                            SET origin_kind = 'internal_system',
+                                turn_kind = 'runtime_scaffolding',
+                                trust_kind = 'no_control'
+                            WHERE role = 'user' AND content = ? AND ({missing})""",
+                        (exact_content,),
+                    )
+                for stable_prefix in (
+                    TODO_INJECTION_HEADER,
+                    '[System: Your previous response was truncated',
+                    '[System: The previous response was cut off',
+                    '[System: Your previous tool call',
+                ):
+                    cursor.execute(
+                        f"""UPDATE messages
+                            SET origin_kind = 'internal_system',
+                                turn_kind = 'runtime_scaffolding',
+                                trust_kind = 'no_control'
+                            WHERE role = 'user' AND substr(content, 1, ?) = ?
+                              AND ({missing})""",
+                        (len(stable_prefix), stable_prefix),
+                    )
+                process_prefix = '[IMPORTANT: Background process '
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'internal_system',
+                            turn_kind = 'notification',
+                            trust_kind = 'trusted_internal'
+                        WHERE role = 'user' AND substr(content, 1, ?) = ?
+                          AND ({missing})""",
+                    (len(process_prefix), process_prefix),
+                )
+                mcp_reload_prefix = '[IMPORTANT: MCP servers have been reloaded.'
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'internal_system',
+                            turn_kind = 'notification',
+                            trust_kind = 'no_control'
+                        WHERE role = 'user' AND substr(content, 1, ?) = ?
+                          AND ({missing})""",
+                    (len(mcp_reload_prefix), mcp_reload_prefix),
+                )
+                cron_delivery_prefix = 'Cronjob Response: '
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'automation',
+                            turn_kind = 'delivery_mirror',
+                            trust_kind = 'no_control'
+                        WHERE role = 'user' AND substr(content, 1, ?) = ?
+                          AND ({missing})""",
+                    (len(cron_delivery_prefix), cron_delivery_prefix),
+                )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'imported',
+                            turn_kind = CASE
+                                WHEN role = 'user' AND content =
+                                    '(imported conversation begins with an assistant reply)'
+                                    THEN 'runtime_scaffolding'
+                                WHEN role = 'user' THEN 'prompt'
+                                WHEN role = 'assistant' AND tool_calls IS NOT NULL
+                                    THEN 'tool_call'
+                                WHEN role = 'assistant' THEN 'response'
+                                WHEN role = 'tool' THEN 'tool_result'
+                                ELSE 'runtime_scaffolding'
+                            END,
+                            trust_kind = 'no_control'
+                        WHERE session_id IN (
+                            SELECT id FROM sessions
+                            WHERE source IN ('claude-code', 'codex-cli')
+                        ) AND ({missing})"""
+                )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'imported',
+                            turn_kind = 'runtime_scaffolding',
+                            trust_kind = 'no_control'
+                        WHERE role = 'user'
+                          AND content = '(imported conversation begins with an assistant reply)'
+                          AND ({missing})"""
+                )
+                for session_source, origin_kind, turn_kind, trust_kind in (
+                    ('cron', 'automation', 'task_instruction', 'trusted_internal'),
+                    ('batch', 'automation', 'task_instruction', 'trusted_internal'),
+                    ('subagent', 'agent', 'task_instruction', 'trusted_internal'),
+                    ('delegate', 'agent', 'task_instruction', 'trusted_internal'),
+                    ('kanban', 'agent', 'task_instruction', 'trusted_internal'),
+                    ('curator', 'agent', 'task_instruction', 'trusted_internal'),
+                    ('memory_review', 'agent', 'task_instruction', 'trusted_internal'),
+                    ('skill_review', 'agent', 'task_instruction', 'trusted_internal'),
+                ):
+                    cursor.execute(
+                        f"""UPDATE messages
+                            SET origin_kind = ?, turn_kind = ?, trust_kind = ?
+                            WHERE role = 'user' AND session_id IN (
+                                SELECT id FROM sessions WHERE source = ?
+                            ) AND ({missing})""",
+                        (origin_kind, turn_kind, trust_kind, session_source),
+                    )
+                # Fall back to protocol structure only after every durable
+                # semantic marker has had a chance to classify the row.
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'assistant',
+                            turn_kind = CASE
+                                WHEN tool_calls IS NOT NULL THEN 'tool_call'
+                                ELSE 'response'
+                            END,
+                            trust_kind = 'no_control'
+                        WHERE role = 'assistant' AND ({missing})"""
+                )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'tool',
+                            turn_kind = 'tool_result',
+                            trust_kind = 'no_control'
+                        WHERE role = 'tool' AND ({missing})"""
+                )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'internal_system',
+                            turn_kind = 'runtime_scaffolding',
+                            trust_kind = 'trusted_internal'
+                        WHERE role = 'system' AND ({missing})"""
+                )
+                cursor.execute(
+                    f"""UPDATE messages
+                        SET origin_kind = 'legacy_unknown',
+                            turn_kind = 'legacy_unknown',
+                            trust_kind = 'legacy_unknown'
+                        WHERE {missing}"""
+                )
+
             # The FTS storage layout is versioned independently of the main
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at
