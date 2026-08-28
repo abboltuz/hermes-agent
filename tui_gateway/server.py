@@ -8547,6 +8547,15 @@ def _fresh_message_id(prefix: str = "turn") -> str:
     return f"{prefix}:{uuid.uuid4().hex}"
 
 
+def _transient_message_id(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    metadata = value.get("provenance_metadata")
+    if not isinstance(metadata, dict):
+        return None
+    return _normalize_client_message_id(metadata.get("message_id"))
+
+
 def _neutral_transient_provenance() -> dict[str, Any]:
     """Fail closed when an older caller supplied no semantic envelope."""
     from agent.message_provenance import (
@@ -8934,20 +8943,17 @@ def _enqueue_prompt(
     # merged envelope cannot re-fire the original on drain after a later
     # correction settles.
     _drop_queued_duplicates_of_inflight_user(session)
-    # Never queue a text-only self-copy of the live inflight user prompt. The
-    # live turn already owns that text; draining it after settle would restart
-    # the same user turn as a fresh agent invocation.
-    if not image_paths and isinstance(text, str):
-        turn = session.get("inflight_turn")
-        original = (
-            str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
-        )
-        if original and text.strip() == original:
-            return
+    queued_provenance = _normalized_transient_provenance(provenance)
+    # Suppress only a proven copy of the same semantic turn. Equal rendered
+    # text with a distinct (or absent) identity is a legitimate new prompt.
+    inflight_id = _transient_message_id(session.get("inflight_turn"))
+    queued_id = _transient_message_id(queued_provenance)
+    if inflight_id and queued_id == inflight_id:
+        return
     queued = {
         "text": text,
         "transport": transport,
-        "provenance": _normalized_transient_provenance(provenance),
+        "provenance": queued_provenance,
     }
     if image_paths:
         queued["image_paths"] = image_paths
@@ -8959,67 +8965,40 @@ def _enqueue_prompt(
 
 
 def _sanitize_queued_entry_vs_inflight_user(
-    entry: Any, original: str
+    entry: Any, inflight_message_id: str | None
 ) -> dict | None:
-    """Drop or rewrite a queue envelope that re-carries the live user text.
-
-    Returns ``None`` to drop the envelope, or a (possibly rewritten) dict to
-    keep. Text-only self-duplicates of ``original`` are dropped. A merged
-    slot ``"{original}\\n\\n{later}"`` (from ``_enqueue_prompt``'s consecutive
-    text merge) is rewritten to just ``later`` so a later correction is not
-    lost and the original is not re-fired (#84417). Image-bearing envelopes
-    are left alone — their chronology/ownership is load-bearing.
-    """
-    if not original or not isinstance(entry, dict):
-        return entry if isinstance(entry, dict) else None
-    if entry.get("image_paths"):
-        return entry
-    text = entry.get("text")
-    if not isinstance(text, str):
-        return entry
-    stripped = text.strip()
-    if not stripped:
+    """Drop only a queue envelope proven to duplicate the live semantic turn."""
+    if not isinstance(entry, dict):
         return None
-    if stripped == original:
+    queued_message_id = _transient_message_id(entry.get("provenance"))
+    if inflight_message_id and queued_message_id == inflight_message_id:
         return None
-    # Lossless text-merge glued the live original onto a later follow-up.
-    for sep in ("\n\n", "\n"):
-        prefix = original + sep
-        if text.startswith(prefix):
-            rest = text[len(prefix) :].strip()
-            if not rest or rest == original:
-                return None
-            cleaned = dict(entry)
-            cleaned["text"] = rest
-            return cleaned
     return entry
 
 
 def _drop_queued_duplicates_of_inflight_user(session: dict) -> None:
     """Remove server-queue copies of the live turn's original user text.
 
-    A mid-turn ``prompt.submit`` of the same text can land in
+    A duplicate representation with the same immutable message id can land in
     ``queued_prompt`` when redirect is not yet available (model not active,
-    build window, tool boundary). If the user then corrects the turn with a
-    different prompt via redirect, that stale self-duplicate must not
-    ``_drain_queued_prompt`` after the redirected turn completes — otherwise
-    the original prompt restarts as a fresh agent turn (#84417).
-
-    Unrelated follow-ups (different text, image-bearing envelopes) stay.
-    Merged ``original + later`` slots are rewritten to ``later`` only.
+    build window, tool boundary). If the user then corrects the turn, that
+    proven self-copy must not drain after the redirected turn completes
+    (#84417). Equal text with a different or unknown identity remains queued.
     """
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
         return
-    original = str(turn.get("user") or "").strip()
-    if not original:
+    inflight_message_id = _transient_message_id(turn)
+    if not inflight_message_id:
         return
 
     head = session.get("queued_prompt")
     rest = list(session.get("queued_prompts") or [])
     kept: list[dict] = []
     for entry in ([head] if head else []) + rest:
-        cleaned = _sanitize_queued_entry_vs_inflight_user(entry, original)
+        cleaned = _sanitize_queued_entry_vs_inflight_user(
+            entry, inflight_message_id
+        )
         if cleaned is not None:
             kept.append(cleaned)
 

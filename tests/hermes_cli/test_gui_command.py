@@ -530,6 +530,31 @@ def test_desktop_macos_local_codesign_signs_native_binaries(tmp_path, monkeypatc
             True,
             False,
         ),
+        (
+            "com.nousresearch.hermes",
+            'designated => identifier "com.nousresearch.hermes" or anchor apple',
+            True,
+            False,
+        ),
+        (
+            "com.nousresearch.hermes",
+            'designated => identifier "com.nousresearch.hermes" and anchor apple',
+            False,
+            False,
+        ),
+        (
+            "com.nousresearch.hermes",
+            'designated => identifier "com.nousresearch.hermes.evil" and anchor apple',
+            True,
+            False,
+        ),
+        (
+            "com.nousresearch.hermes",
+            'designated => identifier "com.nousresearch.hermes"\n'
+            'designated => identifier "com.nousresearch.hermes" and anchor apple',
+            True,
+            False,
+        ),
     ],
 )
 def test_desktop_macos_identity_postcondition(

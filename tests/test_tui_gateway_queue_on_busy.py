@@ -46,6 +46,15 @@ def _without_provenance(entry, *, origin="legacy_unknown", message_id=None):
     return copied
 
 
+def _human_provenance(message_id):
+    return {
+        "origin_kind": "human_user",
+        "turn_kind": "prompt",
+        "trust_kind": "user_authorized",
+        "provenance_metadata": {"message_id": message_id},
+    }
+
+
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
 
 def test_enqueue_pins_text_and_transport():
@@ -124,11 +133,20 @@ def test_successful_redirect_drops_queued_duplicate_of_inflight_user(monkeypatch
         "assistant": "partial",
         "streaming": True,
         "error": "",
+        **_human_provenance("desktop:original"),
     }
     # Stale self-duplicate of the live turn (would re-fire after settle).
-    session["queued_prompt"] = {"text": original, "transport": "ws-1"}
+    session["queued_prompt"] = {
+        "text": original,
+        "transport": "ws-1",
+        "provenance": _human_provenance("desktop:original"),
+    }
     session["queued_prompts"] = [
-        {"text": original, "transport": "ws-1"},
+        {
+            "text": original,
+            "transport": "ws-1",
+            "provenance": _human_provenance("desktop:original"),
+        },
         {"text": "unrelated later task", "transport": "ws-1"},
     ]
 
@@ -173,22 +191,44 @@ def test_successful_redirect_preserves_unrelated_queued_followups(monkeypatch):
     }
 
 
-def test_enqueue_skips_text_duplicate_of_inflight_user():
-    """#84417 defense: do not admit a self-duplicate of the live user prompt."""
+def test_enqueue_dedupes_same_identity_but_preserves_repeated_human_text():
+    """Equal text is distinct unless immutable identity proves a self-copy."""
     session = _session()
     session["inflight_turn"] = {
         "user": "live turn P",
         "assistant": "",
         "streaming": True,
         "error": "",
+        **_human_provenance("desktop:original"),
     }
 
-    server._enqueue_prompt(session, "live turn P", "ws-1")
+    server._enqueue_prompt(
+        session,
+        "live turn P",
+        "ws-1",
+        provenance=_human_provenance("desktop:original"),
+    )
     assert session.get("queued_prompt") is None
 
-    server._enqueue_prompt(session, "different follow-up", "ws-1")
-    assert _without_provenance(session["queued_prompt"]) == {
-        "text": "different follow-up",
+    server._enqueue_prompt(
+        session,
+        "live turn P",
+        "ws-1",
+        image_paths=["/tmp/repeated.png"],
+        provenance=_human_provenance("desktop:original"),
+    )
+    assert session.get("queued_prompt") is None
+
+    server._enqueue_prompt(
+        session,
+        "live turn P",
+        "ws-1",
+        provenance=_human_provenance("desktop:repeat"),
+    )
+    assert _without_provenance(
+        session["queued_prompt"], origin="human_user", message_id="desktop:repeat"
+    ) == {
+        "text": "live turn P",
         "transport": "ws-1",
     }
 
@@ -201,9 +241,14 @@ def test_enqueue_followup_does_not_merge_stale_inflight_self_duplicate():
         "assistant": "",
         "streaming": True,
         "error": "",
+        **_human_provenance("desktop:p"),
     }
     # Pre-existing stale self-duplicate (e.g. admitted before inflight was set).
-    session["queued_prompt"] = {"text": "P", "transport": "ws-1"}
+    session["queued_prompt"] = {
+        "text": "P",
+        "transport": "ws-1",
+        "provenance": _human_provenance("desktop:p"),
+    }
 
     server._enqueue_prompt(session, "Q", "ws-1")
 
@@ -214,8 +259,8 @@ def test_enqueue_followup_does_not_merge_stale_inflight_self_duplicate():
     assert not session.get("queued_prompts")
 
 
-def test_drop_rewrites_merged_inflight_prefix_to_followup_only():
-    """Already-merged ``P\\n\\nQ`` slots keep Q and drop the live original."""
+def test_drop_preserves_legacy_merged_text_without_identity_evidence():
+    """Unknown legacy text is not rewritten into a guessed semantic turn."""
     session = _session()
     session["inflight_turn"] = {
         "user": "P",
@@ -227,7 +272,10 @@ def test_drop_rewrites_merged_inflight_prefix_to_followup_only():
 
     server._drop_queued_duplicates_of_inflight_user(session)
 
-    assert session.get("queued_prompt") == {"text": "Q", "transport": "ws-1"}
+    assert session.get("queued_prompt") == {
+        "text": "P\n\nQ",
+        "transport": "ws-1",
+    }
 
 
 def test_hard_interrupt_queue_path_scrubs_stale_inflight_self_duplicate(monkeypatch):
@@ -245,8 +293,13 @@ def test_hard_interrupt_queue_path_scrubs_stale_inflight_self_duplicate(monkeypa
         "assistant": "",
         "streaming": True,
         "error": "",
+        **_human_provenance("desktop:p"),
     }
-    session["queued_prompt"] = {"text": "P", "transport": "ws-1"}
+    session["queued_prompt"] = {
+        "text": "P",
+        "transport": "ws-1",
+        "provenance": _human_provenance("desktop:p"),
+    }
 
     resp = server._handle_busy_submit("r1", "sid", session, "Q", "ws-1")
 
@@ -276,8 +329,13 @@ def test_redirect_then_drain_does_not_re_fire_original_p(monkeypatch):
         "assistant": "partial",
         "streaming": True,
         "error": "",
+        **_human_provenance("desktop:p"),
     }
-    session["queued_prompt"] = {"text": "P", "transport": "ws-1"}
+    session["queued_prompt"] = {
+        "text": "P",
+        "transport": "ws-1",
+        "provenance": _human_provenance("desktop:p"),
+    }
 
     resp = server._handle_busy_submit("r1", "sid", session, "Q", "ws-1")
     assert resp["result"]["status"] == "redirected"

@@ -7659,13 +7659,36 @@ def _desktop_macos_identity_postcondition(
         )
         dr = f"{requirement.stdout or ''}\n{requirement.stderr or ''}".strip()
         dr_lower = dr.lower()
-        stable_identifier = 'identifier "com.nousresearch.hermes"' in dr
-        certificate_anchored = "anchor " in dr_lower or "certificate " in dr_lower
+        designated_lines = [
+            line.strip()
+            for line in dr.splitlines()
+            if line.strip().lower().startswith("designated =>")
+        ]
+        requirement_expr = (
+            designated_lines[0].split("=>", 1)[1].strip()
+            if len(designated_lines) == 1
+            else ""
+        )
+        identifier_expr = 'identifier "com.nousresearch.hermes"'
+        if require_certificate_anchor:
+            requirement_lower = requirement_expr.lower()
+            valid_requirement_shape = (
+                requirement_expr.startswith(identifier_expr + " and ")
+                and not re.search(r"\bor\b", requirement_expr, re.IGNORECASE)
+                and (
+                    "anchor " in requirement_lower
+                    or "certificate " in requirement_lower
+                )
+            )
+        else:
+            # The allowed ad-hoc fallback is deliberately identifier-only.
+            # Any extra predicate would create a different, potentially
+            # rebuild-unstable identity contract.
+            valid_requirement_shape = requirement_expr == identifier_expr
         if (
             requirement.returncode != 0
-            or not stable_identifier
+            or not valid_requirement_shape
             or "cdhash" in dr_lower
-            or (require_certificate_anchor and not certificate_anchored)
         ):
             print(
                 "  (macOS Desktop identity gate failed: "
