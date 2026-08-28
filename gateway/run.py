@@ -25496,6 +25496,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             evt.get("origin_api_route_profile") or ""
         ).strip()
 
+        def _canonical_event_profile(value: str, *, route: bool = False):
+            """Validate persisted routing provenance before any path resolver."""
+            if not value:
+                return ""
+            # ``custom`` is the legacy marker for the active non-profile
+            # home. It is valid runtime provenance, but never a /p/<name>/
+            # route qualifier.
+            if value == "custom":
+                return None if route else value
+            try:
+                from hermes_cli.profiles import (
+                    normalize_profile_name,
+                    validate_profile_name,
+                )
+
+                canonical = normalize_profile_name(value)
+                validate_profile_name(canonical)
+            except (TypeError, ValueError):
+                return None
+            # Durable provenance is machine-generated and must already use
+            # the canonical on-disk spelling. Do not silently rewrite an
+            # attacker-controlled or corrupted identifier.
+            return canonical if canonical == value else None
+
+        validated_origin_profile = _canonical_event_profile(origin_profile)
+        validated_route_profile = _canonical_event_profile(
+            route_profile,
+            route=True,
+        )
+        if validated_origin_profile is None or validated_route_profile is None:
+            logger.warning(
+                "Rejecting synthetic event with invalid profile provenance"
+            )
+            return None
+        origin_profile = validated_origin_profile
+        route_profile = validated_route_profile
+
+        if route_profile and not origin_profile:
+            logger.warning(
+                "Rejecting synthetic event with route profile but no runtime "
+                "profile provenance"
+            )
+            return None
+
         if route_profile and origin_profile and route_profile != origin_profile:
             logger.warning(
                 "Rejecting synthetic event with contradictory profile provenance"
@@ -25533,7 +25577,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source_profile = origin_profile or (
             "" if typed_api_origin else key_profile
         )
-        if source_profile not in {"", "default"} and not typed_api_origin:
+        if source_profile not in {"", "default"}:
             # A syntactically valid namespace is not routing authority by
             # itself. It must belong to this gateway's active/served profile
             # set; otherwise the shared API adapter would make an absent named
@@ -25723,6 +25767,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         display_metadata = _watch_event_display_metadata(evt)
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
+            # A fully typed API event is resolved entirely above. If that
+            # fail-closed resolver rejected it (invalid/unserved profile,
+            # contradictory route, etc.), the legacy raw-session fallback
+            # must not turn the rejection back into an unvalidated self-post.
+            if (
+                str(evt.get("platform") or "").strip().lower()
+                == Platform.API_SERVER.value
+                and str(evt.get("origin_session_id") or "").strip()
+            ):
+                logger.warning(
+                    "Dropping typed api_server notification with rejected "
+                    "routing provenance"
+                )
+                return None
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
             # structured ``agent:main:...`` key, so _build_process_event_source

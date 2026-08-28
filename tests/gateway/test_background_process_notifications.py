@@ -646,6 +646,7 @@ async def test_api_origin_bypasses_conflicting_push_session_key(monkeypatch, tmp
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     telegram_adapter = runner.adapters[Platform.TELEGRAM]
+    runner._profile_adapters = {"writer": {}}
     api_adapter = SimpleNamespace(
         supports_async_delivery=False,
         handle_message=AsyncMock(),
@@ -687,6 +688,53 @@ async def test_api_origin_bypasses_conflicting_push_session_key(monkeypatch, tmp
     assert wakes[0][1]["session_id"] == "raw-api-session"
     assert wakes[0][1]["profile"] == "writer"
     assert wakes[0][1]["route_profile"] == "writer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin_profile", "route_profile"),
+    [
+        ("../escape", "../escape"),
+        (
+            "definitely-unserved-review-profile",
+            "definitely-unserved-review-profile",
+        ),
+        ("", "../escape"),
+    ],
+)
+async def test_typed_api_origin_rejects_invalid_or_unserved_profile_provenance(
+    monkeypatch,
+    tmp_path,
+    origin_profile,
+    route_profile,
+):
+    """Typed API authority never makes an unsafe profile identifier valid."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._profile_adapters = {"writer": {}}
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    wakes = []
+
+    async def capture_wake(adapter, **kwargs):
+        wakes.append((adapter, kwargs))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", capture_wake)
+
+    event = {
+        "type": "completion",
+        "session_id": "proc-invalid-api-profile",
+        "platform": "api_server",
+        "origin_session_id": "raw-api-session",
+        "origin_profile": origin_profile,
+        "origin_api_route_profile": route_profile,
+    }
+    assert runner._build_process_event_source(event) is None
+    assert await runner._inject_watch_notification("[SYSTEM: done]", event) is None
+    api_adapter.handle_message.assert_not_awaited()
+    assert wakes == []
 
 
 @pytest.mark.asyncio
