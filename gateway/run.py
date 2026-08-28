@@ -19613,6 +19613,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "actor_id": source.user_id,
             "authorized_via": "role" if source.role_authorized else "identity",
         }
+        # Keep the semantic sidecar as audit-complete as the independently
+        # persisted display sidecar.  Push-capable wakes enter through this
+        # gateway boundary, unlike API self-post wakes whose authenticated
+        # envelope already carries provenance.  Dropping these IDs here made
+        # the same Kanban/process event lose identity on Telegram/Discord but
+        # keep it on api_server.
+        for _identity_key in (
+            "event_id",
+            "task_id",
+            "job_id",
+            "process_id",
+            "delegation_id",
+            "run_id",
+            "generation_id",
+        ):
+            _identity_value = (persist_user_display_metadata or {}).get(
+                _identity_key
+            )
+            if _identity_value is not None and _identity_value != "":
+                _provenance_metadata[_identity_key] = _identity_value
+        if isinstance(
+            (persist_user_display_metadata or {}).get("recovered"), bool
+        ):
+            _provenance_metadata["recovered"] = persist_user_display_metadata[
+                "recovered"
+            ]
         _ingress_provenance = provenance_for_gateway_ingress(
             platform=source.platform,
             internal=bool(getattr(event, "internal", False)),

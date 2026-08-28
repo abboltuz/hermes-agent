@@ -6,7 +6,7 @@ OpenAI-shaped `{role, content, tool_calls, tool_call_id}` entries that
 `agent/curator.py` already knows how to read.
 
 Codex emits items with a discriminator field `type`:
-  - userMessage         → {role: "user", content}
+  - userMessage         → ignored (echo of Hermes' already-persisted input)
   - agentMessage        → {role: "assistant", content}
   - reasoning           → stashed in the assistant's "reasoning" field
   - commandExecution    → assistant tool_call(name="exec") + tool result
@@ -107,7 +107,14 @@ class CodexEventProjector:
         if item_type == "dynamicToolCall":
             return self._project_dynamic_tool_call(item, item_id)
         if item_type == "userMessage":
-            return self._project_user_message(item)
+            # Codex echoes the submitted input as a completed userMessage.
+            # Hermes has already appended and crash-safely persisted that
+            # trusted turn before the app-server call starts. Materializing
+            # the echo here would create two consecutive provider-role user
+            # rows and normalize the second, unclassified row to
+            # legacy_unknown. It is transport acknowledgement, not a new
+            # conversation producer.
+            return ProjectionResult()
 
         # Unknown / rare items (plan, hookPrompt, collabAgentToolCall, etc.)
         # — record as opaque assistant note so memory review can still see
@@ -123,21 +130,6 @@ class CodexEventProjector:
             msg["reasoning"] = "\n".join(self._pending_reasoning)
             self._pending_reasoning = []
         return ProjectionResult(messages=[msg], final_text=text)
-
-    def _project_user_message(self, item: dict) -> ProjectionResult:
-        # codex's userMessage content is a list of UserInput variants. For
-        # projection purposes we flatten any text fragments and ignore
-        # non-text parts (images, etc.) — Hermes' messages store text only.
-        text_parts: list[str] = []
-        for fragment in item.get("content") or []:
-            if isinstance(fragment, dict):
-                if fragment.get("type") == "text":
-                    text_parts.append(fragment.get("text") or "")
-                elif "text" in fragment:
-                    text_parts.append(str(fragment["text"]))
-        return ProjectionResult(
-            messages=[{"role": "user", "content": "\n".join(text_parts)}]
-        )
 
     def _project_command(self, item: dict, item_id: str) -> ProjectionResult:
         call_id = _deterministic_call_id("exec", item_id)
