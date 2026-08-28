@@ -7619,12 +7619,78 @@ def _desktop_macos_has_valid_real_signature(app: Path) -> bool:
         if info.returncode != 0 or "TeamIdentifier=" not in output \
                 or "TeamIdentifier=not set" in output:
             return False
+        return _desktop_macos_identity_postcondition(
+            app, require_certificate_anchor=True
+        )
+    except Exception:
+        return False
+
+
+def _desktop_macos_identity_postcondition(
+    app: Path, *, require_certificate_anchor: bool
+) -> bool:
+    """Verify the actual Electron bundle's stable TCC identity, fail closed."""
+    codesign = shutil.which("codesign")
+    plistbuddy = Path("/usr/libexec/PlistBuddy")
+    if not codesign:
+        print("  (macOS Desktop identity gate failed: codesign was not found)")
+        return False
+    try:
+        bundle_id = subprocess.run(
+            [str(plistbuddy), "-c", "Print :CFBundleIdentifier", str(app / "Contents" / "Info.plist")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if bundle_id.returncode != 0 or (bundle_id.stdout or "").strip() != "com.nousresearch.hermes":
+            output = (bundle_id.stderr or bundle_id.stdout or "").strip()
+            print(
+                "  (macOS Desktop identity gate failed: "
+                f"{plistbuddy} -c 'Print :CFBundleIdentifier' {app / 'Contents' / 'Info.plist'}\n"
+                f"   output: {output or '<empty>'})"
+            )
+            return False
+
+        requirement = subprocess.run(
+            [codesign, "-d", "-r-", str(app)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        dr = f"{requirement.stdout or ''}\n{requirement.stderr or ''}".strip()
+        dr_lower = dr.lower()
+        stable_identifier = 'identifier "com.nousresearch.hermes"' in dr
+        certificate_anchored = "anchor " in dr_lower or "certificate " in dr_lower
+        if (
+            requirement.returncode != 0
+            or not stable_identifier
+            or "cdhash" in dr_lower
+            or (require_certificate_anchor and not certificate_anchored)
+        ):
+            print(
+                "  (macOS Desktop identity gate failed: "
+                f"{codesign} -d -r- {app}\n"
+                f"   output: {dr or '<empty>'})"
+            )
+            return False
+
         verify = subprocess.run(
             [codesign, "--verify", "--deep", "--strict", str(app)],
-            check=False, capture_output=True,
+            check=False,
+            capture_output=True,
+            text=True,
         )
-        return verify.returncode == 0
-    except Exception:
+        if verify.returncode != 0:
+            output = f"{verify.stdout or ''}\n{verify.stderr or ''}".strip()
+            print(
+                "  (macOS Desktop identity gate failed: "
+                f"{codesign} --verify --deep --strict {app}\n"
+                f"   output: {output or '<empty>'})"
+            )
+            return False
+        return True
+    except Exception as exc:
+        print(f"  (macOS Desktop identity gate failed while verifying {app}: {exc})")
         return False
 
 
@@ -7657,9 +7723,9 @@ def _desktop_macos_local_codesign(
     if not (ent_main.exists() and ent_inherit.exists()):
         # Hardened-runtime restrictions are enforced even for ad-hoc
         # signatures. Signing with --options runtime but WITHOUT the allow-jit
-        # entitlements would leave Electron/V8 crashing on launch — strictly
-        # worse than the legacy plain ad-hoc sign. Bail out so the caller
-        # falls back to that legacy path instead.
+        # entitlements would leave Electron/V8 crashing on launch. Bail out;
+        # the caller must fail the identity gate rather than emit a broken or
+        # cdhash-pinned legacy artifact.
         raise FileNotFoundError(
             f"desktop entitlement plists missing under {desktop_dir / 'electron'}"
         )
@@ -7718,11 +7784,9 @@ def _desktop_macos_local_codesign(
 
     # 3) The main bundle, with the app's own entitlements.
     sign_path(app, entitlements=ent_main, identifier=_desktop_macos_bundle_id(app))
-    subprocess.run(
-        [codesign, "--verify", "--deep", "--strict", str(app)],
-        check=True, capture_output=True,
+    return _desktop_macos_identity_postcondition(
+        app, require_certificate_anchor=identity != "-"
     )
-    return True
 
 
 def _desktop_macos_relaunchable_fixup(
@@ -7748,9 +7812,9 @@ def _desktop_macos_relaunchable_fixup(
     bundle already carries an intact Developer ID signature, so a properly
     signed/notarized build is never clobbered. Callers that already made the
     publisher-signing decision may pass it explicitly so a later dotenv load
-    can't reverse it. Falls back to the legacy deep ad-hoc sign if the
-    entitlement-preserving path fails. Best-effort: never raises. Returns True
-    when no work was needed or signing + strict verification succeeded.
+    can't reverse it. Never accepts a cdhash-pinned legacy fallback. Best-effort:
+    never raises. Returns True only when no macOS bundle exists or the stable
+    identity postcondition and strict verification succeeded.
     """
     if sys.platform != "darwin":
         return True
@@ -7758,8 +7822,6 @@ def _desktop_macos_relaunchable_fixup(
         publisher_signing_configured = bool(
             os.environ.get("CSC_LINK") or os.environ.get("APPLE_SIGNING_IDENTITY")
         )
-    if publisher_signing_configured:
-        return True
     exe = _desktop_packaged_executable(desktop_dir)
     if exe is None:
         return True
@@ -7770,6 +7832,10 @@ def _desktop_macos_relaunchable_fixup(
     codesign = shutil.which("codesign")
     if not codesign:
         return False
+    if publisher_signing_configured:
+        return _desktop_macos_identity_postcondition(
+            app, require_certificate_anchor=True
+        )
     if _desktop_macos_has_valid_real_signature(app):
         return True
     subprocess.run(["xattr", "-cr", str(app)], check=False)
@@ -7783,44 +7849,12 @@ def _desktop_macos_relaunchable_fixup(
         if identity != "-":
             print(
                 f"  (warning: configured macOS signing identity failed: {identity!r}; "
-                "falling back to ad-hoc — TCC grants may need to be re-granted)"
+                "refusing to replace it with an unstable identity)"
             )
-        print(f"  (warning: stable macOS signing failed ({exc}); using legacy ad-hoc sign)")
-    try:
-        # Legacy ad-hoc fallback: re-sign, but NEVER delete the safeStorage
-        # keychain item. Deleting it would permanently orphan every
-        # credential encrypted under it (gateway token, native OAuth access/
-        # refresh tokens) — and this path is reached exactly when the
-        # entitlement-preserving signer failed, so there is no verified
-        # successor identity to hand the key to. The keychain prompt macOS
-        # shows instead is recoverable ("Always Allow" updates the item's ACL
-        # partition list and preserves the key); deletion is not. The real
-        # fix (proof-carrying rotation/migration) belongs in Electron, where
-        # safeStorage can read the old key. Tracked as follow-up.
-        result = subprocess.run(
-            [codesign, "--force", "--deep", "--sign", "-", str(app)],
-            check=False, capture_output=True, text=True,
+        print(
+            f"  (warning: stable macOS signing failed ({exc}); refusing "
+            "cdhash-pinned legacy ad-hoc fallback; safeStorage keychain item left untouched)"
         )
-        if result.returncode != 0:
-            print(
-                f"  (warning: legacy ad-hoc re-sign failed (exit {result.returncode}); "
-                "leaving safeStorage keychain item untouched)"
-            )
-            return False
-        verify = subprocess.run(
-            [codesign, "--verify", "--deep", "--strict", str(app)],
-            check=False, capture_output=True, text=True,
-        )
-        if verify.returncode != 0:
-            print(
-                f"  (warning: legacy ad-hoc re-sign did not pass strict verification; "
-                "leaving safeStorage keychain item untouched)"
-            )
-            return False
-        print("  → macOS desktop re-signed (legacy ad-hoc); safeStorage keychain item left untouched")
-        return True
-    except Exception as exc:
-        print(f"  (warning: macOS relaunch fixup skipped: {exc})")
     return False
 
 
@@ -8004,8 +8038,12 @@ def _desktop_macos_setup_tcc_identity(identity: str = "Hermes Local Signing") ->
                     "  → packaged app re-signed with certificate-anchored identity; "
                     "TCC grants persist across rebuilds"
                 )
+            else:
+                print("  (packaged app did not pass the macOS Desktop identity gate)")
+                return False
         except Exception as exc:
             print(f"  (could not re-sign packaged app: {exc})")
+            return False
 
     print(
         "\n  Note: macOS will re-prompt for permissions ONE final time (the identity "
@@ -8311,6 +8349,7 @@ def cmd_gui(args: argparse.Namespace):
         sys.exit(0 if ok else 1)
 
     packaged_executable = _desktop_packaged_executable(desktop_dir)
+    macos_identity_verified = False
 
     if source_mode or not skip_build:
         npm = _resolve_node_runtime_npm()
@@ -8455,7 +8494,10 @@ def cmd_gui(args: argparse.Namespace):
                 # Locally-built apps are ad-hoc signed; make them relaunchable after
                 # an in-place self-update (otherwise macOS reports "Hermes is
                 # damaged"). No-op on non-macOS and on real-identity builds.
-                _desktop_macos_relaunchable_fixup(desktop_dir)
+                if not _desktop_macos_relaunchable_fixup(desktop_dir):
+                    print("✗ macOS Desktop identity gate failed; refusing build-only success or launch")
+                    sys.exit(1)
+                macos_identity_verified = True
 
                 # Windows integrity gate (#69179): never declare the rebuild a
                 # success on a Hermes.exe Windows cannot load (truncated PE from
@@ -8475,6 +8517,14 @@ def cmd_gui(args: argparse.Namespace):
 
             # Build succeeded — write the stamp so next run can skip
             _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
+
+    if not source_mode and not macos_identity_verified:
+        # The gate also applies when the content stamp or --skip-build reuses an
+        # existing package. Verify the actual Electron bundle before reporting
+        # build-only success or launching it.
+        if not _desktop_macos_relaunchable_fixup(desktop_dir):
+            print("✗ macOS Desktop identity gate failed; refusing build-only success or launch")
+            sys.exit(1)
 
     # Linux: register the app in the desktop launcher, so Hermes shows up
     # in the application menu with its icon. Best-effort and idempotent.

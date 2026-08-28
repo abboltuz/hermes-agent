@@ -134,6 +134,42 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
 
 
+def test_gui_fails_closed_when_macos_identity_gate_returns_false(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch)
+
+    with patch("hermes_cli.main._desktop_macos_relaunchable_fixup", return_value=False), \
+         patch("hermes_cli.main._register_linux_desktop_entry") as mock_register, \
+         patch("hermes_cli.main.subprocess.run") as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True, build_only=True))
+
+    assert exc.value.code == 1
+    mock_register.assert_not_called()
+    mock_run.assert_not_called()
+
+
+def test_gui_does_not_stamp_or_launch_when_postbuild_identity_gate_fails(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch)
+    ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
+
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=ok), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._desktop_macos_relaunchable_fixup", return_value=False), \
+         patch("hermes_cli.main._write_desktop_build_stamp") as mock_stamp, \
+         patch("hermes_cli.main.subprocess.run", return_value=ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(build_only=True))
+
+    assert exc.value.code == 1
+    mock_stamp.assert_not_called()
+    assert mock_run.call_count == 1
+
+
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
     """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
     shell out to bare ``node``. When Desktop is launched from the updater chain
@@ -425,7 +461,16 @@ def _collect_codesign_calls(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        return subprocess.CompletedProcess(cmd, 0)
+        if cmd[0] == "/usr/libexec/PlistBuddy":
+            return subprocess.CompletedProcess(cmd, 0, stdout="com.nousresearch.hermes\n", stderr="")
+        if "-r-" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="",
+                stderr='designated => identifier "com.nousresearch.hermes"',
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(
         cli_main.shutil, "which", lambda name: "/usr/bin/codesign" if name == "codesign" else None
@@ -452,15 +497,100 @@ def test_desktop_macos_local_codesign_signs_native_binaries(tmp_path, monkeypatc
     assert str(app / "Contents" / "Frameworks" / "chrome_crashpad_handler") in signed
 
 
+@pytest.mark.parametrize(
+    ("bundle_id", "requirement", "anchored", "expected"),
+    [
+        (
+            "com.nousresearch.hermes",
+            'designated => identifier "com.nousresearch.hermes"',
+            False,
+            True,
+        ),
+        (
+            "com.nousresearch.hermes",
+            'designated => identifier "com.nousresearch.hermes" and anchor trusted',
+            True,
+            True,
+        ),
+        (
+            "com.nousresearch.hermes",
+            'designated => cdhash H"1234"',
+            False,
+            False,
+        ),
+        (
+            "com.nousresearch.hermes.setup",
+            'designated => identifier "com.nousresearch.hermes.setup" and anchor trusted',
+            True,
+            False,
+        ),
+        (
+            "com.nousresearch.hermes",
+            'designated => identifier "com.nousresearch.hermes"',
+            True,
+            False,
+        ),
+    ],
+)
+def test_desktop_macos_identity_postcondition(
+    tmp_path, monkeypatch, bundle_id, requirement, anchored, expected
+):
+    app = tmp_path / "Hermes.app"
+    _write_info_plist(app, bundle_id)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[0] == "/usr/libexec/PlistBuddy":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{bundle_id}\n", stderr="")
+        if "-r-" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr=requirement)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: "/usr/bin/codesign")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+    assert cli_main._desktop_macos_identity_postcondition(
+        app, require_certificate_anchor=anchored
+    ) is expected
+    if expected:
+        assert ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)] in calls
+
+
+def test_desktop_macos_identity_postcondition_rejects_strict_verification_failure(
+    tmp_path, monkeypatch, capsys
+):
+    app = tmp_path / "Hermes.app"
+    _write_info_plist(app, "com.nousresearch.hermes")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "/usr/libexec/PlistBuddy":
+            return subprocess.CompletedProcess(cmd, 0, stdout="com.nousresearch.hermes\n", stderr="")
+        if "-r-" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="",
+                stderr='designated => identifier "com.nousresearch.hermes"',
+            )
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bundle format is ambiguous")
+
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: "/usr/bin/codesign")
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+    assert cli_main._desktop_macos_identity_postcondition(
+        app, require_certificate_anchor=False
+    ) is False
+    output = capsys.readouterr().out
+    assert "codesign --verify --deep --strict" in output
+    assert "bundle format is ambiguous" in output
+
+
 
 
 @pytest.mark.macos_only
-def test_relaunchable_fixup_falls_back_to_legacy_adhoc_on_failure(tmp_path, monkeypatch, capsys):
-    """A failing stable sign must still leave a launchable (deep ad-hoc) bundle.
-
-    The stable signer raising routes into the legacy deep ad-hoc fallback;
-    with the fallback sign and strict verification succeeding, the fixup
-    reports ``True`` per its documented contract.
+def test_relaunchable_fixup_refuses_legacy_adhoc_on_failure(tmp_path, monkeypatch, capsys):
+    """A failing stable sign must fail closed before launch/build-only success.
 
     ``macos_only``: the subject is ``codesign`` against a real ``.app`` bundle
     layout (``exe.parents[2]``), which only the macOS packaged tree produces.
@@ -491,9 +621,10 @@ def test_relaunchable_fixup_falls_back_to_legacy_adhoc_on_failure(tmp_path, monk
 
     monkeypatch.setattr(cli_main, "_desktop_macos_local_codesign", boom)
 
-    assert cli_main._desktop_macos_relaunchable_fixup(desktop_dir) is True
+    assert cli_main._desktop_macos_relaunchable_fixup(desktop_dir) is False
     assert ["xattr", "-cr", str(app)] in calls
-    assert ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)] in calls
+    assert ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)] not in calls
+    assert "refusing cdhash-pinned legacy ad-hoc fallback" in capsys.readouterr().out
 
 
 # --- desktop --setup-tcc-identity ------------------------------------------
@@ -817,8 +948,8 @@ def test_relaunchable_fixup_default_noconfig_success_never_touches_keychain(tmp_
 
 
 @pytest.mark.macos_only
-def test_relaunchable_fixup_legacy_adhoc_failure_never_touches_keychain(tmp_path, monkeypatch):
-    """A failed fallback re-sign must preserve the keychain item (no deletion).
+def test_relaunchable_fixup_stable_failure_never_touches_keychain(tmp_path, monkeypatch):
+    """A failed stable re-sign preserves keychain state and does not fall back.
 
     Regression for review feedback on #90961: the fallback previously deleted
     the safeStorage item unconditionally, even when ``codesign`` failed
@@ -861,20 +992,14 @@ def test_relaunchable_fixup_legacy_adhoc_failure_never_touches_keychain(tmp_path
     monkeypatch.setattr(cli_main, "_desktop_macos_local_codesign", boom)
 
     assert cli_main._desktop_macos_relaunchable_fixup(desktop_dir) is False
-    assert ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)] in calls
+    assert ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)] not in calls
     assert not any("--verify" in c for c in calls)
     assert not any("delete-generic-password" in c for c in calls)
 
 
 @pytest.mark.macos_only
-def test_relaunchable_fixup_legacy_adhoc_success_still_verifies_and_never_deletes(tmp_path, monkeypatch):
-    """A successful fallback re-sign runs strict verification, no deletion.
-
-    The legacy ad-hoc fallback signs, verifies with
-    ``codesign --verify --deep --strict``, and leaves the safeStorage keychain
-    item untouched. The keychain prompt macOS shows instead is recoverable
-    ("Always Allow" updates the ACL partition list and preserves the key);
-    deletion is not.
+def test_relaunchable_fixup_never_accepts_legacy_adhoc_even_if_command_would_succeed(tmp_path, monkeypatch):
+    """The old deep-sign fallback is not attempted, even if mocks would pass it.
 
     ``macos_only``: the fixup no-ops on non-macOS (sys.platform guard), and
     the subject is codesign against a real ``.app`` bundle layout.
@@ -905,9 +1030,8 @@ def test_relaunchable_fixup_legacy_adhoc_success_still_verifies_and_never_delete
 
     monkeypatch.setattr(cli_main, "_desktop_macos_local_codesign", boom)
 
-    assert cli_main._desktop_macos_relaunchable_fixup(desktop_dir) is True
-    assert ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)] in calls
-    assert ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)] in calls
+    assert cli_main._desktop_macos_relaunchable_fixup(desktop_dir) is False
+    assert ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)] not in calls
     assert not any("delete-generic-password" in c for c in calls)
 
 
