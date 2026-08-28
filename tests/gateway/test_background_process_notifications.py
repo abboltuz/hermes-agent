@@ -617,6 +617,95 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     ]
 
 
+@pytest.mark.asyncio
+async def test_api_origin_bypasses_conflicting_push_session_key(monkeypatch, tmp_path):
+    """A typed API origin is authoritative over a structured push key."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    telegram_adapter = runner.adapters[Platform.TELEGRAM]
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    conflicting_key = "agent:main:telegram:dm:telegram-victim"
+    runner.session_store._entries[conflicting_key] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="telegram-victim",
+            chat_type="dm",
+            profile="default",
+        )
+    )
+    wakes = []
+
+    async def capture_wake(adapter, **kwargs):
+        wakes.append((adapter, kwargs))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", capture_wake)
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-api",
+            "session_key": conflicting_key,
+            "platform": "api_server",
+            "origin_session_id": "raw-api-session",
+            "origin_profile": "writer",
+            "origin_api_route_profile": "writer",
+        },
+    )
+
+    assert result is True
+    telegram_adapter.handle_message.assert_not_awaited()
+    api_adapter.handle_message.assert_not_awaited()
+    assert len(wakes) == 1
+    assert wakes[0][0] is api_adapter
+    assert wakes[0][1]["session_id"] == "raw-api-session"
+    assert wakes[0][1]["profile"] == "writer"
+    assert wakes[0][1]["route_profile"] == "writer"
+
+
+@pytest.mark.asyncio
+async def test_named_profile_push_completion_uses_profile_adapter(monkeypatch, tmp_path):
+    """A stamped profile must not egress through the default bot adapter."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    default_adapter = runner.adapters[Platform.TELEGRAM]
+    writer_adapter = SimpleNamespace(
+        send=AsyncMock(),
+        handle_message=AsyncMock(),
+    )
+    runner._profile_adapters = {
+        "writer": {Platform.TELEGRAM: writer_adapter},
+    }
+    key = "agent:main:telegram:dm:writer-chat"
+    runner.session_store._entries[key] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="writer-chat",
+            chat_type="dm",
+            profile="writer",
+        )
+    )
+
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-writer",
+            "session_key": key,
+            "origin_profile": "writer",
+        },
+    )
+
+    assert result is True
+    default_adapter.handle_message.assert_not_awaited()
+    writer_adapter.handle_message.assert_awaited_once()
+
+
 def test_gateway_drain_retains_and_formats_overflow_events():
     """watch_overflow_* events must survive the gateway drain and render
     their summary — previously they were discarded at the drain (only

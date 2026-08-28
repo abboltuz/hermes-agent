@@ -26,6 +26,8 @@ rewind cursors / retry instead of silently losing the event.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from typing import Any, Optional
 
@@ -188,6 +190,29 @@ async def _self_post_chat_completion(
         "stream": False,
         INTERNAL_TURN_FIELD: internal_turn,
     }
+    idempotency_material = {
+        "version": 1,
+        "session_id": session_id,
+        "profile": str(profile or "").strip(),
+        "route_profile": str(route_profile or "").strip(),
+        "path": path,
+        "text": text,
+        "internal_turn": internal_turn,
+    }
+    canonical = json.dumps(
+        idempotency_material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    # Stable for every retry of one logical wake (including an outer queue
+    # rewind), distinct across event identity/destination, and bounded well
+    # below common proxy header limits. The digest prevents session ids or
+    # internal metadata from becoming observable header values.
+    headers["Idempotency-Key"] = (
+        "hermes-wake-v1-" + hashlib.sha256(canonical).hexdigest()
+    )
 
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)

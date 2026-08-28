@@ -9,6 +9,8 @@ Two strategies:
 """
 
 import asyncio
+import uuid
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -201,3 +203,56 @@ def test_named_profile_never_falls_back_on_unaware_adapter():
             )
         )
 
+
+def test_wake_retry_after_lost_response_executes_agent_once(monkeypatch):
+    """A lost response after acceptance retries with one stable idempotency key."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01,))
+    api_adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "wake-key"})
+    )
+    result = {"final_response": "ok", "messages": [], "api_calls": 1}
+    usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+    calls = {"http": 0, "keys": []}
+
+    async def flaky_handler(request):
+        calls["http"] += 1
+        calls["keys"].append(request.headers.get("Idempotency-Key"))
+        response = await api_adapter._handle_chat_completions(request)
+        if calls["http"] == 1:
+            request.transport.close()
+        return response
+
+    async def run():
+        runner, port = await _serve(flaky_handler)
+        api_adapter._host = "127.0.0.1"
+        api_adapter._port = port
+        try:
+            with patch.object(
+                api_adapter,
+                "_run_agent",
+                new=AsyncMock(return_value=(result, usage)),
+            ) as run_agent:
+                await deliver_wake(
+                    api_adapter,
+                    text="background task finished",
+                    session_id="raw-session",
+                    display_metadata={
+                        "source": "process",
+                        "internal": True,
+                        "kind": "process_notification",
+                        "event_id": f"proc-{uuid.uuid4().hex}",
+                    },
+                )
+                assert run_agent.await_count == 1
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert calls["http"] == 2
+    assert calls["keys"][0]
+    assert calls["keys"][0] == calls["keys"][1]
+    assert len(calls["keys"][0]) <= 128
