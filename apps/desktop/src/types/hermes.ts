@@ -591,6 +591,18 @@ export interface SessionMessage {
   display_content?: unknown
   context?: unknown
   name?: string
+  origin_kind?:
+    | 'agent'
+    | 'assistant'
+    | 'automation'
+    | 'external_actor'
+    | 'human_user'
+    | 'imported'
+    | 'internal_system'
+    | 'legacy_unknown'
+    | 'tool'
+    | string
+  provenance_metadata?: Record<string, boolean | number | string>
   reasoning?: null | string
   reasoning_content?: null | string
   reasoning_details?: unknown
@@ -624,6 +636,20 @@ export interface SessionMessage {
   tool_call_id?: null | string
   tool_calls?: unknown
   tool_name?: string
+  trust_kind?: 'legacy_unknown' | 'no_control' | 'trusted_internal' | 'untrusted_external' | 'user_authorized' | string
+  turn_kind?:
+    | 'continuation'
+    | 'delivery_mirror'
+    | 'legacy_unknown'
+    | 'notification'
+    | 'prompt'
+    | 'response'
+    | 'runtime_scaffolding'
+    | 'task_instruction'
+    | 'tool_call'
+    | 'tool_result'
+    | 'ui_action'
+    | string
 }
 
 export interface SessionMessagesResponse {

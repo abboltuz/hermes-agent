@@ -9,16 +9,34 @@ import {
   chatMessageText,
   collectUnspokenTurnSpeech,
   completeOpenTimelineParts,
+  toChatMessages as hydrateChatMessages,
   mergeFinalAssistantText,
   preserveLocalAssistantErrors,
   reasoningPart,
   renderMediaTags,
   sealOpenToolParts,
   stripPendingClarifyProjectionForCache,
-  toChatMessages,
   upsertToolPart,
   withUniqueToolCallIdsWithinMessage
 } from './chat-messages'
+
+const HUMAN_PROVENANCE = {
+  origin_kind: 'human_user' as const,
+  turn_kind: 'prompt' as const,
+  trust_kind: 'user_authorized' as const
+}
+
+// Most historical fixtures in this file predate durable provenance and model
+// ordinary typed user input. Stamp that test-boundary fact explicitly; tests
+// for missing/unknown provenance call hydrateChatMessages directly.
+const toChatMessages = (messages: SessionMessage[]) =>
+  hydrateChatMessages(
+    messages.map(message =>
+      message.role === 'user' && !message.origin_kind && !message.display_kind
+        ? { ...HUMAN_PROVENANCE, ...message }
+        : message
+    )
+  )
 
 const toolCallPart = (toolCallId: string): ChatMessagePart =>
   ({
@@ -62,6 +80,51 @@ describe('withUniqueToolCallIdsWithinMessage', () => {
 })
 
 describe('toChatMessages', () => {
+  it('projects typed automation and legacy-unknown user-role rows neutrally', () => {
+    const messages = hydrateChatMessages([
+      {
+        role: 'user',
+        content: 'scheduled task',
+        origin_kind: 'automation',
+        turn_kind: 'task_instruction',
+        trust_kind: 'trusted_internal'
+      },
+      {
+        role: 'user',
+        content: 'unresolved import',
+        origin_kind: 'legacy_unknown',
+        turn_kind: 'legacy_unknown',
+        trust_kind: 'legacy_unknown'
+      },
+      {
+        role: 'user',
+        content: 'remote ask',
+        origin_kind: 'external_actor',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized'
+      },
+      {
+        role: 'user',
+        content: 'internal retry nudge',
+        origin_kind: 'internal_system',
+        turn_kind: 'runtime_scaffolding',
+        trust_kind: 'no_control'
+      },
+      {
+        role: 'user',
+        content: 'missing provenance'
+      }
+    ])
+
+    expect(messages.map(message => message.role)).toEqual(['system', 'system', 'system', 'system'])
+    expect(messages.map(message => message.parts[0])).toEqual([
+      { type: 'text', text: '[automation] scheduled task' },
+      { type: 'text', text: '[Source unknown] unresolved import' },
+      { type: 'text', text: '[External actor] remote ask' },
+      { type: 'text', text: '[Source unknown] missing provenance' }
+    ])
+  })
+
   it('rebuilds the full command from a gateway tool row carrying args', () => {
     // Gateway watch-window hydration projects tool rows as
     // {role:'tool', name, context, args?}. `context` is an 80-char preview;
@@ -482,6 +545,9 @@ describe('toChatMessages', () => {
           content: 'opaque internal Kanban payload',
           display_kind: 'internal_notification',
           display_metadata: displayMetadata as SessionMessage['display_metadata'],
+          origin_kind: 'internal_system',
+          turn_kind: 'notification',
+          trust_kind: 'trusted_internal',
           timestamp: 1
         }
       ])

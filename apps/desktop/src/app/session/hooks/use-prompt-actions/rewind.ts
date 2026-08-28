@@ -190,9 +190,12 @@ export function truncateSubmitParams(
 
 interface DurableHistoryMessage {
   display_kind?: string
+  origin_kind?: string
   role?: string
   row_id?: unknown
   text?: string
+  trust_kind?: string
+  turn_kind?: string
 }
 
 /**
@@ -231,11 +234,22 @@ export async function resolveDurableRowId(
   }
 
   const durableUsers = messages.filter(
-    message =>
-      message.role === 'user' &&
-      !message.display_kind &&
-      typeof message.row_id === 'number' &&
-      Number.isInteger(message.row_id)
+    message => {
+      const authorizedActor =
+        (message.origin_kind === 'human_user' || message.origin_kind === 'external_actor') &&
+        (message.turn_kind === 'prompt' ||
+          message.turn_kind === 'task_instruction' ||
+          message.turn_kind === 'ui_action') &&
+        message.trust_kind === 'user_authorized'
+
+      return (
+        message.role === 'user' &&
+        authorizedActor &&
+        !message.display_kind &&
+        typeof message.row_id === 'number' &&
+        Number.isInteger(message.row_id)
+      )
+    }
   )
 
   const matches = durableUsers.filter(message => (message.text ?? '').trim() === wanted)

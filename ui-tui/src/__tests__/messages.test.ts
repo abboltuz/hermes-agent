@@ -6,10 +6,31 @@ import { describe, expect, it } from 'vitest'
 
 import { fmtMsgTimestamp, MessageLine } from '../components/messageLine.js'
 import { MAX_HISTORY } from '../config/limits.js'
-import { toTranscriptMessages } from '../domain/messages.js'
+import { toTranscriptMessages as projectTranscriptMessages } from '../domain/messages.js'
 import { appendTranscriptMessage, capTranscriptHistory, upsert } from '../lib/messages.js'
 import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
+
+const HUMAN_PROVENANCE = {
+  origin_kind: 'human_user',
+  turn_kind: 'prompt',
+  trust_kind: 'user_authorized'
+}
+
+// Legacy fixtures in this file represent real TUI input unless explicitly
+// typed or presented as a display event. Keep that fact explicit now that the
+// production projector intentionally fails closed on absent provenance.
+const toTranscriptMessages = (rows: unknown) =>
+  projectTranscriptMessages(
+    Array.isArray(rows)
+      ? rows.map(row =>
+          row && typeof row === 'object' && (row as { role?: string }).role === 'user' &&
+          !(row as { origin_kind?: string }).origin_kind && !(row as { display_kind?: string }).display_kind
+            ? { ...HUMAN_PROVENANCE, ...row }
+            : row
+        )
+      : rows
+  )
 
 describe('toTranscriptMessages', () => {
   it('preserves assistant tool-call rows so resume does not drop prior turns', () => {
@@ -83,6 +104,50 @@ describe('toTranscriptMessages', () => {
     const result = toTranscriptMessages(rows)
     expect(result[0]?.kind).toBe('event')
     expect(result[0]?.text).toBe('background agent work finished')
+  })
+
+  it('does not render typed automation or unknown history as the user', () => {
+    const rows = [
+      {
+        role: 'user',
+        text: 'scheduled task',
+        origin_kind: 'automation',
+        turn_kind: 'task_instruction',
+        trust_kind: 'trusted_internal'
+      },
+      {
+        role: 'user',
+        text: 'unresolved import',
+        origin_kind: 'legacy_unknown',
+        turn_kind: 'legacy_unknown',
+        trust_kind: 'legacy_unknown'
+      },
+      {
+        role: 'user',
+        text: 'remote ask',
+        origin_kind: 'external_actor',
+        turn_kind: 'prompt',
+        trust_kind: 'user_authorized'
+      },
+      {
+        role: 'user',
+        text: 'internal retry nudge',
+        origin_kind: 'internal_system',
+        turn_kind: 'runtime_scaffolding',
+        trust_kind: 'no_control'
+      }
+    ]
+
+    rows.push({ role: 'user', text: 'missing provenance' })
+
+    const messages = projectTranscriptMessages(rows)
+    expect(messages.map(message => message.role)).toEqual(['system', 'system', 'system', 'system'])
+    expect(messages.map(message => message.text)).toEqual([
+      '[automation] scheduled task',
+      '[Source unknown] unresolved import',
+      '[External actor] remote ask',
+      '[Source unknown] missing provenance'
+    ])
   })
 })
 
