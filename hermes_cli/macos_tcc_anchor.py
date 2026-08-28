@@ -28,10 +28,11 @@ stays on the stable venv path) and closes both holes:
    (copy if the store is on another device).  Existing ``LC_RPATH`` already
    points at ``@executable_path/../lib`` — no rewrite.
 3. A pre-install boot gate actually launches the staged copy and demands
-   ``import encodings`` plus ``sys.prefix == <venv>``.  Failure rolls the
-   staging file back and leaves the live interpreter untouched (a surplus
-   provisioned dylib in ``venv/lib/`` may remain — harmless), so a bad
-   anchor can never brick update/doctor again.
+   ``import encodings`` plus ``sys.prefix == <venv>``.  Every live executable
+   and dylib is snapshotted before mutation, aliases are promoted while the
+   original canonical route is still live, and the canonical executable is
+   promoted last.  Any failed postcondition restores the complete predecessor
+   layout, so a bad anchor can never brick update/doctor again.
 
 All functions are no-ops on non-macOS and for interpreters that are not
 uv-managed.  Best-effort: never raises to callers.
@@ -39,6 +40,8 @@ uv-managed.  Best-effort: never raises to callers.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 import logging
 import os
 import platform
@@ -46,7 +49,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+from typing import Iterator
 
 from hermes_constants import venv_python_path
 from hermes_cli.managed_uv import (
@@ -59,11 +64,14 @@ from utils import atomic_write_text
 logger = logging.getLogger(__name__)
 
 _MARKER_NAME = ".tcc-anchor-source"
+_LOCK_NAME = ".tcc-anchor.lock"
 
 _STORE_COMMON_MARKERS = ("cpython-", "-macos-")
 # The runtime-store marker is derived from managed_uv so a rename of the
 # repair-generation directory cannot silently stop the anchor from matching.
 _STORE_ROOT_MARKERS = ("/uv/python/", f"/{_RUNTIME_DIR_NAME}/python/")
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 class _BootGateFailed(Exception):
@@ -85,18 +93,9 @@ def is_macos() -> bool:
     return platform.system() == "Darwin"
 
 
-def _sibling_names() -> tuple[str, ...]:
-    """Alias names uv creates inside the venv bin dir."""
-    import sys as _sys
-
-    return ("python3", f"python3.{_sys.version_info.minor}")
-
-
 def _store_bin_names() -> tuple[str, ...]:
-    """Preferred interpreter file names inside a store ``bin`` dir."""
-    import sys as _sys
-
-    return (f"python3.{_sys.version_info.minor}", "python3", "python")
+    """Unversioned interpreter aliases inside a store ``bin`` dir."""
+    return ("python3", "python")
 
 
 def _is_uv_macos_store(path: str) -> bool:
@@ -171,6 +170,33 @@ def _anchor_marker(venv_bin: Path) -> Path:
     return venv_bin / _MARKER_NAME
 
 
+@contextmanager
+def _anchor_transaction_lock(venv_dir: Path) -> Iterator[None]:
+    """Serialize anchor inspection and mutation across threads and processes."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - tests can simulate Darwin on Windows
+        fcntl = None
+
+    lock_path = venv_dir / "bin" / _LOCK_NAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    key = os.path.realpath(str(lock_path))
+    with _THREAD_LOCKS_GUARD:
+        thread_lock = _THREAD_LOCKS.setdefault(key, threading.Lock())
+    with thread_lock:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def _write_marker(venv_bin: Path, source_file: Path) -> None:
     """Write the anchor marker atomically via the shared helper.
 
@@ -190,45 +216,187 @@ def _store_root(source_file: Path) -> Path:
     return source_file.resolve(strict=False).parent.parent
 
 
+def _target_minor_alias(source_file: Path) -> str | None:
+    """Return the versioned alias named by the target interpreter."""
+    try:
+        name = source_file.resolve(strict=False).name
+    except OSError:
+        name = source_file.name
+    return name if re.fullmatch(r"python3\.\d+", name) else None
+
+
+def _alias_names(venv_bin: Path, source_file: Path) -> list[str]:
+    """Return required and already-present Python aliases."""
+    names = {"python3"}
+    target_minor = _target_minor_alias(source_file)
+    if target_minor is not None:
+        names.add(target_minor)
+    try:
+        names.update(
+            path.name
+            for path in venv_bin.glob("python3*")
+            if re.fullmatch(r"python3(\.\d+)?", path.name)
+        )
+    except OSError:
+        pass
+    return sorted(names)
+
+
+def _libpython_targets(venv_dir: Path, source_file: Path) -> list[tuple[Path, Path]]:
+    """Return source/destination pairs required by the target interpreter."""
+    src_lib = _store_root(source_file) / "lib"
+    if not src_lib.is_dir():
+        return []
+    try:
+        return [
+            (src, venv_dir / "lib" / src.name)
+            for src in sorted(src_lib.glob("libpython*"))
+            if src.is_file()
+        ]
+    except OSError:
+        return []
+
+
+@dataclass
+class _PathSnapshot:
+    path: Path
+    kind: str
+    backup: Path | None = None
+    link_target: str | None = None
+
+
+def _snapshot_path(path: Path) -> _PathSnapshot:
+    """Capture a live entry without mutating it."""
+    if path.is_symlink():
+        return _PathSnapshot(path, "symlink", link_target=os.readlink(path))
+    if not path.exists():
+        return _PathSnapshot(path, "missing")
+    fd, backup_name = tempfile.mkstemp(
+        prefix=f".{path.name}.tcc-backup-", dir=str(path.parent)
+    )
+    os.close(fd)
+    backup = Path(backup_name)
+    backup.unlink()
+    try:
+        try:
+            os.link(path, backup)
+        except OSError:
+            shutil.copy2(path, backup)
+        return _PathSnapshot(path, "file", backup=backup)
+    except Exception:
+        backup.unlink(missing_ok=True)
+        raise
+
+
+def _snapshot_paths(paths: list[Path]) -> list[_PathSnapshot]:
+    """Capture each distinct live path, cleaning partial backups on failure."""
+    snapshots: list[_PathSnapshot] = []
+    seen: set[Path] = set()
+    try:
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            snapshots.append(_snapshot_path(path))
+        return snapshots
+    except Exception:
+        _discard_snapshots(snapshots)
+        raise
+
+
+def _restore_snapshot(snapshot: _PathSnapshot) -> None:
+    if snapshot.kind == "file":
+        if snapshot.backup is None:
+            raise OSError(f"missing backup for {snapshot.path}")
+        os.replace(snapshot.backup, snapshot.path)
+        snapshot.backup = None
+        return
+    if snapshot.kind == "symlink":
+        fd, staging_name = tempfile.mkstemp(
+            prefix=f".{snapshot.path.name}.tcc-restore-",
+            dir=str(snapshot.path.parent),
+        )
+        os.close(fd)
+        staging = Path(staging_name)
+        staging.unlink()
+        try:
+            os.symlink(snapshot.link_target or "", staging)
+            os.replace(staging, snapshot.path)
+        finally:
+            staging.unlink(missing_ok=True)
+        return
+    snapshot.path.unlink(missing_ok=True)
+
+
+def _restore_snapshots(snapshots: list[_PathSnapshot]) -> bool:
+    ok = True
+    for snapshot in reversed(snapshots):
+        try:
+            _restore_snapshot(snapshot)
+        except OSError:
+            ok = False
+            logger.error("TCC anchor rollback failed for %s", snapshot.path, exc_info=True)
+    _discard_snapshots(snapshots)
+    return ok
+
+
+def _discard_snapshots(snapshots: list[_PathSnapshot]) -> None:
+    for snapshot in snapshots:
+        if snapshot.backup is not None:
+            try:
+                snapshot.backup.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("could not remove TCC backup %s", snapshot.backup)
+            snapshot.backup = None
+
+
 def _provision_libpython(
     venv_dir: Path, source_file: Path, *, refresh: bool = False
 ) -> bool:
-    """Hardlink (else copy) store ``libpython*`` into ``venv/lib/``.
+    """Atomically hardlink (else copy) store ``libpython*`` into the venv.
 
-    Provision-if-present: a surplus hardlink on a statically-linked build is
-    free; a missed detection is the only way #95425 returns.
+    Every replacement is fully staged before any live dylib is touched.  A
+    promotion failure restores the complete predecessor set.
     """
-    src_lib = _store_root(source_file) / "lib"
-    if not src_lib.is_dir():
+    pairs = [
+        (src, dst)
+        for src, dst in _libpython_targets(venv_dir, source_file)
+        if refresh or not (dst.exists() or dst.is_symlink())
+    ]
+    if not pairs:
         return True
     dst_lib = venv_dir / "lib"
-    ok = True
+    staged: list[tuple[Path, Path]] = []
+    snapshots: list[_PathSnapshot] = []
     try:
         dst_lib.mkdir(parents=True, exist_ok=True)
-        for src in src_lib.glob("libpython*"):
-            if not src.is_file():
-                continue
-            dst = dst_lib / src.name
-            if dst.exists() or dst.is_symlink():
-                if not refresh:
-                    continue
-                try:
-                    dst.unlink()
-                except OSError:
-                    ok = False
-                    continue
+        snapshots = _snapshot_paths([dst for _src, dst in pairs])
+        for src, dst in pairs:
+            fd, staging_name = tempfile.mkstemp(
+                prefix=f".{dst.name}.tcc-", dir=str(dst_lib)
+            )
+            os.close(fd)
+            staging = Path(staging_name)
+            staging.unlink()
+            staged.append((staging, dst))
             try:
-                os.link(src, dst)
+                os.link(src, staging)
             except OSError:
-                try:
-                    shutil.copy2(src, dst)
-                except OSError:
-                    ok = False
-                    logger.warning("libpython provision failed for %s", src, exc_info=True)
+                shutil.copy2(src, staging)
+        for staging, dst in staged:
+            os.replace(staging, dst)
+        _discard_snapshots(snapshots)
+        return True
     except OSError:
         logger.warning("libpython provision failed", exc_info=True)
+        _restore_snapshots(snapshots)
         return False
-    return ok
+    finally:
+        for staging, _dst in staged:
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _copy_alias(venv_bin: Path, name: str, anchor: Path) -> bool:
@@ -260,23 +428,18 @@ def _copy_alias(venv_bin: Path, name: str, anchor: Path) -> bool:
 
 
 def _materialize_aliases(
-    venv_bin: Path, anchor: Path, *, refresh: bool = False
+    venv_bin: Path,
+    anchor: Path,
+    source_file: Path,
+    *,
+    refresh: bool = False,
 ) -> bool:
     """Materialize uv alias names as real-file copies of the anchor.
 
     Returns True only when every alias that needed materializing succeeded.
     """
-    names = set(_sibling_names())
-    try:
-        names.update(
-            p.name
-            for p in venv_bin.glob("python3*")
-            if re.fullmatch(r"python3(\.\d+)?", p.name)
-        )
-    except OSError:
-        pass
     ok = True
-    for name in sorted(names):
+    for name in _alias_names(venv_bin, source_file):
         alias = venv_bin / name
         try:
             if refresh or alias.is_symlink() or not alias.exists():
@@ -326,21 +489,12 @@ def _passes_boot_gate(staged: Path, venv_dir: Path) -> bool:
     try:
         return Path(printed[-1]).resolve() == venv_dir.resolve()
     except OSError:
-        return str(venv_dir) in printed[-1]
+        return False
 
 
-def _alias_paths(venv_bin: Path) -> list[Path]:
+def _alias_paths(venv_bin: Path, source_file: Path) -> list[Path]:
     """Return every required/current Python alias in deterministic order."""
-    names = set(_sibling_names())
-    try:
-        names.update(
-            path.name
-            for path in venv_bin.glob("python3*")
-            if re.fullmatch(r"python3(\.\d+)?", path.name)
-        )
-    except OSError:
-        pass
-    return [venv_bin / name for name in sorted(names)]
+    return [venv_bin / name for name in _alias_names(venv_bin, source_file)]
 
 
 def _libpython_layout_complete(venv_dir: Path, source_file: Path) -> bool:
@@ -372,7 +526,7 @@ def _anchor_layout_complete(
             return False
         if not _passes_boot_gate(anchor, venv_dir):
             return False
-        for alias in _alias_paths(anchor.parent):
+        for alias in _alias_paths(anchor.parent, source_file):
             if alias.is_symlink() or not alias.is_file() or not os.access(alias, os.X_OK):
                 return False
             if not _macos_verify_managed_python_identity(alias):
@@ -391,20 +545,23 @@ def _anchor_layout_complete(
 
 
 def _install_anchor(venv_dir: Path, source_file: Path) -> None:
-    """Replace ``bin/python`` with a signed copy, gated on a real boot."""
+    """Install a complete anchor with bounded predecessor rollback."""
     venv_py = venv_python_path(venv_dir)
     venv_bin = venv_py.parent
     venv_bin.mkdir(parents=True, exist_ok=True)
     marker = _anchor_marker(venv_bin)
-    marker.unlink(missing_ok=True)
-
-    if not _provision_libpython(venv_dir, source_file, refresh=True):
-        raise _AnchorInstallFailed("libpython provisioning was incomplete")
-
-    fd, tmp_name = tempfile.mkstemp(prefix=".python-tcc-", dir=str(venv_bin))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
+    aliases = _alias_paths(venv_bin, source_file)
+    dylibs = [dst for _src, dst in _libpython_targets(venv_dir, source_file)]
+    snapshots = _snapshot_paths([venv_py, *aliases, *dylibs])
+    tmp_path: Path | None = None
     try:
+        marker.unlink(missing_ok=True)
+        if not _provision_libpython(venv_dir, source_file, refresh=True):
+            raise _AnchorInstallFailed("libpython provisioning was incomplete")
+
+        fd, tmp_name = tempfile.mkstemp(prefix=".python-tcc-", dir=str(venv_bin))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
         shutil.copy2(source_file, tmp_path)
         os.chmod(tmp_path, source_file.stat().st_mode | 0o111)
         if not _macos_sign_managed_python(tmp_path):
@@ -413,10 +570,27 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
             raise _BootGateFailed(
                 f"staged copy at {tmp_path} failed encodings/prefix probe"
             )
-        os.replace(tmp_path, venv_py)
-        aliases_ok = _materialize_aliases(venv_bin, venv_py, refresh=True)
+        # Promote aliases while the original store-backed canonical route is
+        # still live.  A partial alias cutover therefore remains bootable even
+        # before bounded rollback runs.
+        aliases_ok = _materialize_aliases(
+            venv_bin, tmp_path, source_file, refresh=True
+        )
         if not aliases_ok:
             raise _AnchorInstallFailed("alias materialization was incomplete")
+        for alias in aliases:
+            if not _macos_sign_managed_python(alias):
+                raise _AnchorInstallFailed(f"alias signing failed: {alias.name}")
+            if not _macos_verify_managed_python_identity(alias):
+                raise _AnchorInstallFailed(
+                    f"alias identity verification failed: {alias.name}"
+                )
+            if not _passes_boot_gate(alias, venv_dir):
+                raise _AnchorInstallFailed(f"alias boot gate failed: {alias.name}")
+
+        # Canonical promotion is the last executable cutover.
+        os.replace(tmp_path, venv_py)
+        tmp_path = None
         if not _anchor_layout_complete(
             venv_dir, source_file, require_marker=False
         ):
@@ -424,11 +598,22 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
         # Marker is the activation record for the complete canonical + alias
         # layout.  It is written atomically and strictly last.
         _write_marker(venv_bin, source_file)
-    except Exception:
+        _discard_snapshots(snapshots)
+    except Exception as exc:
         try:
-            tmp_path.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
         except OSError:
             pass
+        rollback_ok = _restore_snapshots(snapshots)
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if not rollback_ok:
+            raise _AnchorInstallFailed(
+                "anchor installation failed and predecessor rollback was incomplete"
+            ) from exc
         raise
 
 
@@ -445,21 +630,25 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
     venv_dir = _venv_dir(project_root)
     if venv_dir is None:
         return None
-    venv_py = venv_python_path(venv_dir)
-    if not (venv_py.is_file() or venv_py.is_symlink()):
-        return None
-    source = _interpreter_source(venv_dir)
-    if source is None or not _is_uv_macos_store(source):
-        return None
-    source_file = _interpreter_file(source)
-    if source_file is None:
-        return None
-    if not venv_py.is_symlink() and _anchor_layout_complete(
-        venv_dir, source_file, require_marker=True
-    ):
-        return venv_py
     try:
-        _install_anchor(venv_dir, source_file)
+        with _anchor_transaction_lock(venv_dir):
+            # Re-read every mutable input after lock acquisition.  Another
+            # updater may have completed while this caller was waiting.
+            venv_py = venv_python_path(venv_dir)
+            if not (venv_py.is_file() or venv_py.is_symlink()):
+                return None
+            source = _interpreter_source(venv_dir)
+            if source is None or not _is_uv_macos_store(source):
+                return None
+            source_file = _interpreter_file(source)
+            if source_file is None:
+                return None
+            if not venv_py.is_symlink() and _anchor_layout_complete(
+                venv_dir, source_file, require_marker=True
+            ):
+                return venv_py
+            _install_anchor(venv_dir, source_file)
+            return venv_py
     except _BootGateFailed as exc:
         logger.warning("macOS TCC anchor boot-gate refused install: %s", exc)
         return None
@@ -469,7 +658,6 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
     except Exception as exc:  # best-effort: never break update/doctor
         logger.warning("macOS TCC anchor install failed: %s", exc)
         return None
-    return venv_py
 
 
 def tcc_anchor_state(project_root: Path | None = None) -> tuple[str, str]:
