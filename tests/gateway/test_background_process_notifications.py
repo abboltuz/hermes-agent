@@ -511,6 +511,15 @@ def test_parse_session_key_with_extra_parts():
     assert result == {"platform": "discord", "chat_type": "group", "chat_id": "chan123"}
 
 
+def test_parse_session_key_accepts_named_profile_namespace():
+    result = _parse_session_key("agent:writer:telegram:dm:writer-chat")
+    assert result == {
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "writer-chat",
+    }
+
+
 # ---------------------------------------------------------------------------
 # api_server (stateless) wake routing — gateway/wake.py self-post path
 # ---------------------------------------------------------------------------
@@ -518,7 +527,7 @@ def test_parse_session_key_with_extra_parts():
 @pytest.mark.asyncio
 async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch, tmp_path):
     """An event whose session_key is a RAW api_server session id (not an
-    agent:main:... structured key) must wake the real session via the
+    agent:<namespace>:... structured key) must wake the real session via the
     /v1/chat/completions self-post instead of being dropped for missing
     routing metadata."""
     runner = _build_runner(monkeypatch, tmp_path, "all")
@@ -765,7 +774,18 @@ async def test_named_profile_push_completion_rejects_conflicting_stored_profile(
     runner._profile_adapters = {
         "writer": {Platform.TELEGRAM: writer_adapter},
     }
-    key = "agent:main:telegram:dm:writer-chat"
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    api_wakes = []
+
+    async def capture_wake(adapter, **kwargs):
+        api_wakes.append((adapter, kwargs))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", capture_wake)
+    key = "agent:writer:telegram:dm:writer-chat"
     runner.session_store._entries[key] = SimpleNamespace(
         origin=SessionSource(
             platform=Platform.TELEGRAM,
@@ -788,6 +808,8 @@ async def test_named_profile_push_completion_rejects_conflicting_stored_profile(
     assert result is None
     default_adapter.handle_message.assert_not_awaited()
     writer_adapter.handle_message.assert_not_awaited()
+    api_adapter.handle_message.assert_not_awaited()
+    assert api_wakes == []
 
 
 def test_gateway_drain_retains_and_formats_overflow_events():
