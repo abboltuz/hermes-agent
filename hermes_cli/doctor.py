@@ -20,6 +20,10 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.macos_desktop_identity import (
+    DESKTOP_BUNDLE_ID,
+    classify_designated_requirement,
+)
 from hermes_constants import display_hermes_home
 from hermes_constants import agent_browser_runnable
 
@@ -1078,11 +1082,6 @@ def check_macos_tcc_grants() -> None:
             "(could not read code-signing requirement of the desktop bundle)",
         )
         return
-    # The DR string is the only readable signal — TCC.db itself needs Full
-    # Disk Access. A cdhash anchor marks the pre-#73681 ad-hoc identity
-    # (rebuild ⇒ new cdhash ⇒ stale grants); its absence marks identifier-
-    # pinned. Treat the match as a proxy for the signing class, not a
-    # contract on DR wording.
     if "cdhash" in dr.lower():
         check_warn(
             "macOS TCC grants will reset after every update",
@@ -1092,7 +1091,22 @@ def check_macos_tcc_grants() -> None:
             "identity, then re-grant permissions once.",
         )
         return
-    if "certificate" in dr.lower():
+    requirement_kind = classify_designated_requirement(dr)
+    if requirement_kind is None:
+        check_warn(
+            "macOS TCC signing identity is not promotable",
+            "the desktop bundle's designated requirement is malformed, has "
+            "the wrong identifier, or is not one exact stable requirement",
+        )
+        return
+    verified, verification_detail = _macos_desktop_bundle_verifies(app)
+    if not verified:
+        check_warn(
+            "macOS TCC signing identity is not promotable",
+            verification_detail,
+        )
+        return
+    if requirement_kind == "certificate":
         # Certificate-anchored DR (hermes desktop --setup-tcc-identity, or a
         # notarized release build): the strongest anchor TCC can key on.
         check_ok(
@@ -1152,6 +1166,47 @@ def _macos_desktop_dr(app: Path) -> str | None:
     if proc.returncode != 0:
         return None
     return (proc.stdout or "") + (proc.stderr or "")
+
+
+def _macos_desktop_bundle_verifies(app: Path) -> tuple[bool, str]:
+    """Verify bundle identity and strict signature without modifying the app."""
+    plistbuddy = Path("/usr/libexec/PlistBuddy")
+    codesign = shutil.which("codesign")
+    if not codesign:
+        return False, "codesign was not found"
+    try:
+        bundle_id = subprocess.run(
+            [
+                str(plistbuddy),
+                "-c",
+                "Print :CFBundleIdentifier",
+                str(app / "Contents" / "Info.plist"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if (
+            bundle_id.returncode != 0
+            or (bundle_id.stdout or "").strip() != DESKTOP_BUNDLE_ID
+        ):
+            output = (bundle_id.stderr or bundle_id.stdout or "").strip()
+            return False, (
+                f"bundle-ID readback failed or was not {DESKTOP_BUNDLE_ID}: "
+                f"{output or '<empty>'}"
+            )
+        strict = subprocess.run(
+            [codesign, "--verify", "--deep", "--strict", str(app)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return False, f"desktop signature verification failed: {exc}"
+    if strict.returncode != 0:
+        output = (strict.stderr or strict.stdout or "").strip()
+        return False, f"codesign --verify --deep --strict failed: {output or '<empty>'}"
+    return True, ""
 
 
 def check_macos_tcc_anchor(should_fix: bool = False) -> None:

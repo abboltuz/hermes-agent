@@ -447,6 +447,10 @@ from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
 from hermes_cli.subcommands.setup import build_setup_parser
+from hermes_cli.macos_desktop_identity import (
+    DESKTOP_BUNDLE_ID,
+    classify_designated_requirement,
+)
 
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
 from hermes_cli.subcommands.slack import build_slack_parser
@@ -7642,7 +7646,7 @@ def _desktop_macos_identity_postcondition(
             capture_output=True,
             text=True,
         )
-        if bundle_id.returncode != 0 or (bundle_id.stdout or "").strip() != "com.nousresearch.hermes":
+        if bundle_id.returncode != 0 or (bundle_id.stdout or "").strip() != DESKTOP_BUNDLE_ID:
             output = (bundle_id.stderr or bundle_id.stdout or "").strip()
             print(
                 "  (macOS Desktop identity gate failed: "
@@ -7658,37 +7662,15 @@ def _desktop_macos_identity_postcondition(
             text=True,
         )
         dr = f"{requirement.stdout or ''}\n{requirement.stderr or ''}".strip()
-        dr_lower = dr.lower()
-        designated_lines = [
-            line.strip()
-            for line in dr.splitlines()
-            if line.strip().lower().startswith("designated =>")
-        ]
-        requirement_expr = (
-            designated_lines[0].split("=>", 1)[1].strip()
-            if len(designated_lines) == 1
-            else ""
+        requirement_kind = classify_designated_requirement(dr)
+        valid_requirement_shape = (
+            requirement_kind == "certificate"
+            if require_certificate_anchor
+            else requirement_kind == "identifier"
         )
-        identifier_expr = 'identifier "com.nousresearch.hermes"'
-        if require_certificate_anchor:
-            requirement_lower = requirement_expr.lower()
-            valid_requirement_shape = (
-                requirement_expr.startswith(identifier_expr + " and ")
-                and not re.search(r"\bor\b", requirement_expr, re.IGNORECASE)
-                and (
-                    "anchor " in requirement_lower
-                    or "certificate " in requirement_lower
-                )
-            )
-        else:
-            # The allowed ad-hoc fallback is deliberately identifier-only.
-            # Any extra predicate would create a different, potentially
-            # rebuild-unstable identity contract.
-            valid_requirement_shape = requirement_expr == identifier_expr
         if (
             requirement.returncode != 0
             or not valid_requirement_shape
-            or "cdhash" in dr_lower
         ):
             print(
                 "  (macOS Desktop identity gate failed: "

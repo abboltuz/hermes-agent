@@ -1573,6 +1573,11 @@ class TestMacOSTCCGrants:
             "_macos_desktop_dr",
             lambda app: 'designated => identifier "com.nousresearch.hermes"',
         )
+        monkeypatch.setattr(
+            doctor_mod,
+            "_macos_desktop_bundle_verifies",
+            lambda app: (True, ""),
+        )
         doctor_mod.check_macos_tcc_grants()
         out = capsys.readouterr().out
         assert "TCC signing identity is stable" in out
@@ -1599,12 +1604,95 @@ class TestMacOSTCCGrants:
             "_macos_desktop_dr",
             lambda app: 'designated => identifier "com.nousresearch.hermes" and certificate root = H"aabbcc"',
         )
+        monkeypatch.setattr(
+            doctor_mod,
+            "_macos_desktop_bundle_verifies",
+            lambda app: (True, ""),
+        )
         doctor_mod.check_macos_tcc_grants()
         out = capsys.readouterr().out
         assert "TCC signing identity is stable" in out
         assert "certificate-anchored" in out
         assert "--setup-tcc-identity" not in out
         assert "tccutil reset ScreenCapture com.nousresearch.hermes" in out
+
+    @pytest.mark.parametrize(
+        "requirement",
+        [
+            'designated => identifier "com.nousresearch.hermes" or anchor apple',
+            'designated => identifier "com.nousresearch.hermes.evil" and anchor apple',
+            'designated => anchor apple',
+            'designated => identifier "com.nousresearch.hermes"\n'
+            'designated => identifier "com.nousresearch.hermes" and anchor apple',
+        ],
+    )
+    def test_warns_on_non_promotable_requirement(
+        self, monkeypatch, capsys, tmp_path, requirement
+    ):
+        monkeypatch.setattr(doctor_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            doctor_mod,
+            "_desktop_app_bundle",
+            lambda: tmp_path / "Hermes.app",
+        )
+        monkeypatch.setattr(doctor_mod, "_macos_desktop_dr", lambda app: requirement)
+        doctor_mod.check_macos_tcc_grants()
+        out = capsys.readouterr().out
+        assert "TCC signing identity is not promotable" in out
+        assert "TCC signing identity is stable" not in out
+
+    def test_warns_when_bundle_postcondition_fails(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        monkeypatch.setattr(doctor_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            doctor_mod,
+            "_desktop_app_bundle",
+            lambda: tmp_path / "Hermes.app",
+        )
+        monkeypatch.setattr(
+            doctor_mod,
+            "_macos_desktop_dr",
+            lambda app: 'designated => identifier "com.nousresearch.hermes"',
+        )
+        monkeypatch.setattr(
+            doctor_mod,
+            "_macos_desktop_bundle_verifies",
+            lambda app: (False, "codesign --verify --deep --strict failed: invalid"),
+        )
+        doctor_mod.check_macos_tcc_grants()
+        out = capsys.readouterr().out
+        assert "TCC signing identity is not promotable" in out
+        assert "codesign --verify --deep --strict failed" in out
+        assert "TCC signing identity is stable" not in out
+
+    @pytest.mark.parametrize(
+        ("bundle_id", "strict_code", "expected"),
+        [
+            ("com.nousresearch.hermes", 0, True),
+            ("com.nousresearch.hermes.setup", 0, False),
+            ("com.nousresearch.hermes", 1, False),
+        ],
+    )
+    def test_bundle_verifier_requires_desktop_id_and_strict_signature(
+        self, monkeypatch, tmp_path, bundle_id, strict_code, expected
+    ):
+        app = tmp_path / "Hermes.app"
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "/usr/libexec/PlistBuddy":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{bundle_id}\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                cmd, strict_code, stdout="", stderr="strict failure"
+            )
+
+        monkeypatch.setattr(doctor_mod.shutil, "which", lambda name: "/usr/bin/codesign")
+        monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+        ok, _detail = doctor_mod._macos_desktop_bundle_verifies(app)
+        assert ok is expected
 
     def test_warns_when_dr_unreadable(self, monkeypatch, capsys, tmp_path):
         """codesign failure → warn, never crash."""
