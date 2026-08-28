@@ -25464,6 +25464,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session import SessionSource
 
         session_key = str(evt.get("session_key") or "").strip()
+        stamped_platform = str(evt.get("platform") or "").strip().lower()
+        raw_api_session_id = str(evt.get("origin_session_id") or "").strip()
+
+        # API requests use a raw X-Hermes-Session-Id as their continuation
+        # address. A caller may also supply X-Hermes-Session-Key for memory
+        # scoping, and that structured key can legitimately match a persisted
+        # push-channel session. It is never routing authority for an event that
+        # was explicitly stamped as api_server: consulting the session store
+        # first would redirect the completion to that push chat.
+        if stamped_platform == Platform.API_SERVER.value and raw_api_session_id:
+            origin_profile = str(evt.get("origin_profile") or "").strip()
+            route_profile = str(
+                evt.get("origin_api_route_profile") or ""
+            ).strip()
+            if route_profile and origin_profile and route_profile != origin_profile:
+                logger.warning(
+                    "Rejecting synthetic API event with contradictory profile "
+                    "provenance for session %s",
+                    raw_api_session_id,
+                )
+                return None
+            parsed_key = _parse_session_key(session_key) if session_key else None
+            if parsed_key and parsed_key.get("platform") != Platform.API_SERVER.value:
+                logger.warning(
+                    "Ignoring contradictory structured session key on typed "
+                    "api_server completion for raw session %s",
+                    raw_api_session_id,
+                )
+            return SessionSource(
+                platform=Platform.API_SERVER,
+                chat_id=raw_api_session_id,
+                chat_type="dm",
+                profile=origin_profile or None,
+            )
+
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
@@ -25636,35 +25671,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        # Alias-aware resolution (relay-plane): a relay-fronted gateway
-        # registers ONE adapter under Platform.RELAY fronting N logical
-        # platforms, so a literal ``p.value == platform_name`` scan misses
-        # "slack" and silently drops the completion as "no gateway route"
-        # (staging incident 2026-08-09, second occurrence). Resolve through
-        # the shared transport resolver — native adapter wins; relay is
-        # eligible only when it advertises fronting the logical platform.
-        adapter = None
-        try:
-            _platform_enum = Platform(platform_name)
-        except (ValueError, KeyError):
-            _platform_enum = None
-        if _platform_enum is not None:
+        explicit_profile = bool(
+            str(evt.get("origin_profile") or "").strip()
+            or str(getattr(source, "profile", None) or "").strip()
+        )
+        # The canonical resolver is profile-aware and preserves registered
+        # relay provenance. An explicit named profile must fail closed when
+        # its adapter is absent; falling back to self.adapters would egress
+        # through the default profile's bot credential.
+        adapter = self._adapter_for_source(source)
+        if adapter is None and source.platform == Platform.API_SERVER:
+            # The API server is one shared multiplex listener. Its adapter
+            # resolves the profile-qualified path and scoped key itself.
+            adapter = self.adapters.get(Platform.API_SERVER)
+        if adapter is None and not explicit_profile:
+            # Bounded compatibility path for genuinely unstamped historical
+            # events. The transport resolver retains relay delivery, while the
+            # literal scan supports minimal test/third-party runner stubs.
             try:
-                _transport = resolve_delivery_transport(
-                    _platform_enum, self.config, self.adapters,
-                )
-            except Exception:
-                _transport = None
-            if _transport is not None:
-                adapter = _transport.adapter
-        if adapter is None:
-            # Legacy literal scan — still correct for native adapters, and
-            # keeps minimal runner stubs (tests) and exotic platform strings
-            # working when the resolver can't run.
-            for p, a in self.adapters.items():
-                if p.value == platform_name:
-                    adapter = a
-                    break
+                _platform_enum = Platform(platform_name)
+            except (ValueError, KeyError):
+                _platform_enum = None
+            if _platform_enum is not None:
+                try:
+                    _transport = resolve_delivery_transport(
+                        _platform_enum, self.config, self.adapters,
+                    )
+                except Exception:
+                    _transport = None
+                if _transport is not None:
+                    adapter = _transport.adapter
+            if adapter is None:
+                for p, candidate in self.adapters.items():
+                    if p.value == platform_name:
+                        adapter = candidate
+                        break
         if not adapter:
             return None
         from gateway.wake import adapter_supports_push as _wake_push_ok
@@ -25862,6 +25903,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
+        durable_profile = str(
+            evt.get("_durable_profile")
+            if "_durable_profile" in evt
+            else evt.get("origin_profile") or ""
+        )
+        durable_require_existing = "_durable_profile" in evt
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
@@ -25872,7 +25919,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not claim_completion_delivery(
                         durable_delegation_id,
                         durable_claim_id,
-                        profile=str(evt.get("origin_profile") or ""),
+                        profile=durable_profile,
+                        require_existing=durable_require_existing,
                     ):
                         return None
                 except Exception as exc:
@@ -25907,7 +25955,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             drop_completion_delivery(
                                 durable_delegation_id,
                                 durable_claim_id,
-                                profile=str(evt.get("origin_profile") or ""),
+                                profile=durable_profile,
                             )
                         except Exception:
                             logger.debug(
@@ -25923,7 +25971,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             release_completion_delivery(
                                 durable_delegation_id,
                                 durable_claim_id,
-                                profile=str(evt.get("origin_profile") or ""),
+                                profile=durable_profile,
                             )
                         except Exception:
                             logger.debug(
@@ -25996,7 +26044,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     complete_completion_delivery(
                         durable_delegation_id,
                         durable_claim_id,
-                        profile=str(evt.get("origin_profile") or ""),
+                        profile=durable_profile,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -26015,7 +26063,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     release_completion_delivery(
                         durable_delegation_id,
                         durable_claim_id,
-                        profile=str(evt.get("origin_profile") or ""),
+                        profile=durable_profile,
                     )
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
