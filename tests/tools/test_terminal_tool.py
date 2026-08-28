@@ -1,4 +1,7 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Regression tests for sudo detection and terminal execution contracts."""
+
+import json
+from types import SimpleNamespace
 
 import tools.terminal_tool as terminal_tool
 
@@ -9,6 +12,85 @@ def setup_function():
 
 def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
+
+
+def test_background_spawn_checkpoints_api_routing_before_return(
+    monkeypatch, tmp_path
+):
+    """A real terminal spawn is immediately recoverable with its API route."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import async_delegation
+    from tools import process_registry as process_registry_module
+
+    registry = process_registry_module.process_registry
+    checkpoint = tmp_path / "processes.json"
+    task_id = "checkpoint-api-route"
+    config = {
+        "env_type": "local",
+        "cwd": str(tmp_path),
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {task_id: SimpleNamespace(env={}, cwd=str(tmp_path))},
+    )
+    monkeypatch.setattr(terminal_tool, "_last_activity", {task_id: 0.0})
+    monkeypatch.setattr(
+        process_registry_module,
+        "CHECKPOINT_PATH",
+        checkpoint,
+    )
+    tokens = set_session_vars(
+        platform="api_server",
+        chat_id="raw-writer-session",
+        chat_type="dm",
+        session_key="memory-scope",
+        session_id="parent-writer-session",
+        profile="writer",
+        api_route_profile="writer",
+        async_delivery=False,
+    )
+    process_id = ""
+    try:
+        result = json.loads(
+            terminal_tool.terminal_tool(
+                command="sleep 30",
+                background=True,
+                notify_on_complete=True,
+                task_id=task_id,
+                force=True,
+            )
+        )
+        process_id = result["session_id"]
+        rows = json.loads(checkpoint.read_text(encoding="utf-8"))
+        row = next(item for item in rows if item["session_id"] == process_id)
+        assert row["origin_session_id"] == "raw-writer-session"
+        assert row["origin_profile"] == "writer"
+        assert row["origin_api_route_profile"] == "writer"
+        assert row["parent_session_id"] == "parent-writer-session"
+        assert row["notify_on_complete"] is True
+
+        monkeypatch.setattr(
+            async_delegation,
+            "restore_undelivered_completions",
+            lambda _queue: 0,
+        )
+        recovered_registry = process_registry_module.ProcessRegistry()
+        assert recovered_registry.recover_from_checkpoint() == 1
+        recovered = recovered_registry.get(process_id)
+        assert recovered is not None
+        assert recovered.origin_session_id == "raw-writer-session"
+        assert recovered.origin_profile == "writer"
+        assert recovered.origin_api_route_profile == "writer"
+        assert recovered.notify_on_complete is True
+    finally:
+        clear_session_vars(tokens)
+        if process_id:
+            registry.kill_process(process_id)
 
 
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):

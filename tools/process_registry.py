@@ -528,10 +528,22 @@ class ProcessRegistry:
             profile = str(raw_profile or "").strip()
             if not profile or profile in self._restored_delegation_profiles:
                 continue
-            restored += restore_undelivered_completions(
-                self.completion_queue,
-                profile=profile,
-            )
+            try:
+                restored += restore_undelivered_completions(
+                    self.completion_queue,
+                    profile=profile,
+                )
+            except Exception:
+                # One corrupt/unreadable secondary ledger must not prevent
+                # later served profiles from recovering. Leave it unmarked so
+                # a later startup or explicit retry can try again.
+                logger.warning(
+                    "Could not restore async delegation completions for "
+                    "profile %s",
+                    profile,
+                    exc_info=True,
+                )
+                continue
             self._restored_delegation_profiles.add(profile)
         return restored
 
@@ -1057,6 +1069,45 @@ class ProcessRegistry:
     # ----- Spawn -----
 
     @staticmethod
+    def _apply_spawn_routing_metadata(
+        session: ProcessSession,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Bind validated notification routing before the first checkpoint."""
+        if not isinstance(metadata, dict):
+            return
+        text_fields = (
+            "watcher_platform",
+            "watcher_chat_id",
+            "watcher_user_id",
+            "watcher_user_name",
+            "watcher_thread_id",
+            "watcher_message_id",
+            "origin_session_id",
+            "origin_profile",
+            "origin_api_route_profile",
+            "parent_session_id",
+        )
+        for field_name in text_fields:
+            value = metadata.get(field_name)
+            if value is not None:
+                setattr(session, field_name, str(value).strip())
+        try:
+            session.watcher_interval = max(
+                0, int(metadata.get("watcher_interval") or 0)
+            )
+        except (TypeError, ValueError):
+            session.watcher_interval = 0
+        session.notify_on_complete = bool(
+            metadata.get("notify_on_complete", False)
+        )
+        patterns = metadata.get("watch_patterns")
+        if isinstance(patterns, (list, tuple)):
+            session.watch_patterns = [
+                str(pattern) for pattern in patterns if str(pattern)
+            ]
+
+    @staticmethod
     def _env_temp_dir(env: Any) -> str:
         """Return the writable sandbox temp dir for env-backed background tasks."""
         get_temp_dir = getattr(env, "get_temp_dir", None)
@@ -1077,6 +1128,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        routing_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1105,6 +1157,7 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        self._apply_spawn_routing_metadata(session, routing_metadata)
 
         pty_scope_attempted = False
         if use_pty:
@@ -1315,6 +1368,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        routing_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1337,6 +1391,7 @@ class ProcessRegistry:
             env_ref=env,
             pid_scope="sandbox",
         )
+        self._apply_spawn_routing_metadata(session, routing_metadata)
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)

@@ -968,6 +968,32 @@ class TestCheckpoint:
         assert row["origin_profile"] == "writer"
         assert row["origin_api_route_profile"] == "writer"
 
+    def test_secondary_profile_restore_isolates_profile_failures(
+        self, registry, monkeypatch
+    ):
+        from tools import async_delegation
+
+        calls = []
+
+        def restore(_queue, *, profile=""):
+            calls.append(profile)
+            if profile == "broken":
+                raise RuntimeError("corrupt ledger")
+            return 1
+
+        monkeypatch.setattr(
+            async_delegation,
+            "restore_undelivered_completions",
+            restore,
+        )
+
+        assert registry.restore_delegation_profiles(
+            ["broken", "writer"]
+        ) == 1
+        assert calls == ["broken", "writer"]
+        assert "writer" in registry._restored_delegation_profiles
+        assert "broken" not in registry._restored_delegation_profiles
+
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
