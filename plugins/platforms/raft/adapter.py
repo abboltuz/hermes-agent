@@ -724,6 +724,13 @@ class RaftAdapter(BasePlatformAdapter):
             raw_message=payload,
             message_id=delivery_id,
             internal=True,
+            metadata={
+                "source": "raft_bridge",
+                "internal": True,
+                "kind": "raft_wake",
+                "event_id": delivery_id,
+            },
+            allow_gateway_control=False,
         )
         try:
             await self.handle_message(event)

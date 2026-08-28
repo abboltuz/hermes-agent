@@ -438,11 +438,60 @@ class TestAgentExecution:
                 "trust_kind": "trusted_internal",
                 "provenance_metadata": {
                     "producer": "api_server_ingress",
+                    "source": "process",
+                    "event_kind": "process_notification",
                     "platform": "api_server",
+                    "event_id": "proc-7",
                     "session_id": "internal-session",
                 },
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_classifies_display_only_kanban_wake_as_agent_continuation(
+        self, adapter
+    ):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        metadata = {
+            "source": "kanban",
+            "internal": True,
+            "kind": "kanban_wake",
+            "event_id": 17,
+            "task_id": "task-17",
+            "run_id": 23,
+        }
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="worker completed",
+                conversation_history=[],
+                session_id="creator-session",
+                persist_user_display_kind="internal_notification",
+                persist_user_display_metadata=metadata,
+            )
+
+        provenance = mock_agent.run_conversation.call_args.kwargs[
+            "persist_user_provenance"
+        ]
+        assert provenance == {
+            "origin_kind": "agent",
+            "turn_kind": "continuation",
+            "trust_kind": "trusted_internal",
+            "provenance_metadata": {
+                "producer": "api_server_ingress",
+                "source": "kanban",
+                "event_kind": "kanban_wake",
+                "platform": "api_server",
+                "event_id": 17,
+                "task_id": "task-17",
+                "run_id": 23,
+                "session_id": "creator-session",
+            },
+        }
 
     @pytest.mark.asyncio
     async def test_run_agent_sets_and_clears_process_ownership_markers(self, adapter):

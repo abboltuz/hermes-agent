@@ -7539,14 +7539,34 @@ class APIServerAdapter(BasePlatformAdapter):
                             persist_user_provenance.get("provenance_metadata"),
                         )
                     elif persist_user_display_kind:
+                        display_metadata = (
+                            persist_user_display_metadata
+                            if isinstance(persist_user_display_metadata, dict)
+                            else {}
+                        )
+                        runtime_metadata: Dict[str, Any] = {
+                            "producer": "api_server_ingress",
+                            "source": str(display_metadata.get("source") or ""),
+                            "event_kind": str(display_metadata.get("kind") or ""),
+                            "platform": "api_server",
+                            "session_id": effective_task_id,
+                        }
+                        for key in (
+                            "event_id",
+                            "task_id",
+                            "job_id",
+                            "process_id",
+                            "delegation_id",
+                            "run_id",
+                            "generation_id",
+                        ):
+                            value = display_metadata.get(key)
+                            if value is not None and value != "":
+                                runtime_metadata[key] = value
                         current_provenance = provenance_for_runtime_turn(
                             platform="api_server",
                             display_kind=persist_user_display_kind,
-                            metadata={
-                                "producer": "api_server_ingress",
-                                "platform": "api_server",
-                                "session_id": effective_task_id,
-                            },
+                            metadata=runtime_metadata,
                         )
                     else:
                         current_provenance = build_provenance(

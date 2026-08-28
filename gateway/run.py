@@ -6803,7 +6803,17 @@ def _internal_event_display_metadata(event: MessageEvent, source: SessionSource)
     platform = str(platform_value or "").strip()[:128]
     if platform:
         metadata["platform"] = platform
-    for key in ("event_id", "delegation_id", "session_id"):
+    for key in (
+        "event_id",
+        "task_id",
+        "job_id",
+        "process_id",
+        "delegation_id",
+        "run_id",
+        "generation_id",
+        "session_id",
+        "event_kind",
+    ):
         value = raw.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             metadata[key] = value
@@ -6811,6 +6821,8 @@ def _internal_event_display_metadata(event: MessageEvent, source: SessionSource)
             bounded = str(value or "").strip()[:512]
             if bounded:
                 metadata[key] = bounded
+    if isinstance(raw.get("recovered"), bool):
+        metadata["recovered"] = raw["recovered"]
     return metadata
 
 
@@ -12438,6 +12450,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                metadata={
+                    "source": "session",
+                    "internal": True,
+                    "kind": "resume",
+                    "session_id": entry.session_id,
+                },
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -13979,6 +13997,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text=synthetic_text,
             source=dest_source,
             internal=True,
+            metadata={
+                "source": "session",
+                "internal": True,
+                "kind": "session_handoff",
+                "session_id": cli_session_id,
+            },
         )
 
         logger.info(
@@ -22420,6 +22444,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_type=MessageType.TEXT,
                             source=source,
                             internal=True,
+                            metadata={
+                                "source": "loop",
+                                "internal": True,
+                                "kind": "loop_tick",
+                                "session_id": sid,
+                                "event_id": (
+                                    f"{sid}:"
+                                    f"{mgr.state.ticks_fired if mgr.state else 0}"
+                                ),
+                            },
                         )
                         logger.info(
                             "loop wakeup #%s — injecting for %s chat=%s thread=%s",

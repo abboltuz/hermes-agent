@@ -24,7 +24,10 @@ _ID_KEYS = (
     "delegation_id",
     "session_id",
     "task_id",
+    "job_id",
+    "process_id",
     "run_id",
+    "generation_id",
     "event_kind",
 )
 _ID_LIMIT = 512

@@ -1,5 +1,6 @@
 """Gateway /loop command tests — dispatch, routing capture, mid-run guard."""
 
+import asyncio
 import logging
 import time
 from unittest.mock import AsyncMock, Mock
@@ -77,6 +78,51 @@ async def test_gateway_loop_create_captures_route(loop_env):
     assert state.route["platform"] == "discord"
     assert state.route["chat_id"] == "chat-loop"
     assert state.route["thread_id"] == "thread-9"
+
+
+@pytest.mark.asyncio
+async def test_gateway_loop_watcher_emits_automation_continuation(loop_env, monkeypatch):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(
+        runner, _make_event("/loop 5m check the deploy")
+    )
+    state = loops.load_loop("sid-gateway-loop")
+    state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", state)
+
+    adapter = AsyncMock()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._running = True
+    runner._running_agents = {}
+    runner._warm_goals_session_db = AsyncMock()
+    runner._build_process_event_source = Mock(return_value=_make_event("wake").source)
+    runner._session_key_for_source = Mock(return_value="quick-loop")
+
+    real_sleep = asyncio.sleep
+    sleep_calls = 0
+
+    async def stop_after_first_scan(delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            return
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", stop_after_first_scan)
+    await runner._loop_wakeup_watcher(interval=0)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.metadata == {
+        "source": "loop",
+        "internal": True,
+        "kind": "loop_tick",
+        "session_id": "sid-gateway-loop",
+        "event_id": "sid-gateway-loop:1",
+    }
+    assert event.semantic_provenance()["origin_kind"] == "automation"
+    assert event.semantic_provenance()["turn_kind"] == "continuation"
 
 
 @pytest.mark.asyncio

@@ -402,6 +402,13 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
             raw_message=notification,
             message_id=message_id,
             internal=True,
+            metadata={
+                "source": "external_webhook",
+                "internal": True,
+                "kind": "msgraph_notification",
+                "event_id": message_id,
+            },
+            allow_gateway_control=False,
         )
 
     def _render_prompt(self, notification: Dict[str, Any]) -> str:

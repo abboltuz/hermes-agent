@@ -159,6 +159,23 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert wake_metadata["task_id"] == tid
     assert isinstance(wake_metadata["event_id"], int)
     assert wake_metadata["event_kind"] == "completed"
+    expected_provenance_metadata = {
+        "producer": "gateway_wake",
+        "source": "kanban",
+        "event_kind": "kanban_wake",
+        "platform": "api_server",
+        "event_id": wake_metadata["event_id"],
+        "task_id": tid,
+        "session_id": "origin-session",
+    }
+    if wake_metadata.get("run_id") is not None:
+        expected_provenance_metadata["run_id"] = wake_metadata["run_id"]
+    assert posts[0]["internal_turn"]["provenance"] == {
+        "origin_kind": "agent",
+        "turn_kind": "continuation",
+        "trust_kind": "trusted_internal",
+        "provenance_metadata": expected_provenance_metadata,
+    }
     wake_text = posts[0]["text"]
     assert tid in wake_text
     # Graph-safe wake turn (#70752): the synthetic turn must carry the

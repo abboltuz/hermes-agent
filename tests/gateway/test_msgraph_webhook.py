@@ -142,6 +142,16 @@ class TestMSGraphNotifications:
         assert event.source.platform == Platform.MSGRAPH_WEBHOOK
         assert event.source.chat_type == "webhook"
         assert event.message_id == "id:notif-1"
+        assert event.internal is True
+        assert event.allow_gateway_control is False
+        assert event.metadata == {
+            "source": "external_webhook",
+            "internal": True,
+            "kind": "msgraph_notification",
+            "event_id": "id:notif-1",
+        }
+        assert event.semantic_provenance()["origin_kind"] == "external_actor"
+        assert event.semantic_provenance()["trust_kind"] == "untrusted_external"
 
     @pytest.mark.anyio
     async def test_oversized_notification_rejected_by_content_length(self):
@@ -260,5 +270,4 @@ class TestMSGraphSourceIPAllowlist:
             _FakeRequest(json_payload=payload, remote="203.0.113.99")
         )
         assert resp.status == 403
-
 

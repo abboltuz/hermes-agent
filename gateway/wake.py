@@ -76,9 +76,10 @@ async def deliver_wake(
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
     """
+    from agent.message_provenance import provenance_for_gateway_ingress
     from gateway.internal_turn import build_internal_turn_envelope
 
-    envelope = build_internal_turn_envelope(
+    display_envelope = build_internal_turn_envelope(
         display_kind,
         display_metadata
         or {
@@ -86,6 +87,41 @@ async def deliver_wake(
             "internal": True,
             "kind": "wake",
         },
+    )
+    bounded_display = display_envelope["display_metadata"]
+    source_platform = getattr(getattr(source, "platform", None), "value", None)
+    platform = str(source_platform or "api_server")
+    provenance_metadata: dict[str, Any] = {
+        "producer": "gateway_wake",
+        "source": bounded_display["source"],
+        "event_kind": bounded_display["kind"],
+        "platform": platform,
+    }
+    for key in (
+        "event_id",
+        "task_id",
+        "job_id",
+        "process_id",
+        "delegation_id",
+        "run_id",
+        "generation_id",
+    ):
+        value = bounded_display.get(key)
+        if value is not None and value != "":
+            provenance_metadata[key] = value
+    if session_id:
+        provenance_metadata["session_id"] = session_id
+    provenance = provenance_for_gateway_ingress(
+        platform=platform,
+        internal=True,
+        internal_source=bounded_display["source"],
+        event_kind=bounded_display["kind"],
+        metadata=provenance_metadata,
+    )
+    envelope = build_internal_turn_envelope(
+        display_envelope["display_kind"],
+        bounded_display,
+        provenance.as_message_fields(),
     )
 
     if adapter_supports_push(adapter):

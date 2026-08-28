@@ -1116,6 +1116,13 @@ class RecallGuardMiddleware(InboundMiddleware):
             message_type=MessageType.TEXT,
             source=cls._build_source(adapter, group_code, from_account),
             internal=True,
+            metadata={
+                "source": "session",
+                "internal": True,
+                "kind": "recall_interrupt",
+                "event_id": recalled_id,
+            },
+            allow_gateway_control=False,
         )
         # Set pending + signal directly (bypass handle_message to avoid busy-ack).
         # May overwrite a user message pending in the same ~200ms window — acceptable.
