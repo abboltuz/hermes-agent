@@ -13,6 +13,13 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.message_provenance import (
+    OriginKind,
+    TrustKind,
+    TurnKind,
+    stamp_provenance,
+    strip_untrusted_provenance,
+)
 from agent.skill_commands import SKILL_SCAFFOLD_SQL_LIKE
 from hermes_state_common import (
     SCHEMA_SQL,
@@ -770,13 +777,50 @@ class SessionPortabilityMixin:
 
                 sanitized_messages: List[Dict[str, Any]] = []
                 for msg in messages:
-                    clean = dict(msg)
+                    # Session archives are an untrusted ingress boundary. An
+                    # imported JSON document must not be able to forge human
+                    # authorship or user-authorized control provenance.
+                    clean = strip_untrusted_provenance(msg)
+                    # Presentation is not an authorization input. Preserve
+                    # non-hiding display sidecars so a local export/import is
+                    # a faithful timeline round trip. ``hidden`` is rejected:
+                    # an untrusted archive must not make imported content
+                    # disappear from review. Semantic fields are always
+                    # replaced with import-owned provenance below.
+                    imported_display_kind = msg.get("display_kind")
+                    if imported_display_kind and imported_display_kind != "hidden":
+                        clean["display_kind"] = imported_display_kind
+                        if "display_metadata" in msg:
+                            clean["display_metadata"] = msg["display_metadata"]
                     for key in (
                         "reasoning_details",
                         "codex_reasoning_items",
                         "codex_message_items",
                     ):
                         clean[key] = self._reasoning_json_value(clean.get(key))
+                    role = clean.get("role")
+                    imported_turn = (
+                        TurnKind.TOOL_RESULT
+                        if role == "tool"
+                        else TurnKind.TOOL_CALL
+                        if role == "assistant" and clean.get("tool_calls")
+                        else TurnKind.RESPONSE
+                        if role == "assistant"
+                        else TurnKind.RUNTIME_SCAFFOLDING
+                        if role == "system"
+                        else TurnKind.PROMPT
+                    )
+                    stamp_provenance(
+                        clean,
+                        OriginKind.IMPORTED,
+                        imported_turn,
+                        TrustKind.NO_CONTROL,
+                        {
+                            "producer": "session_import",
+                            "import_source": str(raw.get("source") or "archive"),
+                            "session_id": session_id,
+                        },
+                    )
                     sanitized_messages.append(clean)
 
                 total_messages, total_tool_calls = self._insert_message_rows(

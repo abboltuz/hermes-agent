@@ -17,6 +17,13 @@ import pytest
 from hermes_state import SessionDB
 
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
 @pytest.fixture
 def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
@@ -26,9 +33,9 @@ def _seed(db, sid="s1"):
     """Session with 4 archived (compacted) turns + 2 live turns + 1 rewound row."""
     db.create_session(sid, source="cli")
     old = [
-        {"role": "user", "content": "old q1"},
+        {"role": "user", "content": "old q1", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "old a1"},
-        {"role": "user", "content": "old q2"},
+        {"role": "user", "content": "old q2", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "old a2"},
     ]
     db.append_messages_batch(sid, old)
@@ -36,7 +43,7 @@ def _seed(db, sid="s1"):
         sid,
         [
             {"role": "assistant", "content": "summary of old turns"},
-            {"role": "user", "content": "live q1"},
+            {"role": "user", "content": "live q1", **HUMAN_PROVENANCE},
             {"role": "assistant", "content": "live a1"},
         ],
     )

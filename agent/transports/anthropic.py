@@ -28,9 +28,11 @@ class AnthropicTransport(ProviderTransport):
             base_url: Optional[str] — affects thinking signature handling.
         """
         from agent.anthropic_adapter import convert_messages_to_anthropic
+        from agent.message_provenance import strip_provenance_messages_for_provider
 
         base_url = kwargs.get("base_url")
-        return convert_messages_to_anthropic(messages, base_url=base_url)
+        projected = strip_provenance_messages_for_provider(messages)
+        return convert_messages_to_anthropic(projected, base_url=base_url)
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
         """Convert OpenAI tool schemas to Anthropic input_schema format."""
@@ -61,6 +63,9 @@ class AnthropicTransport(ProviderTransport):
             drop_context_1m_beta: bool
         """
         from agent.anthropic_adapter import build_anthropic_kwargs
+        from agent.message_provenance import strip_provenance_messages_for_provider
+
+        messages = strip_provenance_messages_for_provider(messages)
 
         return build_anthropic_kwargs(
             model=model,

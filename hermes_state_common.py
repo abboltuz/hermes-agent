@@ -125,16 +125,22 @@ _PREVIEW_FORCE_USER_REMAINDER_SQL = (
     f" + {len(_SUMMARY_END_MARKER)})"
 )
 
+_PREVIEW_SEMANTIC_SQL = (
+    "m.origin_kind IN ('human_user', 'external_actor', 'automation', 'agent', 'imported')"
+    " AND m.turn_kind IN ('prompt', 'ui_action', 'task_instruction')"
+)
+
 # Session preview subqueries select their first eligible user-authored content.
 # Pure compaction rows are ineligible; force-user-leading and merged carriers
 # remain eligible only when authentic content survives the wire boundary.
 _PREVIEW_ELIGIBLE_SQL = (
-    f"((NOT {_PREVIEW_STANDALONE_SUMMARY_SQL} AND NOT {_PREVIEW_MERGED_SUMMARY_SQL})"
+    f"({_PREVIEW_SEMANTIC_SQL} AND ("
+    f"(NOT {_PREVIEW_STANDALONE_SUMMARY_SQL} AND NOT {_PREVIEW_MERGED_SUMMARY_SQL})"
     f" OR ({_PREVIEW_STANDALONE_SUMMARY_SQL}"
     f" AND INSTR(m.content, {_sql_literal(_SUMMARY_END_MARKER)}) > 0"
     f" AND LENGTH({_sql_trim_whitespace(_PREVIEW_FORCE_USER_REMAINDER_SQL)}) > 0)"
     f" OR ({_PREVIEW_MERGED_SUMMARY_SQL}"
-    f" AND LENGTH({_sql_trim_whitespace(_PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL)}) > 0))"
+    f" AND LENGTH({_sql_trim_whitespace(_PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL)}) > 0)))"
 )
 
 
@@ -326,7 +332,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -451,7 +457,11 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
     display_kind TEXT,
-    display_metadata TEXT
+    display_metadata TEXT,
+    origin_kind TEXT,
+    turn_kind TEXT,
+    trust_kind TEXT,
+    provenance_metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
