@@ -31,10 +31,16 @@ const { getLatestSessionMessages } = await import('@/hermes')
 const ACTIVE_RUNTIME_ID = 'runtime-active'
 const ACTIVE_STORED_ID = 'stored-active'
 
+const humanPrompt = {
+  origin_kind: 'human_user' as const,
+  turn_kind: 'prompt' as const,
+  trust_kind: 'user_authorized' as const
+}
+
 function transcript(answer: string) {
   return {
     messages: [
-      { content: 'question', role: 'user', timestamp: 1 },
+      { content: 'question', role: 'user', timestamp: 1, ...humanPrompt },
       { content: answer, role: 'assistant', timestamp: 2 }
     ],
     session_id: ACTIVE_STORED_ID
@@ -274,7 +280,7 @@ describe('reconcileActiveTranscript', () => {
       { error: 'local failure', id: 'assistant-error', parts: [], role: 'assistant' }
     ]
     vi.mocked(getLatestSessionMessages).mockResolvedValue({
-      messages: [{ content: 'question', role: 'user', timestamp: 1 }],
+      messages: [{ content: 'question', role: 'user', timestamp: 1, ...humanPrompt }],
       session_id: ACTIVE_STORED_ID
     } as never)
 

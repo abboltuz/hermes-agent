@@ -202,7 +202,13 @@ export function useSubmission(opts: UseSubmissionOptions) {
       }
 
       if (mode === 'steer' && live.sid) {
-        gw.request<SessionSteerResponse>('session.steer', { session_id: live.sid, text: item.text })
+        const messageId = `tui-steer:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`
+
+        gw.request<SessionSteerResponse>('session.steer', {
+          session_id: live.sid,
+          text: item.text,
+          message_id: messageId
+        })
           .then(raw => {
             const r = asRpcResult<SessionSteerResponse>(raw)
 

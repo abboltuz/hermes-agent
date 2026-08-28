@@ -137,6 +137,18 @@ function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   }
 }
 
+function humanPrompt(content: string, timestamp: number, messageId?: string) {
+  return {
+    content,
+    role: 'user' as const,
+    timestamp,
+    origin_kind: 'human_user' as const,
+    turn_kind: 'prompt' as const,
+    trust_kind: 'user_authorized' as const,
+    ...(messageId ? { provenance_metadata: { message_id: messageId } } : {})
+  }
+}
+
 function Harness({
   activeSessionId = null,
   navigate = vi.fn(),
@@ -1577,7 +1589,7 @@ describe('branchStoredSession desktop source tagging', () => {
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
     setSelectedStoredSessionId('stored-parent')
     vi.mocked(getAllSessionMessages).mockResolvedValue({
-      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      messages: [humanPrompt('branch me', 1)],
       session_id: 'stored-parent'
     } as never)
 
@@ -1628,7 +1640,7 @@ describe('branchStoredSession desktop source tagging', () => {
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
     setSelectedStoredSessionId('stored-other')
     vi.mocked(getAllSessionMessages).mockResolvedValue({
-      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      messages: [humanPrompt('branch me', 1)],
       session_id: 'stored-parent'
     } as never)
 
@@ -1668,7 +1680,7 @@ describe('branchStoredSession desktop source tagging', () => {
 
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
     vi.mocked(getAllSessionMessages).mockResolvedValue({
-      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      messages: [humanPrompt('branch me', 1)],
       session_id: 'stored-parent'
     } as never)
 
@@ -1831,7 +1843,7 @@ describe('branchStoredSession desktop source tagging', () => {
     setSessions([])
     vi.mocked(getSession).mockResolvedValue(storedSession({ id: 'stored-parent', message_count: 1, profile: 'work' }))
     vi.mocked(getAllSessionMessages).mockResolvedValue({
-      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      messages: [humanPrompt('branch me', 1)],
       session_id: 'stored-parent'
     } as never)
 
@@ -1868,7 +1880,7 @@ describe('branchStoredSession desktop source tagging', () => {
   it('creates the branch on the cached parent session profile', async () => {
     setSessions([storedSession({ id: 'stored-parent', message_count: 1, profile: 'work' })])
     vi.mocked(getAllSessionMessages).mockResolvedValue({
-      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      messages: [humanPrompt('branch me', 1)],
       session_id: 'stored-parent'
     } as never)
 
@@ -1897,7 +1909,7 @@ describe('branchStoredSession desktop source tagging', () => {
   it('omits profile for a profile-less parent so single-profile users are unchanged', async () => {
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
     vi.mocked(getAllSessionMessages).mockResolvedValue({
-      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      messages: [humanPrompt('branch me', 1)],
       session_id: 'stored-parent'
     } as never)
 
@@ -2878,7 +2890,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     }
 
     const persistedMessages = [
-      { content: 'describe this image', role: 'user', timestamp: 1 },
+      humanPrompt('describe this image', 1),
       { content: 'It is a photo.', role: 'assistant', timestamp: 2 }
     ]
 
@@ -3362,7 +3374,8 @@ describe('resumeSession warm-cache mapping integrity', () => {
       {
         id: 'user-optimistic',
         role: 'user',
-        parts: [{ type: 'text', text: 'current prompt' }]
+        parts: [{ type: 'text', text: 'current prompt' }],
+        semanticId: 'prompt-current'
       },
       {
         id: 'assistant-stream-rt-A',
@@ -3385,7 +3398,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       { content: 'older prompt removed by compression', role: 'user', timestamp: -1 },
       { content: 'older answer removed by compression', role: 'assistant', timestamp: 0 },
       ...compressedRuntimeMessages,
-      { content: 'current prompt', role: 'user', timestamp: 3 }
+      humanPrompt('current prompt', 3, 'prompt-current')
     ]
 
     vi.mocked(getLatestSessionMessages).mockResolvedValue({
@@ -3405,7 +3418,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
           inflight: {
             user: 'current prompt',
             assistant: 'partial answer',
-            streaming: true
+            streaming: true,
+            origin_kind: 'human_user',
+            turn_kind: 'prompt',
+            trust_kind: 'user_authorized',
+            provenance_metadata: { message_id: 'prompt-current' }
           },
           info: {}
         } as never

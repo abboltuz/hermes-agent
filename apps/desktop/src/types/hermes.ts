@@ -558,6 +558,7 @@ export type TimelineDisplayMetadata =
       source: 'kanban'
       internal: true
       kind: 'kanban_wake'
+      message_id?: string
       display_text: string
       events: Array<{
         board: string
@@ -566,6 +567,9 @@ export type TimelineDisplayMetadata =
         run_id: null | number
         event_kind: string
         occurred_at: number
+        platform?: string
+        chat_id?: string
+        thread_id?: string
       }>
     }
   | { reactions: MessageReaction[] }
@@ -652,6 +656,17 @@ export interface SessionMessage {
     | string
 }
 
+export interface SessionSemanticEnvelope {
+  display_kind?: string
+  /** Transient presentation metadata is bounded server-side but may describe
+   *  producer-specific events newer than this renderer. */
+  display_metadata?: string | Record<string, unknown>
+  origin_kind?: SessionMessage['origin_kind']
+  provenance_metadata?: SessionMessage['provenance_metadata']
+  trust_kind?: SessionMessage['trust_kind']
+  turn_kind?: SessionMessage['turn_kind']
+}
+
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
   pagination?: {
@@ -672,11 +687,13 @@ export interface SessionResumeResponse {
     interrupted_at: number
   }
   hydrating?: boolean
-  inflight?: null | {
+  inflight?: null | SessionSemanticEnvelope & {
     assistant?: string
     /** Mid-turn redirect corrections, oldest first. The turn's original prompt
      *  stays in `user`; these are the follow-ups typed while it ran. */
     corrections?: string[]
+    /** Semantic envelopes parallel to corrections. */
+    correction_provenance?: SessionSemanticEnvelope[]
     /** Parallel to `corrections`: the length of `assistant` already streamed
      *  when each correction was accepted. Lets a resume rebuild arrival order —
      *  the correction bubble lands after the output the user had already seen
@@ -694,9 +711,12 @@ export interface SessionResumeResponse {
     streaming?: boolean
     user?: string
   }
-  queued?: null | {
+  queued?: null | SessionSemanticEnvelope & {
     user?: string
   }
+  /** Complete accepted FIFO. New gateways also expose the head in `queued`
+   *  for backward compatibility. */
+  queued_prompts?: Array<SessionSemanticEnvelope & { user?: string }>
   // The oldest gateway approval still waiting for a response. This is returned
   // on resume so a reconnect can restore a prompt whose original event was
   // emitted while the client transport was detached.

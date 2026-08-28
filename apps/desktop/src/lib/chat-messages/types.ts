@@ -42,6 +42,12 @@ export type ChatMessage = {
   rowId?: number
   /** Emoji reactions on this message — one per author (see MessageReaction). */
   reactions?: MessageReaction[]
+  /** Stable semantic turn identity shared by optimistic/live/durable rows. */
+  semanticId?: string
+  originKind?: SessionMessage['origin_kind']
+  turnKind?: SessionMessage['turn_kind']
+  trustKind?: SessionMessage['trust_kind']
+  provenanceMetadata?: SessionMessage['provenance_metadata']
 }
 
 export type GatewayEventPayload = {

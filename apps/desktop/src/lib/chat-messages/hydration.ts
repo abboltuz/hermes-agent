@@ -325,6 +325,13 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const reactions = messageReactions(message.display_metadata)
+    const provenanceMetadata = message.provenance_metadata
+
+    const semanticId =
+      typeof provenanceMetadata?.message_id === 'string' && provenanceMetadata.message_id.trim()
+        ? provenanceMetadata.message_id.trim()
+        : undefined
+
     // Gateway resume names the durable row id `row_id`; the REST transcript
     // prefetch ships the same messages.id as a numeric `id`. Either one lets
     // reactions address this exact row later.
@@ -337,7 +344,12 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
       ...(rowId !== undefined ? { rowId } : {}),
       ...(reactions.length ? { reactions } : {}),
-      ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})
+      ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {}),
+      ...(semanticId ? { semanticId } : {}),
+      ...(message.origin_kind ? { originKind: message.origin_kind } : {}),
+      ...(message.turn_kind ? { turnKind: message.turn_kind } : {}),
+      ...(message.trust_kind ? { trustKind: message.trust_kind } : {}),
+      ...(provenanceMetadata ? { provenanceMetadata } : {})
     })
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null

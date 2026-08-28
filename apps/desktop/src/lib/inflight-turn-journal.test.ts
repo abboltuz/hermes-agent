@@ -17,8 +17,8 @@ const MIGRATION_KEY = 'hermes.desktop.inflightTurnJournal.v2.migrated'
 
 const sessionStorageKey = (storedSessionId: string) => `${STORAGE_PREFIX}${encodeURIComponent(storedSessionId)}`
 
-function user(id: string, text: string): ChatMessage {
-  return { id, role: 'user', parts: [{ type: 'text', text }] }
+function user(id: string, text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
+  return { id, role: 'user', parts: [{ type: 'text', text }], ...extra }
 }
 
 function assistant(id: string, text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
@@ -735,6 +735,40 @@ describe('recoverInFlightTurnJournal', () => {
 })
 
 describe('mergeInFlightMessages', () => {
+  it('does not text-match an identified journal row to an unidentified durable row', () => {
+    const base = [user('db-legacy', 'repeat this')]
+
+    const tail = [
+      user('live-new', 'repeat this', { semanticId: 'desktop:new' }),
+      assistant('assistant-stream-new', 'partial answer', { pending: true })
+    ]
+
+    const result = mergeInFlightMessages(base, tail, { keepPending: true })
+
+    expect(result.messages.map(message => message.id)).toEqual([
+      'db-legacy',
+      'live-new',
+      'assistant-stream-new'
+    ])
+  })
+
+  it('does not attach a repeated-text journal tail to a different semantic turn', () => {
+    const base = [user('db-old', 'repeat this', { semanticId: 'desktop:old' })]
+
+    const tail = [
+      user('live-new', 'repeat this', { semanticId: 'desktop:new' }),
+      assistant('assistant-stream-new', 'partial answer', { pending: true })
+    ]
+
+    const result = mergeInFlightMessages(base, tail, { keepPending: true })
+
+    expect(result.applied).toBe(true)
+    expect(result.messages.map(message => message.semanticId).filter(Boolean)).toEqual([
+      'desktop:old',
+      'desktop:new'
+    ])
+  })
+
   it('treats an error-bearing assistant row as recoverable content', () => {
     const tail = [user('u1', 'do the thing'), assistant('a-err', '', { error: 'provider exploded' })]
     const result = mergeInFlightMessages([user('db-u1', 'do the thing')], tail)

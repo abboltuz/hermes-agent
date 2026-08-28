@@ -703,8 +703,14 @@ export const coreCommands: SlashCommand[] = [
         return
       }
 
+      const messageId = `tui-steer:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`
+
       ctx.gateway
-        .rpc<SessionSteerResponse>('session.steer', { session_id: ctx.sid, text: payload })
+        .rpc<SessionSteerResponse>('session.steer', {
+          session_id: ctx.sid,
+          text: payload,
+          message_id: messageId
+        })
         .then(
           ctx.guarded<SessionSteerResponse>(r => {
             if (r?.status === 'queued') {
