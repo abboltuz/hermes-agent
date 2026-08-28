@@ -240,9 +240,15 @@ def split_history_for_partial_compress(
 
     # Walk backwards collecting the indices of the most recent `keep_last`
     # user-message starts. The tail begins at the earliest such index.
+    from agent.message_provenance import is_actionable_continuation, is_human_intent
+
     user_starts: List[int] = []
     for idx in range(n - 1, -1, -1):
-        if history[idx].get("role") == "user":
+        message = history[idx]
+        if message.get("role") == "user" and (
+            is_human_intent(message)
+            or is_actionable_continuation(message)
+        ):
             user_starts.append(idx)
             if len(user_starts) >= keep_last:
                 break
@@ -312,6 +318,9 @@ def rejoin_compressed_head_and_tail(
         if isinstance(last_content, str) and isinstance(first_content, str):
             merged = dict(last)
             merged["content"] = f"{last_content}\n\n{first_content}"
+            from agent.message_provenance import merge_same_role_carrier_provenance
+
+            merge_same_role_carrier_provenance(merged, first)
             head[-1] = merged
             rest = rest[1:]
         else:

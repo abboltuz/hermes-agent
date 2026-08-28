@@ -660,7 +660,17 @@ def _format_timestamp(ts: float) -> str:
 def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
     html_list = []
     for i, msg in enumerate(messages):
+        from agent.message_provenance import is_display_visible
+
+        if not is_display_visible(msg):
+            continue
         role = msg.get("role", "unknown")
+        display_role = role
+        if role == "user":
+            from agent.message_provenance import display_actor
+
+            actor = display_actor(msg)
+            display_role = "user" if actor == "user" else actor
         
         # Skip internal metadata messages
         if role == "session_meta":
@@ -671,11 +681,11 @@ def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
         
         # Icon selection
         role_icon = ICON_TERMINAL
-        if role == "user":
+        if display_role == "user":
             role_icon = ICON_USER
         elif role == "assistant":
             role_icon = ICON_BOT
-        elif role == "system":
+        elif display_role in {"system", "automation", "agent", "imported", "unknown"}:
             role_icon = ICON_SHIELD
 
         # Handle multimodal or complex content
@@ -698,8 +708,8 @@ def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
         #    so a crafted role can neither break out of the attribute nor split
         #    into several unintended classes. Real roles (user/assistant/system/
         #    tool) are unchanged, so the `.message-<role>` rules still match.
-        safe_role = _escape_html(role)
-        role_class = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(role).lower())
+        safe_role = _escape_html(display_role)
+        role_class = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(display_role).lower())
         msg_class = f"message message-{role_class} active"
         # Delay animation for initial items
         delay_style = f' style="animation-delay: {min(i * 0.05, 1.0)}s"' if i < 10 else ""

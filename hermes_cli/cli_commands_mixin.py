@@ -1453,6 +1453,12 @@ class CLICommandsMixin:
                         # replays the parent's exact wire bytes (warm provider
                         # prompt cache) instead of a full cold prefill.
                         "api_content": extract_api_content_sidecar(msg),
+                        "display_kind": msg.get("display_kind"),
+                        "display_metadata": msg.get("display_metadata"),
+                        "origin_kind": msg.get("origin_kind"),
+                        "turn_kind": msg.get("turn_kind"),
+                        "trust_kind": msg.get("trust_kind"),
+                        "provenance_metadata": msg.get("provenance_metadata"),
                         "timestamp": msg.get("timestamp"),
                     }
                     for msg in self.conversation_history
@@ -1508,7 +1514,11 @@ class CLICommandsMixin:
             except Exception:
                 pass
 
-        msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+        from agent.message_provenance import is_human_intent
+
+        msg_count = len(
+            [m for m in self.conversation_history if is_human_intent(m)]
+        )
         _cprint(
             f"  ⑂ Branched session \"{branch_title}\""
             f" ({msg_count} user message{'s' if msg_count != 1 else ''})"
@@ -2230,7 +2240,7 @@ class CLICommandsMixin:
                     quiet_mode=True,
                     verbose_logging=False,
                     session_id=task_id,
-                    platform="cli",
+                    platform="subagent",
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
                     service_tier=self.service_tier,

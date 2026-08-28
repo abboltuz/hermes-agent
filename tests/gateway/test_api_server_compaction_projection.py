@@ -193,6 +193,51 @@ class TestTurnTranscriptProjection:
 
 class TestMessagesEndpointProjection:
     @pytest.mark.asyncio
+    async def test_messages_endpoint_preserves_semantics_for_desktop_hydration(
+        self,
+        adapter,
+        session_db,
+    ):
+        session_id = session_db.create_session("provenance-session", "desktop")
+        session_db.replace_messages(
+            session_id,
+            [
+                {
+                    "role": "user",
+                    "content": "local ask",
+                    "origin_kind": "human_user",
+                    "turn_kind": "prompt",
+                    "trust_kind": "user_authorized",
+                },
+                {
+                    "role": "user",
+                    "content": "scheduled continuation",
+                    "origin_kind": "automation",
+                    "turn_kind": "continuation",
+                    "trust_kind": "trusted_internal",
+                    "provenance_metadata": {"producer": "goal", "event_id": "g-1"},
+                },
+            ],
+        )
+
+        async with TestClient(TestServer(_messages_app(adapter))) as client:
+            response = await client.get(f"/api/sessions/{session_id}/messages")
+            assert response.status == 200
+            payload = await response.json()
+
+        human, automation = payload["data"]
+        assert (human["origin_kind"], human["turn_kind"], human["trust_kind"]) == (
+            "human_user",
+            "prompt",
+            "user_authorized",
+        )
+        assert automation["origin_kind"] == "automation"
+        assert automation["provenance_metadata"] == {
+            "producer": "goal",
+            "event_id": "g-1",
+        }
+
+    @pytest.mark.asyncio
     async def test_messages_endpoint_never_serves_compaction_scaffolding(
         self,
         adapter,

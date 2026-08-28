@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import base64
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -1521,13 +1522,28 @@ class HermesACPAgent(acp.Agent):
                 return False
 
         for message in state.history:
+            from agent.message_provenance import is_display_visible
+
+            if not is_display_visible(message):
+                continue
             role = str(message.get("role") or "")
 
             if role == "user":
                 text = self._history_message_text(message)
                 if text:
+                    from agent.message_provenance import display_actor
+
+                    actor = display_actor(message)
+                    replay_role = "user" if actor == "user" else "assistant"
+                    if replay_role == "assistant":
+                        label = (
+                            "Source unknown"
+                            if actor == "unknown"
+                            else actor.replace("_", " ").title()
+                        )
+                        text = f"[{label}] {text}"
                     update = self._history_message_update(
-                        role=role,
+                        role=replay_role,
                         text=text,
                         field_meta=self._history_summary_meta(message, text),
                     )
@@ -2072,11 +2088,37 @@ class HermesACPAgent(acp.Agent):
 
             agent._on_session_title = _notify_title_update
             try:
+                from agent.message_provenance import provenance_for_runtime_turn
+
+                acp_provenance = provenance_for_runtime_turn(
+                    platform="acp",
+                    metadata={
+                        "producer": "acp_prompt",
+                        "platform": "acp",
+                        "session_id": session_id,
+                    },
+                ).as_message_fields()
+                run_kwargs = {
+                    "user_message": user_content,
+                    "conversation_history": state.history,
+                    "task_id": session_id,
+                    "persist_user_message": user_text or "[Image attachment]",
+                }
+                try:
+                    run_parameters = inspect.signature(
+                        agent.run_conversation
+                    ).parameters
+                    accepts_kwargs = any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in run_parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    run_parameters = {}
+                    accepts_kwargs = False
+                if "persist_user_provenance" in run_parameters or accepts_kwargs:
+                    run_kwargs["persist_user_provenance"] = acp_provenance
                 result = agent.run_conversation(
-                    user_message=user_content,
-                    conversation_history=state.history,
-                    task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
+                    **run_kwargs,
                 )
                 return result
             except Exception as e:

@@ -1086,7 +1086,24 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
         )
         logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",
                     len(prompt), len(history))
-        result = agent.run_conversation(prompt, conversation_history=history or None)
+        from agent.message_provenance import (
+            OriginKind,
+            TrustKind,
+            TurnKind,
+            build_provenance,
+        )
+
+        comment_provenance = build_provenance(
+            OriginKind.EXTERNAL_ACTOR,
+            TurnKind.PROMPT,
+            TrustKind.USER_AUTHORIZED,
+            {"producer": "feishu_comment", "platform": "feishu"},
+        ).as_message_fields()
+        result = agent.run_conversation(
+            prompt,
+            conversation_history=history or None,
+            persist_user_provenance=comment_provenance,
+        )
         response = (result.get("final_response") or "").strip()
         api_calls = result.get("api_calls", 0)
         logger.info("[Feishu-Comment] _run_comment_agent: done api_calls=%d response_len=%d response=%s",

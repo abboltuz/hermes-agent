@@ -391,6 +391,16 @@ class TestAgentExecution:
             user_message="hello",
             conversation_history=[],
             task_id="session-123",
+            persist_user_provenance={
+                "origin_kind": "external_actor",
+                "turn_kind": "prompt",
+                "trust_kind": "user_authorized",
+                "provenance_metadata": {
+                    "producer": "api_server_ingress",
+                    "platform": "api_server",
+                    "session_id": "session-123",
+                },
+            },
         )
 
     @pytest.mark.asyncio
@@ -422,6 +432,16 @@ class TestAgentExecution:
             task_id="internal-session",
             persist_user_display_kind="internal_notification",
             persist_user_display_metadata=metadata,
+            persist_user_provenance={
+                "origin_kind": "internal_system",
+                "turn_kind": "notification",
+                "trust_kind": "trusted_internal",
+                "provenance_metadata": {
+                    "producer": "api_server_ingress",
+                    "platform": "api_server",
+                    "session_id": "internal-session",
+                },
+            },
         )
 
     @pytest.mark.asyncio

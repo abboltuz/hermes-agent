@@ -20,6 +20,27 @@ from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
+def _stamp_test_human_history(history):
+    """Declare ordinary user-role fixtures as local human input."""
+    for message in history or []:
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and not message.get("display_kind")
+            and not message.get("_compressed_summary")
+            and not message.get("origin_kind")
+        ):
+            message.update(HUMAN_PROVENANCE)
+    return history
+
+
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
     """Run one RPC to completion synchronously, regardless of pool routing.
 
@@ -2821,21 +2842,23 @@ def test_history_to_messages_renders_multimodal_content():
     ]
 
 
-def test_history_to_messages_hides_gateway_system_markers():
+def test_history_to_messages_types_gateway_system_markers_as_events():
     # Model-switch / personality notices are persisted as role=user [System: …]
     # rows so strict providers accept them mid-history, but they are model-facing
-    # metadata -- never a user turn. They must not render as a user bubble on any
-    # surface, and dropping them from the display projection also stops the
-    # stored marker from shifting the desktop's user-message ordinals and
-    # duplicating the optimistic prompt (#67603).
+    # metadata -- never a user turn. Typed event projection keeps them out of
+    # local-user affordances while still showing the transition (#67603).
     history = [
-        {"role": "user", "content": "first question"},
+        {"role": "user", "content": "first question", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "first answer"},
         {
             "role": "user",
             "content": "[System: The active model for this chat has changed to k3.]",
+            "display_kind": "model_switch",
+            "origin_kind": "internal_system",
+            "turn_kind": "notification",
+            "trust_kind": "no_control",
         },
-        {"role": "user", "content": "second question"},
+        {"role": "user", "content": "second question", **HUMAN_PROVENANCE},
         {"role": "assistant", "content": "second answer"},
         {
             "role": "user",
@@ -2843,15 +2866,22 @@ def test_history_to_messages_hides_gateway_system_markers():
                 "[System: The user has changed the assistant's personality. "
                 "Adopt the new persona going forward.]"
             ),
+            "display_kind": "personality_switch",
+            "origin_kind": "internal_system",
+            "turn_kind": "notification",
+            "trust_kind": "no_control",
         },
     ]
 
-    assert server._history_to_messages(history) == [
-        {"role": "user", "text": "first question"},
-        {"role": "assistant", "text": "first answer"},
-        {"role": "user", "text": "second question"},
-        {"role": "assistant", "text": "second answer"},
+    projected = server._history_to_messages(history)
+    human_rows = [m for m in projected if m.get("origin_kind") == "human_user"]
+    assert [m["text"] for m in human_rows] == ["first question", "second question"]
+    event_rows = [m for m in projected if m.get("display_kind")]
+    assert [m["display_kind"] for m in event_rows] == [
+        "model_switch",
+        "personality_switch",
     ]
+    assert all(m["origin_kind"] == "internal_system" for m in event_rows)
 
 
 def test_history_to_messages_drops_display_hidden_scaffolding():
@@ -4479,6 +4509,9 @@ def test_startup_runtime_does_not_call_network_detector(monkeypatch):
 
 
 def _session(agent=None, **extra):
+    for history_key in ("history", "display_history_prefix"):
+        if isinstance(extra.get(history_key), list):
+            _stamp_test_human_history(extra[history_key])
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),
         "session_key": "session-key",
@@ -4515,7 +4548,9 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
             {"id": "1", "method": "session.close", "params": {"session_id": "sid"}}
         )
         assert resp["result"]["closed"] is True
-        assert calls["history"] == [{"role": "user", "content": "hello"}]
+        assert calls["history"] == [
+            {"role": "user", "content": "hello", **HUMAN_PROVENANCE}
+        ]
         assert ("on_session_finalize", "session-key") in calls["hooks"]
     finally:
         server._sessions.pop("sid", None)
@@ -9855,7 +9890,11 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     assert resp["result"]["info"] == {"model": "?"}
     # History is preserved with a pivot marker appended
     assert len(session["history"]) == 2
-    assert session["history"][0] == {"role": "user", "text": "hi"}
+    assert session["history"][0] == {
+        "role": "user",
+        "text": "hi",
+        **HUMAN_PROVENANCE,
+    }
     assert session["history"][1]["role"] == "user"
     assert "personality" in session["history"][1]["content"].lower()
     assert "You are helpful." in session["history"][1]["content"]
@@ -11188,7 +11227,9 @@ def test_rollback_restore_preserves_composite_carrier_scaffold(monkeypatch, tmp_
     }
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("rollback-carrier", source="tui")
-    db.append_message("rollback-carrier", "user", carrier["content"])
+    db.append_message(
+        "rollback-carrier", "user", carrier["content"], **HUMAN_PROVENANCE
+    )
     db.append_message("rollback-carrier", "assistant", "answer")
     durable = db.get_messages_as_conversation("rollback-carrier")
     agent = types.SimpleNamespace(
@@ -13578,11 +13619,11 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
 
 
 _PARTIAL_FAKE_HISTORY = [
-    {"role": "user", "content": "msg1"},
+    {"role": "user", "content": "msg1", **HUMAN_PROVENANCE},
     {"role": "assistant", "content": "resp1"},
-    {"role": "user", "content": "msg2"},
+    {"role": "user", "content": "msg2", **HUMAN_PROVENANCE},
     {"role": "assistant", "content": "resp2"},
-    {"role": "user", "content": "keep this"},
+    {"role": "user", "content": "keep this", **HUMAN_PROVENANCE},
     {"role": "assistant", "content": "keep this too"},
 ]
 _PARTIAL_COMPRESSED_HEAD = [
@@ -15784,7 +15825,7 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
         assert resp["result"]["status"] == "working"
         assert resp["result"]["info"] == {"model": "model-b"}
         assert resp["result"]["messages"] == [
-            {"role": "user", "text": "new prompt"},
+            {"role": "user", "text": "new prompt", **HUMAN_PROVENANCE},
             {"role": "assistant", "text": "new answer"},
         ]
     finally:
@@ -19897,6 +19938,68 @@ def test_save_cfg_keeps_unicode_personalities_readable(tmp_path, monkeypatch):
     assert "\\u4f60" not in text
 
 
+def test_session_create_seed_stamps_trusted_desktop_provenance(monkeypatch):
+    """Desktop branch fallback seeds are typed and caller claims are ignored."""
+    monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
+    response = server._methods["session.create"](
+        "seed-rpc",
+        {
+            "source": "desktop",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "local draft",
+                    "origin_kind": "internal_system",
+                    "turn_kind": "runtime_scaffolding",
+                    "trust_kind": "trusted_internal",
+                },
+                {
+                    "role": "assistant",
+                    "content": "draft response",
+                    "origin_kind": "human_user",
+                    "turn_kind": "prompt",
+                    "trust_kind": "user_authorized",
+                },
+            ],
+        },
+    )
+    sid = response["result"]["session_id"]
+    try:
+        history = server._sessions[sid]["history"]
+        assert history[0]["origin_kind"] == "human_user"
+        assert history[0]["turn_kind"] == "prompt"
+        assert history[0]["trust_kind"] == "user_authorized"
+        assert history[1]["origin_kind"] == "assistant"
+        assert history[1]["turn_kind"] == "response"
+        assert history[1]["trust_kind"] == "no_control"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_personality_marker_has_semantic_provenance(monkeypatch):
+    """The live pivot row is typed before persistence or provider projection."""
+
+    class _Agent:
+        ephemeral_system_prompt = None
+
+    monkeypatch.setattr(server, "_session_info", lambda _agent: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    session = _session(agent=_Agent(), history=[])
+
+    server._apply_personality_to_session(
+        "personality-session", session, "Answer tersely.", "terse"
+    )
+
+    marker = session["history"][-1]
+    assert marker["origin_kind"] == "internal_system"
+    assert marker["turn_kind"] == "notification"
+    assert marker["trust_kind"] == "no_control"
+    from agent.message_provenance import strip_provenance_for_provider
+
+    projected = strip_provenance_for_provider(marker)
+    assert projected == {"role": "user", "content": marker["content"]}
+
+
 def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
     """A personality pivot must not occupy a slot in the ordinal address space.
 
@@ -19972,15 +20075,18 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
 
         # Two more real turns land after the personality change.
         session["history"].extend(
-            [
+            _stamp_test_human_history([
                 {"role": "user", "content": "second"},
                 {"role": "assistant", "content": "second reply"},
                 {"role": "user", "content": "third"},
                 {"role": "assistant", "content": "third reply"},
-            ]
+            ])
         )
         history_before = list(session["history"])
-        third_index = history_before.index({"role": "user", "content": "third"})
+        third_index = next(
+            i for i, message in enumerate(history_before)
+            if message.get("role") == "user" and message.get("content") == "third"
+        )
 
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
@@ -20010,7 +20116,10 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
         )
         # The turn before the target must survive — that is the span the three
         # reported incidents lost.
-        assert {"role": "user", "content": "second"} in expected
+        assert any(
+            message.get("role") == "user" and message.get("content") == "second"
+            for message in expected
+        )
         # And the mechanism that keeps it out of the address space, so a future
         # producer cannot regress this by dropping the tag.
         assert marker.get("display_kind"), (
@@ -20240,6 +20349,7 @@ def test_prompt_submit_row_id_resolves_via_db_when_memory_lacks_stamps(monkeypat
         {"_row_id": 503, "role": "user", "content": "second"},
         {"_row_id": 504, "role": "assistant", "content": "reply 2"},
     ]
+    _stamp_test_human_history(durable_history)
 
     class _FakeDB:
         def replace_messages(
@@ -20306,6 +20416,7 @@ def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
         {"role": "user", "content": "third"},
         {"role": "assistant", "content": "reply 3"},
     ]
+    _stamp_test_human_history(msgs)
     with db._lock:
         db._insert_message_rows(db._conn, session_key, msgs)
         db._conn.commit()
@@ -20372,6 +20483,7 @@ def test_prompt_submit_row_id_real_sessiondb_unknown_refuses_despite_ordinal(
         {"role": "user", "content": "second"},
         {"role": "assistant", "content": "reply 2"},
     ]
+    _stamp_test_human_history(msgs)
     with db._lock:
         db._insert_message_rows(db._conn, session_key, msgs)
         db._conn.commit()
@@ -20430,6 +20542,7 @@ def test_prompt_submit_row_id_misaligned_memory_refuses_content_swap(
         {"role": "user", "content": "B"},
         {"role": "assistant", "content": "rb"},
     ]
+    _stamp_test_human_history(msgs)
     with db._lock:
         db._insert_message_rows(db._conn, session_key, msgs)
         db._conn.commit()
@@ -20501,6 +20614,7 @@ def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
         {"role": "user", "content": "B"},
         {"role": "assistant", "content": "rb"},
     ]
+    _stamp_test_human_history(msgs)
     with db._lock:
         db._insert_message_rows(db._conn, session_key, msgs)
         db._conn.commit()
@@ -20655,6 +20769,7 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
         {"role": "user", "content": "third"},
         {"role": "assistant", "content": "reply 3"},
     ]
+    _stamp_test_human_history(msgs)
     with db._lock:
         db._insert_message_rows(db._conn, session_key, msgs)
         db._conn.commit()
@@ -20775,6 +20890,7 @@ def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
         {"role": "user", "content": "target"},
         {"role": "assistant", "content": "target reply"},
     ]
+    _stamp_test_human_history(physical)
     with db._lock:
         db._insert_message_rows(db._conn, session_key, physical)
         db._conn.commit()

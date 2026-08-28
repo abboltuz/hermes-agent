@@ -437,7 +437,9 @@ class CLIAgentSetupMixin:
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
                 self.conversation_history = restored
-                msg_count = len([m for m in restored if m.get("role") == "user"])
+                from agent.message_provenance import is_human_intent
+
+                msg_count = len([m for m in restored if is_human_intent(m)])
                 title_part = ""
                 if session_meta.get("title"):
                     title_part = f" \"{session_meta['title']}\""
@@ -475,6 +477,11 @@ class CLIAgentSetupMixin:
                 pass
         
         try:
+            from gateway.session_context import get_session_env
+
+            agent_platform = str(
+                get_session_env("HERMES_SESSION_SOURCE", "cli") or "cli"
+            ).strip() or "cli"
             runtime = runtime_override or {
                 "api_key": self.api_key,
                 "base_url": self.base_url,
@@ -519,7 +526,7 @@ class CLIAgentSetupMixin:
                 provider_data_collection=self._provider_data_collection,
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
-                platform="cli",
+                platform=agent_platform,
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
@@ -778,7 +785,9 @@ class CLIAgentSetupMixin:
             content = msg.get("content")
             tool_calls = msg.get("tool_calls") or []
 
-            if display_kind == "hidden":
+            from agent.message_provenance import is_display_visible
+
+            if not is_display_visible(msg):
                 continue
             if display_kind == "model_switch":
                 entries.append(("event", "model changed"))
@@ -813,7 +822,13 @@ class CLIAgentSetupMixin:
                 text = _sanitize_display_text(text)
                 if len(text) > MAX_USER_LEN:
                     text = text[:MAX_USER_LEN] + "..."
-                entries.append(("user", text))
+                from agent.message_provenance import display_actor
+
+                actor = display_actor(msg)
+                if actor == "user":
+                    entries.append(("user", text))
+                else:
+                    entries.append(("event", f"{actor.replace('_', ' ').title()}: {text}"))
 
             elif role == "assistant":
                 text = "" if content is None else str(content)

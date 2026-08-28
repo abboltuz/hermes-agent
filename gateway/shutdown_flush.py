@@ -352,6 +352,12 @@ def recover_pending_to_db(
                     role=message.get("role", "unknown"),
                     content=message.get("content") or "",
                     timestamp=message.get("timestamp") or payload.get("ts"),
+                    origin_kind=message.get("origin_kind"),
+                    turn_kind=message.get("turn_kind"),
+                    trust_kind=message.get("trust_kind"),
+                    provenance_metadata=message.get("provenance_metadata"),
+                    display_kind=message.get("display_kind"),
+                    display_metadata=message.get("display_metadata"),
                 )
                 recovered += 1
                 path.unlink(missing_ok=True)
@@ -389,11 +395,45 @@ def recover_pending_to_db(
                 )
                 continue
 
+            from agent.message_provenance import (
+                OriginKind,
+                TrustKind,
+                TurnKind,
+                build_provenance,
+                provenance_for_runtime_turn,
+            )
+
+            platform = data.get("platform")
+            if platform:
+                recovered_provenance = provenance_for_runtime_turn(
+                    platform=platform,
+                    metadata={
+                        "producer": "shutdown_recovery",
+                        "platform": platform,
+                        "session_id": session_id,
+                        "recovered": True,
+                    },
+                )
+            else:
+                recovered_provenance = build_provenance(
+                    OriginKind.LEGACY_UNKNOWN,
+                    TurnKind.LEGACY_UNKNOWN,
+                    TrustKind.LEGACY_UNKNOWN,
+                    {
+                        "producer": "shutdown_recovery",
+                        "session_id": session_id,
+                        "recovered": True,
+                    },
+                )
             session_db.append_message(
                 session_id=session_id,
                 role="user",
                 content=text,
                 timestamp=payload.get("ts", int(time.time())),
+                origin_kind=recovered_provenance.origin_kind.value,
+                turn_kind=recovered_provenance.turn_kind.value,
+                trust_kind=recovered_provenance.trust_kind.value,
+                provenance_metadata=recovered_provenance.metadata,
             )
             recovered += 1
             path.unlink(missing_ok=True)

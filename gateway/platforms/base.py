@@ -2467,10 +2467,38 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    def semantic_provenance(self) -> Dict[str, Any]:
+        """Trusted adapter-boundary provenance for control interpretation."""
+        from agent.message_provenance import provenance_for_gateway_ingress
+
+        metadata = self.metadata if isinstance(self.metadata, dict) else {}
+        internal_source = metadata.get("source")
+        event_kind = metadata.get("kind")
+        if metadata.get("hermes_plugin_injection") is True:
+            internal_source = "plugin_injection"
+            event_kind = "plugin_message"
+        source = self.source
+        provenance = provenance_for_gateway_ingress(
+            platform=getattr(source, "platform", None),
+            internal=bool(self.internal),
+            is_bot=bool(getattr(source, "is_bot", False)),
+            authorized=bool(self.allow_gateway_control),
+            internal_source=internal_source,
+            event_kind=event_kind,
+        )
+        return provenance.as_message_fields()
+
+    def may_authorize_control(self) -> bool:
+        from agent.message_provenance import may_authorize_control
+
+        return may_authorize_control(
+            {"role": "user", "content": self.text, **self.semantic_provenance()}
+        )
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
-        return self.allow_gateway_control and (self.text or "").lstrip().startswith("/")
+        return self.may_authorize_control() and (self.text or "").lstrip().startswith("/")
     
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""
@@ -6133,7 +6161,7 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
-        if event.allow_gateway_control:
+        if event.may_authorize_control():
             coerce_plaintext_gateway_command(event)
 
         # Telegram topic recovery only applies to private DM topic lanes. Do
@@ -6248,7 +6276,7 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd and event.allow_gateway_control:
+            if not cmd and event.may_authorize_control():
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (

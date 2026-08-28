@@ -5,10 +5,16 @@ import json
 
 
 from hermes_cli.session_recap import build_recap
+from agent.message_provenance import stamp_provenance
 
 
 def _user(text):
-    return {"role": "user", "content": text}
+    return stamp_provenance(
+        {"role": "user", "content": text},
+        "human_user",
+        "prompt",
+        "user_authorized",
+    )
 
 
 def _assistant(text=None, tool_calls=None):

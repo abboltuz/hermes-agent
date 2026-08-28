@@ -24,6 +24,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from agent.message_provenance import (
+    OriginKind,
+    TrustKind,
+    TurnKind,
+    stamp_provenance,
+)
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -9500,6 +9506,13 @@ class TelegramAdapter(BasePlatformAdapter):
             }
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
+            stamp_provenance(
+                entry,
+                OriginKind.EXTERNAL_ACTOR,
+                TurnKind.NOTIFICATION,
+                TrustKind.UNTRUSTED_EXTERNAL,
+                {"producer": "group_observer", "platform": "telegram"},
+            )
             store.append_to_transcript(session_entry.session_id, entry)
             adapter_name = getattr(self, "name", "telegram")
             logger.info(

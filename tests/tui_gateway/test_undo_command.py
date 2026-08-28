@@ -22,6 +22,12 @@ import pytest
 
 from hermes_state import SessionDB
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 @pytest.fixture()
 def hermes_home(tmp_path, monkeypatch):
@@ -72,7 +78,9 @@ def session_with_history(server, db):
     session_key = "tui-undo-1"
     db.create_session(session_key, source="tui")
     for i in range(1, 4):
-        db.append_message(session_key, "user", f"question {i}")
+        db.append_message(
+            session_key, "user", f"question {i}", **HUMAN_PROVENANCE
+        )
         db.append_message(session_key, "assistant", f"answer {i}")
     history = db.get_messages_as_conversation(session_key)
     agent = MagicMock()
@@ -108,5 +116,4 @@ def test_undo_returns_prefill_with_target_text(server, session_with_history):
     assert "Undid" in result["notice"]
     assert s["history"]
     assert all("_row_id" in message for message in s["history"])
-
 

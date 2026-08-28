@@ -79,7 +79,9 @@ def iter_user_prompt_records(
         session_id = str(session.get("id") or session.get("session_id") or "")
         index = 0
         for message in _messages(session):
-            if message.get("role") != "user":
+            from agent.message_provenance import is_human_intent
+
+            if not is_human_intent(message):
                 continue
             index += 1
             record: Dict[str, Any] = {

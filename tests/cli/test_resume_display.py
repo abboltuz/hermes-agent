@@ -11,6 +11,17 @@ from unittest.mock import MagicMock, patch
 import cli as cli_mod
 
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
+def _human(content, **extra):
+    return {"role": "user", "content": content, **HUMAN_PROVENANCE, **extra}
+
+
 
 def _make_cli(config_overrides=None, env_overrides=None, **kwargs):
     """Create a HermesCLI instance with minimal mocking."""
@@ -52,9 +63,9 @@ def _simple_history():
     """Two-turn conversation: user → assistant → user → assistant."""
     return [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What is Python?"},
+        _human("What is Python?"),
         {"role": "assistant", "content": "Python is a high-level programming language."},
-        {"role": "user", "content": "How do I install it?"},
+        _human("How do I install it?"),
         {"role": "assistant", "content": "You can install Python from python.org."},
     ]
 
@@ -63,7 +74,7 @@ def _tool_call_history():
     """Conversation with tool calls and tool results."""
     return [
         {"role": "system", "content": "system prompt"},
-        {"role": "user", "content": "Search for Python tutorials"},
+        _human("Search for Python tutorials"),
         {
             "role": "assistant",
             "content": None,
@@ -90,7 +101,7 @@ def _large_history(n_exchanges=15):
     """Build a history with many exchanges to test truncation."""
     msgs = [{"role": "system", "content": "system prompt"}]
     for i in range(n_exchanges):
-        msgs.append({"role": "user", "content": f"Question #{i + 1}: What is item {i + 1}?"})
+        msgs.append(_human(f"Question #{i + 1}: What is item {i + 1}?"))
         msgs.append({"role": "assistant", "content": f"Answer #{i + 1}: Item {i + 1} is great."})
     return msgs
 
@@ -99,13 +110,12 @@ def _multimodal_history():
     """Conversation with multimodal (image) content."""
     return [
         {"role": "system", "content": "system prompt"},
-        {
-            "role": "user",
-            "content": [
+        _human(
+            [
                 {"type": "text", "text": "What's in this image?"},
                 {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}},
-            ],
-        },
+            ]
+        ),
         {"role": "assistant", "content": "I see a cat in the image."},
     ]
 
@@ -182,9 +192,9 @@ class TestDisplayResumedHistory:
         """
         cli = _make_cli()
         cli.conversation_history = [
-            {"role": "user", "content": ""},
+            _human(""),
             {"role": "assistant", "content": ""},
-            {"role": "user", "content": "Follow-up question"},
+            _human("Follow-up question"),
             {"role": "assistant", "content": "Real answer"},
         ]
         # Must not raise IndexError
@@ -197,7 +207,7 @@ class TestDisplayResumedHistory:
         """Whitespace-only messages should also not crash the resume display."""
         cli = _make_cli()
         cli.conversation_history = [
-            {"role": "user", "content": "   "},
+            _human("   "),
             {"role": "assistant", "content": "\n\n"},
         ]
         output = self._capture_display(cli)
@@ -222,7 +232,7 @@ class TestDisplayResumedHistory:
         """Assistant messages that are only reasoning should be skipped."""
         cli = _make_cli()
         cli.conversation_history = [
-            {"role": "user", "content": "Hello"},
+            _human("Hello"),
             {
                 "role": "assistant",
                 "content": "<REASONING_SCRATCHPAD>\nJust thinking...\n</REASONING_SCRATCHPAD>",
@@ -242,7 +252,7 @@ class TestDisplayResumedHistory:
         """Unclosed <think> (truncated generation) should not leak reasoning."""
         cli = _make_cli()
         cli.conversation_history = [
-            {"role": "user", "content": "Truncated response"},
+            _human("Truncated response"),
             {
                 "role": "assistant",
                 "content": "Some text before.\n<think>\nUnfinished reasoning...",
@@ -287,7 +297,7 @@ class TestPreloadResumedSession:
 
     def test_reopens_session_in_db(self):
         cli = _make_cli(resume="reopen_session")
-        messages = [{"role": "user", "content": "hi"}]
+        messages = [_human("hi")]
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "reopen_session", "title": None}
         mock_db.get_resume_conversations.return_value = (messages, messages)
@@ -364,11 +374,11 @@ class TestHandleResumeCommandRecap:
         cli = _make_cli(resume="session_a")
         cli.session_id = "session_a"
         # Simulate startup --resume A having populated both projections.
-        messages_a = [{"role": "user", "content": "from session A"}]
+        messages_a = [_human("from session A")]
         cli.conversation_history = messages_a
         cli._resume_display_history = messages_a
 
-        messages_b = [{"role": "user", "content": "from session B"}]
+        messages_b = [_human("from session B")]
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "session_b", "title": "Session B"}
         mock_db.get_resume_conversations.return_value = (messages_b, messages_b)
@@ -443,7 +453,7 @@ class TestResumeDisplaySanitization:
     def test_escape_sequences_stripped_from_user_and_assistant(self):
         cli = _make_cli()
         cli.conversation_history = [
-            {"role": "user", "content": "hi \x1b[2J\x1b]0;pwned\x07 there"},
+            _human("hi \x1b[2J\x1b]0;pwned\x07 there"),
             {"role": "assistant", "content": "ok \x9b31m fine\x07"},
         ]
         output = self._capture_display(cli)

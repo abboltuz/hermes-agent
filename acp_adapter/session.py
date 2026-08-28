@@ -304,11 +304,14 @@ class SessionManager:
                 if normalized_cwd and _normalize_cwd_for_compare(s.cwd) != normalized_cwd:
                     continue
                 persisted = persisted_rows.get(s.session_id, {})
+                from agent.message_provenance import is_human_intent
+
                 preview = next(
                     (
                         str(msg.get("content") or "").strip()
                         for msg in s.history
-                        if msg.get("role") == "user" and str(msg.get("content") or "").strip()
+                        if is_human_intent(msg)
+                        and str(msg.get("content") or "").strip()
                     ),
                     persisted.get("preview") or "",
                 )

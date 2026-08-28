@@ -16,6 +16,12 @@ from hermes_state import SessionDB
 from gateway.config import GatewayConfig
 from gateway.session import SessionStore
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "external_actor",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 @pytest.fixture()
 def store(tmp_path, monkeypatch):
@@ -30,7 +36,7 @@ def store(tmp_path, monkeypatch):
 def _seed(store, sid, source="telegram", turns=3):
     store._db.create_session(sid, source=source)
     for i in range(1, turns + 1):
-        store._db.append_message(sid, "user", f"q{i}")
+        store._db.append_message(sid, "user", f"q{i}", **HUMAN_PROVENANCE)
         store._db.append_message(sid, "assistant", f"a{i}")
     return sid
 

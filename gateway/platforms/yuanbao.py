@@ -42,6 +42,13 @@ import sys
 
 import httpx
 
+from agent.message_provenance import (
+    OriginKind,
+    TrustKind,
+    TurnKind,
+    stamp_provenance,
+)
+
 try:
     import websockets
     import websockets.exceptions
@@ -1217,11 +1224,19 @@ class RecallGuardMiddleware(InboundMiddleware):
             return
 
         # Branch B: not found in transcript → append system note
-        store.append_to_transcript(sid, {
+        recall_note = {
             "role": "system",
             "content": f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.',
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-        })
+        }
+        stamp_provenance(
+            recall_note,
+            OriginKind.INTERNAL_SYSTEM,
+            TurnKind.NOTIFICATION,
+            TrustKind.NO_CONTROL,
+            {"producer": "yuanbao_recall", "platform": "yuanbao"},
+        )
+        store.append_to_transcript(sid, recall_note)
         logger.info("[%s] Recall: system note for msg_id=%s (branch B)", adapter.name, recalled_id)
 
 
@@ -1982,6 +1997,13 @@ class GroupAtGuardMiddleware(InboundMiddleware):
             }
             if msg_id:
                 entry["message_id"] = msg_id
+            stamp_provenance(
+                entry,
+                OriginKind.EXTERNAL_ACTOR,
+                TurnKind.NOTIFICATION,
+                TrustKind.UNTRUSTED_EXTERNAL,
+                {"producer": "group_observer", "platform": "yuanbao"},
+            )
             store.append_to_transcript(
                 session_entry.session_id,
                 entry,
