@@ -12,7 +12,29 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from hermes_cli import main as hermes_main
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _isolate_post_update_runtime(monkeypatch):
+    """Keep command-flow tests away from this host's live runtime fleet."""
+    from hermes_cli import gateway
+    from hermes_cli import macos_tcc_anchor
+    from hermes_cli import update_inventory
+    from hermes_cli.update_inventory import UpdatePlan
+
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(macos_tcc_anchor, "ensure_tcc_anchor", lambda _root: None)
+    monkeypatch.setattr(
+        update_inventory, "collect_runtime_inventory", lambda: UpdatePlan()
+    )
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda **_kwargs: [])
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda *_a, **_k: [])
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
 
 
 def _make_run_side_effect(

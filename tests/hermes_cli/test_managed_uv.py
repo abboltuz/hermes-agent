@@ -83,6 +83,140 @@ class TestManagedUvPath:
             assert managed_uv_path() == tmp_path / "bin" / "uv"
 
 
+class TestMacOSManagedPythonSigning:
+    def test_signs_with_identifier_dr_and_strict_verification(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.managed_uv as managed_uv
+
+        python = tmp_path / "generation" / "bin" / "python3.11"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            if "-d" in command:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="",
+                    stderr=(
+                        f"Executable={python}\n"
+                        "designated => identifier "
+                        '"com.nousresearch.hermes.managed-python"\n'
+                    ),
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            managed_uv.shutil, "which", lambda _name: "/usr/bin/codesign"
+        )
+        monkeypatch.setattr(managed_uv.subprocess, "run", run)
+
+        assert managed_uv._macos_sign_managed_python(python)
+        assert calls[0][0] == [
+            "/usr/bin/codesign",
+            "--force",
+            "--deep",
+            "--sign",
+            "-",
+            "--timestamp=none",
+            "--identifier",
+            "com.nousresearch.hermes.managed-python",
+            "--requirements",
+            '=designated => identifier "com.nousresearch.hermes.managed-python"',
+            str(python),
+        ]
+        assert calls[1][0] == [
+            "/usr/bin/codesign", "-d", "-r-", str(python)
+        ]
+        assert calls[2][0] == [
+            "/usr/bin/codesign", "--verify", "--deep", "--strict", str(python)
+        ]
+
+    @pytest.mark.parametrize(
+        "requirement",
+        [
+            'designated => cdhash H"012345"',
+            'designated => identifier "com.nousresearch.hermes.other"',
+            (
+                'designated => identifier "com.nousresearch.hermes.managed-python"\n'
+                'designated => identifier "com.nousresearch.hermes.managed-python"'
+            ),
+        ],
+    )
+    def test_rejects_unstable_or_ambiguous_requirement(
+        self, tmp_path, monkeypatch, requirement
+    ):
+        import hermes_cli.managed_uv as managed_uv
+
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            managed_uv.shutil, "which", lambda _name: "/usr/bin/codesign"
+        )
+        monkeypatch.setattr(
+            managed_uv.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0, stdout="", stderr=requirement
+            ),
+        )
+
+        assert not managed_uv._macos_verify_managed_python_identity(
+            tmp_path / "python"
+        )
+
+    def test_signing_and_strict_verification_failures_return_false(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.managed_uv as managed_uv
+
+        python = tmp_path / "python"
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            managed_uv.shutil, "which", lambda _name: "/usr/bin/codesign"
+        )
+        monkeypatch.setattr(
+            managed_uv.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=1, stdout="", stderr="not signable"
+            ),
+        )
+        assert not managed_uv._macos_sign_managed_python(python)
+
+        responses = iter(
+            [
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout="",
+                    stderr=(
+                        "designated => identifier "
+                        '"com.nousresearch.hermes.managed-python"'
+                    ),
+                ),
+                SimpleNamespace(returncode=1, stdout="", stderr="invalid"),
+            ]
+        )
+        monkeypatch.setattr(
+            managed_uv.subprocess, "run", lambda *_args, **_kwargs: next(responses)
+        )
+        assert not managed_uv._macos_sign_managed_python(python)
+
+    def test_skips_non_macos(self, tmp_path, monkeypatch):
+        import hermes_cli.managed_uv as managed_uv
+
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            managed_uv.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("codesign must not run"),
+        )
+        assert not managed_uv._macos_sign_managed_python(tmp_path / "python")
+
+
 # ---------------------------------------------------------------------------
 # resolve_uv
 # ---------------------------------------------------------------------------
@@ -633,7 +767,9 @@ class TestRuntimeRequestMinorLine:
         assert _runtime_request(info) == "3.11"
 
     @staticmethod
-    def _run_generation(tmp_path, monkeypatch, current_version, candidate_version):
+    def _run_generation(
+        tmp_path, monkeypatch, current_version, candidate_version, signed=None
+    ):
         """Drive _install_safe_python_generation with fakes; return result."""
         import hermes_cli.managed_uv as managed_uv
         from hermes_cli.sqlite_runtime import SQLiteRuntimeInfo
@@ -670,6 +806,12 @@ class TestRuntimeRequestMinorLine:
         )
         monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
         monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", fake_probe)
+        signed_paths = signed if signed is not None else []
+        monkeypatch.setattr(
+            managed_uv,
+            "_macos_sign_managed_python",
+            lambda path: signed_paths.append(Path(path)) or True,
+        )
         return managed_uv._install_safe_python_generation(
             "uv", project_root=tmp_path, current=current
         )
@@ -681,6 +823,23 @@ class TestRuntimeRequestMinorLine:
         assert result is not None
         _, _, candidate = result
         assert candidate.python_version == (3, 11, 15)
+
+    def test_signs_new_runtime_generation_before_probe(self, tmp_path, monkeypatch):
+        signed = []
+
+        result = self._run_generation(
+            tmp_path,
+            monkeypatch,
+            (3, 11, 14),
+            (3, 11, 15),
+            signed=signed,
+        )
+
+        assert result is not None
+        assert len(signed) == 1
+        generation, python, _candidate = result
+        assert signed == [python]
+        assert python.is_relative_to(generation)
 
 
 class TestPatchRetryOnVulnerableCandidate:
@@ -756,6 +915,9 @@ class TestPatchRetryOnVulnerableCandidate:
         monkeypatch.setattr(
             managed_uv, "_list_available_patches", lambda *a, **kw: patch_list
         )
+        monkeypatch.setattr(
+            managed_uv, "_macos_sign_managed_python", lambda _path: True
+        )
         return managed_uv._install_safe_python_generation(
             "uv", project_root=tmp_path, current=current
         )
@@ -806,6 +968,9 @@ class TestPatchRetryOnVulnerableCandidate:
         monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", fake_probe2)
         monkeypatch.setattr(
             managed_uv, "_list_available_patches", lambda *a, **kw: huge_patch_list
+        )
+        monkeypatch.setattr(
+            managed_uv, "_macos_sign_managed_python", lambda _path: True
         )
         result = managed_uv._install_safe_python_generation(
             "uv", project_root=tmp_path, current=current
@@ -933,6 +1098,9 @@ class TestMinorLineFallForward:
             managed_uv, "_list_available_patches",
             lambda uv_bin, minor, **kw: patch_lists[minor],
         )
+        monkeypatch.setattr(
+            managed_uv, "_macos_sign_managed_python", lambda _path: True
+        )
 
         result = managed_uv._install_safe_python_generation(
             "uv", project_root=tmp_path, current=self._current_3_11_14()
@@ -975,6 +1143,9 @@ class TestMinorLineFallForward:
         monkeypatch.setattr(
             managed_uv, "_list_available_patches",
             lambda uv_bin, minor, **kw: patch_lists[minor],
+        )
+        monkeypatch.setattr(
+            managed_uv, "_macos_sign_managed_python", lambda _path: True
         )
 
         result = managed_uv._install_safe_python_generation(
@@ -1286,4 +1457,3 @@ class TestVenvPythonUpdateBoundary:
         expected = Path("/opt/hermes/venv/Scripts/python.exe") \
             if sys.platform == "win32" else Path("/opt/hermes/venv/bin/python")
         assert _venv_python(Path("/opt/hermes/venv")) == expected
-
