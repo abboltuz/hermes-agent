@@ -517,7 +517,20 @@ def test_parse_session_key_accepts_named_profile_namespace():
         "platform": "telegram",
         "chat_type": "dm",
         "chat_id": "writer-chat",
+        "profile": "writer",
     }
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "agent:../escape:telegram:dm:victim",
+        "agent:default:telegram:dm:victim",
+        "agent::telegram:dm:victim",
+    ],
+)
+def test_parse_session_key_rejects_invalid_profile_namespace(key):
+    assert _parse_session_key(key) is None
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +821,77 @@ async def test_named_profile_push_completion_rejects_conflicting_stored_profile(
     assert result is None
     default_adapter.handle_message.assert_not_awaited()
     writer_adapter.handle_message.assert_not_awaited()
+    api_adapter.handle_message.assert_not_awaited()
+    assert api_wakes == []
+
+
+@pytest.mark.asyncio
+async def test_named_profile_key_without_stored_source_uses_profile_adapter(
+    monkeypatch, tmp_path
+):
+    """A valid multiplex namespace must never reconstruct as default."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    default_adapter = runner.adapters[Platform.TELEGRAM]
+    writer_adapter = SimpleNamespace(
+        send=AsyncMock(),
+        handle_message=AsyncMock(),
+    )
+    runner._profile_adapters = {
+        "writer": {Platform.TELEGRAM: writer_adapter},
+    }
+
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-writer-key",
+            "session_key": "agent:writer:telegram:dm:writer-chat",
+        },
+    )
+
+    assert result is True
+    default_adapter.handle_message.assert_not_awaited()
+    writer_adapter.handle_message.assert_awaited_once()
+    delivered = writer_adapter.handle_message.await_args.args[0]
+    assert delivered.source.profile == "writer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key",
+    [
+        "agent:../escape:telegram:dm:victim",
+        "agent:definitely-unserved-review-profile:telegram:dm:victim",
+    ],
+)
+async def test_invalid_or_unserved_profile_key_cannot_fall_back(
+    monkeypatch, tmp_path, key
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    default_adapter = runner.adapters[Platform.TELEGRAM]
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    api_wakes = []
+
+    async def capture_wake(adapter, **kwargs):
+        api_wakes.append((adapter, kwargs))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", capture_wake)
+
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {
+            "type": "completion",
+            "session_id": "proc-invalid-profile-key",
+            "session_key": key,
+        },
+    )
+
+    assert result is None
+    default_adapter.handle_message.assert_not_awaited()
     api_adapter.handle_message.assert_not_awaited()
     assert api_wakes == []
 
