@@ -25533,6 +25533,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source_profile = origin_profile or (
             "" if typed_api_origin else key_profile
         )
+        if source_profile not in {"", "default"} and not typed_api_origin:
+            # A syntactically valid namespace is not routing authority by
+            # itself. It must belong to this gateway's active/served profile
+            # set; otherwise the shared API adapter would make an absent named
+            # profile look deliverable and could self-post through default.
+            served_profiles = {self._active_profile_name(), "default"}
+            served_profiles.update(
+                str(name)
+                for name in (getattr(self, "_profile_adapters", {}) or {})
+            )
+            try:
+                served_profiles.update(
+                    name for name, _home in _multiplex_profile_homes(self.config)
+                )
+            except Exception:
+                logger.warning(
+                    "Could not resolve served profiles for synthetic event; "
+                    "rejecting named provenance"
+                )
+                return None
+            if source_profile not in served_profiles:
+                logger.warning(
+                    "Rejecting synthetic event for an unserved profile namespace"
+                )
+                return None
 
         def _bind_event_profile(source):
             """Reconcile a persisted source with authoritative event provenance."""
@@ -25810,9 +25835,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter,
                     text=synth_text,
                     session_id=raw_sid,
-                    profile=str(evt.get("origin_profile") or ""),
-                    route_profile=str(
-                        evt.get("origin_api_route_profile") or ""
+                    profile=(
+                        str(evt.get("origin_profile") or "").strip()
+                        or str(getattr(source, "profile", None) or "").strip()
+                    ),
+                    route_profile=(
+                        str(evt.get("origin_api_route_profile") or "").strip()
+                        or str(getattr(source, "profile", None) or "").strip()
                     ),
                     display_metadata=display_metadata,
                 )
