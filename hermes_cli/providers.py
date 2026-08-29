@@ -65,6 +65,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         auth_type="oauth_external",
         base_url_override="https://chatgpt.com/backend-api/codex",
     ),
+    "cursor": HermesOverlay(
+        transport="openai_chat",
+        auth_type="external_process",
+        extra_env_vars=("CURSOR_API_KEY",),
+        base_url_override="sdkbridge://cursor",
+    ),
     "openai-api": HermesOverlay(
         transport="codex_responses",
         base_url_override="https://api.openai.com/v1",

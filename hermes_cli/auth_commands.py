@@ -35,7 +35,7 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "cursor", "xai-oauth", "qwen-oauth", "minimax-oauth"}
 
 
 def _get_custom_provider_entries() -> list[dict]:
@@ -252,6 +252,52 @@ def auth_add_command(args) -> None:
         raise SystemExit(f"Unknown provider: {provider}")
     if configured_provider is not None:
         _migrate_legacy_custom_pool_key(provider, configured_provider["pool_key"])
+
+    if provider == "cursor":
+        from agent.cursor_sdk_auth import login, resolve_backend_url, save_sdk_credentials
+        from agent.cursor_bridge_transport import download_bridge, resolve_bridge_command
+
+        def ensure_cursor_bridge() -> None:
+            if resolve_bridge_command():
+                return
+            print("Installing the pinned Cursor SDK bridge...")
+            try:
+                download_bridge(progress=True)
+            except Exception as exc:
+                raise SystemExit(
+                    f"Cursor credential was stored, but bridge installation failed: {exc}"
+                ) from exc
+
+        requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
+        if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:
+            api_key = str(getattr(args, "api_key", "") or "").strip()
+            if not api_key:
+                api_key = (masked_secret_prompt("Cursor API key: ") or "").strip()
+            if not api_key:
+                raise SystemExit("Cursor API key cannot be empty.")
+            save_sdk_credentials(
+                backend_url=resolve_backend_url(),
+                api_key=api_key,
+                source="manual_api_key",
+            )
+            ensure_cursor_bridge()
+            print("Cursor API key stored securely for this Hermes profile.")
+            return
+        try:
+            result = login(
+                on_login_url=lambda url: print("Open this Cursor login URL in your browser:\n" + url),
+                open_browser=not getattr(args, "no_browser", False),
+                api_key_name=(getattr(args, "label", None) or "").strip(),
+            )
+        except KeyboardInterrupt:
+            raise SystemExit("Cursor login cancelled.")
+        except Exception as exc:
+            raise SystemExit(f"Cursor login failed: {exc}") from exc
+        print("Cursor login complete; credential stored securely for this Hermes profile.")
+        ensure_cursor_bridge()
+        if result.get("email"):
+            print(f"Account: {result['email']}")
+        return
 
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
     if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:
@@ -564,6 +610,25 @@ def auth_remove_command(args) -> None:
     target = getattr(args, "target", None)
     if target is None:
         target = getattr(args, "index", None)
+    if provider == "cursor":
+        from agent.cursor_sdk_auth import clear_sdk_credentials, resolve_cursor_api_key
+
+        removed = clear_sdk_credentials()
+        _, remaining_source = resolve_cursor_api_key()
+        if removed:
+            print("Removed the profile-scoped Cursor credential.")
+        if remaining_source == "env":
+            raise SystemExit(
+                "CURSOR_API_KEY is still configured in this profile's .env or process environment; "
+                "remove it there to finish logging out."
+            )
+        if not removed:
+            raise SystemExit("No profile-scoped Cursor credential found.")
+        return
+    if target is None:
+        raise SystemExit(
+            f"Credential target is required for provider {provider}."
+        )
     pool = load_pool(provider)
     index, matched, error = pool.resolve_target(target)
     if matched is None or index is None:

@@ -10856,6 +10856,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "status_fn": None,  # dispatched via auth.get_codex_auth_status
     },
     {
+        "id": "cursor",
+        "name": "Cursor Subscription",
+        "flow": "external",
+        "cli_command": "hermes auth add cursor",
+        "docs_url": "https://cursor.com",
+        "status_fn": None,
+    },
+    {
         "id": "qwen-oauth",
         "name": "Qwen (via Qwen CLI)",
         "flow": "external",
@@ -11035,6 +11043,8 @@ def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str
         if sys.platform == "darwin":
             return f'security delete-generic-password -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
         return rm_file
+    if provider.get("id") == "cursor":
+        return "hermes cursor logout"
     return None
 
 

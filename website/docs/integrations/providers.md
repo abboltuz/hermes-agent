@@ -16,6 +16,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 |----------|-------|
 | **Nous Portal** | `hermes model` (OAuth, subscription-based) |
 | **OpenAI Codex** | `hermes model` → **ChatGPT or Codex Subscription** (ChatGPT OAuth, uses Codex models) |
+| **Cursor** | `hermes cursor login`, then `hermes model` → **Cursor** (official SDK bridge; no raw API key required) |
 | **GitHub Copilot** | `hermes model` (OAuth device code flow, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`) |
 | **GitHub Copilot ACP** | `hermes model` (spawns local `copilot --acp --stdio`) |
 | **Anthropic** | `hermes model` (Claude Max + extra usage credits via OAuth; also supports Anthropic API key or manual setup-token — see note below) |
@@ -47,6 +48,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Google / Gemini** | `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `~/.hermes/.env` (provider: `gemini`) |
 | **Google Vertex AI** | `hermes model` → "Google Vertex AI" (provider: `vertex`; OAuth2 via service-account JSON or ADC, GCP billing) |
 | **OpenAI API (direct)** | `OPENAI_API_KEY` in `~/.hermes/.env` (provider: `openai-api`, optional `OPENAI_BASE_URL`) |
+| **Cursor subscription** | `hermes auth add cursor` (browser account login + verified SDK bridge install), then `hermes model` (provider: `cursor`) |
 | **Azure AI Foundry** | `hermes model` → "Azure AI Foundry" (provider: `azure-foundry`; uses Azure OpenAI / Foundry endpoint and key) |
 | **AWS Bedrock** | `hermes model` → "AWS Bedrock" (provider: `bedrock`; standard AWS credentials chain via boto3) |
 | **NVIDIA Build** | `NVIDIA_API_KEY` in `~/.hermes/.env` (provider: `nvidia`; NIM-hosted models on build.nvidia.com) |
@@ -58,6 +60,26 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Custom Endpoint** | `hermes model` → choose "Custom endpoint" (saved in `config.yaml`) |
 
 For the official API-key path, see the dedicated [Google Gemini guide](/guides/google-gemini).
+
+### Cursor subscription
+
+`hermes auth add cursor` uses the official Cursor subscription SDK login flow,
+stores only the expiring user API key under the active `$HERMES_HOME`, and
+installs the local SDK bridge from a pinned release with a trusted
+per-platform SHA-256 digest embedded in Hermes; runtime startup does not
+download artifacts. Use
+`hermes cursor status` to inspect availability without printing credentials.
+
+Hermes disables all Cursor built-in tools. Cursor
+custom-tool callbacks are allowlisted against the exact Hermes tool set and
+return through Hermes's normal approval, budget, interrupt, and plugin
+lifecycle. The SDK exposes an agent-style prompt rather than Hermes's native
+wire-level system-role priority, so Hermes sends an explicit transcript
+envelope; this is a semantic limitation, not a claim of role equivalence.
+
+Credentials use the same profile-scoped, atomic private-file conventions as
+other Hermes account providers. Cursor Cloud Agents are not part of this
+integration.
 
 :::tip Model key alias
 In the `model:` config section, you can use either `default:` or `model:` as the key name for your model ID. Both `model: { default: my-model }` and `model: { model: my-model }` work identically.

@@ -455,6 +455,7 @@ from hermes_cli.macos_desktop_identity import (
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
 from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.login import build_login_parser
+from hermes_cli.subcommands.cursor import build_cursor_parser
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
@@ -820,6 +821,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_openrouter,
     _model_flow_nous,
     _model_flow_openai_codex,
+    _model_flow_cursor,
     _model_flow_xai_oauth,
     _model_flow_qwen_oauth,
     _model_flow_minimax_oauth,
@@ -4154,6 +4156,8 @@ def select_provider_and_model(args=None):
         _model_flow_nous(config, current_model, args=args)
     elif selected_provider == "openai-codex":
         _model_flow_openai_codex(config, current_model)
+    elif selected_provider == "cursor":
+        _model_flow_cursor(config, current_model)
     elif selected_provider == "xai-oauth":
         _model_flow_xai_oauth(config, current_model, args=args)
     elif selected_provider == "qwen-oauth":
@@ -5540,6 +5544,13 @@ def cmd_login(args):
     from hermes_cli.auth import login_command
 
     login_command(args)
+
+
+def cmd_cursor(args):
+    """Manage the Cursor subscription account and SDK bridge."""
+    from hermes_cli.subcommands.cursor import cmd_cursor as _cmd_cursor
+
+    _cmd_cursor(args)
 
 
 def cmd_logout(args):
@@ -13468,6 +13479,11 @@ def main():
     # login command  (parser built in hermes_cli/subcommands/login.py)
     # =========================================================================
     build_login_parser(subparsers, cmd_login=cmd_login)
+
+    # =========================================================================
+    # cursor command — profile-scoped Cursor subscription account
+    # =========================================================================
+    build_cursor_parser(subparsers, cmd_cursor=cmd_cursor)
 
     # =========================================================================
     # logout command  (parser built in hermes_cli/subcommands/logout.py)

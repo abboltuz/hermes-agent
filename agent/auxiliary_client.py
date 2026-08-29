@@ -6202,6 +6202,16 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return sync_client, model
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
+    try:
+        from agent.cursor_bridge_client import CursorBridgeClient, AsyncCursorBridgeClient
+        if isinstance(sync_client, CursorBridgeClient):
+            return AsyncCursorBridgeClient(
+                api_key=sync_client.api_key,
+                workspace=sync_client._workspace,
+                bridge_command=sync_client._bridge_command,
+            ), model
+    except ImportError:
+        pass
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
     if isinstance(sync_client, BedrockAuxiliaryClient):
@@ -6562,6 +6572,25 @@ def resolve_provider_client(
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
+
+    # ── Cursor subscription (official sdk.v1 bridge) ──────────────────
+    if provider == "cursor":
+        if not model:
+            logger.warning("resolve_provider_client: cursor requested without a model")
+            return None, None
+        from agent.cursor_sdk_auth import resolve_cursor_api_key
+        from agent.cursor_bridge_client import CursorBridgeClient, AsyncCursorBridgeClient
+        from agent.cursor_bridge_transport import resolve_bridge_command
+        cursor_key, _ = resolve_cursor_api_key()
+        command = resolve_bridge_command()
+        if not cursor_key or not command:
+            logger.warning("resolve_provider_client: cursor credential or bridge unavailable")
+            return None, None
+        if async_mode:
+            client = AsyncCursorBridgeClient(api_key=cursor_key, bridge_command=command)
+        else:
+            client = CursorBridgeClient(api_key=cursor_key, bridge_command=command)
+        return client, _normalize_resolved_model(model, provider)
 
     # ── xAI Grok OAuth (device code → Responses API) ───────────────
     # Without this branch, an xai-oauth main provider falls through to the

@@ -343,6 +343,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-4o-mini",
     ],
     "openai-codex": _codex_curated_models(),
+    "cursor": ["auto"],
     "xai-oauth": _xai_curated_models(),
     "copilot-acp": [
         "copilot-acp",
@@ -1220,6 +1221,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("lmstudio",       "LM Studio",                "LM Studio (Local desktop app with built-in model server)"),
     ProviderEntry("anthropic",      "Anthropic",                "Anthropic (Claude models via API key or Claude Code)"),
     ProviderEntry("openai-codex",   "ChatGPT or Codex Subscription", "ChatGPT or Codex Subscription (Sign in with your ChatGPT account, uses Codex models)"),
+    ProviderEntry("cursor",         "Cursor",                    "Cursor subscription (official SDK bridge)"),
     ProviderEntry("openai-api",     "OpenAI API",               "OpenAI API (api.openai.com, API key)"),
     ProviderEntry("alibaba",        "Qwen Cloud",               "Qwen Cloud / DashScope (Qwen + multi-provider)"),
     ProviderEntry("xai-oauth",      "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)"),
@@ -4110,6 +4112,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         from hermes_cli.auth import resolve_api_key_provider_credentials
 
         _p = get_provider_profile(normalized)
+        if _p and normalized == "cursor":
+            live = _p.fetch_models()
+            return live or list(_PROVIDER_MODELS.get("cursor", []))
         if _p and _p.auth_type == "api_key" and _p.base_url:
             try:
                 creds = resolve_api_key_provider_credentials(normalized)
@@ -4340,7 +4345,10 @@ def _credential_fingerprint(provider: str) -> str:
     # OAuth / external-file mtimes that change on re-auth
     try:
         from hermes_constants import get_hermes_home
-        for rel in ("auth.json", "credentials.json"):
+        rel_paths = ["auth.json", "credentials.json"]
+        if provider == "cursor":
+            rel_paths.extend(["cursor/auth.json", ".env"])
+        for rel in rel_paths:
             p = get_hermes_home() / rel
             try:
                 parts.append(f"{rel}@{p.stat().st_mtime_ns}")
