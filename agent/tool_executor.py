@@ -52,6 +52,10 @@ from tools.tool_result_storage import (
     extract_persisted_path,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from agent.runtime_control import (
+    KANBAN_TERMINAL_TOOL_NAMES,
+    get_kanban_terminal_transition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1100,6 +1104,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     mixed batch and the segmented dispatcher owns the turn-end work.
     """
     tool_calls = assistant_message.tool_calls
+    if any(
+        getattr(getattr(call, "function", None), "name", "")
+        in KANBAN_TERMINAL_TOOL_NAMES
+        for call in tool_calls
+    ):
+        return execute_tool_calls_sequential(
+            agent,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+            finalize=finalize,
+        )
     num_tools = len(tool_calls)
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
@@ -1943,6 +1960,63 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+def _append_kanban_terminal_fence_results(
+    agent,
+    messages: list,
+    tool_calls,
+    *,
+    effective_task_id: str,
+) -> bool:
+    """Pair undispatched calls after a successful worker terminal transition."""
+    transition = get_kanban_terminal_transition(agent)
+    calls = list(tool_calls)
+    if transition is None or not calls:
+        return transition is not None
+    for tool_call in calls:
+        name = getattr(getattr(tool_call, "function", None), "name", "") or "tool"
+        tool_call_id = _pairing_tool_call_id(tool_call)
+        result = json.dumps(
+            {
+                "error": (
+                    f"Tool {name} was not dispatched because this worker already "
+                    f"committed {transition.tool_name} for task "
+                    f"{transition.task_id} run {transition.run_id}."
+                ),
+                "error_type": "kanban_terminal_transition",
+                "terminal": True,
+                "task_id": transition.task_id,
+                "run_id": transition.run_id,
+            },
+            ensure_ascii=False,
+        )
+        messages.append(
+            make_tool_result_message(
+                name,
+                result,
+                tool_call_id,
+                effect_disposition="none",
+            )
+        )
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=name,
+            function_args={},
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            status="cancelled",
+            error_type="kanban_terminal_transition",
+            error_message="Tool execution fenced by terminal Kanban transition",
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"kanban terminal fence result {name}",
+        ):
+            return True
+    return True
+
+
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -1959,6 +2033,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
+        control = getattr(agent, "_runtime_control", None)
+        bind_session = getattr(control, "bind_session", None)
+        if callable(bind_session):
+            bind_session(getattr(agent, "session_id", "") or "")
         tool_call_id = _pairing_tool_call_id(tool_call)
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -2525,6 +2603,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            runtime_control=getattr(agent, "_runtime_control", None),
                         )
 
                 (
@@ -2607,6 +2686,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            runtime_control=getattr(agent, "_runtime_control", None),
                         )
 
                 (
@@ -2766,6 +2846,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ):
             return
 
+        if get_kanban_terminal_transition(agent) is not None:
+            _append_kanban_terminal_fence_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i:],
+                effective_task_id=effective_task_id,
+            )
+            break
+
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
         if not _execution_blocked and agent.tool_progress_callback:
@@ -2885,9 +2974,10 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -2902,6 +2992,20 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+
+        if get_kanban_terminal_transition(agent) is not None:
+            remaining_calls = [
+                call
+                for _remaining_kind, segment_calls in segments[segment_index + 1:]
+                for call in segment_calls
+            ]
+            _append_kanban_terminal_fence_results(
+                agent,
+                messages,
+                remaining_calls,
+                effective_task_id=effective_task_id,
+            )
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

@@ -1673,6 +1673,12 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
+    from agent.runtime_control import RuntimeControl
+
+    agent._runtime_control = RuntimeControl.from_environment(
+        session_id=agent.session_id,
+    )
+
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
