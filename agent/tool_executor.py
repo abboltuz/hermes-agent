@@ -633,6 +633,24 @@ def _run_agent_tool_execution_middleware(
             )
         )
 
+    def _is_terminal_actor_attempt() -> bool:
+        control = getattr(agent, "_runtime_control", None)
+        authorizes = getattr(control, "authorizes_kanban_terminal_attempt", None)
+        if not callable(authorizes):
+            return False
+        raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        try:
+            requested_run_id = int(raw_run_id) if raw_run_id else None
+        except ValueError:
+            requested_run_id = None
+        return bool(
+            authorizes(
+                tool_name=function_name,
+                run_id=requested_run_id,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+            )
+        )
+
     def _advance_start_order(callback=None) -> None:
         if begin_execution is None:
             if callback is not None:
@@ -825,7 +843,7 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    if _is_exact_terminal_actor(function_args):
+    if _is_terminal_actor_attempt():
         # Run every callback-style wrapper to completion as a non-mutating
         # preflight. Relay/request/execution/pre-tool rewrites and policy all
         # settle before a possible COMMIT, so even wrapper ``finally`` blocks
