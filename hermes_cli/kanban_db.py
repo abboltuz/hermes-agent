@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -3041,12 +3041,22 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+def write_txn(
+    conn: sqlite3.Connection,
+    *,
+    allow_nested: bool = False,
+    on_commit: Optional[Callable[[], None]] = None,
+):
     """Context manager for an IMMEDIATE write transaction.
 
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.). A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
+
+    ``on_commit`` runs immediately after a successful outer ``COMMIT`` and
+    before post-commit integrity diagnostics. It is reserved for in-process
+    control signals that must observe the durable boundary exactly; savepoint
+    transactions reject it because ``RELEASE`` is not a durable commit.
 
     Nesting is an explicit opt-in: a caller already inside a transaction
     gets a loud ``RuntimeError`` unless it passes ``allow_nested=True``,
@@ -3065,6 +3075,11 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """
     _assert_not_delegated_child_mutation()
     if getattr(conn, "in_transaction", False):
+        if on_commit is not None:
+            raise RuntimeError(
+                "write_txn: on_commit requires an outer durable transaction; "
+                "it cannot be used with savepoint semantics"
+            )
         if not allow_nested:
             raise RuntimeError(
                 "write_txn: already inside a transaction. Nested composition "
@@ -3110,6 +3125,8 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             except sqlite3.OperationalError:
                 pass
             raise
+        if on_commit is not None:
+            on_commit()
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -5460,6 +5477,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    on_terminal_commit: Optional[Callable[[Optional[int], str], None]] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5529,7 +5547,14 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    terminal_staged = False
+    run_id: Optional[int] = None
+
+    def _after_terminal_commit() -> None:
+        if terminal_staged and on_terminal_commit is not None:
+            on_terminal_commit(run_id, "done")
+
+    with write_txn(conn, on_commit=_after_terminal_commit):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -5650,6 +5675,7 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        terminal_staged = True
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -6351,6 +6377,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    on_terminal_commit: Optional[Callable[[Optional[int], str], None]] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6384,7 +6411,15 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
-    with write_txn(conn):
+    terminal_staged = False
+    landed_status = "blocked"
+    run_id: Optional[int] = None
+
+    def _after_terminal_commit() -> None:
+        if terminal_staged and on_terminal_commit is not None:
+            on_terminal_commit(run_id, landed_status)
+
+    with write_txn(conn, on_commit=_after_terminal_commit):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -6443,6 +6478,8 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            landed_status = "todo"
+            terminal_staged = True
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -6503,6 +6540,8 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            landed_status = "triage"
+            terminal_staged = True
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -6560,6 +6599,8 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            landed_status = "blocked"
+            terminal_staged = True
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -6598,6 +6639,7 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    on_terminal_commit: Optional[Callable[[Optional[int], str], None]] = None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -6624,7 +6666,14 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
-    with write_txn(conn):
+    terminal_staged = False
+    run_id: Optional[int] = None
+
+    def _after_terminal_commit() -> None:
+        if terminal_staged and on_terminal_commit is not None:
+            on_terminal_commit(run_id, "review")
+
+    with write_txn(conn, on_commit=_after_terminal_commit):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -6747,6 +6796,7 @@ def request_review(
             },
             run_id=run_id,
         )
+        terminal_staged = True
     return _ret(True)
 
 
@@ -6756,6 +6806,7 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    on_terminal_commit: Optional[Callable[[Optional[int], str], None]] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -6769,7 +6820,15 @@ def request_changes(
     if not reason:
         return False, "reason is required"
 
-    with write_txn(conn):
+    terminal_staged = False
+    run_id: Optional[int] = None
+    new_status = "ready"
+
+    def _after_terminal_commit() -> None:
+        if terminal_staged and on_terminal_commit is not None:
+            on_terminal_commit(run_id, new_status)
+
+    with write_txn(conn, on_commit=_after_terminal_commit):
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
@@ -6866,6 +6925,7 @@ def request_changes(
             },
             run_id=run_id,
         )
+        terminal_staged = True
     return True, implementer
 
 

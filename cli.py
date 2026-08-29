@@ -1508,7 +1508,8 @@ def _finalize_single_query(cli) -> None:
             _flush_one_shot_session_store(cli)
         except Exception:
             logger.debug("one-shot session store flush failed", exc_info=True)
-        _notify_single_query_session_finalize(cli)
+        if terminal_transition is None:
+            _notify_single_query_session_finalize(cli)
         _run_cleanup(
             notify_session_finalize=False,
             skip_memory_provider=terminal_transition is not None,
