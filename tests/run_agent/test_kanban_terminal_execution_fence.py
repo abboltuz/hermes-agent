@@ -437,6 +437,118 @@ def test_steer_racing_with_terminal_commit_is_discarded(worker_case, monkeypatch
     assert result["messages"][-1]["role"] == "assistant"
 
 
+def test_post_commit_diagnostic_failure_still_arms_terminal_fence(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, _run_id = worker_case
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        kb,
+        "latest_run",
+        MagicMock(side_effect=RuntimeError("diagnostic read failed")),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "kanban_block",
+                    {"reason": "preflight failed"},
+                    "block-1",
+                )
+            ]
+        ),
+        _response(
+            tool_calls=[
+                _tool_call(_SENTINEL_TOOL, {"phase": "after-error"}, "sentinel-2")
+            ]
+        ),
+    ]
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert _sentinel_calls == []
+    assert result["terminal_transition"]["tool_name"] == "kanban_block"
+    assert result["completed"] is True
+
+
+def test_post_commit_integrity_check_failure_still_arms_terminal_fence(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, _run_id = worker_case
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        kb,
+        "_check_file_length_invariant",
+        MagicMock(side_effect=RuntimeError("post-commit integrity check failed")),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "kanban_block",
+                    {"reason": "preflight failed"},
+                    "block-1",
+                )
+            ]
+        ),
+        _response(
+            tool_calls=[
+                _tool_call(_SENTINEL_TOOL, {"phase": "after-error"}, "sentinel-2")
+            ]
+        ),
+    ]
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert _sentinel_calls == []
+    assert result["terminal_transition"]["tool_name"] == "kanban_block"
+    assert result["completed"] is True
+
+
+def test_terminal_tools_bypass_post_dispatch_middleware_and_relay(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, _run_id = worker_case
+    from agent import relay_tools
+    from hermes_cli import middleware
+
+    middleware_after_dispatch = []
+    relay_after_dispatch = []
+
+    def _execution_wrapper(tool_name, args, terminal_call, **_kwargs):
+        result = terminal_call(args)
+        if tool_name == "kanban_block":
+            middleware_after_dispatch.append(tool_name)
+        return result
+
+    def _relay_wrapper(tool_name, args, callback, **_kwargs):
+        result = callback(args)
+        if tool_name == "kanban_block":
+            relay_after_dispatch.append(tool_name)
+        return result, args
+
+    monkeypatch.setattr(middleware, "run_tool_execution_middleware", _execution_wrapper)
+    monkeypatch.setattr(relay_tools, "execute", _relay_wrapper)
+    agent.client.chat.completions.create.return_value = _response(
+        tool_calls=[
+            _tool_call("kanban_block", {"reason": "preflight failed"}, "block-1")
+        ]
+    )
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert result["terminal_transition"]["tool_name"] == "kanban_block"
+    assert middleware_after_dispatch == []
+    assert relay_after_dispatch == []
+
+
 @pytest.mark.parametrize(
     ("handler_name", "arguments", "expected_tool", "expected_status"),
     [
@@ -505,6 +617,21 @@ def test_stale_run_rejection_does_not_arm_fence(worker_case, monkeypatch):
         assert task.current_run_id == run_id
     finally:
         conn.close()
+
+
+def test_session_mismatch_does_not_arm_exact_actor_fence(worker_case):
+    agent, task_id, run_id = worker_case
+
+    armed = agent._runtime_control.commit_kanban_terminal_transition(
+        tool_name="kanban_block",
+        task_id=task_id,
+        run_id=run_id,
+        session_id="different-session",
+        status="blocked",
+    )
+
+    assert armed is False
+    assert agent._runtime_control.kanban_terminal_transition is None
 
 
 def test_foreign_task_rejection_does_not_arm_fence(worker_case):

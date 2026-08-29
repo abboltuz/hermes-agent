@@ -788,11 +788,21 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
 
             try:
+                expected_run_id = _worker_run_id(tid)
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=expected_run_id,
+                    on_terminal_commit=lambda _closed_run_id, landed_status: (
+                        _commit_actor_terminal_transition(
+                            kw,
+                            tool_name="kanban_complete",
+                            task_id=tid,
+                            run_id=expected_run_id,
+                            status=landed_status,
+                        )
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -826,14 +836,6 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            expected_run_id = _worker_run_id(tid)
-            _commit_actor_terminal_transition(
-                kw,
-                tool_name="kanban_complete",
-                task_id=tid,
-                run_id=expected_run_id,
-                status="done",
-            )
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -895,11 +897,21 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            expected_run_id = _worker_run_id(tid)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
+                on_terminal_commit=lambda _closed_run_id, landed_status: (
+                    _commit_actor_terminal_transition(
+                        kw,
+                        tool_name="kanban_block",
+                        task_id=tid,
+                        run_id=expected_run_id,
+                        status=landed_status,
+                    )
+                ),
             )
             if not ok:
                 return tool_error(
@@ -910,14 +922,6 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
-            expected_run_id = _worker_run_id(tid)
-            _commit_actor_terminal_transition(
-                kw,
-                tool_name="kanban_block",
-                task_id=tid,
-                run_id=expected_run_id,
-                status=landed.status if landed else "blocked",
-            )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -982,13 +986,23 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
+            expected_run_id = _worker_run_id(tid)
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
                 with_reason=True,
+                on_terminal_commit=lambda _closed_run_id, landed_status: (
+                    _commit_actor_terminal_transition(
+                        kw,
+                        tool_name="kanban_request_review",
+                        task_id=tid,
+                        run_id=expected_run_id,
+                        status=landed_status,
+                    )
+                ),
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"
@@ -997,14 +1011,6 @@ def _handle_request_review(args: dict, **kw) -> str:
                 )
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
-            expected_run_id = _worker_run_id(tid)
-            _commit_actor_terminal_transition(
-                kw,
-                tool_name="kanban_request_review",
-                task_id=tid,
-                run_id=expected_run_id,
-                status=landed.status if landed else "review",
-            )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -1040,11 +1046,21 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            expected_run_id = _worker_run_id(tid)
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
+                on_terminal_commit=lambda _closed_run_id, landed_status: (
+                    _commit_actor_terminal_transition(
+                        kw,
+                        tool_name="kanban_request_changes",
+                        task_id=tid,
+                        run_id=expected_run_id,
+                        status=landed_status,
+                    )
+                ),
             )
             if not ok:
                 return tool_error(
@@ -1052,14 +1068,6 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 )
             landed = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
-            expected_run_id = _worker_run_id(tid)
-            _commit_actor_terminal_transition(
-                kw,
-                tool_name="kanban_request_changes",
-                task_id=tid,
-                run_id=expected_run_id,
-                status=landed.status if landed else "ready",
-            )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
