@@ -428,14 +428,6 @@ class _ManagedToolResult:
     dispatched: bool
 
 
-class _KanbanTerminalDispatchFence(BaseException):
-    """Unwind callback wrappers after an exact terminal transition commits."""
-
-    def __init__(self, result: Any) -> None:
-        super().__init__("kanban terminal dispatch fence")
-        self.result = result
-
-
 class _ToolTimeoutResult(str):
     """Marker for a synthesized sequential-tool timeout result."""
 
@@ -615,6 +607,28 @@ def _run_agent_tool_execution_middleware(
     }
     dispatch_lock = threading.Lock()
 
+    def _is_exact_terminal_actor(next_args: dict[str, Any]) -> bool:
+        control = getattr(agent, "_runtime_control", None)
+        authorizes = getattr(control, "authorizes_kanban_terminal_call", None)
+        if not callable(authorizes):
+            return False
+        requested_task_id = next_args.get("task_id") or os.environ.get(
+            "HERMES_KANBAN_TASK"
+        )
+        raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        try:
+            requested_run_id = int(raw_run_id) if raw_run_id else None
+        except ValueError:
+            requested_run_id = None
+        return bool(
+            authorizes(
+                tool_name=function_name,
+                task_id=str(requested_task_id) if requested_task_id else None,
+                run_id=requested_run_id,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+            )
+        )
+
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
         with dispatch_lock:
             if state["dispatched"]:
@@ -735,22 +749,10 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            dispatch_result = execute(final_args)
+            return execute(final_args)
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
-        transition = get_kanban_terminal_transition(agent)
-        if (
-            function_name in KANBAN_TERMINAL_TOOL_NAMES
-            and transition is not None
-            and transition.tool_name == function_name
-        ):
-            # BaseException intentionally crosses ordinary ``except Exception``
-            # plugin wrappers. The outer executor catches it immediately and
-            # preserves the real tool result; normal post-callback middleware
-            # and Relay work never resumes after the durable actor boundary.
-            raise _KanbanTerminalDispatchFence(dispatch_result)
-        return dispatch_result
 
     def _apply_request_pipeline(relay_args: dict[str, Any]) -> dict[str, Any]:
         request_result = apply_tool_request_middleware(
@@ -788,7 +790,16 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    try:
+    if _is_exact_terminal_actor(function_args):
+        # A potentially successful exact-worker terminal dispatch cannot be
+        # placed inside arbitrary callback wrappers: even exception unwinding
+        # executes their ``finally`` blocks after COMMIT. All request rewrites
+        # finish first, then policy/authorization and the handler run directly.
+        # Orchestrator, foreign, and stale-run calls fail this typed authority
+        # gate and retain the complete execution-middleware/Relay pipeline.
+        request_args = _apply_request_pipeline(function_args)
+        result = _authorized_dispatch(request_args)
+    else:
         result, _relay_args = relay_tools.execute(
             function_name,
             function_args,
@@ -801,8 +812,6 @@ def _run_agent_tool_execution_middleware(
                 "tool_call_id": tool_call_id or "",
             },
         )
-    except _KanbanTerminalDispatchFence as fence:
-        result = fence.result
     return _ManagedToolResult(
         result=result,
         args=state["args"],

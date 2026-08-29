@@ -523,16 +523,18 @@ def test_terminal_tools_bypass_post_dispatch_middleware_and_relay(
     relay_after_dispatch = []
 
     def _execution_wrapper(tool_name, args, terminal_call, **_kwargs):
-        result = terminal_call(args)
-        if tool_name == "kanban_block":
-            middleware_after_dispatch.append(tool_name)
-        return result
+        try:
+            return terminal_call(args)
+        finally:
+            if tool_name == "kanban_block":
+                middleware_after_dispatch.append(tool_name)
 
     def _relay_wrapper(tool_name, args, callback, **_kwargs):
-        result = callback(args)
-        if tool_name == "kanban_block":
-            relay_after_dispatch.append(tool_name)
-        return result, args
+        try:
+            return callback(args), args
+        finally:
+            if tool_name == "kanban_block":
+                relay_after_dispatch.append(tool_name)
 
     monkeypatch.setattr(middleware, "run_tool_execution_middleware", _execution_wrapper)
     monkeypatch.setattr(relay_tools, "execute", _relay_wrapper)
