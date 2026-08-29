@@ -574,7 +574,10 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
     marker = _anchor_marker(venv_bin)
     aliases = _alias_paths(venv_bin, source_file)
     dylibs = [dst for _src, dst in _libpython_targets(venv_dir, source_file)]
-    snapshots = _snapshot_paths([venv_py, *aliases, *dylibs])
+    # _restore_snapshots walks in reverse.  Restore the canonical route first,
+    # then aliases, and only then their venv-local dylibs so every intermediate
+    # rollback state retains at least one bootable executable/dependency pair.
+    snapshots = _snapshot_paths([*reversed(dylibs), *reversed(aliases), venv_py])
     tmp_path: Path | None = None
     alias_stage_dir: Path | None = None
     committed = False

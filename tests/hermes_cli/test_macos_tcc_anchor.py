@@ -975,6 +975,53 @@ class TestAnchoredAliasesBootE2E:
             assert os.readlink(entrypoint) == target
         _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
 
+    def test_rollback_keeps_every_route_bootable_after_each_restore_step(
+        self, tmp_path, monkeypatch
+    ):
+        root, venv_bin, minor, console_script = _real_macos_venv(tmp_path)
+        original_restore = tcc._restore_snapshot
+        observations = []
+        env = dict(os.environ)
+        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "__PYVENV_LAUNCHER__"):
+            env.pop(key, None)
+
+        def fail_marker(*_args, **_kwargs):
+            raise OSError("marker write failed")
+
+        def restore_and_probe(snapshot):
+            original_restore(snapshot)
+            returncodes = []
+            for entrypoint in (
+                venv_bin / "python",
+                venv_bin / "python3",
+                venv_bin / minor,
+                console_script,
+            ):
+                argv = [str(entrypoint)]
+                if entrypoint != console_script:
+                    argv.extend(["-c", "import encodings, sys; print(sys.prefix)"])
+                probe = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env=env,
+                )
+                returncodes.append(probe.returncode)
+            observations.append((snapshot.path.name, returncodes))
+
+        monkeypatch.setattr(tcc, "_write_marker", fail_marker)
+        monkeypatch.setattr(tcc, "_restore_snapshot", restore_and_probe)
+        assert tcc.ensure_tcc_anchor(root) is None
+
+        assert observations
+        assert observations[0][0] == "python"
+        assert all(
+            returncode == 0
+            for _path, returncodes in observations
+            for returncode in returncodes
+        )
+
     def test_persistent_restore_failure_retains_predecessor_backup(
         self, tmp_path, monkeypatch
     ):
