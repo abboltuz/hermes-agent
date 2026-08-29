@@ -347,3 +347,50 @@ def test_orchestrator_transition_does_not_arm_actor_fence(worker_case, monkeypat
 
     assert result["ok"] is True
     assert control.kanban_terminal_transition is None
+
+
+def test_reviewer_request_changes_arms_same_exact_review_run_contract(
+    worker_case,
+    monkeypatch,
+):
+    _agent, task_id, implementation_run_id = worker_case
+    from agent.runtime_control import RuntimeControl
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="implementation ready",
+            reviewer="fence-worker",
+            expected_run_id=implementation_run_id,
+        )
+        review = kb.claim_review_task(
+            conn,
+            task_id,
+            claimer="fence-worker:review",
+        )
+        assert review is not None and review.current_run_id is not None
+        review_run_id = int(review.current_run_id)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
+    control = RuntimeControl.from_environment(session_id="fence-session")
+    result = json.loads(
+        kt._handle_request_changes(
+            {"reason": "add the missing regression"},
+            runtime_control=control,
+            session_id="fence-session",
+        )
+    )
+
+    assert result["ok"] is True
+    transition = control.kanban_terminal_transition
+    assert transition is not None
+    assert transition.tool_name == "kanban_request_changes"
+    assert transition.task_id == task_id
+    assert transition.run_id == review_run_id
+    assert transition.status == "ready"
