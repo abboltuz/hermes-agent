@@ -196,6 +196,14 @@ def test_terminal_tool_skips_later_same_response_call_with_exact_pairing(worker_
     assert skipped["terminal"] is True
     assert result["terminal_transition"]["task_id"] == task_id
     assert result["terminal_transition"]["run_id"] == run_id
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "assistant",
+    ]
+    assert result["messages"][-1]["content"] == result["final_response"]
     _assert_single_block_receipt(task_id, run_id)
 
 
@@ -347,6 +355,46 @@ def test_orchestrator_transition_does_not_arm_actor_fence(worker_case, monkeypat
 
     assert result["ok"] is True
     assert control.kanban_terminal_transition is None
+
+
+def test_orchestrator_terminal_mutation_does_not_stop_conversation_loop(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, _run_id = worker_case
+    from agent.runtime_control import RuntimeControl
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    agent._runtime_control = RuntimeControl.from_environment(
+        session_id=agent.session_id,
+    )
+    conn = kb.connect()
+    try:
+        target = kb.create_task(conn, title="operator-managed", assignee="worker")
+    finally:
+        conn.close()
+
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "kanban_block",
+                    {"task_id": target, "reason": "operator decision"},
+                    "block-1",
+                )
+            ]
+        ),
+        _response(content="operator conversation continues", finish_reason="stop"),
+    ]
+
+    result = agent.run_conversation("manage another task")
+
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["final_response"] == "operator conversation continues"
+    assert "terminal_transition" not in result
+    assert agent._runtime_control.kanban_terminal_transition is None
 
 
 def test_reviewer_request_changes_arms_same_exact_review_run_contract(
