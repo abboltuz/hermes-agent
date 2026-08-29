@@ -783,9 +783,11 @@ def finalize_turn(
         result["cleanup_errors"] = _cleanup_errors
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
-    # delivered as the next user turn instead of being silently lost.
+    # delivered as the next user turn instead of being silently lost. A
+    # terminal Kanban actor has no next turn: drain a racing steer so it cannot
+    # escape the execution fence through a caller-side requeue.
     _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
+    if _leftover_steer and kanban_terminal_transition is None:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
 
