@@ -428,6 +428,14 @@ class _ManagedToolResult:
     dispatched: bool
 
 
+class _KanbanTerminalDispatchFence(BaseException):
+    """Unwind callback wrappers after an exact terminal transition commits."""
+
+    def __init__(self, result: Any) -> None:
+        super().__init__("kanban terminal dispatch fence")
+        self.result = result
+
+
 class _ToolTimeoutResult(str):
     """Marker for a synthesized sequential-tool timeout result."""
 
@@ -727,10 +735,22 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            dispatch_result = execute(final_args)
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
+        transition = get_kanban_terminal_transition(agent)
+        if (
+            function_name in KANBAN_TERMINAL_TOOL_NAMES
+            and transition is not None
+            and transition.tool_name == function_name
+        ):
+            # BaseException intentionally crosses ordinary ``except Exception``
+            # plugin wrappers. The outer executor catches it immediately and
+            # preserves the real tool result; normal post-callback middleware
+            # and Relay work never resumes after the durable actor boundary.
+            raise _KanbanTerminalDispatchFence(dispatch_result)
+        return dispatch_result
 
     def _apply_request_pipeline(relay_args: dict[str, Any]) -> dict[str, Any]:
         request_result = apply_tool_request_middleware(
@@ -768,14 +788,7 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    if function_name in KANBAN_TERMINAL_TOOL_NAMES:
-        # A successful dispatcher-owned terminal mutation is an execution
-        # fence. Request rewrites and authorization must finish before the
-        # mutation, but callback-style execution middleware and Relay wrappers
-        # could otherwise resume arbitrary work after the durable COMMIT.
-        request_args = _apply_request_pipeline(function_args)
-        result = _authorized_dispatch(request_args)
-    else:
+    try:
         result, _relay_args = relay_tools.execute(
             function_name,
             function_args,
@@ -788,6 +801,8 @@ def _run_agent_tool_execution_middleware(
                 "tool_call_id": tool_call_id or "",
             },
         )
+    except _KanbanTerminalDispatchFence as fence:
+        result = fence.result
     return _ManagedToolResult(
         result=result,
         args=state["args"],

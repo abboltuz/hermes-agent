@@ -619,6 +619,48 @@ def test_stale_run_rejection_does_not_arm_fence(worker_case, monkeypatch):
         conn.close()
 
 
+def test_rejected_terminal_call_preserves_middleware_and_relay(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, run_id = worker_case
+    from agent import relay_tools
+    from hermes_cli import middleware
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 1))
+    middleware_after_dispatch = []
+    relay_after_dispatch = []
+
+    def _execution_wrapper(tool_name, args, terminal_call, **_kwargs):
+        result = terminal_call(args)
+        middleware_after_dispatch.append(tool_name)
+        return result
+
+    def _relay_wrapper(tool_name, args, callback, **_kwargs):
+        result = callback(args)
+        relay_after_dispatch.append(tool_name)
+        return result, args
+
+    monkeypatch.setattr(middleware, "run_tool_execution_middleware", _execution_wrapper)
+    monkeypatch.setattr(relay_tools, "execute", _relay_wrapper)
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call("kanban_block", {"reason": "stale attempt"}, "block-1")
+            ]
+        ),
+        _response(content="rejected call handled", finish_reason="stop"),
+    ]
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["final_response"] == "rejected call handled"
+    assert "terminal_transition" not in result
+    assert middleware_after_dispatch == ["kanban_block"]
+    assert relay_after_dispatch == ["kanban_block"]
+
+
 def test_session_mismatch_does_not_arm_exact_actor_fence(worker_case):
     agent, task_id, run_id = worker_case
 
@@ -689,7 +731,9 @@ def test_orchestrator_terminal_mutation_does_not_stop_conversation_loop(
     monkeypatch,
 ):
     agent, _task_id, _run_id = worker_case
+    from agent import relay_tools
     from agent.runtime_control import RuntimeControl
+    from hermes_cli import middleware
     from hermes_cli import kanban_db as kb
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -702,6 +746,22 @@ def test_orchestrator_terminal_mutation_does_not_stop_conversation_loop(
         target = kb.create_task(conn, title="operator-managed", assignee="worker")
     finally:
         conn.close()
+
+    middleware_after_dispatch = []
+    relay_after_dispatch = []
+
+    def _execution_wrapper(tool_name, args, terminal_call, **_kwargs):
+        result = terminal_call(args)
+        middleware_after_dispatch.append(tool_name)
+        return result
+
+    def _relay_wrapper(tool_name, args, callback, **_kwargs):
+        result = callback(args)
+        relay_after_dispatch.append(tool_name)
+        return result, args
+
+    monkeypatch.setattr(middleware, "run_tool_execution_middleware", _execution_wrapper)
+    monkeypatch.setattr(relay_tools, "execute", _relay_wrapper)
 
     agent.client.chat.completions.create.side_effect = [
         _response(
@@ -722,6 +782,8 @@ def test_orchestrator_terminal_mutation_does_not_stop_conversation_loop(
     assert result["final_response"] == "operator conversation continues"
     assert "terminal_transition" not in result
     assert agent._runtime_control.kanban_terminal_transition is None
+    assert middleware_after_dispatch == ["kanban_block"]
+    assert relay_after_dispatch == ["kanban_block"]
 
 
 def test_reviewer_request_changes_arms_same_exact_review_run_contract(
