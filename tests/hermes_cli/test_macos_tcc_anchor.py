@@ -892,6 +892,124 @@ class TestAnchoredAliasesBootE2E:
         assert tcc.tcc_anchor_state(root)[0] == "active"
         _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
 
+    def test_transient_canonical_restore_failure_retries_before_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        root, venv_bin, minor, console_script = _real_macos_venv(tmp_path)
+        original_targets = {
+            name: os.readlink(venv_bin / name)
+            for name in ("python", "python3", minor)
+        }
+        original_write_marker = tcc._write_marker
+        original_replace = tcc.os.replace
+        restore_failed = False
+
+        def fail_marker(*_args, **_kwargs):
+            raise OSError("marker write failed")
+
+        def fail_first_canonical_restore(src, dst):
+            nonlocal restore_failed
+            source = Path(src)
+            if (
+                not restore_failed
+                and Path(dst) == venv_bin / "python"
+                and ".python.tcc-restore-" in source.name
+            ):
+                restore_failed = True
+                raise OSError("transient canonical restore failure")
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(tcc, "_write_marker", fail_marker)
+        monkeypatch.setattr(tcc.os, "replace", fail_first_canonical_restore)
+        assert tcc.ensure_tcc_anchor(root) is None
+
+        assert restore_failed
+        assert not (venv_bin / ".tcc-anchor-source").exists()
+        for name, target in original_targets.items():
+            entrypoint = venv_bin / name
+            assert entrypoint.is_symlink()
+            assert os.readlink(entrypoint) == target
+        _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
+
+        monkeypatch.setattr(tcc, "_write_marker", original_write_marker)
+        monkeypatch.setattr(tcc.os, "replace", original_replace)
+        assert tcc.ensure_tcc_anchor(root) is not None
+        assert tcc.tcc_anchor_state(root)[0] == "active"
+
+    def test_interrupt_during_canonical_restore_finishes_rollback(
+        self, tmp_path, monkeypatch
+    ):
+        root, venv_bin, minor, console_script = _real_macos_venv(tmp_path)
+        original_targets = {
+            name: os.readlink(venv_bin / name)
+            for name in ("python", "python3", minor)
+        }
+        original_replace = tcc.os.replace
+        interrupted = False
+
+        def fail_marker(*_args, **_kwargs):
+            raise OSError("marker write failed")
+
+        def interrupt_first_canonical_restore(src, dst):
+            nonlocal interrupted
+            source = Path(src)
+            if (
+                not interrupted
+                and Path(dst) == venv_bin / "python"
+                and ".python.tcc-restore-" in source.name
+            ):
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(tcc, "_write_marker", fail_marker)
+        monkeypatch.setattr(tcc.os, "replace", interrupt_first_canonical_restore)
+        with pytest.raises(KeyboardInterrupt):
+            tcc.ensure_tcc_anchor(root)
+
+        assert interrupted
+        assert not (venv_bin / ".tcc-anchor-source").exists()
+        for name, target in original_targets.items():
+            entrypoint = venv_bin / name
+            assert entrypoint.is_symlink()
+            assert os.readlink(entrypoint) == target
+        _assert_real_entrypoints_boot(root, venv_bin, minor, console_script)
+
+    def test_persistent_restore_failure_retains_predecessor_backup(
+        self, tmp_path, monkeypatch
+    ):
+        root, venv_bin, _minor, _console_script = _real_macos_venv(tmp_path)
+        assert tcc.ensure_tcc_anchor(root) is not None
+        canonical = venv_bin / "python"
+        predecessor = canonical.read_bytes()
+        source_file = Path(
+            (venv_bin / ".tcc-anchor-source")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        original_replace = tcc.os.replace
+
+        def fail_marker(*_args, **_kwargs):
+            raise OSError("marker write failed")
+
+        def fail_canonical_backup_restore(src, dst):
+            source = Path(src)
+            if (
+                Path(dst) == canonical
+                and ".python.tcc-backup-" in source.name
+            ):
+                raise OSError("persistent canonical restore failure")
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(tcc, "_write_marker", fail_marker)
+        monkeypatch.setattr(tcc.os, "replace", fail_canonical_backup_restore)
+        with pytest.raises(tcc._AnchorInstallFailed, match="rollback was incomplete"):
+            tcc._install_anchor(root / ".venv", source_file)
+
+        backups = list(venv_bin.glob(".python.tcc-backup-*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == predecessor
+
     def test_interrupted_alias_signing_preserves_predecessor_and_retries(
         self, tmp_path, monkeypatch
     ):

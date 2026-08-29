@@ -330,13 +330,37 @@ def _restore_snapshot(snapshot: _PathSnapshot) -> None:
 
 def _restore_snapshots(snapshots: list[_PathSnapshot]) -> bool:
     ok = True
+    pending_interrupt: BaseException | None = None
     for snapshot in reversed(snapshots):
-        try:
-            _restore_snapshot(snapshot)
-        except OSError:
-            ok = False
-            logger.error("TCC anchor rollback failed for %s", snapshot.path, exc_info=True)
-    _discard_snapshots(snapshots)
+        for attempt in range(2):
+            try:
+                _restore_snapshot(snapshot)
+                break
+            except OSError:
+                if attempt == 0:
+                    continue
+                ok = False
+                logger.error(
+                    "TCC anchor rollback failed for %s",
+                    snapshot.path,
+                    exc_info=True,
+                )
+            except BaseException as exc:
+                if pending_interrupt is None:
+                    pending_interrupt = exc
+                if attempt == 0:
+                    continue
+                ok = False
+                logger.error(
+                    "TCC anchor rollback was interrupted for %s",
+                    snapshot.path,
+                    exc_info=True,
+                )
+    # Successful file restores consume their backup with os.replace.  Never
+    # discard a backup whose restore failed: it is the only remaining recovery
+    # evidence if the live path cannot be repaired within the bounded retry.
+    if pending_interrupt is not None:
+        raise pending_interrupt
     return ok
 
 
