@@ -98,6 +98,27 @@ class RuntimeControl:
             if self._kanban_terminal_transition is None:
                 self._session_id = session_id
 
+    def authorizes_kanban_terminal_call(
+        self,
+        *,
+        tool_name: str,
+        task_id: Optional[str],
+        run_id: Optional[int],
+        session_id: str,
+    ) -> bool:
+        """Return whether this call can commit this actor's terminal fence."""
+        if tool_name not in KANBAN_TERMINAL_TOOL_NAMES or run_id is None:
+            return False
+        with self._lock:
+            return bool(
+                self._kanban_terminal_transition is None
+                and self._dispatcher_owned
+                and task_id == self._task_id
+                and int(run_id) == self._run_id
+                and session_id
+                and session_id == self._session_id
+            )
+
     def commit_kanban_terminal_transition(
         self,
         *,
