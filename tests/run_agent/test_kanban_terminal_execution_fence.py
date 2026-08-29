@@ -237,6 +237,111 @@ def test_terminal_turn_does_not_run_post_turn_hooks_or_review(worker_case):
     assert "on_session_end" not in hook_names
 
 
+def test_terminal_on_iteration_limit_is_truthful_without_failure_fallback(
+    worker_case,
+):
+    agent, task_id, run_id = worker_case
+    from hermes_cli import kanban_db as kb
+
+    agent.max_iterations = 1
+    agent.client.chat.completions.create.return_value = _response(
+        tool_calls=[
+            _tool_call("kanban_block", {"reason": "preflight failed"}, "block-1")
+        ]
+    )
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert result["terminal_transition"]["run_id"] == run_id
+    assert result["completed"] is True
+    assert result["failed"] is False
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, task_id)
+        terminal_kinds = [
+            event.kind
+            for event in events
+            if event.kind in {"blocked", "timed_out", "gave_up"}
+        ]
+        assert terminal_kinds == ["blocked"]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.consecutive_failures == 0
+    finally:
+        conn.close()
+
+
+def test_terminal_boundary_suppresses_generic_post_tool_hooks(worker_case):
+    agent, _task_id, _run_id = worker_case
+    agent.client.chat.completions.create.return_value = _response(
+        tool_calls=[
+            _tool_call("kanban_block", {"reason": "preflight failed"}, "block-1"),
+            _tool_call(_SENTINEL_TOOL, {"phase": "same-response"}, "sentinel-2"),
+        ]
+    )
+
+    with (
+        patch("hermes_cli.lifecycle.has_hook", return_value=True),
+        patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+    ):
+        result = agent.run_conversation("perform the worker task")
+
+    assert result["terminal_transition"]["tool_name"] == "kanban_block"
+    hook_names = [call.args[0] for call in invoke_hook.call_args_list if call.args]
+    assert "post_tool_call" not in hook_names
+
+
+def test_terminal_transition_wins_when_tool_result_persistence_initially_fails(
+    worker_case,
+):
+    agent, _task_id, _run_id = worker_case
+    failed_tool_result_flush = False
+
+    def _flush(messages, *_args, **_kwargs):
+        nonlocal failed_tool_result_flush
+        if (
+            not failed_tool_result_flush
+            and messages
+            and messages[-1].get("role") == "tool"
+        ):
+            failed_tool_result_flush = True
+            agent._last_persistence_error_cause = "locked"
+            return False
+        return True
+
+    agent._flush_messages_to_session_db = _flush
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "kanban_block",
+                    {"reason": "preflight failed"},
+                    "block-1",
+                ),
+                _tool_call(
+                    _SENTINEL_TOOL,
+                    {"phase": "same-response"},
+                    "sentinel-2",
+                ),
+            ]
+        ),
+        _response(content="must not be requested", finish_reason="stop"),
+    ]
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert failed_tool_result_flush is True
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["terminal_transition"]["tool_name"] == "kanban_block"
+    assert result["completed"] is True
+    assert [
+        message["tool_call_id"]
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ] == ["block-1", "sentinel-2"]
+    assert result["messages"][-1]["role"] == "assistant"
+
+
 @pytest.mark.parametrize(
     ("handler_name", "arguments", "expected_tool", "expected_status"),
     [

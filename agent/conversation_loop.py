@@ -7496,15 +7496,6 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
-                if getattr(agent, "_incremental_persistence_failed", False):
-                    # A tool result could not be made canonical. Do not send
-                    # the in-memory result back to the model or project any
-                    # later events from this turn.
-                    _turn_exit_reason = "session_persistence_failed"
-                    final_response = ""
-                    failed = True
-                    break
-
                 from agent.runtime_control import get_kanban_terminal_transition
 
                 _kanban_terminal_transition = get_kanban_terminal_transition(agent)
@@ -7516,9 +7507,11 @@ def run_conversation(
                         {"role": "assistant", "content": final_response},
                     )
                     try:
-                        agent._flush_messages_to_session_db(
+                        _terminal_closure_persisted = agent._flush_messages_to_session_db(
                             messages, conversation_history
                         )
+                        if _terminal_closure_persisted is not False:
+                            agent._incremental_persistence_failed = False
                     except Exception:
                         logger.warning(
                             "Kanban terminal transcript closure flush failed "
@@ -7527,6 +7520,15 @@ def run_conversation(
                             exc_info=True,
                         )
                     agent._session_messages = messages
+                    break
+
+                if getattr(agent, "_incremental_persistence_failed", False):
+                    # A non-terminal tool result could not be made canonical.
+                    # Do not send the in-memory result back to the model or
+                    # project any later events from this turn.
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:
