@@ -398,6 +398,45 @@ def test_segmented_terminal_fence_pairs_later_parallel_calls_after_flush_failure
     assert result["messages"][-1]["role"] == "assistant"
 
 
+def test_steer_racing_with_terminal_commit_is_discarded(worker_case, monkeypatch):
+    agent, _task_id, _run_id = worker_case
+    control = agent._runtime_control
+    original_commit = control.commit_kanban_terminal_transition
+
+    def _commit_and_steer(**kwargs):
+        committed = original_commit(**kwargs)
+        if committed:
+            assert agent.steer("continue with another provider turn") is True
+        return committed
+
+    monkeypatch.setattr(
+        control,
+        "commit_kanban_terminal_transition",
+        _commit_and_steer,
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "kanban_block",
+                    {"reason": "preflight failed"},
+                    "block-1",
+                )
+            ]
+        ),
+        _response(content="must not be requested", finish_reason="stop"),
+    ]
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["terminal_transition"]["tool_name"] == "kanban_block"
+    assert result["completed"] is True
+    assert "pending_steer" not in result
+    assert agent._pending_steer is None
+    assert result["messages"][-1]["role"] == "assistant"
+
+
 @pytest.mark.parametrize(
     ("handler_name", "arguments", "expected_tool", "expected_status"),
     [
