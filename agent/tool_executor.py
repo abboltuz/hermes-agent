@@ -1997,23 +1997,11 @@ def _append_kanban_terminal_fence_results(
                 effect_disposition="none",
             )
         )
-        _emit_terminal_post_tool_call(
-            agent,
-            function_name=name,
-            function_args={},
-            result=result,
-            effective_task_id=effective_task_id,
-            tool_call_id=tool_call_id,
-            status="cancelled",
-            error_type="kanban_terminal_transition",
-            error_message="Tool execution fenced by terminal Kanban transition",
-        )
-        if not _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"kanban terminal fence result {name}",
-        ):
-            return True
+    _flush_session_db_after_tool_progress(
+        agent,
+        messages,
+        stage="kanban terminal fence results",
+    )
     return True
 
 
@@ -2761,6 +2749,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _executor_must_emit_post_hook = (
             not _execution_blocked
             and not _execution_timed_out
+            and get_kanban_terminal_transition(agent) is None
         )
         if _executor_must_emit_post_hook:
             _emit_terminal_post_tool_call(
@@ -2839,12 +2828,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
-        if not _flush_session_db_after_tool_progress(
+        _tool_result_persisted = _flush_session_db_after_tool_progress(
             agent,
             messages,
             stage=f"tool result {function_name}",
-        ):
-            return
+        )
 
         if get_kanban_terminal_transition(agent) is not None:
             _append_kanban_terminal_fence_results(
@@ -2854,6 +2842,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 effective_task_id=effective_task_id,
             )
             break
+
+        if not _tool_result_persisted:
+            return
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
