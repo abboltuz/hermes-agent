@@ -82,3 +82,46 @@ def test_persistent_busy_at_commit_rolls_back():
         with kb.write_txn(conn):
             pass
     assert conn.count("ROLLBACK") == 1
+
+
+def test_on_commit_runs_after_durable_commit_before_integrity_check(monkeypatch):
+    conn = _FakeConn({})
+    observations = []
+
+    def _on_commit():
+        observations.append(("callback", conn.count("COMMIT")))
+
+    monkeypatch.setattr(
+        kb,
+        "_check_file_length_invariant",
+        lambda _conn: observations.append(("integrity", conn.count("COMMIT"))),
+    )
+
+    with kb.write_txn(conn, on_commit=_on_commit):
+        pass
+
+    assert observations == [("callback", 1), ("integrity", 1)]
+
+
+def test_on_commit_does_not_run_when_commit_fails():
+    conn = _FakeConn({"COMMIT": [_other()]})
+    callbacks = []
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        with kb.write_txn(conn, on_commit=lambda: callbacks.append("called")):
+            pass
+
+    assert callbacks == []
+    assert conn.count("ROLLBACK") == 1
+
+
+def test_on_commit_rejects_savepoint_semantics():
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("BEGIN")
+        with pytest.raises(RuntimeError, match="outer durable transaction"):
+            with kb.write_txn(conn, allow_nested=True, on_commit=lambda: None):
+                pass
+    finally:
+        conn.rollback()
+        conn.close()

@@ -79,7 +79,6 @@ def test_terminal_worker_finalization_skips_linger_and_memory_postwork(monkeypat
 
     assert order == [
         "flush",
-        "finalize",
         (
             "cleanup",
             {

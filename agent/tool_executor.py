@@ -732,7 +732,7 @@ def _run_agent_tool_execution_middleware(
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
 
-    def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
+    def _apply_request_pipeline(relay_args: dict[str, Any]) -> dict[str, Any]:
         request_result = apply_tool_request_middleware(
             function_name,
             relay_args,
@@ -750,6 +750,10 @@ def _run_agent_tool_execution_middleware(
         )
         trace.clear()
         trace.extend(request_result.trace)
+        return request_args
+
+    def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
+        request_args = _apply_request_pipeline(relay_args)
         return run_tool_execution_middleware(
             function_name,
             request_args,
@@ -764,18 +768,26 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    result, _relay_args = relay_tools.execute(
-        function_name,
-        function_args,
-        _hermes_pipeline,
-        session_id=str(getattr(agent, "session_id", "") or ""),
-        metadata={
-            "task_id": effective_task_id or "",
-            "turn_id": getattr(agent, "_current_turn_id", "") or "",
-            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-            "tool_call_id": tool_call_id or "",
-        },
-    )
+    if function_name in KANBAN_TERMINAL_TOOL_NAMES:
+        # A successful dispatcher-owned terminal mutation is an execution
+        # fence. Request rewrites and authorization must finish before the
+        # mutation, but callback-style execution middleware and Relay wrappers
+        # could otherwise resume arbitrary work after the durable COMMIT.
+        request_args = _apply_request_pipeline(function_args)
+        result = _authorized_dispatch(request_args)
+    else:
+        result, _relay_args = relay_tools.execute(
+            function_name,
+            function_args,
+            _hermes_pipeline,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            metadata={
+                "task_id": effective_task_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "tool_call_id": tool_call_id or "",
+            },
+        )
     return _ManagedToolResult(
         result=result,
         args=state["args"],
