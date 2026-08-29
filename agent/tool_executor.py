@@ -605,6 +605,10 @@ def _run_agent_tool_execution_middleware(
         "blocked": False,
         "dispatched": False,
     }
+    terminal_preflight = {
+        "ready": False,
+        "args": None,
+    }
     dispatch_lock = threading.Lock()
 
     def _is_exact_terminal_actor(next_args: dict[str, Any]) -> bool:
@@ -629,7 +633,14 @@ def _run_agent_tool_execution_middleware(
             )
         )
 
-    def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
+    def _advance_start_order(callback=None) -> None:
+        if begin_execution is None:
+            if callback is not None:
+                callback()
+            return
+        begin_execution(callback)
+
+    def _dispatch_after_policy(final_args: dict[str, Any]) -> Any:
         with dispatch_lock:
             if state["dispatched"]:
                 raise RuntimeError(
@@ -649,12 +660,40 @@ def _run_agent_tool_execution_middleware(
                 display_index=display_index,
             )
 
-        def _advance_start_order(callback=None) -> None:
-            if begin_execution is None:
-                if callback is not None:
-                    callback()
-                return
-            begin_execution(callback)
+        if function_name == "memory":
+            agent._turns_since_memory = 0
+        elif function_name == "skill_manage":
+            agent._iters_since_skill = 0
+
+        _advance_start_order(_begin)
+
+        # Keep the gateway turn-inactivity watchdog from abandoning a turn
+        # whose tool call runs silently for longer than the inactivity
+        # timeout (#84491): stamp activity periodically while the tool is
+        # in flight, not just at start/completion. Both the sequential and
+        # the concurrent paths funnel through here, so a single heartbeat
+        # covers every tool.
+        _hb_stop = threading.Event()
+        _hb_thread = threading.Thread(
+            target=_run_tool_activity_heartbeat,
+            args=(agent, _hb_stop, f"tool running: {function_name}"),
+            kwargs={"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S},
+            daemon=True,
+            name=f"tool-activity-hb-{function_name[:24]}",
+        )
+        _hb_thread.start()
+        try:
+            return execute(final_args)
+        finally:
+            _hb_stop.set()
+            _hb_thread.join(timeout=2.0)
+
+    def _authorized_dispatch(
+        final_args: dict[str, Any],
+        *,
+        preflight_only: bool = False,
+    ) -> Any:
+        state["args"] = final_args
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
@@ -726,33 +765,12 @@ def _run_agent_tool_execution_middleware(
             )
             return result
 
-        if function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
+        if preflight_only:
+            terminal_preflight["ready"] = True
+            terminal_preflight["args"] = final_args
+            return json.dumps({"ok": True, "terminal_preflight": True})
 
-        _advance_start_order(_begin)
-
-        # Keep the gateway turn-inactivity watchdog from abandoning a turn
-        # whose tool call runs silently for longer than the inactivity
-        # timeout (#84491): stamp activity periodically while the tool is
-        # in flight, not just at start/completion. Both the sequential and
-        # the concurrent paths funnel through here, so a single heartbeat
-        # covers every tool.
-        _hb_stop = threading.Event()
-        _hb_thread = threading.Thread(
-            target=_run_tool_activity_heartbeat,
-            args=(agent, _hb_stop, f"tool running: {function_name}"),
-            kwargs={"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S},
-            daemon=True,
-            name=f"tool-activity-hb-{function_name[:24]}",
-        )
-        _hb_thread.start()
-        try:
-            return execute(final_args)
-        finally:
-            _hb_stop.set()
-            _hb_thread.join(timeout=2.0)
+        return _dispatch_after_policy(final_args)
 
     def _apply_request_pipeline(relay_args: dict[str, Any]) -> dict[str, Any]:
         request_result = apply_tool_request_middleware(
@@ -790,15 +808,57 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
+    def _terminal_preflight_pipeline(relay_args: dict[str, Any]) -> Any:
+        request_args = _apply_request_pipeline(relay_args)
+        return run_tool_execution_middleware(
+            function_name,
+            request_args,
+            lambda next_args: _authorized_dispatch(
+                next_args if isinstance(next_args, dict) else request_args,
+                preflight_only=True,
+            ),
+            original_args=function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+
     if _is_exact_terminal_actor(function_args):
-        # A potentially successful exact-worker terminal dispatch cannot be
-        # placed inside arbitrary callback wrappers: even exception unwinding
-        # executes their ``finally`` blocks after COMMIT. All request rewrites
-        # finish first, then policy/authorization and the handler run directly.
-        # Orchestrator, foreign, and stale-run calls fail this typed authority
-        # gate and retain the complete execution-middleware/Relay pipeline.
-        request_args = _apply_request_pipeline(function_args)
-        result = _authorized_dispatch(request_args)
+        # Run every callback-style wrapper to completion as a non-mutating
+        # preflight. Relay/request/execution/pre-tool rewrites and policy all
+        # settle before a possible COMMIT, so even wrapper ``finally`` blocks
+        # are safely on the pre-commit side of the actor fence.
+        preflight_result, _relay_args = relay_tools.execute(
+            function_name,
+            function_args,
+            _terminal_preflight_pipeline,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            metadata={
+                "task_id": effective_task_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "tool_call_id": tool_call_id or "",
+                "terminal_preflight": True,
+            },
+        )
+        prepared_args = terminal_preflight["args"]
+        if terminal_preflight["ready"] and isinstance(prepared_args, dict):
+            if _is_exact_terminal_actor(prepared_args):
+                result = _dispatch_after_policy(prepared_args)
+            else:
+                result = json.dumps(
+                    {
+                        "error": (
+                            "terminal call rejected: request rewrites changed "
+                            "the dispatcher-owned task/run/session authority"
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+        else:
+            result = preflight_result
     else:
         result, _relay_args = relay_tools.execute(
             function_name,

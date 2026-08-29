@@ -526,14 +526,20 @@ def test_terminal_tools_bypass_post_dispatch_middleware_and_relay(
         try:
             return terminal_call(args)
         finally:
-            if tool_name == "kanban_block":
+            if (
+                tool_name == "kanban_block"
+                and agent._runtime_control.kanban_terminal_transition is not None
+            ):
                 middleware_after_dispatch.append(tool_name)
 
     def _relay_wrapper(tool_name, args, callback, **_kwargs):
         try:
             return callback(args), args
         finally:
-            if tool_name == "kanban_block":
+            if (
+                tool_name == "kanban_block"
+                and agent._runtime_control.kanban_terminal_transition is not None
+            ):
                 relay_after_dispatch.append(tool_name)
 
     monkeypatch.setattr(middleware, "run_tool_execution_middleware", _execution_wrapper)
@@ -549,6 +555,100 @@ def test_terminal_tools_bypass_post_dispatch_middleware_and_relay(
     assert result["terminal_transition"]["tool_name"] == "kanban_block"
     assert middleware_after_dispatch == []
     assert relay_after_dispatch == []
+
+
+def test_request_rewrite_to_foreign_task_returns_to_rejected_pipeline(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, _run_id = worker_case
+    from agent import relay_tools
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import middleware
+
+    conn = kb.connect()
+    try:
+        foreign_id = kb.create_task(conn, title="foreign rewrite", assignee="other")
+    finally:
+        conn.close()
+
+    middleware_after_dispatch = []
+    relay_after_dispatch = []
+
+    monkeypatch.setattr(
+        middleware,
+        "apply_tool_request_middleware",
+        lambda _name, args, **_kwargs: SimpleNamespace(
+            payload={**args, "task_id": foreign_id},
+            trace=[],
+        ),
+    )
+
+    def _execution_wrapper(tool_name, args, terminal_call, **_kwargs):
+        result = terminal_call(args)
+        middleware_after_dispatch.append(tool_name)
+        return result
+
+    def _relay_wrapper(tool_name, args, callback, **_kwargs):
+        result = callback(args)
+        relay_after_dispatch.append(tool_name)
+        return result, args
+
+    monkeypatch.setattr(middleware, "run_tool_execution_middleware", _execution_wrapper)
+    monkeypatch.setattr(relay_tools, "execute", _relay_wrapper)
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call("kanban_block", {"reason": "rewritten"}, "block-1")
+            ]
+        ),
+        _response(content="rewrite rejected", finish_reason="stop"),
+    ]
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert result["final_response"] == "rewrite rejected"
+    assert "terminal_transition" not in result
+    assert middleware_after_dispatch == ["kanban_block"]
+    assert relay_after_dispatch == ["kanban_block"]
+
+
+def test_relay_rewrite_runs_before_exact_terminal_authority_decision(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, _run_id = worker_case
+    from agent import relay_tools
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        foreign_id = kb.create_task(conn, title="relay foreign", assignee="other")
+    finally:
+        conn.close()
+
+    relay_calls = []
+
+    def _relay_rewrite(tool_name, args, callback, **_kwargs):
+        relay_calls.append(tool_name)
+        rewritten = {**args, "task_id": foreign_id}
+        return callback(rewritten), rewritten
+
+    monkeypatch.setattr(relay_tools, "execute", _relay_rewrite)
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[
+                _tool_call("kanban_block", {"reason": "relay rewrite"}, "block-1")
+            ]
+        ),
+        _response(content="relay rewrite rejected", finish_reason="stop"),
+    ]
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert result["final_response"] == "relay rewrite rejected"
+    assert "terminal_transition" not in result
+    assert relay_calls == ["kanban_block"]
 
 
 @pytest.mark.parametrize(
