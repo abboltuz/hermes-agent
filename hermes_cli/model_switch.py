@@ -2404,6 +2404,16 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
         list(executor.map(_fetch_one, stale_slugs))
 
 
+def _has_cursor_credentials() -> bool:
+    """Return whether the active profile has a usable Cursor credential."""
+    try:
+        from agent.cursor_sdk_auth import resolve_cursor_api_key
+
+        return bool(resolve_cursor_api_key()[0])
+    except Exception:
+        return False
+
+
 def _collect_authed_provider_slugs(
     models_dev_data: dict,
     curated: dict[str, list[str]],
@@ -2507,6 +2517,8 @@ def _collect_authed_provider_slugs(
                 has_creds = has_vertex_credentials()
             except Exception:
                 pass
+        elif hermes_slug == "cursor":
+            has_creds = _has_cursor_credentials()
         elif overlay.extra_env_vars:
             has_creds = any(_scoped_key_env(ev) for ev in overlay.extra_env_vars)
         if not has_creds and overlay.auth_type == "api_key":
@@ -2964,6 +2976,8 @@ def list_authenticated_providers(
                 has_creds = has_vertex_credentials()
             except Exception as exc:
                 logger.debug("Vertex credential check failed: %s", exc)
+        elif hermes_slug == "cursor":
+            has_creds = _has_cursor_credentials()
         elif overlay.extra_env_vars:
             has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
@@ -3133,8 +3147,8 @@ def list_authenticated_providers(
 
         # Check credentials via PROVIDER_REGISTRY (auth.py)
         _cp_config = _auth_registry.get(_cp.slug)
-        _cp_has_creds = False
-        if _cp_config and _cp_config.api_key_env_vars:
+        _cp_has_creds = _has_cursor_credentials() if _cp.slug == "cursor" else False
+        if not _cp_has_creds and _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
         if not _cp_has_creds:

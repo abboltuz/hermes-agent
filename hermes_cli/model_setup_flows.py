@@ -709,6 +709,65 @@ def _model_flow_openai_codex(config, current_model=""):
     else:
         print("No change.")
 
+def _model_flow_cursor(config, current_model=""):
+    """Cursor subscription provider: authenticate, verify bridge, pick live model."""
+    del config
+    from hermes_cli.auth import _prompt_model_selection, _save_model_choice, _update_config_for_provider
+    from agent.cursor_sdk_auth import login, resolve_cursor_api_key
+    from agent.cursor_bridge_client import CursorBridgeClient
+    from agent.cursor_bridge_transport import download_bridge, resolve_bridge_command
+
+    api_key, _ = resolve_cursor_api_key()
+    if api_key:
+        print("  Cursor credentials: ✓")
+        choice = _prompt_auth_credentials_choice("Cursor credentials:")
+        if choice == "cancel":
+            return
+        if choice == "reauth":
+            api_key = ""
+    if not api_key:
+        print("Not logged into Cursor. Starting browser login...")
+        try:
+            login(on_login_url=lambda url: print("Open this Cursor login URL in your browser:\n" + url))
+        except (KeyboardInterrupt, SystemExit):
+            print("Login cancelled or failed.")
+            return
+        except Exception as exc:
+            print(f"Login failed: {exc}")
+            return
+        api_key, _ = resolve_cursor_api_key()
+    if not api_key:
+        print("Cursor login did not produce a usable credential.")
+        return
+    command = resolve_bridge_command()
+    if not command:
+        print("Cursor SDK bridge is not installed; downloading the verified release...")
+        try:
+            command = download_bridge(progress=True)
+        except Exception as exc:
+            print(f"Bridge installation failed: {exc}")
+            return
+    try:
+        client = CursorBridgeClient(api_key=api_key, bridge_command=command)
+        try:
+            models = client.list_models()
+        finally:
+            client.close()
+    except Exception as exc:
+        print(f"Could not load live Cursor models: {exc}")
+        return
+    model_ids = [str(item.get("id") or "").strip() for item in models if isinstance(item, dict)]
+    model_ids = [model_id for model_id in model_ids if model_id] or ["auto"]
+    selected = _prompt_model_selection(model_ids, current_model=current_model,
+        confirm_provider="cursor", confirm_base_url="sdkbridge://cursor", confirm_api_key=api_key)
+    if selected:
+        _save_model_choice(selected)
+        _update_config_for_provider("cursor", "sdkbridge://cursor")
+        print(f"Default model set to: {selected} (via Cursor)")
+    else:
+        print("No change.")
+
+
 def _model_flow_xai_oauth(_config, current_model="", *, args=None):
     """xAI Grok OAuth (SuperGrok / Premium+) provider: ensure logged in, then pick model."""
     from hermes_cli.auth import (

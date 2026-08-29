@@ -262,6 +262,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="oauth_external",
         inference_base_url=DEFAULT_CODEX_BASE_URL,
     ),
+    "cursor": ProviderConfig(
+        id="cursor",
+        name="Cursor",
+        auth_type="external_process",
+        inference_base_url="sdkbridge://cursor",
+        api_key_env_vars=("CURSOR_API_KEY",),
+    ),
     "openai-api": ProviderConfig(
         id="openai-api",
         name="OpenAI API",
@@ -2127,6 +2134,13 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
             auth_store["credential_pool"] = pool
 
         cleared = False
+        if target == "cursor":
+            try:
+                from agent.cursor_sdk_auth import clear_sdk_credentials
+
+                cleared = clear_sdk_credentials()
+            except Exception:
+                pass
         if target in providers:
             del providers[target]
             cleared = True
@@ -7309,6 +7323,37 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
+    if target == "cursor":
+        try:
+            from agent.cursor_sdk_auth import (
+                read_sdk_credentials,
+                resolve_cursor_api_key,
+                sdk_auth_path,
+            )
+            from agent.cursor_bridge_transport import resolve_bridge_command
+            api_key, source = resolve_cursor_api_key()
+            stored = read_sdk_credentials() or {}
+            source_label = (
+                "CURSOR_API_KEY"
+                if source == "env"
+                else str(sdk_auth_path()) if source else ""
+            )
+            return {
+                "provider": target,
+                "logged_in": bool(api_key),
+                "configured": bool(api_key),
+                "credential_source": source,
+                "source": "env_var" if source == "env" else source,
+                "source_label": source_label,
+                "auth_store": str(sdk_auth_path()),
+                "email": stored.get("email", ""),
+                "expires_at": stored.get("apiKeyExpiresAtMs"),
+                "bridge_available": bool(resolve_bridge_command()),
+                "base_url": "sdkbridge://cursor",
+            }
+        except Exception as exc:
+            return {"provider": target, "logged_in": False, "configured": False,
+                    "error": type(exc).__name__, "base_url": "sdkbridge://cursor"}
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
     # API-key providers
@@ -7492,6 +7537,33 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             provider=provider_id,
             code="invalid_provider",
         )
+
+    if provider_id == "cursor":
+        from agent.cursor_sdk_auth import resolve_cursor_api_key
+        from agent.cursor_bridge_transport import resolve_bridge_command
+
+        api_key, source = resolve_cursor_api_key()
+        command = resolve_bridge_command()
+        if not api_key:
+            raise AuthError(
+                "No Cursor account credential is available. Run `hermes cursor login`.",
+                provider=provider_id,
+                code="missing_cursor_credentials",
+            )
+        if not command:
+            raise AuthError(
+                "Cursor SDK bridge is not installed.",
+                provider=provider_id,
+                code="missing_cursor_bridge",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": api_key,
+            "base_url": pconfig.inference_base_url,
+            "command": command,
+            "args": [],
+            "source": source,
+        }
 
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:

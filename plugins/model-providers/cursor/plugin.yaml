@@ -1,0 +1,5 @@
+name: cursor
+kind: model-provider
+version: 1.0.0
+description: Cursor subscription — runs Hermes turns through the official Cursor SDK bridge (sdk.v1), billed to the user's own Cursor account
+author: Cekasha

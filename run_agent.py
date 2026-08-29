@@ -5538,7 +5538,7 @@ class AIAgent:
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
-        """Cross-thread abort: shut sockets down without releasing FDs.
+        """Cross-thread abort for HTTP pools and explicit process clients.
 
         Companion to :meth:`_close_request_openai_client` for stranger-thread
         callers (interrupt-check loop, stale-call detector). Calling
@@ -5546,10 +5546,12 @@ class AIAgent:
         connection raced the still-live SSL BIO and corrupted unrelated file
         descriptors when the kernel recycled the just-freed TCP FD (#29507).
 
-        Here we only ``shutdown(SHUT_RDWR)`` the pool's sockets. That unblocks
-        the owning worker thread's pending ``recv``/``send`` with an EOF or
-        ``EPIPE`` so it can unwind and close ``client`` from its own context
-        — which is where the FD release belongs.
+        Clients that explicitly advertise ``supports_abort_inflight is True``
+        own a non-http transport and receive their safe process-level abort
+        hook. All other clients only ``shutdown(SHUT_RDWR)`` their pool sockets.
+        That unblocks the owning worker thread's pending ``recv``/``send`` with
+        an EOF or ``EPIPE`` so it can unwind and close ``client`` from its own
+        context — which is where the FD release belongs.
         """
         if client is None:
             return
@@ -5561,6 +5563,19 @@ class AIAgent:
             if cache["client"] is client:
                 cache["poisoned"] = True
         try:
+            abort_inflight = getattr(client, "abort_inflight", None)
+            if (
+                getattr(client, "supports_abort_inflight", False) is True
+                and callable(abort_inflight)
+            ):
+                abort_inflight()
+                logger.info(
+                    "Request client aborted (%s, shared=False, custom_abort=True, "
+                    "deferred_close=stranger_thread) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+                return
             shutdown_count = self._force_close_tcp_sockets(client)
             # tcp_force_closed=0 means the stranger-thread abort found no
             # sockets to shut down — the worker stays blocked in recv and the
