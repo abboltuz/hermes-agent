@@ -152,6 +152,7 @@ def finalize_turn(
     )
     budget_fallback_eligible = (
         budget_exhausted
+        and kanban_terminal_transition is None
         and not interrupted
         and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
@@ -211,7 +212,7 @@ def finalize_turn(
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
-    elif budget_exhausted:
+    elif budget_exhausted and kanban_terminal_transition is None:
         # Bounded fallback (#87096): budget was exhausted but none of the
         # normal fallback paths were eligible (interrupted / failed /
         # anomalous exit_reason). If running as a kanban worker we must
@@ -232,7 +233,8 @@ def finalize_turn(
         final_response is not None
         and not failed
         and (
-            api_call_count < agent.max_iterations
+            kanban_terminal_transition is not None
+            or api_call_count < agent.max_iterations
             or normal_text_response
         )
     )
