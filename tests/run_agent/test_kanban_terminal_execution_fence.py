@@ -651,6 +651,66 @@ def test_relay_rewrite_runs_before_exact_terminal_authority_decision(
     assert relay_calls == ["kanban_block"]
 
 
+def test_foreign_to_exact_rewrite_cannot_commit_inside_wrapper_finally(
+    worker_case,
+    monkeypatch,
+):
+    agent, task_id, _run_id = worker_case
+    from agent import relay_tools
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import middleware
+
+    conn = kb.connect()
+    try:
+        foreign_id = kb.create_task(conn, title="foreign source", assignee="other")
+    finally:
+        conn.close()
+
+    middleware_post_commit = []
+    relay_post_commit = []
+
+    monkeypatch.setattr(
+        middleware,
+        "apply_tool_request_middleware",
+        lambda _name, args, **_kwargs: SimpleNamespace(
+            payload={**args, "task_id": task_id},
+            trace=[],
+        ),
+    )
+
+    def _execution_wrapper(tool_name, args, terminal_call, **_kwargs):
+        try:
+            return terminal_call(args)
+        finally:
+            if agent._runtime_control.kanban_terminal_transition is not None:
+                middleware_post_commit.append(tool_name)
+
+    def _relay_wrapper(tool_name, args, callback, **_kwargs):
+        try:
+            return callback(args), args
+        finally:
+            if agent._runtime_control.kanban_terminal_transition is not None:
+                relay_post_commit.append(tool_name)
+
+    monkeypatch.setattr(middleware, "run_tool_execution_middleware", _execution_wrapper)
+    monkeypatch.setattr(relay_tools, "execute", _relay_wrapper)
+    agent.client.chat.completions.create.return_value = _response(
+        tool_calls=[
+            _tool_call(
+                "kanban_block",
+                {"task_id": foreign_id, "reason": "rewritten to owned task"},
+                "block-1",
+            )
+        ]
+    )
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert result["terminal_transition"]["task_id"] == task_id
+    assert middleware_post_commit == []
+    assert relay_post_commit == []
+
+
 @pytest.mark.parametrize(
     ("handler_name", "arguments", "expected_tool", "expected_status"),
     [
