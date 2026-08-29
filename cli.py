@@ -1172,7 +1172,11 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
         pass  # never let the backstop break signal handling
 
 
-def _run_cleanup(*, notify_session_finalize: bool = True):
+def _run_cleanup(
+    *,
+    notify_session_finalize: bool = True,
+    skip_memory_provider: bool = False,
+):
     """Run resource cleanup exactly once."""
     global _cleanup_done, _cleanup_in_progress
     if _cleanup_done:
@@ -1235,7 +1239,11 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
                     reason="shutdown",
                 )
         try:
-            if _active_agent_ref and hasattr(_active_agent_ref, 'shutdown_memory_provider'):
+            if (
+                not skip_memory_provider
+                and _active_agent_ref
+                and hasattr(_active_agent_ref, 'shutdown_memory_provider')
+            ):
                 # A /new shortly before exit leaves its end→switch boundary task
                 # (old-session extraction, LLM-bound) queued on the memory
                 # manager's serialized worker. shutdown_all()'s drain only waits
@@ -1456,8 +1464,30 @@ def _wait_for_oneshot_background_completions(cli) -> None:
         )
 
 
+def _kanban_terminal_transition_for_cli(cli):
+    """Return the typed actor transition attached to a CLI's active agent."""
+    try:
+        from agent.runtime_control import get_kanban_terminal_transition
+
+        return get_kanban_terminal_transition(getattr(cli, "agent", None))
+    except Exception:
+        return None
+
+
+def _should_run_kanban_goal_loop(result) -> bool:
+    """Keep goal-mode continuation behind the terminal-result boundary."""
+    return (
+        os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+        and not (
+            isinstance(result, dict)
+            and isinstance(result.get("terminal_transition"), dict)
+        )
+    )
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
+    terminal_transition = _kanban_terminal_transition_for_cli(cli)
     try:
         # Linger (bounded) for background processes the turn spawned with
         # notify_on_complete=true BEFORE any teardown. The one-shot parent
@@ -1466,10 +1496,11 @@ def _finalize_single_query(cli) -> None:
         # short-lived `hermes -p <bot> chat -Q` recipient (message_agent /
         # bot_relay spawns) are exactly this shape and were silently
         # destroyed on parent exit (#90879).
-        try:
-            _wait_for_oneshot_background_completions(cli)
-        except Exception:
-            logger.debug("one-shot background completion wait failed", exc_info=True)
+        if terminal_transition is None:
+            try:
+                _wait_for_oneshot_background_completions(cli)
+            except Exception:
+                logger.debug("one-shot background completion wait failed", exc_info=True)
         # Durable flush FIRST: memory-provider shutdown inside _run_cleanup
         # can issue aux-LLM calls, and nothing after it may fail in a way
         # that loses the turn (#88583).
@@ -1478,7 +1509,10 @@ def _finalize_single_query(cli) -> None:
         except Exception:
             logger.debug("one-shot session store flush failed", exc_info=True)
         _notify_single_query_session_finalize(cli)
-        _run_cleanup(notify_session_finalize=False)
+        _run_cleanup(
+            notify_session_finalize=False,
+            skip_memory_provider=terminal_transition is not None,
+        )
     finally:
         cli._release_active_session()
 
@@ -21781,7 +21815,7 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        if _should_run_kanban_goal_loop(result):
                             try:
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
