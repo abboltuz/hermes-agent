@@ -7505,6 +7505,30 @@ def run_conversation(
                     failed = True
                     break
 
+                from agent.runtime_control import get_kanban_terminal_transition
+
+                _kanban_terminal_transition = get_kanban_terminal_transition(agent)
+                if _kanban_terminal_transition is not None:
+                    _turn_exit_reason = _kanban_terminal_transition.exit_reason()
+                    final_response = _kanban_terminal_transition.closure_message()
+                    append_message(
+                        messages,
+                        {"role": "assistant", "content": final_response},
+                    )
+                    try:
+                        agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Kanban terminal transcript closure flush failed "
+                            "(session=%s)",
+                            getattr(agent, "session_id", None) or "none",
+                            exc_info=True,
+                        )
+                    agent._session_messages = messages
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

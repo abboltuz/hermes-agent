@@ -212,6 +212,28 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _commit_actor_terminal_transition(
+    kw: dict,
+    *,
+    tool_name: str,
+    task_id: str,
+    run_id: Optional[int],
+    status: str,
+) -> None:
+    """Arm typed runtime control after an exact-run DB mutation succeeds."""
+    control = kw.get("runtime_control")
+    commit = getattr(control, "commit_kanban_terminal_transition", None)
+    if not callable(commit):
+        return
+    commit(
+        tool_name=tool_name,
+        task_id=task_id,
+        run_id=run_id,
+        session_id=str(kw.get("session_id") or ""),
+        status=status,
+    )
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -804,6 +826,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            expected_run_id = _worker_run_id(tid)
+            _commit_actor_terminal_transition(
+                kw,
+                tool_name="kanban_complete",
+                task_id=tid,
+                run_id=expected_run_id,
+                status="done",
+            )
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -880,6 +910,14 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
+            expected_run_id = _worker_run_id(tid)
+            _commit_actor_terminal_transition(
+                kw,
+                tool_name="kanban_block",
+                task_id=tid,
+                run_id=expected_run_id,
+                status=landed.status if landed else "blocked",
+            )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -959,6 +997,14 @@ def _handle_request_review(args: dict, **kw) -> str:
                 )
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
+            expected_run_id = _worker_run_id(tid)
+            _commit_actor_terminal_transition(
+                kw,
+                tool_name="kanban_request_review",
+                task_id=tid,
+                run_id=expected_run_id,
+                status=landed.status if landed else "review",
+            )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -1006,6 +1052,14 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 )
             landed = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
+            expected_run_id = _worker_run_id(tid)
+            _commit_actor_terminal_transition(
+                kw,
+                tool_name="kanban_request_changes",
+                task_id=tid,
+                run_id=expected_run_id,
+                status=landed.status if landed else "ready",
+            )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
