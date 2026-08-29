@@ -2923,13 +2923,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # only receives this batch after all calls finish, and an early drain can
     # be discarded when aggregate budget enforcement replaces a tool result.
     num_tools_seq = len(assistant_message.tool_calls)
-    if finalize and num_tools_seq > 0:
+    if (
+        finalize
+        and num_tools_seq > 0
+        and get_kanban_terminal_transition(agent) is None
+    ):
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
     # applied to sequential execution as well.
-    if finalize and num_tools_seq > 0:
+    if (
+        finalize
+        and num_tools_seq > 0
+        and get_kanban_terminal_transition(agent) is None
+    ):
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
@@ -2966,6 +2974,19 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
     for segment_index, (kind, calls) in enumerate(segments):
+        if get_kanban_terminal_transition(agent) is not None:
+            remaining_calls = [
+                call
+                for _remaining_kind, segment_calls in segments[segment_index:]
+                for call in segment_calls
+            ]
+            _append_kanban_terminal_fence_results(
+                agent,
+                messages,
+                remaining_calls,
+                effective_task_id=effective_task_id,
+            )
+            break
         if getattr(agent, "_incremental_persistence_failed", False):
             return
 
@@ -2981,9 +3002,6 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 finalize=False,
             )
 
-        if getattr(agent, "_incremental_persistence_failed", False):
-            return
-
         if get_kanban_terminal_transition(agent) is not None:
             remaining_calls = [
                 call
@@ -2998,9 +3016,12 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             )
             break
 
+        if getattr(agent, "_incremental_persistence_failed", False):
+            return
+
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)
-    if total_tools > 0:
+    if total_tools > 0 and get_kanban_terminal_transition(agent) is None:
         _tool_budget = _budget_for_agent(agent)
         enforce_turn_budget(
             messages[-total_tools:],

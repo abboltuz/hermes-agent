@@ -273,6 +273,7 @@ def test_terminal_on_iteration_limit_is_truthful_without_failure_fallback(
 
 def test_terminal_boundary_suppresses_generic_post_tool_hooks(worker_case):
     agent, _task_id, _run_id = worker_case
+    agent._apply_pending_steer_to_tool_results = MagicMock()
     agent.client.chat.completions.create.return_value = _response(
         tool_calls=[
             _tool_call("kanban_block", {"reason": "preflight failed"}, "block-1"),
@@ -289,6 +290,8 @@ def test_terminal_boundary_suppresses_generic_post_tool_hooks(worker_case):
     assert result["terminal_transition"]["tool_name"] == "kanban_block"
     hook_names = [call.args[0] for call in invoke_hook.call_args_list if call.args]
     assert "post_tool_call" not in hook_names
+    assert "transform_tool_result" not in hook_names
+    agent._apply_pending_steer_to_tool_results.assert_not_called()
 
 
 def test_terminal_transition_wins_when_tool_result_persistence_initially_fails(
@@ -339,6 +342,59 @@ def test_terminal_transition_wins_when_tool_result_persistence_initially_fails(
         for message in result["messages"]
         if message.get("role") == "tool"
     ] == ["block-1", "sentinel-2"]
+    assert result["messages"][-1]["role"] == "assistant"
+
+
+def test_segmented_terminal_fence_pairs_later_parallel_calls_after_flush_failure(
+    worker_case,
+    monkeypatch,
+):
+    agent, _task_id, _run_id = worker_case
+    from tools.registry import registry
+
+    agent.valid_tool_names.add("read_file")
+    dispatched_reads = []
+    original_dispatch = registry.dispatch
+
+    def _dispatch(name, args, **kwargs):
+        if name == "read_file":
+            dispatched_reads.append(dict(args))
+        return original_dispatch(name, args, **kwargs)
+
+    monkeypatch.setattr(registry, "dispatch", _dispatch)
+    failed_tool_result_flush = False
+
+    def _flush(messages, *_args, **_kwargs):
+        nonlocal failed_tool_result_flush
+        if (
+            not failed_tool_result_flush
+            and messages
+            and messages[-1].get("role") == "tool"
+        ):
+            failed_tool_result_flush = True
+            agent._last_persistence_error_cause = "locked"
+            return False
+        return True
+
+    agent._flush_messages_to_session_db = _flush
+    agent.client.chat.completions.create.return_value = _response(
+        tool_calls=[
+            _tool_call("kanban_block", {"reason": "preflight failed"}, "block-1"),
+            _tool_call("read_file", {"path": "/tmp/one"}, "read-2"),
+            _tool_call("read_file", {"path": "/tmp/two"}, "read-3"),
+        ]
+    )
+
+    result = agent.run_conversation("perform the worker task")
+
+    assert failed_tool_result_flush is True
+    assert dispatched_reads == []
+    assert result["terminal_transition"]["tool_name"] == "kanban_block"
+    assert [
+        message["tool_call_id"]
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ] == ["block-1", "read-2", "read-3"]
     assert result["messages"][-1]["role"] == "assistant"
 
 

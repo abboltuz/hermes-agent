@@ -1536,18 +1536,25 @@ def handle_function_call(
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
-        _emit_post_tool_call_hook(
-            function_name=function_name,
-            function_args=function_args,
-            result=result,
-            task_id=task_id,
-            session_id=session_id,
-            tool_call_id=tool_call_id,
-            turn_id=turn_id,
-            api_request_id=api_request_id,
-            duration_ms=duration_ms,
-            middleware_trace=list(_tool_middleware_trace),
+        from agent.runtime_control import RuntimeControl
+
+        _terminal_transition_committed = (
+            isinstance(runtime_control, RuntimeControl)
+            and runtime_control.kanban_terminal_transition is not None
         )
+        if not _terminal_transition_committed:
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=duration_ms,
+                middleware_trace=list(_tool_middleware_trace),
+            )
 
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
@@ -1559,7 +1566,10 @@ def handle_function_call(
         # field derivation and the payload dispatch.
         try:
             from hermes_cli.lifecycle import has_hook, invoke_hook
-            if has_hook("transform_tool_result"):
+            if (
+                not _terminal_transition_committed
+                and has_hook("transform_tool_result")
+            ):
                 status, error_type, error_message = _tool_result_observer_fields(
                     function_name,
                     result,
