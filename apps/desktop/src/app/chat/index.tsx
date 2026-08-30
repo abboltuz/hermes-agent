@@ -344,6 +344,14 @@ function ChatRuntimeBoundary({
 // Memoized: the tile caller (session-tile.tsx) and the contrib surface re-render
 // on idle ticks unrelated to the chat; with stable callback props (hoisted to
 // useCallback at the call sites) memo() lets the whole chat shell skip those.
+const CURSOR_MODEL_CATALOG_REFRESH_MS = 5 * 60 * 1000
+
+function modelOptionsIncludeConfiguredCursor(data: ModelOptionsResponse | undefined): boolean {
+  return Boolean(
+    data?.providers?.some(provider => provider.slug === 'cursor' && provider.authenticated !== false)
+  )
+}
+
 export const ChatView = memo(function ChatView(props: ChatViewProps) {
   const composerSurfaceId = useId()
 
@@ -526,7 +534,13 @@ const ChatViewContent = memo(function ChatViewContent({
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
     queryKey: modelOptionsQueryKey(activeGatewayProfile, activeSessionId),
     queryFn: () => requestModelOptions({ gateway: gateway || undefined, sessionId: activeSessionId }),
-    enabled: gatewayOpen
+    enabled: gatewayOpen,
+    refetchInterval: query =>
+      isPrimary && modelOptionsIncludeConfiguredCursor(query.state.data) ? CURSOR_MODEL_CATALOG_REFRESH_MS : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: query => isPrimary && modelOptionsIncludeConfiguredCursor(query.state.data),
+    staleTime: query =>
+      modelOptionsIncludeConfiguredCursor(query.state.data) ? CURSOR_MODEL_CATALOG_REFRESH_MS : 60_000
   })
 
   const quickModels = useMemo(

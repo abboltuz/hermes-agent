@@ -1,10 +1,12 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { focusManager, QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { atom } from 'nanostores'
 import { useState } from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
+import { requestModelOptions } from '@/lib/model-options'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -19,6 +21,9 @@ import {
   $selectedStoredSessionId,
   $sessions
 } from '@/store/session'
+import type { ModelOptionsResponse } from '@/types/hermes'
+
+import { type SessionView, SessionViewProvider } from './session-view'
 
 const threadRenderCount = vi.hoisted(() => ({ current: 0 }))
 
@@ -160,5 +165,216 @@ describe('ChatView render isolation', () => {
     // memo(ChatView) with stable props must absorb the parent's idle tick —
     // the transcript (Thread) must not re-render. This is PR #38470's contract.
     expect(threadRenderCount.current).toBe(1)
+  })
+})
+
+const CURSOR_CATALOG_MS = 5 * 60 * 1000
+
+const cursorModelOptions: ModelOptionsResponse = {
+  providers: [{ authenticated: true, models: ['auto'], name: 'Cursor', slug: 'cursor' }]
+}
+
+const openrouterModelOptions: ModelOptionsResponse = {
+  providers: [{ authenticated: true, models: ['openrouter-model'], name: 'OpenRouter', slug: 'openrouter' }]
+}
+
+function chatViewProps() {
+  return {
+    gateway: null,
+    maxVoiceRecordingSeconds: 120,
+    onAddContextRef: vi.fn(),
+    onAddUrl: vi.fn(),
+    onAttachDroppedItems: vi.fn(),
+    onAttachImageBlob: vi.fn(),
+    onBranchInNewChat: vi.fn(),
+    onCancel: vi.fn(),
+    onDeleteSelectedSession: vi.fn(),
+    onEdit: vi.fn(),
+    onPasteClipboardImage: vi.fn(),
+    onPickFiles: vi.fn(),
+    onPickFolders: vi.fn(),
+    onPickImages: vi.fn(),
+    onReload: vi.fn(),
+    onRemoveAttachment: vi.fn(),
+    onRetryResume: vi.fn(),
+    onSteer: vi.fn(),
+    onSubmit: vi.fn(),
+    onThreadMessagesChange: vi.fn(),
+    onToggleSelectedPin: vi.fn(),
+    onTranscribeAudio: vi.fn()
+  }
+}
+
+function tileSessionView(): SessionView {
+  return {
+    kind: 'tile',
+    $awaitingResponse: atom(false),
+    $busy: atom(false),
+    $cwd: atom(''),
+    $fast: atom(false),
+    $lastVisibleIsUser: atom(false),
+    $messages: atom([]),
+    $messagesEmpty: atom(true),
+    $model: atom('auto'),
+    $provider: atom('cursor'),
+    $reasoningEffort: atom(''),
+    $runtimeId: atom('tile-runtime'),
+    $storedId: atom('tile-stored'),
+    $turnStartedAt: atom(null)
+  }
+}
+
+function resetChatStores() {
+  $activeSessionId.set('runtime-1')
+  $awaitingResponse.set(false)
+  $busy.set(false)
+  $contextSuggestions.set([])
+  $currentCwd.set('/work')
+  $currentModel.set('test-model')
+  $currentProvider.set('test-provider')
+  $freshDraftReady.set(false)
+  $messages.set([assistantMessage('assistant-1', 'Stable historical answer')])
+  $selectedStoredSessionId.set('stored-1')
+  $sessions.set([{ id: 'stored-1', message_count: 1, title: 'Stable chat' } as never])
+}
+
+async function flushQuery() {
+  await act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+}
+
+function renderChatView({
+  tile = false
+}: {
+  tile?: boolean
+} = {}) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: 60_000 } }
+  })
+
+  const view = tile ? tileSessionView() : undefined
+
+  const tree = (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/stored-1']}>
+        {view ? (
+          <SessionViewProvider value={view}>
+            <ChatView {...chatViewProps()} />
+          </SessionViewProvider>
+        ) : (
+          <ChatView {...chatViewProps()} />
+        )}
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+
+  return { queryClient, ...render(tree) }
+}
+
+describe('ChatView Cursor model catalog revalidation', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    focusManager.setFocused(true)
+    resetChatStores()
+    $gatewayState.set('open')
+    vi.mocked(requestModelOptions).mockReset()
+    vi.mocked(requestModelOptions).mockResolvedValue(cursorModelOptions)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    focusManager.setFocused(undefined)
+    $activeSessionId.set(null)
+    $awaitingResponse.set(false)
+    $busy.set(false)
+    $contextSuggestions.set([])
+    $currentCwd.set('')
+    $currentModel.set('')
+    $currentProvider.set('')
+    $freshDraftReady.set(false)
+    $gatewayState.set('idle')
+    $messages.set([])
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+  })
+
+  it('does not fire an extra primary request until the five-minute Cursor boundary', async () => {
+    renderChatView()
+    await flushQuery()
+
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(requestModelOptions).mock.calls[0]?.[0]).not.toEqual(expect.objectContaining({ refresh: true }))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CURSOR_CATALOG_MS - 1)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(requestModelOptions).mock.calls[1]?.[0]).not.toEqual(expect.objectContaining({ refresh: true }))
+  })
+
+  it('does not start a five-minute interval when the payload has no Cursor provider', async () => {
+    vi.mocked(requestModelOptions).mockResolvedValue(openrouterModelOptions)
+    renderChatView()
+    await flushQuery()
+
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CURSOR_CATALOG_MS)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not poll from a non-primary ChatView even when Cursor is configured', async () => {
+    renderChatView({ tile: true })
+    await flushQuery()
+
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CURSOR_CATALOG_MS)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops polling after unmount and refetches a stale primary query on focus', async () => {
+    const { unmount } = renderChatView()
+    await flushQuery()
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+
+    unmount()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CURSOR_CATALOG_MS)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+
+    renderChatView()
+    await flushQuery()
+    expect(requestModelOptions).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CURSOR_CATALOG_MS)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(3)
+
+    focusManager.setFocused(false)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CURSOR_CATALOG_MS)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(3)
+
+    await act(async () => {
+      focusManager.setFocused(true)
+    })
+    await flushQuery()
+    expect(requestModelOptions).toHaveBeenCalledTimes(4)
   })
 })
