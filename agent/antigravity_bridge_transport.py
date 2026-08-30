@@ -10,6 +10,7 @@ import re
 import secrets
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,7 +75,7 @@ class AntigravityBridgeProcess:
         self.command = command
         self.startup_timeout = startup_timeout
         self.auth_token = secrets.token_urlsafe(32)
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen[Any] | None = None
         self.endpoint: AntigravityBridgeEndpoint | None = None
         self._stop_lock = threading.Lock()
 
@@ -87,7 +88,7 @@ class AntigravityBridgeProcess:
         try:
             self._process = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env,
+                stderr=subprocess.PIPE, text=False, env=env,
             )
             atexit.register(self.stop)
         except OSError as exc:
@@ -95,24 +96,36 @@ class AntigravityBridgeProcess:
         assert self._process.stdout is not None
         ready: queue.Queue[dict[str, Any] | Exception] = queue.Queue(maxsize=1)
 
+        process = self._process
+
         def scan() -> None:
-            assert self._process is not None and self._process.stdout is not None
-            for raw in self._process.stdout:
-                try:
-                    payload = parse_antigravity_ready(raw.rstrip("\r\n"))
-                except Exception as exc:
-                    ready.put(exc)
+            assert process is not None and process.stdout is not None
+            line = bytearray()
+            deadline = time.monotonic() + self.startup_timeout
+            while time.monotonic() < deadline:
+                raw = process.stdout.read(1)
+                if not raw:
+                    ready.put(AntigravityBridgeError("bridge exited before readiness"))
                     return
-                if payload is not None:
-                    ready.put(payload)
-                    for _ in self._process.stdout:
-                        pass
+                line.extend(raw)
+                if len(line) > MAX_READY_LINE_BYTES:
+                    ready.put(AntigravityBridgeError("bridge readiness line exceeds size limit"))
                     return
-            ready.put(AntigravityBridgeError("bridge exited before readiness"))
+                if raw in (b"\n", b"\r"):
+                    try:
+                        payload = parse_antigravity_ready(line.decode("utf-8", "replace").rstrip("\r\n"))
+                    except Exception as exc:
+                        ready.put(exc)
+                        return
+                    line.clear()
+                    if payload is not None:
+                        ready.put(payload)
+                        return
+            ready.put(AntigravityBridgeError("timed out waiting for Antigravity bridge readiness"))
 
         def drain_stderr() -> None:
-            assert self._process is not None and self._process.stderr is not None
-            for _ in self._process.stderr:
+            assert process is not None and process.stderr is not None
+            for _ in process.stderr:
                 pass
         threading.Thread(target=drain_stderr, daemon=True, name="antigravity-bridge-log").start()
         threading.Thread(target=scan, daemon=True, name="antigravity-bridge-ready").start()
@@ -173,12 +186,16 @@ class AntigravityHTTPTransport:
             headers={"Authorization": f"Bearer {self.endpoint.auth_token}",
                      "Accept": "application/json", "Content-Type": "application/json"},
         )
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect())
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with opener.open(request, timeout=timeout) as response:
                 data = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
-            raw = exc.read(4096).decode("utf-8", "replace")
-            raise AntigravityBridgeError(redact_antigravity_text(f"bridge HTTP {exc.code}: {raw}", self.endpoint.auth_token)) from None
+            raise AntigravityBridgeError(f"bridge HTTP {exc.code}") from None
         except (urllib.error.URLError, OSError) as exc:
             raise AntigravityBridgeError("Antigravity bridge request failed") from exc
         if len(data) > MAX_RESPONSE_BYTES:

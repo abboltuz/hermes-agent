@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,7 +13,10 @@ from agent.antigravity_bridge_transport import (
 
 BRIDGE_MARKER_BASE_URL = "sdkbridge://antigravity"
 SUPPORTED_MODEL_FAMILIES = ("gemini", "claude")
-CURATED_FALLBACK_MODELS = ("gemini-2.5-pro", "gemini-2.5-flash", "claude-sonnet-4")
+CURATED_FALLBACK_MODELS = (
+    "antigravity-gemini-3-pro",
+    "antigravity-claude-sonnet-4-6",
+)
 
 
 def filter_antigravity_models(items: list[dict[str, Any]] | None) -> list[str] | None:
@@ -21,7 +25,9 @@ def filter_antigravity_models(items: list[dict[str, Any]] | None) -> list[str] |
     result: set[str] = set()
     for item in items:
         model_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
-        if model_id and model_id.lower().startswith(SUPPORTED_MODEL_FAMILIES):
+        if model_id and model_id.lower().startswith((
+            "gemini-", "claude-", "antigravity-gemini-", "antigravity-claude-",
+        )):
             result.add(model_id)
     return sorted(result, key=lambda value: (value.lower(), value))
 
@@ -60,10 +66,13 @@ class AntigravityBridgeClient:
         self._bridge_command = bridge_command
         self._process: AntigravityBridgeProcess | None = None
         self.__transport: AntigravityHTTPTransport | None = None
+        self._lock = threading.Lock()
         self.chat = _Chat(self)
         self.is_closed = False
 
     def _ensure_transport(self) -> AntigravityHTTPTransport:
+        if self.is_closed:
+            raise AntigravityBridgeError("Antigravity bridge client is closed")
         if self.__transport is not None and self._process is not None:
             return self.__transport
         command = self._bridge_command or resolve_antigravity_bridge_command()
@@ -71,11 +80,16 @@ class AntigravityBridgeClient:
             raise AntigravityBridgeError("Antigravity bridge artifact is not installed")
         process = AntigravityBridgeProcess(command)
         endpoint = process.start()
+        if self.is_closed:
+            process.stop()
+            raise AntigravityBridgeError("Antigravity bridge client is closed")
         self._process = process
         self.__transport = AntigravityHTTPTransport(endpoint)
         return self.__transport
 
     def _get_transport(self) -> AntigravityHTTPTransport:
+        if self.is_closed:
+            raise AntigravityBridgeError("Antigravity bridge client is closed")
         return self.__transport or self._ensure_transport()
 
     def list_models(self) -> list[dict[str, Any]]:
@@ -85,13 +99,23 @@ class AntigravityBridgeClient:
         return data if isinstance(data, list) else []
 
     def close(self) -> None:
-        if self.is_closed:
-            return
-        self.is_closed = True
-        if self._process is not None:
-            self._process.stop()
-        self._process = None
-        self.__transport = None
+        with self._lock:
+            if self.is_closed:
+                return
+            self.is_closed = True
+            process, self._process = self._process, None
+            self.__transport = None
+        if process is not None:
+            process.stop()
+
+    def abort_inflight(self) -> None:
+        """Stop the owned child so a blocked request thread can unwind."""
+        with self._lock:
+            self.is_closed = True
+            process, self._process = self._process, None
+            self.__transport = None
+        if process is not None:
+            process.stop()
 
 
 class AsyncAntigravityBridgeClient:
@@ -109,3 +133,6 @@ class AsyncAntigravityBridgeClient:
 
     async def close(self) -> None:
         await asyncio.to_thread(self._sync.close)
+
+    async def abort_inflight(self) -> None:
+        await asyncio.to_thread(self._sync.abort_inflight)
