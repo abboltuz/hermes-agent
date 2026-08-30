@@ -1,19 +1,20 @@
-"""Tests for the GUI-surface ``read_preview`` tool."""
+"""Tests for the read operation behind the consolidated preview tool."""
 
 import json
 
-from tools import read_preview_tool as rp
+from tools import preview_tool, read_preview_tool as rp  # noqa: F401
 from tools.registry import registry
 
 
-def test_lives_in_the_gui_surface_toolset(monkeypatch):
+def test_consolidated_tool_lives_in_the_gui_surface_toolset(monkeypatch):
     """Mirrors read_terminal: scoped by toolset, not by the backend's env."""
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
-    entry = registry.get_entry("read_preview")
+    entry = registry.get_entry("desktop_preview")
 
     assert entry is not None
     assert entry.toolset == "desktop_ui"
     assert entry.check_fn is None
+    assert registry.get_entry("read_preview") is None
 
 
 def test_requires_callback():

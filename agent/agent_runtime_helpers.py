@@ -108,7 +108,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "drive_preview", "annotate_preview", "read_window_below", "setup_mcp", "tour", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "desktop_preview", "drive_preview", "annotate_preview", "read_window_below", "setup_mcp", "tour", "delegate_task"}
 )
 
 
@@ -3365,13 +3365,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
-    elif function_name == "read_preview":
+    elif function_name == "desktop_preview":
         def _execute(next_args: dict) -> Any:
-            from tools.read_preview_tool import read_preview_tool as _read_preview_tool
+            from tools.preview_tool import dispatch_preview
             return _finish_agent_tool(
-                _read_preview_tool(
-                    start=next_args.get("start"),
-                    count=next_args.get("count"),
+                dispatch_preview(
+                    next_args,
                     callback=getattr(agent, "read_preview_callback", None),
                 ),
                 next_args,

@@ -85,4 +85,4 @@ def test_passes_the_renderer_s_answer_straight_through():
 
 def test_reports_a_silent_bridge():
     result = json.loads(an.annotate_preview_tool(ref="@e1", callback=lambda _p: ""))
-    assert "open_preview" in result["error"]
+    assert "desktop_preview" in result["error"]
