@@ -2673,6 +2673,69 @@ class TestSelectiveControlContract:
         else:
             raise AssertionError("unknown strict-schema field was not rejected")
 
+    def test_startup_cursor_fallback_uses_current_strict_session_schema(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        from tools.computer_use import cua_backend
+
+        class ImmediateBridge:
+            def run(self, coroutine, timeout=30.0):
+                return asyncio.run(coroutine)
+
+        session = cua_backend._CuaDriverSession(ImmediateBridge())
+        session._started = True
+        session._tool_schemas = {
+            "start_session": {
+                "type": "object",
+                "properties": {"session": {"type": "string"}},
+                "required": ["session"],
+                "additionalProperties": False,
+            },
+            "set_agent_cursor_enabled": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "session": {"type": "string"},
+                },
+                "required": ["enabled", "session"],
+                "additionalProperties": False,
+            },
+        }
+        calls = []
+
+        async def fake_call_tool(name, args):
+            calls.append((name, dict(args)))
+            return {
+                "data": {},
+                "images": [],
+                "structuredContent": {},
+                "isError": False,
+            }
+
+        monkeypatch.setattr(session, "_call_tool_async", fake_call_tool)
+        monkeypatch.setattr(
+            cua_backend,
+            "cua_driver_runtime_contract_status",
+            lambda: {"ready": True},
+        )
+        monkeypatch.setattr(cua_backend, "_maybe_nudge_update", lambda: None)
+        monkeypatch.setattr(cua_backend, "_computer_use_max_image_dimension", lambda: 0)
+        monkeypatch.setattr(cua_backend, "_cua_no_overlay", lambda: True)
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+
+        backend = cua_backend.CuaDriverBackend()
+        backend._session = session
+        session.set_transport_reset_callback(backend._handle_transport_reset)
+
+        backend.start()
+
+        assert ("set_agent_cursor_enabled", {
+            "enabled": False,
+            "session": backend._session_id,
+        }) in calls
+
     def test_error_envelope_outranks_contradictory_confirmed_effect(self):
         from tools.computer_use.backend import ActionResult
         from tools.computer_use.tool import _action_payload
