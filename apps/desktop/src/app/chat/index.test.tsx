@@ -246,12 +246,20 @@ async function flushQuery() {
 }
 
 function renderChatView({
-  tile = false
+  tile = false,
+  refetchIntervalInBackground
 }: {
   tile?: boolean
+  refetchIntervalInBackground?: boolean
 } = {}) {
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, staleTime: 60_000 } }
+    defaultOptions: {
+      queries: {
+        retry: false,
+        staleTime: 60_000,
+        ...(refetchIntervalInBackground === undefined ? {} : { refetchIntervalInBackground })
+      }
+    }
   })
 
   const view = tile ? tileSessionView() : undefined
@@ -376,5 +384,18 @@ describe('ChatView Cursor model catalog revalidation', () => {
     })
     await flushQuery()
     expect(requestModelOptions).toHaveBeenCalledTimes(4)
+  })
+
+  it('does not poll the catalog in the background when QueryClient defaults allow interval refetch', async () => {
+    renderChatView({ refetchIntervalInBackground: true })
+    await flushQuery()
+
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
+
+    focusManager.setFocused(false)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CURSOR_CATALOG_MS)
+    })
+    expect(requestModelOptions).toHaveBeenCalledTimes(1)
   })
 })
