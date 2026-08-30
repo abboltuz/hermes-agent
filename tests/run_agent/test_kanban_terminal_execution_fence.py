@@ -1069,6 +1069,151 @@ def test_orchestrator_terminal_mutation_does_not_stop_conversation_loop(
     assert relay_after_dispatch == ["kanban_block"]
 
 
+def _enable_kanban_tool_call_bridge(monkeypatch, current_defs):
+    from tools import tool_search
+
+    monkeypatch.setattr(tool_search, "_core_tool_names", lambda: frozenset())
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **_kwargs: current_defs,
+    )
+
+
+def test_tool_call_bridge_preserves_runtime_control_for_terminal_handler(
+    worker_case,
+    monkeypatch,
+):
+    import model_tools
+    from tools.registry import registry
+
+    agent, task_id, run_id = worker_case
+    control = agent._runtime_control
+    _enable_kanban_tool_call_bridge(
+        monkeypatch,
+        [_tool_def("kanban_block")],
+    )
+    dispatched_controls = []
+    original_dispatch = registry.dispatch
+
+    def _capture_dispatch(name, args, **kwargs):
+        if name == "kanban_block":
+            dispatched_controls.append(kwargs.get("runtime_control"))
+        return original_dispatch(name, args, **kwargs)
+
+    monkeypatch.setattr(registry, "dispatch", _capture_dispatch)
+    result = json.loads(
+        model_tools.handle_function_call(
+            "tool_call",
+            {
+                "name": "kanban_block",
+                "arguments": {"reason": "bridge terminal transition"},
+            },
+            task_id=task_id,
+            session_id=agent.session_id,
+            runtime_control=control,
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+            enabled_toolsets=["kanban"],
+        )
+    )
+
+    assert result["ok"] is True
+    assert len(dispatched_controls) == 1
+    assert dispatched_controls[0] is control
+    transition = control.kanban_terminal_transition
+    assert transition is not None
+    assert transition.tool_name == "kanban_block"
+    assert transition.task_id == task_id
+    assert transition.run_id == run_id
+
+
+def test_tool_call_bridge_foreign_terminal_rejection_does_not_arm(
+    worker_case,
+    monkeypatch,
+):
+    import model_tools
+    from hermes_cli import kanban_db as kb
+
+    agent, _task_id, _run_id = worker_case
+    control = agent._runtime_control
+    _enable_kanban_tool_call_bridge(
+        monkeypatch,
+        [_tool_def("kanban_block")],
+    )
+    conn = kb.connect()
+    try:
+        foreign_id = kb.create_task(conn, title="foreign bridge", assignee="other")
+    finally:
+        conn.close()
+
+    result = json.loads(
+        model_tools.handle_function_call(
+            "tool_call",
+            {
+                "name": "kanban_block",
+                "arguments": {
+                    "task_id": foreign_id,
+                    "reason": "not this worker's task",
+                },
+            },
+            task_id=foreign_id,
+            session_id=agent.session_id,
+            runtime_control=control,
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+            enabled_toolsets=["kanban"],
+        )
+    )
+
+    assert "error" in result
+    assert control.kanban_terminal_transition is None
+    conn = kb.connect()
+    try:
+        foreign = kb.get_task(conn, foreign_id)
+        assert foreign is not None
+        assert foreign.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_tool_call_bridge_scope_gate_still_rejects_terminal_tool(
+    worker_case,
+    monkeypatch,
+):
+    import model_tools
+    from tools.registry import registry
+
+    agent, task_id, _run_id = worker_case
+    control = agent._runtime_control
+    _enable_kanban_tool_call_bridge(monkeypatch, [])
+    dispatch = MagicMock(side_effect=AssertionError("out-of-scope dispatch"))
+    monkeypatch.setattr(registry, "dispatch", dispatch)
+
+    result = json.loads(
+        model_tools.handle_function_call(
+            "tool_call",
+            {
+                "name": "kanban_block",
+                "arguments": {"reason": "out-of-scope attempt"},
+            },
+            task_id=task_id,
+            session_id=agent.session_id,
+            runtime_control=control,
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+            enabled_toolsets=[],
+        )
+    )
+
+    assert "error" in result
+    assert "not available in this session" in result["error"]
+    dispatch.assert_not_called()
+    assert control.kanban_terminal_transition is None
+
+
 def test_reviewer_request_changes_arms_same_exact_review_run_contract(
     worker_case,
     monkeypatch,
