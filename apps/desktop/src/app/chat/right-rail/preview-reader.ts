@@ -1,5 +1,5 @@
 /**
- * PREVIEW READER — the read_preview tool's window into the preview pane, the
+ * PREVIEW READER — desktop_preview action='read' into the preview pane, the
  * preview analog of the terminal's buffer registry (see right-sidebar/
  * terminal/buffer.ts).
  *

@@ -42,7 +42,8 @@ describe('actOnActivePreview (drive_preview tool)', () => {
     const result = await actOnActivePreview({ kind: 'elements' })
 
     expect(result.success).toBe(false)
-    expect(result.error).toContain('open_preview')
+    expect(result.error).toContain("desktop_preview with action='open'")
+    expect(result.error).not.toContain('open_preview')
   })
 
   it('injects the engine and returns the page’s answer', async () => {
@@ -311,6 +312,9 @@ describe('actOnActivePreview (drive_preview tool)', () => {
   })
 
   it('reports history verbs with no pane to drive', async () => {
-    expect((await actOnActivePreview({ kind: 'reload' })).error).toContain('open_preview')
+    const result = await actOnActivePreview({ kind: 'reload' })
+
+    expect(result.error).toContain("desktop_preview with action='open'")
+    expect(result.error).not.toContain('open_preview')
   })
 })

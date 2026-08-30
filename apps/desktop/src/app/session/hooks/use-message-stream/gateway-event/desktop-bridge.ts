@@ -65,7 +65,7 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'preview.read.request') {
-    // read_preview tool: serialize the active preview tab (a Browser
+    // desktop_preview action='read': serialize the active preview tab (a Browser
     // webview's page text is async) and answer. Empty text = nothing open.
     const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
