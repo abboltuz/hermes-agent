@@ -967,6 +967,27 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
 # Response shaping
 # ---------------------------------------------------------------------------
 
+def _public_escalation(escalation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Normalize current and legacy driver escalation fields for the model."""
+    if not isinstance(escalation, dict):
+        return None
+
+    normalized = {
+        key: value
+        for key, value in escalation.items()
+        if key not in {"target", "recommended", "reason", "reason_code"}
+    }
+    target = escalation.get("target") or escalation.get("recommended")
+    if target == "px":
+        target = "pixel"
+    if isinstance(target, str):
+        normalized["target"] = target
+    reason_code = escalation.get("reason_code") or escalation.get("reason")
+    if isinstance(reason_code, str):
+        normalized["reason_code"] = reason_code
+    return normalized
+
+
 def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     """Choose the next ladder step from semantic evidence, in precedence order.
 
@@ -974,25 +995,23 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     effect and it never turns an unverifiable action into permission to repeat
     input. The model must first obtain fresh evidence.
     """
-    if not res.ok or res.code is not None:
+    escalation = _public_escalation(res.escalation)
+
+    if not res.ok or res.code is not None or res.effect == "refused":
         decision: Dict[str, Any] = {"decision": "escalate"}
-        if isinstance(res.escalation, dict):
-            decision["recommended"] = (
-                res.escalation.get("target")
-                or res.escalation.get("recommended")
-            )
+        if escalation:
+            decision.update(escalation)
         return decision
+    if res.effect == "partial":
+        return {"decision": "verify_fresh_state"}
     if res.effect == "confirmed" or res.verified is True:
         return {"decision": "done"}
     if res.effect == "unverifiable":
         return {"decision": "verify_fresh_state"}
     if res.effect == "suspected_noop":
         decision: Dict[str, Any] = {"decision": "escalate"}
-        if isinstance(res.escalation, dict):
-            decision["recommended"] = (
-                res.escalation.get("target")
-                or res.escalation.get("recommended")
-            )
+        if escalation:
+            decision.update(escalation)
         return decision
     # Transport success without semantic proof is not proof of effect.
     return {"decision": "verify_fresh_state"}
@@ -1010,8 +1029,9 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
         payload["verified"] = res.verified
     if res.effect is not None:
         payload["effect"] = res.effect
-    if res.escalation is not None:
-        payload["escalation"] = res.escalation
+    public_escalation = _public_escalation(res.escalation)
+    if public_escalation is not None:
+        payload["escalation"] = public_escalation
     if res.path is not None:
         payload["path"] = res.path
     if res.route is not None:
