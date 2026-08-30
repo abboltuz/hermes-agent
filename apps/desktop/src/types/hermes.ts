@@ -59,7 +59,7 @@ export interface OAuthProvider {
   disconnect_hint?: null | string
   disconnectable?: boolean
   docs_url: string
-  flow: 'device_code' | 'external' | 'pkce'
+  flow: 'browser_poll' | 'device_code' | 'external' | 'pkce'
   id: string
   name: string
   status: OAuthProviderStatus
@@ -70,6 +70,13 @@ export interface OAuthProvidersResponse {
 }
 
 export type OAuthStartResponse =
+  | {
+      auth_url: string
+      expires_in: number
+      flow: 'browser_poll'
+      poll_interval: number
+      session_id: string
+    }
   | {
       auth_url: string
       expires_in: number

@@ -26,6 +26,7 @@ import os
 import secrets
 import socket
 import stat
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -140,6 +141,8 @@ def poll_for_login_tokens(
     on_status: Callable[[str], None] | None = None,
     max_attempts: int = _POLL_MAX_ATTEMPTS,
     sleep: Callable[[float], None] = time.sleep,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> dict[str, str] | None:
     """Poll ``/auth/poll`` until the browser completes the login.
 
@@ -152,6 +155,10 @@ def poll_for_login_tokens(
     """
     consecutive_errors = 0
     for attempt in range(max_attempts):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if deadline is not None and time.time() >= deadline:
+            return None
         delay = min(_POLL_BASE_DELAY_S * (_POLL_BACKOFF ** attempt), _POLL_MAX_DELAY_S)
         try:
             request = urllib.request.Request(
@@ -171,7 +178,10 @@ def poll_for_login_tokens(
                     # A pending login is represented by a 404; never retry via
                     # GET because the verifier is redeemable and must not enter a URL.
                     consecutive_errors = 0
-                    sleep(delay)
+                    if cancel_event is None:
+                        sleep(delay)
+                    else:
+                        cancel_event.wait(max(0.0, min(delay, deadline - time.time()) if deadline else delay))
                     continue
                 raise
             if len(raw) > _MAX_AUTH_RESPONSE_BYTES:
@@ -195,7 +205,10 @@ def poll_for_login_tokens(
             logger.debug("auth/poll attempt %d failed (%s)", attempt, type(exc).__name__)
             if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                 return None
-            sleep(delay)
+            if cancel_event is None:
+                sleep(delay)
+            else:
+                cancel_event.wait(max(0.0, min(delay, deadline - time.time()) if deadline else delay))
     return None
 
 

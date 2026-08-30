@@ -19,6 +19,7 @@ import type { ModelOptionProvider, OAuthProvider, OAuthStartResponse } from '@/t
 
 type PkceStart = Extract<OAuthStartResponse, { flow: 'pkce' }>
 type DeviceStart = Extract<OAuthStartResponse, { flow: 'device_code' }>
+type BrowserPollStart = Extract<OAuthStartResponse, { flow: 'browser_poll' }>
 
 export type OnboardingMode = 'apikey' | 'oauth'
 
@@ -27,6 +28,7 @@ export type OnboardingFlow =
   | { provider: OAuthProvider; status: 'starting' }
   | { code: string; provider: OAuthProvider; start: PkceStart; status: 'awaiting_user' }
   | { copied: boolean; provider: OAuthProvider; start: DeviceStart; status: 'polling' }
+  | { provider: OAuthProvider; start: BrowserPollStart; status: 'browser_polling' }
   | { provider: OAuthProvider; start: OAuthStartResponse; status: 'submitting' }
   | { copied: boolean; provider: OAuthProvider; status: 'external_pending' }
   | { provider: OAuthProvider; status: 'success' }
@@ -160,6 +162,7 @@ export const $desktopOnboarding = atom<DesktopOnboardingState>(INITIAL)
 
 let pollTimer: number | null = null
 let providersRefreshPromise: null | Promise<void> = null
+let activeProfile: string | undefined
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -603,6 +606,7 @@ async function openSignInUrl(url: string) {
 
 export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {
   clearPoll()
+  activeProfile = ctx.profile
 
   if (provider.flow === 'external') {
     setFlow({ status: 'external_pending', provider, copied: false })
@@ -613,7 +617,7 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
   setFlow({ status: 'starting', provider })
 
   try {
-    const start = await startOAuthLogin(provider.id)
+    const start = await startOAuthLogin(provider.id, ctx.profile)
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
     await openSignInUrl(browserUrl)
 
@@ -623,10 +627,37 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
       return
     }
 
+    if (start.flow === 'browser_poll') {
+      setFlow({ status: 'browser_polling', provider, start })
+      pollTimer = window.setInterval(() => void pollBrowserSession(provider, start, ctx), POLL_MS)
+
+      return
+    }
+
     setFlow({ status: 'polling', provider, start, copied: false })
     pollTimer = window.setInterval(() => void pollSession(provider, start, ctx), POLL_MS)
   } catch (error) {
     setFlow({ status: 'error', provider, message: `Could not start sign-in: ${errMessage(error)}` })
+  }
+}
+
+async function pollBrowserSession(provider: OAuthProvider, start: BrowserPollStart, ctx: OnboardingContext) {
+  try {
+    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id, ctx.profile)
+
+    if (status === 'approved') {
+      clearPoll()
+      setFlow({ status: 'success', provider })
+      await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
+        setFlow({ status: 'error', provider, message: providerResolutionFailure(reason) })
+      )
+    } else if (status !== 'pending') {
+      clearPoll()
+      setFlow({ status: 'error', provider, start, message: error_message || `Sign-in ${status}.` })
+    }
+  } catch (error) {
+    clearPoll()
+    setFlow({ status: 'error', provider, start, message: `Polling failed: ${errMessage(error)}` })
   }
 }
 
@@ -698,7 +729,7 @@ export function cancelOnboardingFlow() {
   const sessionId = sessionIdFor($desktopOnboarding.get().flow)
 
   if (sessionId) {
-    cancelOAuthSession(sessionId).catch(() => undefined)
+    cancelOAuthSession(sessionId, activeProfile).catch(() => undefined)
   }
 
   setFlow({ status: 'idle' })

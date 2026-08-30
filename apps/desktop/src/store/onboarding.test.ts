@@ -1,16 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import * as hermes from '@/hermes'
 import * as notifications from '@/store/notifications'
 import { makeOAuthProvider } from '@/test/oauth-provider'
 import type { OAuthProvider } from '@/types/hermes'
 
 import {
   $desktopOnboarding,
+  cancelOnboardingFlow,
   type DesktopOnboardingState,
   type OnboardingContext,
   refreshOnboarding,
   requestDesktopOnboarding,
   saveOnboardingLocalEndpoint,
+  startProviderOAuth,
   submitOnboardingCode
 } from './onboarding'
 
@@ -641,5 +644,180 @@ describe('saveOnboardingLocalEndpoint', () => {
     expect(result.ok).toBe(false)
     expect(result.message).toContain('No provider can serve the selected model.')
     expect($desktopOnboarding.get().configured).not.toBe(true)
+  })
+})
+
+describe('Cursor browser-poll onboarding', () => {
+  beforeEach(() => {
+    $desktopOnboarding.set(baseState())
+    vi.useFakeTimers()
+    vi.spyOn(hermes, 'startOAuthLogin').mockResolvedValue({
+      auth_url: 'https://cursor.example/sign-in?exact=1',
+      expires_in: 600,
+      flow: 'browser_poll',
+      poll_interval: 2,
+      session_id: 'cursor-session'
+    })
+    vi.spyOn(hermes, 'pollOAuthSession').mockResolvedValue({
+      session_id: 'cursor-session',
+      status: 'pending'
+    })
+    vi.spyOn(hermes, 'cancelOAuthSession').mockResolvedValue({ ok: true })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('opens the exact browser URL, keeps browser state secret-free, and scopes cancel', async () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api: vi.fn(), openExternal } })
+    const provider = makeOAuthProvider('cursor', 'Cursor')
+    provider.flow = 'browser_poll'
+
+    const ctx = onboardingContext(async method => {
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        return { ok: true, provider: 'cursor' } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    })
+
+    ctx.profile = 'selected'
+
+    await startProviderOAuth(provider, ctx)
+
+    expect(hermes.startOAuthLogin).toHaveBeenCalledWith('cursor', 'selected')
+    expect(openExternal).toHaveBeenCalledWith('https://cursor.example/sign-in?exact=1')
+    expect($desktopOnboarding.get().flow).toMatchObject({
+      status: 'browser_polling',
+      provider,
+      start: { session_id: 'cursor-session' }
+    })
+    expect(JSON.stringify($desktopOnboarding.get().flow)).not.toContain('verifier')
+    cancelOnboardingFlow()
+    expect($desktopOnboarding.get().flow).toEqual({ status: 'idle' })
+    expect(hermes.cancelOAuthSession).toHaveBeenCalledWith('cursor-session', 'selected')
+  })
+
+  it('polls with explicit profile scope', async () => {
+    const provider = makeOAuthProvider('cursor', 'Cursor')
+    provider.flow = 'browser_poll'
+
+    const ctx = onboardingContext(async method => {
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        return { ok: true, provider: 'cursor' } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    })
+
+    ctx.profile = 'selected'
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { api: vi.fn(), openExternal: vi.fn().mockResolvedValue(undefined) }
+    })
+    await startProviderOAuth(provider, ctx)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(hermes.pollOAuthSession).toHaveBeenCalledWith('cursor', 'cursor-session', 'selected')
+  })
+
+  it('uses backend Cursor model options after approval and enters the existing confirmation flow', async () => {
+    const model = 'cursor/backend-model'
+    const apiCalls: { body?: unknown; path: string }[] = []
+    vi.mocked(hermes.pollOAuthSession).mockResolvedValue({
+      session_id: 'cursor-session',
+      status: 'approved'
+    })
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        api: vi.fn(async ({ body, path }: { body?: unknown; path: string }) => {
+          apiCalls.push({ body, path })
+
+          if (path.startsWith('/api/model/options')) {
+            return { providers: [{ name: 'Cursor', slug: 'cursor', models: [model] }] }
+          }
+
+          if (path.startsWith('/api/model/recommended-default?')) {
+            return { provider: 'cursor', model, free_tier: false }
+          }
+
+          if (path === '/api/model/set') {
+            return { ok: true, provider: 'cursor', model, gateway_tools: [] }
+          }
+
+          throw new Error(`unexpected api path: ${path}`)
+        }),
+        openExternal: vi.fn().mockResolvedValue(undefined)
+      }
+    })
+    const provider = makeOAuthProvider('cursor', 'Cursor')
+    provider.flow = 'browser_poll'
+
+    const ctx = onboardingContext(async (method, params) => {
+      if (method === 'reload.env') {
+        return {} as never
+      }
+
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        expect(params).toEqual({ provider: 'cursor' })
+
+        return { ok: true, provider: 'cursor' } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    })
+
+    ctx.profile = 'selected'
+
+    await startProviderOAuth(provider, ctx)
+    await vi.advanceTimersByTimeAsync(2000)
+
+    expect($desktopOnboarding.get().flow).toMatchObject({
+      status: 'confirming_model',
+      providerSlug: 'cursor',
+      currentModel: model,
+      label: 'Cursor'
+    })
+    expect(apiCalls.some(call => call.path.startsWith('/api/model/options'))).toBe(true)
+    expect(apiCalls.some(call => call.path === '/api/model/set' && JSON.stringify(call.body).includes(model))).toBe(
+      true
+    )
+  })
+
+  it('keeps the established window.open compatibility fallback', async () => {
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api: vi.fn() } })
+    const provider = makeOAuthProvider('cursor', 'Cursor')
+    provider.flow = 'browser_poll'
+
+    const ctx = onboardingContext(async method => {
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        return { ok: true, provider: 'cursor' } as never
+      }
+
+      throw new Error()
+    })
+
+    await startProviderOAuth(provider, ctx)
+    expect(open).toHaveBeenCalledWith('https://cursor.example/sign-in?exact=1', '_blank', 'noopener,noreferrer')
   })
 })
