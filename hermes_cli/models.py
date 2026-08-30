@@ -4259,14 +4259,16 @@ class _CursorRefreshAttempt:
 
 def _active_hermes_home_identity() -> str:
     """Return the active profile home's stable process-local coordination key."""
-    try:
-        from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home
 
-        return os.path.normcase(str(get_hermes_home().expanduser().resolve(strict=False)))
-    except Exception:
-        # Coordination must remain deterministic even if an unusual filesystem
-        # error prevents canonicalization; never substitute a process profile.
-        return "<unresolved-active-hermes-home>"
+    home = get_hermes_home().expanduser()
+    try:
+        resolved = home.resolve(strict=False)
+    except OSError:
+        # Keep unusual filesystem failures profile-local rather than collapsing
+        # every active home into a shared coordinator identity.
+        resolved = Path(os.path.abspath(os.fspath(home)))
+    return os.path.normcase(str(resolved))
 
 
 def _cursor_refresh_key(fp: Optional[str] = None) -> tuple[str, str, str]:
@@ -4284,13 +4286,14 @@ def _clear_cursor_refresh_failures(provider: Optional[str] = None) -> None:
         if requested == "ollama"
         else (normalize_provider(provider) or requested)
     )
+    if provider is not None and normalized != "cursor":
+        return
+    active_home = _active_hermes_home_identity()
     with _cursor_refresh_lock:
-        if provider is None:
-            _cursor_refresh_failed_at.clear()
-            return
-        if normalized != "cursor":
-            return
-        for key in [key for key in _cursor_refresh_failed_at if key[1] == "cursor"]:
+        for key in [
+            key for key in _cursor_refresh_failed_at
+            if key[0] == active_home and key[1] == "cursor"
+        ]:
             _cursor_refresh_failed_at.pop(key, None)
 
 
