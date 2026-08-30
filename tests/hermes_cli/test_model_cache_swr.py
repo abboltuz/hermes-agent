@@ -218,6 +218,180 @@ class TestProviderModelsSWR:
         assert saved["openrouter"]["models"] == ["fresh1", "fresh2"]
         assert not mod._swr_refresh_inflight  # exact profile-scoped tuple cleared on completion
 
+    def test_swr_workers_write_only_to_their_originating_profile_cache(self, tmp_path, monkeypatch):
+        """Overlapping profile refreshes retain both their home and singleflight boundary."""
+        from agent.secret_scope import (
+            is_multiplex_active,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        import hermes_cli.models as mod
+
+        class TrackingThread(threading.Thread):
+            workers = []
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.workers.append(self)
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                threading.Event().wait(0.01)
+            return predicate()
+
+        was_multiplexed = is_multiplex_active()
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        key = "swr-profile-write-isolation"
+        entered_a = threading.Event()
+        entered_b = threading.Event()
+        release = threading.Event()
+        duplicate_ran = threading.Event()
+        tracked_paths = [
+            home_a / "provider_models_cache.json",
+            home_b / "provider_models_cache.json",
+        ]
+        original_cache_bytes = {
+            path: path.read_bytes() if path.exists() else None for path in tracked_paths
+        }
+        identities = {}
+        set_multiplex_active(True)
+        monkeypatch.setattr(mod.threading, "Thread", TrackingThread)
+        try:
+            def refresh(label, entered):
+                def run():
+                    entered.set()
+                    assert release.wait(timeout=2)
+                    return {"fp": label, "at": time.time(), "models": [label]}
+                return run
+
+            home_a_token = set_hermes_home_override(home_a)
+            scope_a_token = set_secret_scope({"SCOPE_MARKER": "a"})
+            try:
+                identities["a"] = mod._active_hermes_home_identity()
+                mod._spawn_swr_refresh(key, refresh("a", entered_a))
+                assert entered_a.wait(timeout=2)
+                mod._spawn_swr_refresh(key, lambda: duplicate_ran.set())
+            finally:
+                reset_secret_scope(scope_a_token)
+                reset_hermes_home_override(home_a_token)
+
+            home_b_token = set_hermes_home_override(home_b)
+            scope_b_token = set_secret_scope({"SCOPE_MARKER": "b"})
+            try:
+                identities["b"] = mod._active_hermes_home_identity()
+                mod._spawn_swr_refresh(key, refresh("b", entered_b))
+                assert entered_b.wait(timeout=2)
+            finally:
+                reset_secret_scope(scope_b_token)
+                reset_hermes_home_override(home_b_token)
+
+            assert identities["a"] != identities["b"]
+            assert not duplicate_ran.is_set()
+            release.set()
+            assert wait_for(
+                lambda: all((identity, key) not in mod._swr_refresh_inflight
+                            for identity in identities.values())
+            )
+            assert wait_for(lambda: all(not worker.is_alive() for worker in TrackingThread.workers))
+
+            assert tracked_paths[0].exists(), "profile-local-write assertion for profile A"
+            assert tracked_paths[1].exists(), "profile-local-write assertion for profile B"
+            cache_a = _read_provider_cache(tracked_paths[0])
+            cache_b = _read_provider_cache(tracked_paths[1])
+            assert cache_a[key]["models"] == ["a"], "profile-local-write assertion for profile A"
+            assert key not in cache_b or cache_b[key]["models"] != ["a"]
+            assert cache_b[key]["models"] == ["b"], "profile-local-write assertion for profile B"
+            assert key not in cache_a or cache_a[key]["models"] != ["b"]
+        finally:
+            release.set()
+            for worker in TrackingThread.workers:
+                worker.join(timeout=2)
+            for path, original in original_cache_bytes.items():
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(original)
+            set_multiplex_active(was_multiplexed)
+
+    def test_swr_owner_exception_clears_inflight_before_same_profile_retry(self, tmp_path, monkeypatch):
+        """A failed owner releases its exact profile/key reservation for retry."""
+        from agent.secret_scope import (
+            is_multiplex_active,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        import hermes_cli.models as mod
+
+        class TrackingThread(threading.Thread):
+            workers = []
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.workers.append(self)
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                threading.Event().wait(0.01)
+            return predicate()
+
+        was_multiplexed = is_multiplex_active()
+        home = tmp_path / "profile-retry"
+        key = "swr-owner-exception-retry"
+        entered = threading.Event()
+        retry_runs = []
+        home_token = set_hermes_home_override(home)
+        scope_token = set_secret_scope({"SCOPE_MARKER": "retry"})
+        set_multiplex_active(True)
+        monkeypatch.setattr(mod.threading, "Thread", TrackingThread)
+        try:
+            identity = mod._active_hermes_home_identity()
+
+            def fail_owner():
+                entered.set()
+                raise RuntimeError("synthetic refresh failure")
+
+            mod._spawn_swr_refresh(key, fail_owner)
+            assert entered.wait(timeout=2)
+            assert wait_for(
+                lambda: (identity, key) not in mod._swr_refresh_inflight
+            ), "owner-exception cleanup/retry assertion"
+
+            def retry_owner():
+                retry_runs.append(True)
+                return {"fp": "retry", "at": time.time(), "models": ["retry"]}
+
+            mod._spawn_swr_refresh(key, retry_owner)
+            assert wait_for(lambda: retry_runs == [True])
+            assert wait_for(
+                lambda: (identity, key) not in mod._swr_refresh_inflight
+            ), "owner-exception cleanup/retry assertion"
+            assert wait_for(lambda: all(not worker.is_alive() for worker in TrackingThread.workers))
+            assert len(retry_runs) == 1
+        finally:
+            for worker in TrackingThread.workers:
+                worker.join(timeout=2)
+            reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+            set_multiplex_active(was_multiplexed)
+
 
 class TestCatalogSWR:
     def test_stale_disk_catalog_served_with_background_refresh(self, tmp_path, monkeypatch):
