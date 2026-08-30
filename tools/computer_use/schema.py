@@ -168,24 +168,34 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                         "win", "windows", "super", "meta",
                     ],
                 },
-                "description": "Modifier keys held during the action.",
+                "description": (
+                    "Modifier keys held during click, double_click, "
+                    "right_click, middle_click, drag, or scroll. Live driver "
+                    "schemas may refuse modifiers they do not support."
+                ),
             },
             # ── drag ───────────────────────────────────────────────
             "from_element": {"type": "integer",
-                              "description": "Source element index (drag)."},
+                              "description": (
+                                  "Source element index for drag; accepted only "
+                                  "when the live driver advertises element endpoints."
+                              )},
             "to_element": {"type": "integer",
-                            "description": "Target element index (drag)."},
+                            "description": (
+                                "Target element index for drag; accepted only "
+                                "when the live driver advertises element endpoints."
+                            )},
             "from_coordinate": {
                 "type": "array",
                 "items": {"type": "integer"},
                 "minItems": 2, "maxItems": 2,
-                "description": "Source [x,y] (drag; use when no element available).",
+                "description": "Source [x,y] for drag; the portable default.",
             },
             "to_coordinate": {
                 "type": "array",
                 "items": {"type": "integer"},
                 "minItems": 2, "maxItems": 2,
-                "description": "Target [x,y] (drag; use when no element available).",
+                "description": "Target [x,y] for drag; the portable default.",
             },
             # ── scroll ─────────────────────────────────────────────
             "direction": {
@@ -266,9 +276,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "capture_after": {
                 "type": "boolean",
                 "description": (
-                    "If true, take a follow-up capture after the action "
-                    "and include it in the response. Saves a round-trip "
-                    "when you need to verify an action's effect."
+                    "For click, double_click, right_click, middle_click, drag, "
+                    "scroll, type, key, set_value, or focus_app: if true, take "
+                    "a follow-up capture after a successful action and include "
+                    "it in the response."
                 ),
             },
         },

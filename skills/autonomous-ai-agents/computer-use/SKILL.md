@@ -87,7 +87,8 @@ click             element=N     OR     coordinate=[x, y]    button=left|right|mi
 double_click      element=N     OR     coordinate=[x, y]
 right_click       element=N     OR     coordinate=[x, y]
 middle_click      element=N     OR     coordinate=[x, y]
-drag              from_element=N, to_element=M        (or from/to_coordinate)
+drag              from_coordinate=[x, y], to_coordinate=[x, y]
+                  (element endpoints only when the live driver supports them)
 scroll            direction=up|down|left|right   amount=3 (ticks)
 type              text="…"
 key               keys="<save shortcut>" | "return" | "escape" | "<modifier>+t"
@@ -96,9 +97,12 @@ list_apps
 focus_app         app="<app name>"   raise_window=false   (default: don't raise)
 ```
 
-All actions accept optional `capture_after=True` to get a follow-up
-screenshot in the same tool call. All actions that target an element
-accept `modifiers=[…]` for held keys.
+State-changing actions that expose it (`click`, `double_click`, `right_click`,
+`middle_click`, `drag`, `scroll`, `type`, `key`, `set_value`, and `focus_app`)
+accept optional `capture_after=True` to get a follow-up screenshot after a
+successful action. `modifiers=[…]` is accepted only by click variants, drag,
+and scroll, and the live driver may refuse a modifier combination it does not
+support.
 
 The input actions (`click`, `double_click`, `right_click`, `middle_click`,
 `drag`, `scroll`, `type`, `key`) also accept `delivery_mode`. The optional
@@ -210,18 +214,19 @@ shortcut to use.
 
 ## Drag & drop
 
-Prefer element indices:
-
-```
-computer_use(action="drag", from_element=3, to_element=17)
-```
-
-For a rubber-band selection on empty canvas, use coordinates:
+Use coordinate endpoints; they are the portable live contract:
 
 ```
 computer_use(action="drag",
              from_coordinate=[100, 200],
              to_coordinate=[400, 500])
+```
+
+Element endpoints remain exposed for compatible drivers, but are capability
+gated and can return `code:"element_drag_unsupported"` without sending input:
+
+```
+computer_use(action="drag", from_element=3, to_element=17)
 ```
 
 ## Scroll
@@ -242,9 +247,13 @@ computer_use(action="scroll", direction="down", amount=3, coordinate=[500, 400])
 
 `list_apps` returns running apps with bundle IDs / process names, PIDs,
 and window counts. `focus_app` routes input to an app without raising
-it. You rarely need to focus explicitly — passing `app=...` to
-`capture` / `click` / `type` will target that app's frontmost window
-automatically.
+it. Select a target with `capture(app=...)` or `focus_app(app=...)` before
+input. On `click`, `type`, and other mutation actions, `app=...` is only a
+safety assertion against that sticky target; it never retargets the action.
+Hermes refuses an unknown or mismatched sticky target instead of risking input
+to another window. `type` accepts text plus an optional supported element
+target, but not a coordinate; `key` accepts only `keys` and rejects element or
+coordinate targets.
 
 ## Delivering screenshots to the user
 

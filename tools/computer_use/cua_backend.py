@@ -2834,7 +2834,7 @@ class CuaDriverBackend(ComputerUseBackend):
             # redraw loops cannot keep burning CPU after the first action.
             if _cua_no_overlay():
                 try:
-                    self.set_agent_cursor_enabled(False, cursor_id=self._session_id)
+                    self.set_agent_cursor_enabled(False)
                 except Exception as e:
                     logger.debug("cua-driver set_agent_cursor_enabled failed: %s", e)
 
@@ -4173,17 +4173,10 @@ class CuaDriverBackend(ComputerUseBackend):
     #
     # Sessions (start_session/end_session, wired in start/stop) own the
     # cursor. These knobs tune its appearance + behavior per-session.
-    # All accept an optional `cursor_id` to address a specific cursor
-    # when the run drives multiple (rare); the default is this run's
-    # session id.
 
-    def set_agent_cursor_enabled(self, enabled: bool, *,
-                                 cursor_id: Optional[str] = None) -> ActionResult:
+    def set_agent_cursor_enabled(self, enabled: bool) -> ActionResult:
         """Toggle the agent cursor overlay's visibility for this run."""
-        args: Dict[str, Any] = {"enabled": bool(enabled)}
-        if cursor_id:
-            args["cursor_id"] = cursor_id
-        return self._action("set_agent_cursor_enabled", args)
+        return self._action("set_agent_cursor_enabled", {"enabled": bool(enabled)})
 
     def set_agent_cursor_motion(self, *,
                                 glide_ms: Optional[float] = None,
