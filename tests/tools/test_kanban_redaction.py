@@ -33,10 +33,16 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv(
+        "HERMES_KANBAN_RUN_ID",
+        str(claimed.current_run_id),
+    )
     return tid
 
 
@@ -71,7 +77,8 @@ def test_kanban_block_reason_scrubbed_jwt(worker_env):
         ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
         ".dozjgNryP4J3jVmNHl0w5N_5NjP1-iXkpHgcth826Iw"
     )
-    kt._handle_block({"reason": f"Bearer {jwt}"})
+    result = json.loads(kt._handle_block({"reason": f"Bearer {jwt}"}))
+    assert result.get("ok") is True, result
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
@@ -131,7 +138,10 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
     secret = "sk-" + "D" * 48
-    kt._handle_complete({"result": f"finished with key={secret}"})
+    result = json.loads(
+        kt._handle_complete({"result": f"finished with key={secret}"})
+    )
+    assert result.get("ok") is True, result
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
