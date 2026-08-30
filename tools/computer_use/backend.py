@@ -69,6 +69,14 @@ class CaptureResult:
     # capture lanes that intentionally return no elements (e.g. full-screen
     # composited grabs) to tell the model how to reach an interactive lane.
     note: str = ""
+    # Exact native identity resolved for this capture. Non-window backends
+    # leave these unset.
+    pid: Optional[int] = None
+    window_id: Optional[int] = None
+    # A failed target resolution carries a machine-readable code and safe
+    # candidate metadata without arming a sticky mutation target.
+    error: Optional[str] = None
+    available_windows: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -98,11 +106,16 @@ class ActionResult:
     verified: Optional[bool] = None
     # Confidence signal: "confirmed" | "unverifiable" | "suspected_noop".
     effect: Optional[str] = None
-    # Machine-readable next-rung hint: {"recommended": "px"|"foreground"|"page",
-    # "reason": str} — present only when the driver recommends climbing.
+    # Machine-readable next-rung hint. Current drivers use
+    # {"target": "px"|"foreground", "reason_code": str}; the legacy
+    # {"recommended": ..., "reason": ...} shape remains accepted.
     escalation: Optional[Dict[str, Any]] = None
     # Delivery rung that actually ran (e.g. "ax", "x11_pixel", "cgevent_fg").
     path: Optional[str] = None
+    # Current cua-driver vocabulary. ``path`` remains as a legacy alias.
+    route: Optional[str] = None
+    delivery: Optional[Dict[str, Any]] = None
+    evidence: Optional[Dict[str, Any]] = None
     # True when an AX walk found no actionable elements (act by px instead).
     degraded: Optional[bool] = None
     # The delivery_mode the caller requested for this action, echoed back.
@@ -183,7 +196,8 @@ class ComputerUseBackend(ABC):
 
     # ── Keyboard ────────────────────────────────────────────────────
     @abstractmethod
-    def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
+    def type_text(self, text: str, *, element: Optional[int] = None,
+                  delivery_mode: Optional[str] = None,
                   bring_to_front: bool = False) -> ActionResult: ...
 
     @abstractmethod
@@ -215,35 +229,6 @@ class ComputerUseBackend(ABC):
 
         `element` is the 1-based SOM index returned by a prior capture call.
         """
-
-    # ── Optional typed-browser adapter ──────────────────────────────
-    @staticmethod
-    def _typed_browser_unavailable() -> Dict[str, Any]:
-        return {
-            "ok": False,
-            "status": "refused",
-            "code": "typed_browser_unavailable",
-            "message": "This computer-use backend has no typed browser route; use native capture/input.",
-            "native_fallback_required": True,
-        }
-
-    def typed_browser_state(self, **kwargs: Any) -> Dict[str, Any]:
-        """Optional exact-bind/read hook; native-only backends fail closed."""
-        return self._typed_browser_unavailable()
-
-    def typed_browser_prepare(self, **kwargs: Any) -> Dict[str, Any]:
-        """Optional setup hook; native-only backends fail closed."""
-        return self._typed_browser_unavailable()
-
-    def typed_browser_action(
-        self,
-        driver_tool: str,
-        *,
-        tab_id: Optional[str] = None,
-        args: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Optional mutation hook; native-only backends fail closed."""
-        return self._typed_browser_unavailable()
 
     # ── Timing ──────────────────────────────────────────────────────
     def wait(self, seconds: float) -> ActionResult:

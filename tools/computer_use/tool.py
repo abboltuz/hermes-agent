@@ -79,16 +79,13 @@ def set_approval_callback(cb) -> None:
 
 # Actions that read, not mutate. Always allowed.
 _SAFE_ACTIONS = frozenset({
-    "capture", "wait", "list_apps", "list_windows", "cua_browser_state",
+    "capture", "wait", "list_apps", "list_windows",
 })
 
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value", "focus_app",
-    "cua_browser_prepare", "cua_browser_navigate", "cua_browser_click",
-    "cua_browser_type", "cua_browser_pointer", "cua_browser_dialog",
-    "cua_browser_set_input_files", "cua_browser_download",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -133,6 +130,90 @@ _INPUT_ACTIONS = frozenset({
 })
 
 
+_ACTION_ARGUMENTS = {
+    "capture": {"mode", "app", "pid", "window_id", "max_elements"},
+    "click": {
+        "element", "coordinate", "button", "modifiers", "app",
+        "delivery_mode", "bring_to_front", "capture_after",
+    },
+    "double_click": {
+        "element", "coordinate", "button", "modifiers", "app",
+        "delivery_mode", "bring_to_front", "capture_after",
+    },
+    "right_click": {
+        "element", "coordinate", "modifiers", "app", "delivery_mode",
+        "bring_to_front", "capture_after",
+    },
+    "middle_click": {
+        "element", "coordinate", "modifiers", "app", "delivery_mode",
+        "bring_to_front", "capture_after",
+    },
+    "drag": {
+        "from_element", "to_element", "from_coordinate", "to_coordinate",
+        "button", "modifiers", "app", "delivery_mode", "bring_to_front",
+        "capture_after",
+    },
+    "scroll": {
+        "direction", "amount", "element", "coordinate", "modifiers", "app",
+        "delivery_mode", "bring_to_front", "capture_after",
+    },
+    "type": {
+        "text", "element", "coordinate", "app", "delivery_mode",
+        "bring_to_front", "capture_after",
+    },
+    "key": {
+        "keys", "element", "coordinate", "app", "delivery_mode",
+        "bring_to_front", "capture_after",
+    },
+    "set_value": {"value", "element", "app", "capture_after"},
+    "wait": {"seconds"},
+    "list_apps": set(),
+    "list_windows": set(),
+    "focus_app": {"app", "raise_window", "capture_after"},
+}
+
+
+def _unexpected_action_arguments(
+    action: str, args: Dict[str, Any],
+) -> List[str]:
+    """Return supplied fields that this action would otherwise ignore."""
+    allowed = _ACTION_ARGUMENTS.get(action)
+    if allowed is None:
+        return []
+    return sorted(
+        key
+        for key, value in args.items()
+        if key != "action" and value is not None and key not in allowed
+    )
+
+
+def _conflicting_action_arguments(action: str, args: Dict[str, Any]) -> List[str]:
+    """Return mutually exclusive target fields supplied together."""
+    if action == "capture" and args.get("app") is not None and (
+        args.get("pid") is not None or args.get("window_id") is not None
+    ):
+        return [
+            key for key in ("app", "pid", "window_id")
+            if args.get(key) is not None
+        ]
+    if action in {
+        "click", "double_click", "right_click", "middle_click", "scroll",
+    } and args.get("element") is not None and args.get("coordinate") is not None:
+        return ["element", "coordinate"]
+    if action == "drag":
+        element_fields = [
+            key for key in ("from_element", "to_element")
+            if args.get(key) is not None
+        ]
+        coordinate_fields = [
+            key for key in ("from_coordinate", "to_coordinate")
+            if args.get(key) is not None
+        ]
+        if element_fields and coordinate_fields:
+            return [*element_fields, *coordinate_fields]
+    return []
+
+
 def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
     """Current sticky-target app when it clearly differs from *requested_app*.
 
@@ -175,7 +256,7 @@ def _is_blocked_type(text: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 # Per-Hermes-session cached backends. Each backend owns its own cua-driver
-# session, native target, typed-browser binding, refs, and grant namespace.
+# session, native target, snapshot tokens, and permission-mode namespace.
 _backend_lock = threading.Lock()
 # Backward-compatible empty-session injection hook used by older tests.
 # Process-scoped aux-vision routing cache: (provider, model) → bool.
@@ -275,32 +356,6 @@ def _cua_permission_mode(session_id: str) -> str:
         return _cua_configured_permission_mode()
     except Exception:
         return "standard"
-
-
-def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
-    """True when config already carries the authorization for this action.
-
-    ``computer_use.grant_existing_profile`` is a durable, file-backed opt-in
-    that the model can never set. When it is on, an extra runtime prompt for
-    the existing-profile prepare asks the user to re-authorize what they
-    already authorized — and it makes the documented opt-in unusable on any
-    non-interactive run, where the prompt has nobody to answer it and the
-    call dies on approval timeout instead of attaching.
-
-    Scope is deliberately narrow: only the existing-profile prepare, only
-    when the grant is present. Isolated-profile launches still prompt, and
-    any resolution failure falls closed to prompting.
-    """
-    if action != "cua_browser_prepare":
-        return False
-    if args.get("profile_mode") != "existing_profile":
-        return False
-    try:
-        from tools.computer_use.cua_backend import _cua_grant_existing_profile
-
-        return _cua_grant_existing_profile() is True
-    except Exception:
-        return False
 
 
 def _get_backend(session_id: str = "") -> ComputerUseBackend:
@@ -552,12 +607,36 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     action = (args.get("action") or "").strip().lower()
     if not action:
         return json.dumps({"error": "missing `action`"})
+    unexpected = _unexpected_action_arguments(action, args)
+    if unexpected:
+        return json.dumps({
+            "ok": False,
+            "action": action,
+            "code": "unexpected_action_arguments",
+            "error": (
+                f"{action} does not accept: {', '.join(unexpected)}; "
+                "remove those fields and retry"
+            ),
+            "unexpected": unexpected,
+        })
+    conflicting = _conflicting_action_arguments(action, args)
+    if conflicting:
+        return json.dumps({
+            "ok": False,
+            "action": action,
+            "code": "conflicting_action_arguments",
+            "error": (
+                f"{action} received mutually exclusive fields: "
+                f"{', '.join(conflicting)}; choose one target form"
+            ),
+            "conflicting": conflicting,
+        })
     # Per-run key for approval-state and daemon-mode isolation across
     # concurrent sessions.
     session_id = str(kwargs.get("session_id") or "")
 
     # Safety: validate actions before approval prompt.
-    if action in {"type", "cua_browser_type"}:
+    if action == "type":
         text = args.get("text", "")
         pat = _is_blocked_type(text)
         if pat:
@@ -582,9 +661,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             "code": "bring_to_front_requires_foreground",
         })
 
-    # Approval gate (destructive actions only). A durable config grant is
-    # already the user's authorization, so it stands in for the prompt.
-    if action in _DESTRUCTIVE_ACTIONS and not _config_preauthorized(action, args):
+    # Approval gate (destructive actions only).
+    if action in _DESTRUCTIVE_ACTIONS:
         err = _request_approval(action, args, session_id)
         if err is not None:
             return err
@@ -730,94 +808,6 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
         return _maybe_follow_capture(backend, res, capture_after)
 
-    # cua-driver's typed browser surface is namespaced inside the existing
-    # computer_use tool so it cannot collide with native browser/MCP tools.
-    # The backend owns the opaque driver session, target, tab and ref state;
-    # none of those capabilities can be supplied across Hermes sessions.
-    if action == "cua_browser_state":
-        state_args: Dict[str, Any] = {}
-        for public, internal in (
-            ("pid", "pid"),
-            ("window_id", "window_id"),
-            ("tab_id", "tab_id"),
-            ("snapshot_format", "snapshot_format"),
-            ("query", "query"),
-            ("scope_ref", "scope_ref"),
-            ("continuation", "continuation"),
-            ("include_screenshot", "include_screenshot"),
-        ):
-            if args.get(public) is not None:
-                state_args[internal] = args[public]
-        return _browser_state_response(backend.typed_browser_state(**state_args))
-
-    if action == "cua_browser_prepare":
-        return json.dumps(backend.typed_browser_prepare(
-            pid=args.get("pid"),
-            window_id=args.get("window_id"),
-            profile_mode=args.get("profile_mode", "isolated_new"),
-            profile_name=args.get("profile_name"),
-            allow_launch=bool(args.get("allow_launch")),
-        ))
-
-    browser_tools = {
-        "cua_browser_navigate": "browser_navigate",
-        "cua_browser_click": "browser_click",
-        "cua_browser_type": "browser_type",
-        "cua_browser_pointer": "browser_pointer",
-        "cua_browser_dialog": "browser_dialog",
-        "cua_browser_set_input_files": "browser_set_input_files",
-        "cua_browser_download": "browser_download",
-    }
-    driver_tool = browser_tools.get(action)
-    if driver_tool is not None:
-        call_args: Dict[str, Any] = {}
-        allowed_fields = {
-            "browser_navigate": ("url",),
-            "browser_click": ("ref", "input_route", "x", "y"),
-            "browser_type": ("ref", "text", "replace"),
-            "browser_pointer": (
-                "ref", "destination_ref", "input_route", "x", "y",
-                "to_x", "to_y", "delta_x", "delta_y",
-            ),
-            "browser_dialog": (
-                "dialog_id", "prompt_text", "delivery_mode",
-            ),
-            "browser_set_input_files": ("ref", "files"),
-            "browser_download": ("ref", "destination_root"),
-        }
-        for field in allowed_fields[driver_tool]:
-            if args.get(field) is not None:
-                call_args[field] = args[field]
-        if (
-            driver_tool in {"browser_click", "browser_pointer"}
-            and args.get("coordinate") is not None
-        ):
-            coordinate = args["coordinate"]
-            if isinstance(coordinate, (list, tuple)) and len(coordinate) == 2:
-                call_args["x"], call_args["y"] = coordinate
-        pointer_action = args.get("browser_pointer_action")
-        dialog_action = args.get("browser_dialog_action")
-        # Direct adapter callers may omit the public discriminator from args;
-        # retain this narrow compatibility path without making it usable to
-        # override the namespaced action selected by handle_computer_use.
-        nested_action = args.get("action")
-        if nested_action not in browser_tools:
-            if driver_tool == "browser_pointer" and pointer_action is None:
-                pointer_action = nested_action
-            if driver_tool == "browser_dialog" and dialog_action is None:
-                dialog_action = nested_action
-        if pointer_action is not None:
-            call_args["action"] = pointer_action
-        if dialog_action is not None:
-            call_args["action"] = dialog_action
-        if args.get("browser_type_mode") is not None:
-            call_args["mode"] = args["browser_type_mode"]
-        return json.dumps(backend.typed_browser_action(
-            driver_tool,
-            tab_id=args.get("tab_id"),
-            args=call_args,
-        ))
-
     # delivery_mode / bring_to_front thread through every input action so the
     # model can escalate background → foreground per cua-driver's ladder.
     delivery_mode = args.get("delivery_mode")
@@ -833,6 +823,19 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
     if action in _INPUT_ACTIONS:
         requested_app = args.get("app")
         if isinstance(requested_app, str) and requested_app.strip():
+            current_app = str(getattr(backend, "_last_app", None) or "").strip()
+            if not current_app:
+                return json.dumps({
+                    "ok": False,
+                    "action": action,
+                    "code": "input_target_unverified",
+                    "error": (
+                        f"{action} cannot verify that the sticky target belongs "
+                        f"to {requested_app.strip()!r}. Call "
+                        f"capture(app={requested_app.strip()!r}) or focus_app "
+                        "first, then retry."
+                    ),
+                })
             mismatch = _input_target_mismatch(backend, requested_app)
             if mismatch is not None:
                 return json.dumps({
@@ -859,6 +862,13 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             button = "middle"
         else:
             button = button or "left"
+        if action == "double_click" and button not in {None, "left"}:
+            return json.dumps({
+                "ok": False,
+                "action": action,
+                "code": "double_click_button_unsupported",
+                "error": "double_click supports only the left button",
+            })
         element = args.get("element")
         coord = args.get("coordinate") or (None, None)
         x, y = (coord[0], coord[1]) if coord and coord[0] is not None else (None, None)
@@ -902,11 +912,25 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "type":
-        res = backend.type_text(args.get("text", ""),
+        if args.get("coordinate") is not None:
+            return json.dumps({
+                "ok": False,
+                "action": action,
+                "code": "targeted_type_coordinate_unsupported",
+                "error": "coordinate-targeted type is not supported by the live Cua contract",
+            })
+        res = backend.type_text(args.get("text", ""), element=args.get("element"),
                                 delivery_mode=delivery_mode, bring_to_front=bring_to_front)
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "key":
+        if args.get("element") is not None or args.get("coordinate") is not None:
+            return json.dumps({
+                "ok": False,
+                "action": action,
+                "code": "targeted_key_unsupported",
+                "error": "targeted key delivery is not supported by the live Cua contract",
+            })
         res = backend.key(args.get("keys", ""),
                           delivery_mode=delivery_mode, bring_to_front=bring_to_front)
         return _maybe_follow_capture(backend, res, capture_after)
@@ -943,41 +967,6 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
 # Response shaping
 # ---------------------------------------------------------------------------
 
-def _browser_state_response(payload: Dict[str, Any]) -> Any:
-    """Return browser state as JSON, preserving requested MCP image parts."""
-    state = dict(payload)
-    raw_images = state.pop("_mcp_images", None)
-    if not isinstance(raw_images, list) or not raw_images:
-        return json.dumps(state)
-
-    text_summary = json.dumps(state)
-    content: List[Dict[str, Any]] = [
-        {"type": "text", "text": text_summary},
-    ]
-    image_count = 0
-    for image in raw_images:
-        if not isinstance(image, dict):
-            continue
-        data = image.get("data")
-        if not isinstance(data, str) or not data:
-            continue
-        mime_type = image.get("mime_type")
-        if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
-            mime_type = "image/jpeg" if data.startswith("/9j/") else "image/png"
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime_type};base64,{data}"},
-        })
-        image_count += 1
-    if image_count == 0:
-        return text_summary
-    return {
-        "_multimodal": True,
-        "content": content,
-        "text_summary": text_summary,
-        "meta": {"action": "cua_browser_state", "images": image_count},
-    }
-
 def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     """Choose the next ladder step from semantic evidence, in precedence order.
 
@@ -985,14 +974,25 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     effect and it never turns an unverifiable action into permission to repeat
     input. The model must first obtain fresh evidence.
     """
+    if not res.ok or res.code is not None:
+        decision: Dict[str, Any] = {"decision": "escalate"}
+        if isinstance(res.escalation, dict):
+            decision["recommended"] = (
+                res.escalation.get("target")
+                or res.escalation.get("recommended")
+            )
+        return decision
     if res.effect == "confirmed" or res.verified is True:
         return {"decision": "done"}
     if res.effect == "unverifiable":
         return {"decision": "verify_fresh_state"}
-    if res.effect == "suspected_noop" or not res.ok or res.code is not None:
+    if res.effect == "suspected_noop":
         decision: Dict[str, Any] = {"decision": "escalate"}
         if isinstance(res.escalation, dict):
-            decision["recommended"] = res.escalation.get("recommended")
+            decision["recommended"] = (
+                res.escalation.get("target")
+                or res.escalation.get("recommended")
+            )
         return decision
     # Transport success without semantic proof is not proof of effect.
     return {"decision": "verify_fresh_state"}
@@ -1010,11 +1010,16 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
         payload["verified"] = res.verified
     if res.effect is not None:
         payload["effect"] = res.effect
-    escalation = _enrich_escalation(res)
-    if escalation is not None:
-        payload["escalation"] = escalation
+    if res.escalation is not None:
+        payload["escalation"] = res.escalation
     if res.path is not None:
         payload["path"] = res.path
+    if res.route is not None:
+        payload["route"] = res.route
+    if res.delivery is not None:
+        payload["delivery"] = res.delivery
+    if res.evidence is not None:
+        payload["evidence"] = res.evidence
     if res.degraded is not None:
         payload["degraded"] = res.degraded
     if res.delivery_mode is not None:
@@ -1031,51 +1036,9 @@ def _text_response(res: ActionResult) -> str:
     return json.dumps(_action_payload(res))
 
 
-# Window classes of browsers whose page content the typed cua_browser_* route
-# can drive with trusted input and ZERO focus steal. When background text
-# delivery is refused for one of these surfaces, the driver's only hint is
-# "foreground" (it doesn't know Hermes has a typed page route), so the model
-# flashes the user's window to front for every keystroke batch. The hint below
-# offers the no-flash rung first; foreground remains valid for browser chrome,
-# native dialogs, and anything the typed route can't bind exactly.
-_TYPED_BROWSER_WINDOW_CLASSES = {
-    "chrome_widgetwin_1",   # Chrome, Edge, Brave, Electron-embedded Chromium
-    "mozillawindowclass",   # Firefox
-}
-
-
 def _enrich_escalation(res: ActionResult) -> Optional[Dict[str, Any]]:
-    """Return the driver's escalation dict, adding a typed-page alternative.
-
-    Purely additive: never changes the driver's `recommended` rung, only
-    appends `alternative`/`alternative_hint` when the refused target is a
-    known browser window class and the refused event is page-directed input
-    (typing/keys into page content). The model can then try the
-    `cua_browser_*` route — trusted input, no window flash — before a
-    foreground escalation, per the documented ladder ordering.
-    """
-    escalation = res.escalation
-    if not isinstance(escalation, dict):
-        return escalation
-    if escalation.get("recommended") != "foreground":
-        return escalation
-    meta = res.meta or {}
-    target_class = str(meta.get("target_class") or "").lower()
-    if target_class not in _TYPED_BROWSER_WINDOW_CLASSES:
-        return escalation
-    if meta.get("event_kind") not in {"text_input", "key_press"}:
-        return escalation
-    enriched = dict(escalation)
-    enriched["alternative"] = "page"
-    enriched["alternative_hint"] = (
-        "target is a browser window: if the input goes into PAGE content "
-        "(not browser chrome or a native dialog), the typed cua_browser_* "
-        "route can deliver it without any window flash — bind with "
-        "cua_browser_state (exact pid/window_id), then cua_browser_type. "
-        "Use foreground only for chrome/native surfaces or if typed binding "
-        "is unavailable."
-    )
-    return enriched
+    """Compatibility alias returning the driver's authoritative escalation."""
+    return res.escalation
 
 
 # Default cap for the AX `elements` array returned by capture. Dense UIs
@@ -1167,6 +1130,16 @@ def _coerce_max_elements(value: Any) -> int:
 
 
 def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
+    target_fields = {
+        **({"pid": cap.pid} if cap.pid is not None else {}),
+        **({"window_id": cap.window_id} if cap.window_id is not None else {}),
+        **({"error": cap.error} if cap.error is not None else {}),
+        **(
+            {"available_windows": cap.available_windows}
+            if cap.available_windows
+            else {}
+        ),
+    }
     total_elements = len(cap.elements)
     visible_elements = cap.elements[:max_elements]
     truncated_elements = max(0, total_elements - len(visible_elements))
@@ -1209,7 +1182,12 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
     summary_lines = [
         f"capture mode={cap.mode} {response_width}x{response_height}"
         + (f" app={cap.app}" if cap.app else "")
-        + (f" window={cap.window_title!r}" if cap.window_title else ""),
+        + (f" window={cap.window_title!r}" if cap.window_title else "")
+        + (
+            f" pid={cap.pid} window_id={cap.window_id}"
+            if cap.pid is not None or cap.window_id is not None
+            else ""
+        ),
         f"{total_elements} interactable element(s):",
     ]
     if bounds_note:
@@ -1285,6 +1263,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
                 "total_elements": total_elements,
                 "summary": "\n".join(summary_lines),
                 "vision_unavailable": True,
+                **target_fields,
             }
             if truncated_elements:
                 payload["truncated_elements"] = truncated_elements
@@ -1318,6 +1297,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             "text_summary": summary,
             "meta": {"mode": cap.mode, "width": response_width, "height": response_height,
                       "elements": total_elements, "png_bytes": cap.png_bytes_len,
+                      **target_fields,
                       **({"screenshot_path": screenshot_path} if screenshot_path else {}),
                       **({"elements_file": elements_file} if elements_file else {}),
                       **({"bounds_scale": bounds_scale} if bounds_scale else {})},
@@ -1339,6 +1319,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         "elements": [_element_to_dict(e) for e in visible_elements],
         "total_elements": total_elements,
         "summary": summary,
+        **target_fields,
     }
     if truncated_elements:
         payload["truncated_elements"] = truncated_elements

@@ -72,13 +72,14 @@ def test_real_exact_target_still_wins_over_app():
     assert cap.app == "Ghost", f"exact targeting was bypassed; detail={cap.window_title!r}"
 
 
-def test_partial_target_still_reports_the_missing_half():
-    """Guard: one real id and one placeholder is a caller error, not discovery."""
+def test_placeholder_window_id_turns_exact_request_into_pid_discovery():
+    """A placeholder window id must not be sent as an exact native target."""
     backend = _backend_with_windows(_WINDOWS)
 
     cap = backend.capture(mode="som", app="Comet", pid=200, window_id=0)
 
-    assert "requires both pid and window_id" in cap.window_title
+    assert cap.pid == 200
+    assert cap.window_id == 2
 
 
 def test_malformed_ids_are_not_treated_as_placeholders():
