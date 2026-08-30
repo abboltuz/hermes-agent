@@ -318,10 +318,70 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
 
+_ARCHIVE_ORIGIN_HOST = "github.com"
+_ARCHIVE_ASSET_HOST = "release-assets.githubusercontent.com"
+_ARCHIVE_REDIRECT_TARGETS = {
+    _ARCHIVE_ORIGIN_HOST: frozenset({_ARCHIVE_ASSET_HOST}),
+    _ARCHIVE_ASSET_HOST: frozenset({_ARCHIVE_ASSET_HOST}),
+}
+_ARCHIVE_RELEASE_PATH_PREFIX = "/cursor/sdk-bridge/releases/download/"
+_MAX_ARCHIVE_REDIRECTS = 3
+
+
+def _validate_archive_url(url: str, *, source_host: str | None = None) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        raise CursorBridgeError("bridge archive redirect must use HTTPS")
+    if parsed.username or parsed.password:
+        raise CursorBridgeError("bridge archive redirect contains userinfo")
+    if parsed.fragment:
+        raise CursorBridgeError("bridge archive redirect contains a fragment")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise CursorBridgeError("bridge archive redirect has an unsafe port") from exc
+    if port is not None and port != 443:
+        raise CursorBridgeError("bridge archive redirect has an unsafe port")
+    if source_host is not None and host not in _ARCHIVE_REDIRECT_TARGETS.get(source_host, ()):
+        raise CursorBridgeError("bridge archive redirect destination is untrusted")
+    return host
+
+
+class _ArchiveRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self):
+        super().__init__()
+        self._redirects = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source_host = _validate_archive_url(req.full_url)
+        _validate_archive_url(newurl, source_host=source_host)
+        self._redirects += 1
+        if self._redirects > _MAX_ARCHIVE_REDIRECTS:
+            raise CursorBridgeError("bridge archive redirect chain exceeds limit")
+        # Release assets are public; never copy credentials or arbitrary headers.
+        return urllib.request.Request(
+            newurl,
+            headers={"User-Agent": "hermes-cli"},
+            origin_req_host=req.origin_req_host,
+            unverifiable=True,
+            method="GET",
+        )
+
+
+def _build_archive_download_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_ArchiveRedirectHandler())
+
 
 def _fetch_url(url: str, timeout: float = 120) -> bytes:
+    _validate_archive_url(url)
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower() != _ARCHIVE_ORIGIN_HOST or not parsed.path.startswith(
+        _ARCHIVE_RELEASE_PATH_PREFIX
+    ):
+        raise CursorBridgeError("bridge archive source is not a trusted GitHub release")
     request = urllib.request.Request(url, headers={"User-Agent": "hermes-cli"})
-    with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+    with _build_archive_download_opener().open(request, timeout=timeout) as response:
         data = response.read(_MAX_ARCHIVE_BYTES + 1)
     if len(data) > _MAX_ARCHIVE_BYTES:
         raise CursorBridgeError("bridge archive exceeds download size limit")
