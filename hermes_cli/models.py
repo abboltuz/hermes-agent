@@ -3885,10 +3885,10 @@ def _cursor_discovered_models() -> Optional[list[str]]:
         live = profile.fetch_models()
     except Exception:
         return None
-    if not live:
+    if live is None:
         return None
     models = [str(item).strip() for item in live if str(item).strip()]
-    return models or None
+    return models
 
 
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
@@ -4137,7 +4137,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         _p = get_provider_profile(normalized)
         if _p and normalized == "cursor":
             live = _cursor_discovered_models()
-            return live or list(_PROVIDER_MODELS.get("cursor", []))
+            return live if live is not None else list(_PROVIDER_MODELS.get("cursor", []))
         if _p and _p.auth_type == "api_key" and _p.base_url:
             try:
                 creds = resolve_api_key_provider_credentials(normalized)
@@ -4264,7 +4264,7 @@ def _active_hermes_home_identity() -> str:
     home = get_hermes_home().expanduser()
     try:
         resolved = home.resolve(strict=False)
-    except OSError:
+    except (OSError, RuntimeError):
         # Keep unusual filesystem failures profile-local rather than collapsing
         # every active home into a shared coordinator identity.
         resolved = Path(os.path.abspath(os.fspath(home)))
@@ -4334,13 +4334,15 @@ def _coordinate_cursor_catalog_refresh() -> Optional[list[str]]:
         entry = cache.get("cursor")
         if (
             isinstance(entry, dict)
-            and provider_models_cache_entry_is_fresh(entry, fp, provider="cursor")
+            and provider_models_cache_entry_is_fresh(
+                entry, fp, provider="cursor", allow_empty=True
+            )
         ):
             discovered = list(entry["models"])
         else:
             discovered = _cursor_discovered_models()
-            if discovered:
-                update_provider_cache_entry("cursor", discovered)
+            if discovered is not None:
+                update_provider_cache_entry("cursor", discovered, allow_empty=True)
                 with _cursor_refresh_lock:
                     _cursor_refresh_failed_at.pop(key, None)
             else:
@@ -4604,7 +4606,9 @@ def provider_models_cache_entry_is_fresh(
     return age < provider_models_cache_ttl_seconds(provider, ttl_seconds)
 
 
-def update_provider_cache_entry(provider: str, models: list[str]) -> None:
+def update_provider_cache_entry(
+    provider: str, models: list[str], *, allow_empty: bool = False
+) -> None:
     """Thread-safe single-entry update of the provider-models disk cache.
 
     Used by parallel prefetch workers so concurrent fetches don't clobber
@@ -4614,7 +4618,7 @@ def update_provider_cache_entry(provider: str, models: list[str]) -> None:
     """
     try:
         normalized = normalize_provider(provider) or (provider or "")
-        if not normalized or not models:
+        if not normalized or (not models and not allow_empty):
             return
         fp = _credential_fingerprint(normalized)
         with _cache_write_lock:
@@ -4653,8 +4657,8 @@ def cached_provider_model_ids(
     entry = cache.get(normalized)
     now = time.time()
 
-    allow_empty_ollama = normalized == "ollama"
-    if not force_refresh and _cache_entry_valid(entry, fp, allow_empty=allow_empty_ollama):
+    allow_empty_catalog = normalized in {"cursor", "ollama"}
+    if not force_refresh and _cache_entry_valid(entry, fp, allow_empty=allow_empty_catalog):
         age = now - entry["at"]
         if age < ttl_seconds:
             return list(entry["models"])
@@ -4671,7 +4675,7 @@ def cached_provider_model_ids(
     # Cache miss / stale / forced refresh — call the live path.
     if normalized == "cursor":
         discovered = _coordinate_cursor_catalog_refresh()
-        if discovered:
+        if discovered is not None:
             return list(discovered)
         if _cache_entry_valid(entry, fp):
             return list(entry["models"])
