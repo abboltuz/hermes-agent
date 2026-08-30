@@ -35,6 +35,69 @@ def _reset_swr_state():
 
 
 class TestProviderModelsSWR:
+    def test_swr_inflight_and_worker_context_are_profile_scoped(self, tmp_path):
+        """Same cache keys in distinct profiles neither share workers nor homes."""
+        from agent.secret_scope import (
+            is_multiplex_active,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        import hermes_cli.models as mod
+
+        was_multiplexed = is_multiplex_active()
+        entered_a = threading.Event()
+        entered_b = threading.Event()
+        finished_a = threading.Event()
+        finished_b = threading.Event()
+        release = threading.Event()
+        observed = []
+        lock = threading.Lock()
+        set_multiplex_active(True)
+        try:
+            def refresh(label, entered, finished):
+                def run():
+                    with lock:
+                        observed.append((label, get_hermes_home()))
+                    entered.set()
+                    assert release.wait(timeout=2)
+                    finished.set()
+                    return None
+                return run
+
+            home_a = tmp_path / "profile-a"
+            home_a_token = set_hermes_home_override(home_a)
+            scope_a_token = set_secret_scope({})
+            try:
+                mod._spawn_swr_refresh("openrouter", refresh("a", entered_a, finished_a))
+                assert entered_a.wait(timeout=2)
+            finally:
+                reset_secret_scope(scope_a_token)
+                reset_hermes_home_override(home_a_token)
+
+            home_b = tmp_path / "profile-b"
+            home_b_token = set_hermes_home_override(home_b)
+            scope_b_token = set_secret_scope({})
+            try:
+                mod._spawn_swr_refresh("openrouter", refresh("b", entered_b, finished_b))
+                assert entered_b.wait(timeout=2)
+            finally:
+                reset_secret_scope(scope_b_token)
+                reset_hermes_home_override(home_b_token)
+            release.set()
+            assert finished_a.wait(timeout=2)
+            assert finished_b.wait(timeout=2)
+        finally:
+            release.set()
+            set_multiplex_active(was_multiplexed)
+
+        assert sorted(observed) == [("a", home_a), ("b", home_b)]
+
     def _cache_entry(self, models, age_seconds, fp="fp"):
         return {"fp": fp, "at": time.time() - age_seconds, "models": list(models)}
 

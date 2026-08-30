@@ -8,6 +8,7 @@ Add, remove, or reorder entries here — both `hermes setup` and
 from __future__ import annotations
 
 import copy
+import contextvars
 import json
 import http.client
 import logging
@@ -4244,8 +4245,8 @@ _swr_refresh_lock = threading.Lock()
 # attempt per (provider, credential fingerprint). A failed attempt suppresses
 # further raw discovery until the existing Cursor TTL boundary.
 _cursor_refresh_lock = threading.Lock()
-_cursor_refresh_inflight: dict[tuple[str, str], "_CursorRefreshAttempt"] = {}
-_cursor_refresh_failed_at: dict[tuple[str, str], float] = {}
+_cursor_refresh_inflight: dict[tuple[str, str, str], "_CursorRefreshAttempt"] = {}
+_cursor_refresh_failed_at: dict[tuple[str, str, str], float] = {}
 
 
 class _CursorRefreshAttempt:
@@ -4256,8 +4257,24 @@ class _CursorRefreshAttempt:
         self.result: Optional[list[str]] = None
 
 
-def _cursor_refresh_key(fp: Optional[str] = None) -> tuple[str, str]:
-    return ("cursor", fp if fp is not None else _credential_fingerprint("cursor"))
+def _active_hermes_home_identity() -> str:
+    """Return the active profile home's stable process-local coordination key."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return os.path.normcase(str(get_hermes_home().expanduser().resolve(strict=False)))
+    except Exception:
+        # Coordination must remain deterministic even if an unusual filesystem
+        # error prevents canonicalization; never substitute a process profile.
+        return "<unresolved-active-hermes-home>"
+
+
+def _cursor_refresh_key(fp: Optional[str] = None) -> tuple[str, str, str]:
+    return (
+        _active_hermes_home_identity(),
+        "cursor",
+        fp if fp is not None else _credential_fingerprint("cursor"),
+    )
 
 
 def _clear_cursor_refresh_failures(provider: Optional[str] = None) -> None:
@@ -4273,7 +4290,7 @@ def _clear_cursor_refresh_failures(provider: Optional[str] = None) -> None:
             return
         if normalized != "cursor":
             return
-        for key in [key for key in _cursor_refresh_failed_at if key[0] == "cursor"]:
+        for key in [key for key in _cursor_refresh_failed_at if key[1] == "cursor"]:
             _cursor_refresh_failed_at.pop(key, None)
 
 
@@ -4353,10 +4370,12 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
     ``PROVIDER_REGISTRY`` slug and refreshed via :func:`provider_model_ids`
     (the original behavior).
     """
+    inflight_key = (_active_hermes_home_identity(), cache_key)
+    caller_context = contextvars.copy_context()
     with _swr_refresh_lock:
-        if cache_key in _swr_refresh_inflight:
+        if inflight_key in _swr_refresh_inflight:
             return
-        _swr_refresh_inflight.add(cache_key)
+        _swr_refresh_inflight.add(inflight_key)
 
     def _default_refresh():
         if cache_key == "cursor":
@@ -4396,10 +4415,12 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
             logger.debug("SWR refresh failed for %s", cache_key, exc_info=True)
         finally:
             with _swr_refresh_lock:
-                _swr_refresh_inflight.discard(cache_key)
+                _swr_refresh_inflight.discard(inflight_key)
 
     threading.Thread(
-        target=_refresh, daemon=True, name=f"model-cache-swr-{cache_key}"
+        target=lambda: caller_context.run(_refresh),
+        daemon=True,
+        name=f"model-cache-swr-{cache_key}",
     ).start()
 
 
@@ -4423,8 +4444,10 @@ def _credential_fingerprint(provider: str) -> str:
     """
     import hashlib
     import os as _os
+    from agent.secret_scope import UnscopedSecretError
+    from hermes_cli.config import get_env_value_prefer_dotenv
 
-    parts: list[str] = []
+    parts: list[str] = [f"profile_home={_active_hermes_home_identity()}"]
 
     # Env vars from PROVIDER_REGISTRY for this slug
     try:
@@ -4432,10 +4455,12 @@ def _credential_fingerprint(provider: str) -> str:
         pcfg = PROVIDER_REGISTRY.get(provider)
         if pcfg is not None:
             for ev in getattr(pcfg, "api_key_env_vars", ()) or ():
-                parts.append(f"{ev}={_os.environ.get(ev, '')}")
+                parts.append(f"{ev}={get_env_value_prefer_dotenv(ev) or ''}")
             bev = getattr(pcfg, "base_url_env_var", "") or ""
             if bev:
-                parts.append(f"{bev}={_os.environ.get(bev, '')}")
+                parts.append(f"{bev}={get_env_value_prefer_dotenv(bev) or ''}")
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -4461,7 +4486,7 @@ def _credential_fingerprint(provider: str) -> str:
         key_env = provider_cfg.get("key_env") or provider_cfg.get("api_key_env") or ""
         parts.append(f"providers.ollama.key_env={key_env}")
         if key_env:
-            parts.append(f"{key_env}={_os.environ.get(str(key_env), '')}")
+            parts.append(f"{key_env}={get_env_value_prefer_dotenv(str(key_env)) or ''}")
         model_cfg = _get_model_config_dict()
         parts.append(
             "model.provider="
