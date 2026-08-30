@@ -33,7 +33,7 @@ _HERMES_CORE_TOOLS = [
     "web_search", "web_extract",
     # Terminal + process management
     "terminal", "process",
-    # NOTE: the desktop GUI affordances (read_terminal, open_preview, …) are
+    # NOTE: the desktop GUI affordances (read_terminal, desktop_preview, …) are
     # deliberately NOT here, for the same reason as the `project` tools below:
     # they only work where a GUI renderer can answer them. They live in the
     # `desktop_ui` toolset and are enabled solely by the GUI gateway for a
@@ -253,7 +253,7 @@ TOOLSETS = {
         "description": "Desktop GUI affordances — in-app terminal/browser panes, pane focus, reactions (GUI sessions only)",
         "tools": [
             "read_terminal", "close_terminal",
-            "open_preview", "close_preview", "read_preview", "drive_preview", "annotate_preview",
+            "desktop_preview", "drive_preview", "annotate_preview",
             "read_window_below",
             "focus_pane", "react_to_message",
             "setup_mcp", "tour",

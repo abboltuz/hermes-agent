@@ -10,9 +10,9 @@ Two surfaces share the same engine (driver.js in the renderer):
 
 - ``surface="app"`` — the Hermes desktop app's own DOM (tours of Hermes itself).
 - ``surface="preview"`` — the page loaded in the in-app browser/preview pane
-  (tours of ANY web app, e.g. a project open via open_preview).
+  (tours of ANY web app, e.g. a project opened by ``desktop_preview``).
 
-Round-trips through the gateway's blocking-prompt bridge like ``read_preview``:
+Round-trips through the gateway's blocking-prompt bridge like the preview read action:
 tui_gateway emits ``tour.request``, the renderer drives driver.js (injecting it
 into the preview's webview when needed) and answers ``tour.respond`` with the
 outcome, so the agent knows whether the selector matched. This module is just

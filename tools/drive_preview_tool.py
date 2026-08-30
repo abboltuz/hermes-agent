@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interact with the in-app browser / preview pane in the Hermes desktop GUI.
 
-``open_preview`` shows a page and ``read_preview`` reads it; this tool is the
+``desktop_preview`` opens or reads a page; this tool is the
 third leg — clicking, typing, scrolling, and history — so the agent can drive
 the same page the user is looking at instead of narrating from the outside.
 
@@ -17,7 +17,7 @@ inventory after every click. That is the cheap half of the arrangement, and it
 only works because the refs are legible enough to read on their own three turns
 later.
 
-Round-trips through the gateway's blocking-prompt bridge like ``read_preview``:
+Round-trips through the gateway's blocking-prompt bridge like the read action:
 tui_gateway emits ``preview.act.request``, the renderer injects the interaction
 engine into the pane's webview and answers ``preview.act.respond`` with the
 outcome plus whatever moved. This module is just schema + a thin dispatcher
@@ -114,7 +114,7 @@ def drive_preview_tool(
     if not raw:
         return tool_error(
             "The action timed out, or no GUI window answered. "
-            "Open a page with open_preview first."
+            "Open a page with desktop_preview action='open' first."
         )
 
     # The renderer answers with a JSON object; pass it through, else wrap it.
@@ -128,7 +128,7 @@ ACT_PREVIEW_SCHEMA = {
     "name": "drive_preview",
     "description": (
         "Interact with the page open in the in-app browser / preview pane of "
-        "the Hermes desktop GUI — the pane open_preview opens beside this "
+        "the Hermes desktop GUI — the pane desktop_preview action='open' opens beside this "
         "chat. This is how you USE a web app the user is looking at: log in, "
         "fill a form, click through a flow, page a long document. ALWAYS call "
         "action='elements' first to get the current inventory of clickable and "
@@ -161,7 +161,7 @@ ACT_PREVIEW_SCHEMA = {
         "'back'/'forward'/'reload' for history. The pane draws every move as "
         "it happens so the user can follow along; those marks fade on their "
         "own, and annotate_preview is how you leave one up on purpose. Use "
-        "read_preview when you only "
+        "desktop_preview action='read' when you only "
         "need the page's text, and the browser_* tools when the work belongs "
         "in a separate automated browser rather than the user's own pane."
     ),
