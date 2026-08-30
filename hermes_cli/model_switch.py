@@ -2333,7 +2333,7 @@ def _scoped_key_env(name: str) -> str:
 
 _PARALLEL_PREFETCH_WORKERS = 8
 _prefetch_singleflight_lock = threading.Lock()
-_prefetch_singleflight: dict[str, threading.Event] = {}
+_prefetch_singleflight: dict[tuple[str, str], threading.Event] = {}
 
 
 def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
@@ -2359,6 +2359,7 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     # between this check and the actual fetch, cached_provider_model_ids will
     # still do the right thing (it re-reads the cache internally).
     from hermes_cli.models import (
+        _active_hermes_home_identity,
         _load_provider_models_cache,
         _credential_fingerprint,
         normalize_provider,
@@ -2386,15 +2387,17 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     def _fetch_one(slug: str) -> None:
         owner = True
         done: threading.Event | None = None
+        inflight_key: tuple[str, str] | None = None
         if slug != "cursor":
+            inflight_key = (_active_hermes_home_identity(), slug)
             owner = False
             with _prefetch_singleflight_lock:
-                inflight = _prefetch_singleflight.get(slug)
+                inflight = _prefetch_singleflight.get(inflight_key)
                 if inflight is not None:
                     done = inflight
                 else:
                     done = threading.Event()
-                    _prefetch_singleflight[slug] = done
+                    _prefetch_singleflight[inflight_key] = done
                     owner = True
             if not owner:
                 done.wait()
@@ -2411,17 +2414,25 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
         except Exception:
             pass  # best-effort; picker falls back to curated list
         finally:
-            if done is not None:
+            if done is not None and inflight_key is not None:
                 with _prefetch_singleflight_lock:
                     done.set()
-                    if _prefetch_singleflight.get(slug) is done:
-                        _prefetch_singleflight.pop(slug, None)
+                    if _prefetch_singleflight.get(inflight_key) is done:
+                        _prefetch_singleflight.pop(inflight_key, None)
 
+    import contextvars
+
+    caller_context = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(_PARALLEL_PREFETCH_WORKERS, len(stale_slugs)),
         thread_name_prefix="model-cache-prefetch",
     ) as executor:
-        list(executor.map(_fetch_one, stale_slugs))
+        futures = [
+            executor.submit(caller_context.copy().run, _fetch_one, slug)
+            for slug in stale_slugs
+        ]
+        for future in futures:
+            future.result()
 
 
 def _has_cursor_credentials() -> bool:

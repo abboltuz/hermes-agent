@@ -446,12 +446,16 @@ def resolve_cursor_api_key() -> tuple[str, str]:
     Returns ``(api_key, source)`` where source is ``"env"``, the stored
     credential's source label, or ``("", "")`` when nothing usable exists.
     """
+    from agent.secret_scope import UnscopedSecretError
+
     try:
         from hermes_cli.config import get_env_value_prefer_dotenv
 
         env_key = (get_env_value_prefer_dotenv("CURSOR_API_KEY") or "").strip()
         if env_key:
             return env_key, "env"
+    except UnscopedSecretError:
+        raise
     except Exception:
         env_key = os.getenv("CURSOR_API_KEY", "").strip()
         if env_key:

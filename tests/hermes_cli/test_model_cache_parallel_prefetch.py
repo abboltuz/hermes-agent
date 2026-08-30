@@ -157,6 +157,45 @@ def _install_non_cursor_waiter_probe(model_switch):
 class TestPrefetchProviderModelsParallel:
     """Verify ``_prefetch_provider_models_parallel`` fetches concurrently."""
 
+    def test_prefetch_executor_uses_callers_profile_context(self, tmp_path, monkeypatch):
+        """Executor work retains the profile home and scoped Cursor credential."""
+        from agent.secret_scope import (
+            get_secret,
+            is_multiplex_active,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        was_multiplexed = is_multiplex_active()
+        home = tmp_path / "profile-a"
+        observed = []
+        monkeypatch.setenv("CURSOR_API_KEY", "process-only-sentinel")
+        set_multiplex_active(True)
+        home_token = set_hermes_home_override(home)
+        scope_token = set_secret_scope({"CURSOR_API_KEY": "scoped-a"})
+        try:
+            def fetch(slug, force_refresh=False):
+                observed.append((slug, get_hermes_home(), get_secret("CURSOR_API_KEY")))
+                return ["live-cursor"]
+
+            with patch("hermes_cli.models._load_provider_models_cache", return_value={}), \
+                 patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+                 patch("hermes_cli.models.cached_provider_model_ids", side_effect=fetch):
+                _prefetch_provider_models_parallel(["cursor"])
+        finally:
+            reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+            set_multiplex_active(was_multiplexed)
+
+        assert observed == [("cursor", home, "scoped-a")]
+
     def test_skips_all_fresh_entries(self, monkeypatch):
         """When all cache entries are fresh, no fetch is made."""
         from hermes_cli.model_switch import _prefetch_provider_models_parallel

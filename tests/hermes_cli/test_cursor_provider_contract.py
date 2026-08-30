@@ -66,6 +66,50 @@ def test_profile_dotenv_precedes_stale_process_env(cursor_home, monkeypatch):
     assert resolve_cursor_api_key() == ("dotenv-value", "env")
 
 
+def test_cursor_profile_fingerprint_is_scoped_and_unscoped_resolution_fails_closed(
+    tmp_path, monkeypatch
+):
+    """Multiplexed catalog identity must follow the active profile context."""
+    from agent.secret_scope import (
+        UnscopedSecretError,
+        is_multiplex_active,
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import models
+
+    was_multiplexed = is_multiplex_active()
+    monkeypatch.setenv("CURSOR_API_KEY", "process-only-sentinel")
+    set_multiplex_active(True)
+    try:
+        with pytest.raises(UnscopedSecretError):
+            resolve_cursor_api_key()
+
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        home_a_token = set_hermes_home_override(home_a)
+        scope_a_token = set_secret_scope({"CURSOR_API_KEY": "scoped-a"})
+        try:
+            fingerprint_a = models._credential_fingerprint("cursor")
+        finally:
+            reset_secret_scope(scope_a_token)
+            reset_hermes_home_override(home_a_token)
+
+        home_b_token = set_hermes_home_override(home_b)
+        scope_b_token = set_secret_scope({"CURSOR_API_KEY": "scoped-b"})
+        try:
+            fingerprint_b = models._credential_fingerprint("cursor")
+        finally:
+            reset_secret_scope(scope_b_token)
+            reset_hermes_home_override(home_b_token)
+
+        assert fingerprint_a != fingerprint_b
+    finally:
+        set_multiplex_active(was_multiplexed)
+
+
 def test_credential_save_rejects_symlink_target(cursor_home):
     target = cursor_home / "must-not-change"
     target.write_text("safe", encoding="utf-8")
