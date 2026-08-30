@@ -182,6 +182,50 @@ def test_active_home_identity_fallback_remains_profile_distinct(tmp_path, monkey
     assert identity_a != identity_b
 
 
+def test_active_home_identity_handles_runtime_canonicalization_failures(tmp_path, monkeypatch):
+    """The narrow fallback also covers Path.resolve's symlink-loop error."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import models
+
+    monkeypatch.setattr(
+        models.Path,
+        "resolve",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("synthetic")),
+    )
+    identities = []
+    for name in ("profile-a", "profile-b"):
+        token = set_hermes_home_override(tmp_path / name)
+        try:
+            identities.append(models._active_hermes_home_identity())
+        finally:
+            reset_hermes_home_override(token)
+
+    assert identities[0] != identities[1]
+
+
+@pytest.mark.macos_only
+def test_active_home_identity_handles_real_symlink_loops(tmp_path):
+    """A real self-referential home symlink remains a stable unique identity."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import models
+
+    identities = []
+    for name in ("loop-a", "loop-b"):
+        home = tmp_path / name
+        try:
+            home.symlink_to(home)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+        token = set_hermes_home_override(home)
+        try:
+            identities.append(models._active_hermes_home_identity())
+            assert models._active_hermes_home_identity() == identities[-1]
+        finally:
+            reset_hermes_home_override(token)
+
+    assert identities[0] != identities[1]
+
+
 def test_credential_save_rejects_symlink_target(cursor_home):
     target = cursor_home / "must-not-change"
     target.write_text("safe", encoding="utf-8")
@@ -291,6 +335,31 @@ def test_provider_model_catalog_uses_cursor_profile_live_fetch(cursor_home, monk
     assert profile is not None
     monkeypatch.setattr(profile, "fetch_models", lambda **_kwargs: ["auto", "live-model"])
     assert models.provider_model_ids("cursor") == ["auto", "live-model"]
+
+
+def test_cursor_profile_and_picker_preserve_successful_empty_catalog(cursor_home, monkeypatch):
+    """An empty native ListModels response is a successful Cursor catalog."""
+    from agent import cursor_bridge_client, cursor_bridge_transport
+    from hermes_cli import models
+    from providers import get_provider_profile
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_models(self):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cursor_bridge_transport, "resolve_bridge_command", lambda: "bridge")
+    monkeypatch.setattr(cursor_bridge_client, "CursorBridgeClient", FakeClient)
+    profile = get_provider_profile("cursor")
+    assert profile is not None
+    assert profile.fetch_models(api_key="fixture") == []
+    monkeypatch.setattr(profile, "fetch_models", lambda **_kwargs: [])
+    assert models.provider_model_ids("cursor") == []
 
 
 def test_cursor_discovery_none_is_ordinary_auto_fallback_not_cached_live(cursor_home, monkeypatch):

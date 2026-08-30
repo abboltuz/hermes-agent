@@ -108,6 +108,16 @@ class TestUpdateProviderCacheEntry:
         cache = mod._load_provider_models_cache()
         assert "empty_provider" not in cache
 
+    def test_explicit_empty_write_opt_in_persists_only_when_requested(self, tmp_path, monkeypatch):
+        import hermes_cli.models as mod
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        with patch.object(mod, "_credential_fingerprint", return_value="fp"):
+            mod.update_provider_cache_entry("cursor", [], allow_empty=True)
+
+        assert mod._load_provider_models_cache()["cursor"]["models"] == []
+
     def test_concurrent_writes_no_lost_entries(self, tmp_path, monkeypatch):
         """Multiple threads writing different providers concurrently — all land."""
         import hermes_cli.models as mod

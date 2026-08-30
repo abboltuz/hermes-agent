@@ -56,7 +56,7 @@ class CursorProfile(ProviderProfile):
             finally:
                 client.close()
             ids = [str(m.get("id") or "").strip() for m in models]
-            return [m for m in ids if m] or None
+            return [m for m in ids if m]
         except Exception:
             return None
 

@@ -633,3 +633,58 @@ class TestCursorForcedDiscoveryCache:
         saved = _read_provider_cache(cache_path)
         assert saved["cursor"]["models"] == ["auto"]
         assert saved["cursor"]["at"] > time.time() - 5
+
+    def test_successful_empty_catalog_is_cached_fresh_then_reprobed_after_cursor_ttl(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        calls = []
+
+        def fetch(**_kwargs):
+            calls.append(True)
+            return [] if len(calls) == 1 else ["named-after-expiry"]
+
+        _patch_cursor_fetch_models(monkeypatch, fetch)
+        assert mod.cached_provider_model_ids("cursor", force_refresh=True) == []
+        saved = _read_provider_cache(cache_path)
+        assert saved["cursor"]["models"] == []
+        assert mod.cached_provider_model_ids("cursor") == []
+        assert calls == [True]
+
+        saved["cursor"]["at"] = time.time() - 301
+        _write_provider_cache(cache_path, saved)
+        assert mod.cached_provider_model_ids("cursor") == ["named-after-expiry"]
+        assert calls == [True, True]
+
+    def test_concurrent_successful_empty_catalog_callers_share_result(self, tmp_path, monkeypatch):
+        import hermes_cli.models as mod
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        results = []
+
+        def fetch(**_kwargs):
+            calls.append(True)
+            entered.set()
+            assert release.wait(timeout=2)
+            return []
+
+        _patch_cursor_fetch_models(monkeypatch, fetch)
+        workers = [threading.Thread(target=lambda: results.append(
+            mod.cached_provider_model_ids("cursor", force_refresh=True)
+        )) for _ in range(2)]
+        workers[0].start()
+        assert entered.wait(timeout=2)
+        workers[1].start()
+        release.set()
+        for worker in workers:
+            worker.join(timeout=2)
+        assert all(not worker.is_alive() for worker in workers)
+        assert calls == [True]
+        assert results == [[], []]
