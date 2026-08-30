@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 import time
@@ -252,3 +253,175 @@ ns.serve_forever()
         client.close()
         client.close()
     assert client._process is None
+
+
+def _write_blocking_bridge(path):
+    path.write_text(
+        """import json, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({'data': []}).encode(); self.send_response(200)
+        self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        while True: time.sleep(1)
+    def log_message(self, *args): pass
+ns = ThreadingHTTPServer(('127.0.0.1', 0), H)
+print('antigravity-bridge ready ' + json.dumps({'protocol': 'antigravity-openai-v1', 'host': '127.0.0.1', 'port': ns.server_port}), flush=True)
+ns.serve_forever()
+""",
+        encoding="utf-8",
+    )
+
+
+def test_antigravity_async_cancellation_reaps_concrete_child(tmp_path):
+    from agent.antigravity_bridge_client import AsyncAntigravityBridgeClient
+
+    child = tmp_path / "blocking_async_bridge.py"
+    _write_blocking_bridge(child)
+
+    async def exercise():
+        client = AsyncAntigravityBridgeClient(bridge_command=[sys.executable, str(child)])
+        await client.list_models()
+        process = client._sync._process
+        assert process is not None and process._process is not None
+        child_process = process._process
+        task = asyncio.create_task(client.chat.completions.create(model="x", messages=[]))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert child_process.poll() is not None
+        await client.close()
+
+    asyncio.run(exercise())
+
+
+def test_antigravity_concurrent_first_use_has_one_owned_child(tmp_path):
+    from agent.antigravity_bridge_client import AntigravityBridgeClient
+
+    child = tmp_path / "blocking_concurrent_bridge.py"
+    _write_blocking_bridge(child)
+    client = AntigravityBridgeClient(bridge_command=[sys.executable, str(child)])
+    barrier = threading.Barrier(3)
+    results = []
+
+    def call_list_models():
+        barrier.wait()
+        try:
+            results.append(client.list_models())
+        except Exception as exc:
+            results.append(exc)
+
+    threads = [threading.Thread(target=call_list_models) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+    try:
+        assert all(not isinstance(result, Exception) for result in results)
+        process = client._process
+        assert process is not None and process._process is not None
+        child_process = process._process
+        assert child_process.poll() is None
+        client.close()
+        assert child_process.poll() is not None
+    finally:
+        client.close()
+
+
+def test_antigravity_loopback_bypasses_environment_proxy(monkeypatch):
+    from agent.antigravity_bridge_transport import (
+        AntigravityBridgeEndpoint, AntigravityHTTPTransport,
+    )
+
+    origin_requests = []
+    proxy_requests = []
+
+    class OriginHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            origin_requests.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            proxy_requests.append(self.headers.get("Authorization"))
+            self.send_response(502)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    origin = ThreadingHTTPServer(("127.0.0.1", 0), OriginHandler)
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    threads = [threading.Thread(target=server.serve_forever, daemon=True)
+               for server in (origin, proxy)]
+    for thread in threads:
+        thread.start()
+    try:
+        for name in ("HTTP_PROXY", "http_proxy"):
+            monkeypatch.setenv(name, f"http://127.0.0.1:{proxy.server_port}")
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        transport = AntigravityHTTPTransport(
+            AntigravityBridgeEndpoint(f"http://127.0.0.1:{origin.server_port}", "private-bearer")
+        )
+        assert transport.request("GET", "/v1/models") == b"{}"
+        assert origin_requests == ["Bearer private-bearer"]
+        assert proxy_requests == []
+    finally:
+        origin.shutdown()
+        proxy.shutdown()
+
+
+def test_antigravity_runtime_factory_selects_client_without_starting_bridge(monkeypatch):
+    from types import SimpleNamespace
+    from agent.agent_runtime_helpers import create_openai_client
+    from agent.antigravity_bridge_client import AntigravityBridgeClient
+
+    agent = SimpleNamespace(provider="antigravity", model="gemini-3-pro")
+    client = create_openai_client(
+        agent,
+        {"base_url": "sdkbridge://antigravity", "bridge_command": [sys.executable, "-c", "raise SystemExit"]},
+        reason="test",
+        shared=False,
+    )
+    assert isinstance(client, AntigravityBridgeClient)
+    assert client._process is None
+    client.close()
+
+
+def test_antigravity_auxiliary_router_returns_sync_and_async_clients(monkeypatch):
+    from agent import antigravity_bridge_transport
+    from agent.antigravity_bridge_client import AntigravityBridgeClient, AsyncAntigravityBridgeClient
+    from agent.auxiliary_client import resolve_provider_client
+
+    monkeypatch.setattr(
+        antigravity_bridge_transport,
+        "resolve_antigravity_bridge_command",
+        lambda: "/tmp/fake-antigravity-bridge",
+    )
+    sync_client, sync_model = resolve_provider_client("antigravity", model="gemini-3-pro")
+    async_client, async_model = resolve_provider_client(
+        "antigravity", model="antigravity-claude-sonnet-4-6", async_mode=True
+    )
+    assert isinstance(sync_client, AntigravityBridgeClient)
+    assert isinstance(async_client, AsyncAntigravityBridgeClient)
+    assert sync_model == "gemini-3-pro"
+    assert async_model == "antigravity-claude-sonnet-4-6"
+    sync_client.close()
+    async_client._sync.close()
+
+
+def test_antigravity_command_resolution_fails_closed_for_missing_managed_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-hermes"))
+    from agent.antigravity_bridge_transport import resolve_antigravity_bridge_command
+
+    assert resolve_antigravity_bridge_command() is None

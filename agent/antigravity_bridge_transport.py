@@ -78,6 +78,7 @@ class AntigravityBridgeProcess:
         self._process: subprocess.Popen[Any] | None = None
         self.endpoint: AntigravityBridgeEndpoint | None = None
         self._stop_lock = threading.Lock()
+        self._stopped = False
 
     def start(self) -> AntigravityBridgeEndpoint:
         argv = [self.command] if isinstance(self.command, str) else list(self.command)
@@ -86,20 +87,22 @@ class AntigravityBridgeProcess:
         env = dict(os.environ)
         env[TOKEN_ENV] = self.auth_token
         try:
-            self._process = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=False, env=env,
-            )
-            atexit.register(self.stop)
+            with self._stop_lock:
+                if self._stopped:
+                    raise AntigravityBridgeError("Antigravity bridge process is stopped")
+                process = subprocess.Popen(
+                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=False, env=env,
+                )
+                self._process = process
+                atexit.register(self.stop)
         except OSError as exc:
             raise AntigravityBridgeError("could not launch Antigravity bridge") from exc
-        assert self._process.stdout is not None
+        assert process.stdout is not None
         ready: queue.Queue[dict[str, Any] | Exception] = queue.Queue(maxsize=1)
 
-        process = self._process
-
         def scan() -> None:
-            assert process is not None and process.stdout is not None
+            assert process.stdout is not None
             line = bytearray()
             deadline = time.monotonic() + self.startup_timeout
             while time.monotonic() < deadline:
@@ -144,6 +147,7 @@ class AntigravityBridgeProcess:
 
     def stop(self) -> None:
         with self._stop_lock:
+            self._stopped = True
             process, self._process = self._process, None
             self.endpoint = None
             if process is None:
@@ -190,7 +194,9 @@ class AntigravityHTTPTransport:
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
 
-        opener = urllib.request.build_opener(_NoRedirect())
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect()
+        )
         try:
             with opener.open(request, timeout=timeout) as response:
                 data = response.read(MAX_RESPONSE_BYTES + 1)
