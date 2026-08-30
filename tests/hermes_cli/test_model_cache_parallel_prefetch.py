@@ -135,6 +135,25 @@ class TestUpdateProviderCacheEntry:
 # Parallel prefetch (hermes_cli/model_switch.py)
 # ---------------------------------------------------------------------------
 
+def _install_non_cursor_waiter_probe(model_switch):
+    """Return a lock wrapper that signals when a waiter sees an in-flight slug."""
+    real_lock = model_switch._prefetch_singleflight_lock
+    waiter_saw_inflight = threading.Event()
+
+    class _GuardLock:
+        def __enter__(self):
+            real_lock.acquire()
+            if model_switch._prefetch_singleflight:
+                waiter_saw_inflight.set()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            real_lock.release()
+            return False
+
+    return _GuardLock(), waiter_saw_inflight
+
+
 class TestPrefetchProviderModelsParallel:
     """Verify ``_prefetch_provider_models_parallel`` fetches concurrently."""
 
@@ -249,6 +268,130 @@ class TestPrefetchProviderModelsParallel:
         with patch("hermes_cli.models.cached_provider_model_ids") as fetch:
             _prefetch_provider_models_parallel([])
         fetch.assert_not_called()
+
+    def test_overlapping_stale_openrouter_prefetches_share_one_forced_discovery(self):
+        """Two overlapping stale OpenRouter prefetches share one forced discovery."""
+        from hermes_cli import model_switch
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        release = threading.Event()
+        entered = threading.Event()
+        start = threading.Barrier(2)
+        calls = []
+        lock = threading.Lock()
+        guard_lock, waiter_saw_inflight = _install_non_cursor_waiter_probe(model_switch)
+
+        def mock_fetch(slug, force_refresh=False):
+            with lock:
+                calls.append((slug, force_refresh))
+            entered.set()
+            assert release.wait(timeout=2)
+            return ["or-live"]
+
+        def worker():
+            start.wait(timeout=2)
+            _prefetch_provider_models_parallel(["openrouter"])
+
+        with patch.object(model_switch, "_prefetch_singleflight_lock", guard_lock), \
+             patch("hermes_cli.models._load_provider_models_cache", return_value={}), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
+             patch("hermes_cli.models.update_provider_cache_entry"):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            assert entered.wait(timeout=2)
+            assert waiter_saw_inflight.wait(timeout=2)
+            assert all(thread.is_alive() for thread in threads)
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+            assert all(not thread.is_alive() for thread in threads)
+
+        assert calls == [("openrouter", True)]
+
+    def test_overlapping_stale_openrouter_prefetches_share_one_forced_discovery_on_failure(self):
+        """Waiters share a failing OpenRouter owner attempt and still terminate."""
+        from hermes_cli import model_switch
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        release = threading.Event()
+        entered = threading.Event()
+        start = threading.Barrier(2)
+        calls = []
+        lock = threading.Lock()
+        guard_lock, waiter_saw_inflight = _install_non_cursor_waiter_probe(model_switch)
+
+        def mock_fetch(slug, force_refresh=False):
+            with lock:
+                calls.append((slug, force_refresh))
+            entered.set()
+            assert release.wait(timeout=2)
+            raise ConnectionError("simulated openrouter failure")
+
+        def worker():
+            start.wait(timeout=2)
+            _prefetch_provider_models_parallel(["openrouter"])
+
+        with patch.object(model_switch, "_prefetch_singleflight_lock", guard_lock), \
+             patch("hermes_cli.models._load_provider_models_cache", return_value={}), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
+             patch("hermes_cli.models.update_provider_cache_entry"):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            assert entered.wait(timeout=2)
+            assert waiter_saw_inflight.wait(timeout=2)
+            assert all(thread.is_alive() for thread in threads)
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+            assert all(not thread.is_alive() for thread in threads)
+
+        assert calls == [("openrouter", True)]
+
+    def test_cursor_prefetch_does_not_enter_generic_singleflight(self):
+        """Cursor stays on the models.py coordinator, not the generic guard."""
+        from hermes_cli import model_switch
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        release = threading.Event()
+        entered = threading.Event()
+        saw_cursor_in_guard = []
+
+        def mock_fetch(slug, force_refresh=False):
+            state = getattr(model_switch, "_prefetch_singleflight", None)
+            lock = getattr(model_switch, "_prefetch_singleflight_lock", None)
+            if state is None or lock is None:
+                saw_cursor_in_guard.append(False)
+            else:
+                with lock:
+                    saw_cursor_in_guard.append("cursor" in state)
+            entered.set()
+            assert release.wait(timeout=2)
+            return ["cursor-live"]
+
+        worker_done = threading.Event()
+
+        def worker():
+            _prefetch_provider_models_parallel(["cursor"])
+            worker_done.set()
+
+        with patch("hermes_cli.models._load_provider_models_cache", return_value={}), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
+             patch("hermes_cli.models.update_provider_cache_entry"):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            assert entered.wait(timeout=2)
+            assert thread.is_alive()
+            release.set()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert worker_done.is_set()
+
+        assert saw_cursor_in_guard == [False]
 
 
 def _write_provider_cache(path, payload):
