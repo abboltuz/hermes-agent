@@ -171,6 +171,182 @@ def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypa
         ws._oauth_sessions.pop(session_id, None)
 
 
+def test_cursor_browser_start_is_safe_profile_scoped_and_singleton(tmp_path, monkeypatch):
+    from hermes_cli import web_server as ws
+
+    _make_profile_home(tmp_path, monkeypatch, profile="selected")
+    (tmp_path / "profiles" / "other").mkdir(parents=True)
+    class Handshake:
+        login_url = "https://cursor.example/login?fixture=1"
+        uuid = "uuid-fixture"
+        verifier = "verifier-fixture"
+
+    monkeypatch.setattr("agent.cursor_sdk_auth.create_login_handshake", lambda: Handshake())
+    started = []
+    class Thread:
+        def __init__(self, *, target, args, daemon, name):
+            started.append((target, args, daemon, name))
+        def start(self):
+            return None
+    monkeypatch.setattr(ws.threading, "Thread", Thread)
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    try:
+        resp = client.post("/api/providers/oauth/cursor/start?profile=selected", headers=HEADERS)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert set(body) == {"flow", "session_id", "auth_url", "expires_in", "poll_interval"}
+        assert body["auth_url"] == Handshake.login_url
+        assert all(secret not in json.dumps(body) for secret in (Handshake.uuid, Handshake.verifier))
+        sid = body["session_id"]
+        session = ws._oauth_sessions[sid]
+        assert session["profile"] == "selected"
+        assert session["expires_at"] > time.time()
+        assert client.post("/api/providers/oauth/cursor/start?profile=selected", headers=HEADERS).status_code == 409
+        other = client.post("/api/providers/oauth/cursor/start?profile=other", headers=HEADERS)
+        assert other.status_code == 200, other.text
+        assert len(started) == 2
+    finally:
+        with ws._oauth_sessions_lock:
+            ws._oauth_sessions.clear()
+
+
+def test_cursor_browser_start_thread_failure_removes_and_scrubs_session(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import web_server as ws
+
+    _make_profile_home(tmp_path, monkeypatch, profile="selected")
+
+    class Handshake:
+        login_url = "https://cursor.example/login?fixture=1"
+        uuid = "uuid-fixture"
+        verifier = "verifier-fixture"
+
+    class FailingThread:
+        def __init__(self, *, target, args, daemon, name):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread-secret-fixture")
+
+    monkeypatch.setattr(
+        "agent.cursor_sdk_auth.create_login_handshake", lambda: Handshake()
+    )
+    monkeypatch.setattr(ws.threading, "Thread", FailingThread)
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+
+    response = client.post(
+        "/api/providers/oauth/cursor/start?profile=selected", headers=HEADERS
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Cursor sign-in could not start"}
+    assert all(
+        secret not in response.text
+        for secret in (Handshake.uuid, Handshake.verifier, "thread-secret-fixture")
+    )
+    with ws._oauth_sessions_lock:
+        assert not ws._oauth_sessions
+
+
+def test_cursor_poll_requires_profile_and_expiry_scrubs_session(monkeypatch):
+    from hermes_cli import web_server as ws
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    sid, session = ws._new_oauth_session("cursor", "browser_poll", profile="selected")
+    session.update(uuid="uuid-fixture", verifier="verifier-fixture", expires_at=time.time() - 1)
+    try:
+        mismatch = client.get(f"/api/providers/oauth/cursor/poll/{sid}?profile=other", headers=HEADERS)
+        assert mismatch.status_code == 400
+        expired = client.get(f"/api/providers/oauth/cursor/poll/{sid}?profile=selected", headers=HEADERS)
+        assert expired.status_code == 200
+        assert expired.json()["status"] == "expired"
+        assert session["cancel_event"].is_set()
+        assert "uuid" not in session and "verifier" not in session
+    finally:
+        with ws._oauth_sessions_lock:
+            ws._oauth_sessions.clear()
+
+
+def test_cursor_worker_real_delete_during_poll_never_mints_or_saves(monkeypatch):
+    from agent import cursor_bridge_transport
+    from agent.cursor_sdk_auth import create_login_handshake
+    from hermes_cli import web_server as ws
+
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    sid, session = ws._new_oauth_session(
+        "cursor", "browser_poll", profile="selected"
+    )
+    session.update(handshake=create_login_handshake(), expires_at=9999999999)
+    calls = []
+    monkeypatch.setattr(
+        cursor_bridge_transport, "resolve_bridge_command", lambda: "/tmp/bridge"
+    )
+
+    def cancel_while_polling(**_kwargs):
+        response = client.delete(
+            f"/api/providers/oauth/sessions/{sid}?profile=selected",
+            headers=HEADERS,
+        )
+        assert response.status_code == 200, response.text
+        assert "fixture" not in response.text
+        return {"accessToken": "token-fixture"}
+
+    monkeypatch.setattr(
+        "agent.cursor_sdk_auth.poll_for_login_tokens", cancel_while_polling
+    )
+    monkeypatch.setattr(
+        "agent.cursor_sdk_auth.mint_user_api_key",
+        lambda **_: calls.append("mint"),
+    )
+    monkeypatch.setattr(
+        "agent.cursor_sdk_auth.save_sdk_credentials",
+        lambda **_: calls.append("save"),
+    )
+
+    ws._cursor_login_worker(sid)
+
+    assert calls == []
+    assert session["cancelled"] is True
+    assert session["cancel_event"].is_set()
+    assert "handshake" not in session
+    with ws._oauth_sessions_lock:
+        assert sid not in ws._oauth_sessions
+
+
+def test_cursor_disconnect_is_profile_isolated(tmp_path, monkeypatch):
+    from agent.cursor_sdk_auth import save_sdk_credentials, sdk_auth_path
+    from hermes_cli import web_server as ws
+
+    _make_profile_home(tmp_path, monkeypatch, profile="selected")
+    (tmp_path / "profiles" / "other").mkdir(parents=True)
+
+    save_sdk_credentials(
+        backend_url="https://api2.cursor.sh", api_key="default-fixture"
+    )
+    with ws._profile_scope("selected"):
+        save_sdk_credentials(
+            backend_url="https://api2.cursor.sh", api_key="selected-fixture"
+        )
+    with ws._profile_scope("other"):
+        save_sdk_credentials(
+            backend_url="https://api2.cursor.sh", api_key="other-fixture"
+        )
+
+    response = client.delete(
+        "/api/providers/oauth/cursor?profile=selected", headers=HEADERS
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "provider": "cursor"}
+    with ws._profile_scope("selected"):
+        assert not sdk_auth_path().exists()
+    with ws._profile_scope("other"):
+        assert sdk_auth_path().exists()
+    assert sdk_auth_path().exists()
 
 
 def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):

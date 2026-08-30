@@ -10858,7 +10858,7 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     {
         "id": "cursor",
         "name": "Cursor Subscription",
-        "flow": "external",
+        "flow": "browser_poll",
         "cli_command": "hermes auth add cursor",
         "docs_url": "https://cursor.com",
         "status_fn": None,
@@ -11044,7 +11044,7 @@ def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str
             return f'security delete-generic-password -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
         return rm_file
     if provider.get("id") == "cursor":
-        return "hermes cursor logout"
+        return None
     return None
 
 
@@ -11118,7 +11118,7 @@ async def list_oauth_providers(profile: Optional[str] = None):
     Response shape (per provider):
         id              stable identifier (used in DELETE path)
         name            human label
-        flow            "pkce" | "device_code" | "external"
+        flow            "pkce" | "device_code" | "browser_poll" | "external"
         cli_command     fallback CLI command for users to run manually
         disconnect_command  shell command that clears an external provider's
                             creds (run in the embedded terminal), else null
@@ -11214,6 +11214,13 @@ async def disconnect_oauth_provider(
                 _log.info("oauth/disconnect: %s", provider_id)
                 return {"ok": bool(cleared), "provider": provider_id}
 
+            if provider_id == "cursor":
+                from agent.cursor_sdk_auth import clear_sdk_credentials
+                with _profile_scope(_oauth_profile_name(profile)):
+                    cleared = clear_sdk_credentials()
+                _log.info("oauth/disconnect: %s (cleared=%s)", provider_id, cleared)
+                return {"ok": bool(cleared), "provider": provider_id}
+
             try:
                 from hermes_cli.auth import clear_provider_auth, invalidate_nous_auth_status_cache
                 cleared = clear_provider_auth(provider_id)
@@ -11290,9 +11297,18 @@ def _gc_oauth_sessions() -> None:
     """Drop expired sessions. Called opportunistically on /start."""
     cutoff = time.time() - _OAUTH_SESSION_TTL_SECONDS
     with _oauth_sessions_lock:
-        stale = [sid for sid, sess in _oauth_sessions.items() if sess["created_at"] < cutoff]
+        stale = [sid for sid, sess in _oauth_sessions.items()
+                 if sess.get("expires_at", sess["created_at"] + _OAUTH_SESSION_TTL_SECONDS) < time.time()
+                 or sess["created_at"] < cutoff]
         for sid in stale:
-            _oauth_sessions.pop(sid, None)
+            sess = _oauth_sessions.pop(sid, None)
+            if sess:
+                sess["cancelled"] = True
+                event = sess.get("cancel_event")
+                if event:
+                    event.set()
+                if sess.get("provider") == "cursor":
+                    _scrub_cursor_session(sess)
 
 
 def _oauth_profile_name(profile: Optional[str]) -> Optional[str]:
@@ -11312,6 +11328,8 @@ def _new_oauth_session(
     provider_id: str,
     flow: str,
     profile: Optional[str] = None,
+    *,
+    unique_pending: bool = False,
 ) -> tuple[str, Dict[str, Any]]:
     """Create + register a new OAuth session, return (session_id, session_dict)."""
     sid = secrets.token_urlsafe(16)
@@ -11324,8 +11342,16 @@ def _new_oauth_session(
         "created_at": time.time(),
         "status": "pending",  # pending | approved | denied | expired | error
         "error_message": None,
+        "cancel_event": threading.Event(),
     }
     with _oauth_sessions_lock:
+        if unique_pending and any(
+            existing.get("provider") == provider_id
+            and existing.get("profile") == profile_name
+            and existing.get("status") == "pending"
+            for existing in _oauth_sessions.values()
+        ):
+            raise HTTPException(status_code=409, detail="Sign-in is already in progress")
         _oauth_sessions[sid] = sess
     return sid, sess
 
@@ -12127,6 +12153,106 @@ def _codex_full_login_worker(session_id: str) -> None:
                 s["error_message"] = str(e)
 
 
+def _scrub_cursor_session(sess: Dict[str, Any]) -> None:
+    """Remove redeemable Cursor login material after a terminal transition."""
+    for key in ("verifier", "uuid", "access_token", "refresh_token", "api_key", "handshake"):
+        sess.pop(key, None)
+
+
+def _cursor_login_worker(session_id: str) -> None:
+    """Run Cursor's SDK login in the backend, never exposing its secrets."""
+    session_profile = None
+    handshake = tokens = api_key = None
+    try:
+        from agent.cursor_sdk_auth import (
+            create_login_handshake,
+            get_login_email,
+            mint_user_api_key,
+            poll_for_login_tokens,
+            resolve_backend_url,
+            save_sdk_credentials,
+        )
+        from agent.cursor_bridge_transport import download_bridge, resolve_bridge_command
+
+        with _oauth_sessions_lock:
+            sess = _oauth_sessions.get(session_id)
+            if not sess:
+                return
+            session_profile = sess.get("profile")
+            cancel_event = sess["cancel_event"]
+        with _oauth_sessions_lock:
+            sess = _oauth_sessions.get(session_id)
+            if not sess or sess.get("cancelled"):
+                return
+            handshake = sess["handshake"]
+        # Verify/prep the pinned bridge before any login result can be used.
+        if not resolve_bridge_command():
+            download_bridge(progress=False)
+        if not resolve_bridge_command():
+            raise RuntimeError("Cursor SDK bridge is unavailable")
+        tokens = poll_for_login_tokens(
+            api_url=resolve_backend_url(),
+            uuid=handshake.uuid,
+            verifier=handshake.verifier,
+            cancel_event=cancel_event,
+            deadline=sess.get("expires_at"),
+        )
+        if not tokens or cancel_event.is_set():
+            with _oauth_sessions_lock:
+                sess = _oauth_sessions.get(session_id)
+                if sess and not sess.get("cancelled"):
+                    sess["status"] = "expired" if time.time() >= sess.get("expires_at", 0) else "error"
+                    sess["error_message"] = "Sign-in expired. Please try again." if sess["status"] == "expired" else "Cursor sign-in could not be completed. Please try again."
+                    _scrub_cursor_session(sess)
+            return
+        backend_url = resolve_backend_url()
+        if cancel_event.is_set():
+            return
+        email = get_login_email(backend_url, tokens["accessToken"])
+        with _oauth_sessions_lock:
+            sess = _oauth_sessions.get(session_id)
+            if not sess or sess.get("cancelled") or cancel_event.is_set():
+                return
+        from agent.cursor_sdk_auth import DEFAULT_API_KEY_TTL_MS
+        expires_at_ms = int(time.time() * 1000) + DEFAULT_API_KEY_TTL_MS
+        with _oauth_sessions_lock:
+            sess = _oauth_sessions.get(session_id)
+            if not sess or sess.get("cancelled") or cancel_event.is_set():
+                return
+        api_key = mint_user_api_key(
+            backend_url=backend_url,
+            access_token=tokens["accessToken"],
+            name="Hermes Agent",
+            expires_at_ms=expires_at_ms,
+        )
+        with _oauth_sessions_lock:
+            sess = _oauth_sessions.get(session_id)
+            if not sess or sess.get("cancelled") or cancel_event.is_set():
+                return
+            with _profile_scope(session_profile):
+                save_sdk_credentials(
+                    backend_url=backend_url,
+                    api_key=api_key,
+                    api_key_expires_at_ms=expires_at_ms,
+                    email=email,
+                    source="cursor_login",
+                )
+            sess["status"] = "approved"
+            _scrub_cursor_session(sess)
+    except Exception as exc:
+        _log.warning("oauth/browser_poll: Cursor login failed (%s)", type(exc).__name__)
+        with _oauth_sessions_lock:
+            sess = _oauth_sessions.get(session_id)
+            if sess and not sess.get("cancelled"):
+                sess["status"] = "error"
+                sess["error_message"] = "Cursor sign-in could not be completed. Please try again."
+                _scrub_cursor_session(sess)
+    finally:
+        # Drop references to redeemable material on every worker exit path.
+        handshake = tokens = api_key = None
+        session_profile = None
+
+
 @app.post("/api/providers/oauth/{provider_id}/start")
 async def start_oauth_login(
     provider_id: str,
@@ -12141,6 +12267,30 @@ async def start_oauth_login(
     if provider_id not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown provider {provider_id}")
     catalog_entry = next(p for p in _OAUTH_PROVIDER_CATALOG if p["id"] == provider_id)
+    if provider_id == "cursor":
+        from agent.cursor_sdk_auth import create_login_handshake
+        handshake = create_login_handshake()
+        sid, _sess = _new_oauth_session("cursor", "browser_poll", profile=profile, unique_pending=True)
+        with _oauth_sessions_lock:
+            _sess["handshake"] = handshake
+            _sess["auth_url"] = handshake.login_url
+            _sess["uuid"] = handshake.uuid
+            _sess["verifier"] = handshake.verifier
+            _sess["expires_at"] = time.time() + _OAUTH_SESSION_TTL_SECONDS
+        try:
+            thread = threading.Thread(target=_cursor_login_worker, args=(sid,), daemon=True,
+                                      name=f"oauth-cursor-{sid[:6]}")
+            thread.start()
+        except Exception:
+            with _oauth_sessions_lock:
+                failed = _oauth_sessions.pop(sid, None)
+                if failed:
+                    failed["cancelled"] = True
+                    failed["cancel_event"].set()
+                    _scrub_cursor_session(failed)
+            raise HTTPException(status_code=500, detail="Cursor sign-in could not start")
+        return {"flow": "browser_poll", "session_id": sid, "auth_url": handshake.login_url,
+                "expires_in": _OAUTH_SESSION_TTL_SECONDS, "poll_interval": 2}
     if catalog_entry["flow"] == "external":
         raise HTTPException(
             status_code=400,
@@ -12189,9 +12339,10 @@ async def poll_oauth_session(
 ):
     """Poll a session's status (no auth — read-only state).
 
-    Shared by the device-code flows (Nous, OpenAI Codex, MiniMax, xAI).
-    Each surfaces progress through the same background-worker-updated
-    ``status`` field, so a single poll endpoint serves them all.
+    Shared by device-code flows and backend-owned browser polling (Cursor).
+    Each surface reports progress through the same background-worker-updated
+    ``status`` field; browser-poll sessions additionally enforce their bounded
+    TTL and profile scope while keeping redeemable material backend-only.
     """
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
@@ -12199,6 +12350,14 @@ async def poll_oauth_session(
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
+    if provider_id == "cursor" and _oauth_profile_name(profile) != sess.get("profile"):
+        raise HTTPException(status_code=400, detail="Profile mismatch for session")
+    if sess.get("expires_at") and sess["expires_at"] < time.time() and sess["status"] == "pending":
+        with _oauth_sessions_lock:
+            sess["status"] = "expired"
+            sess["error_message"] = "Sign-in expired. Please try again."
+            sess.get("cancel_event", threading.Event()).set()
+            _scrub_cursor_session(sess)
     return {
         "session_id": session_id,
         "status": sess["status"],
@@ -12224,8 +12383,15 @@ async def cancel_oauth_session(
     _require_token(request)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
+        if sess is not None and sess.get("provider") == "cursor" and _oauth_profile_name(profile) != sess.get("profile"):
+            raise HTTPException(status_code=400, detail="Profile mismatch for session")
         if sess is not None:
             sess["cancelled"] = True
+            event = sess.get("cancel_event")
+            if event is not None:
+                event.set()
+            if sess.get("provider") == "cursor":
+                _scrub_cursor_session(sess)
         _oauth_sessions.pop(session_id, None)
     if sess is None:
         return {"ok": False, "message": "session not found"}

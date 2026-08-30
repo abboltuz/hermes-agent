@@ -32,7 +32,7 @@ function provider(id: string, loggedIn: boolean, patch: Partial<OAuthProvider> =
     docs_url: '',
     flow: 'device_code',
     id,
-    name: id === 'nous' ? 'Nous Portal' : 'MiniMax',
+    name: id === 'nous' ? 'Nous Portal' : id === 'cursor' ? 'Cursor' : 'MiniMax',
     status: {
       logged_in: loggedIn
     },
@@ -233,5 +233,22 @@ describe('ProvidersSettings', () => {
     fireEvent.click(row)
 
     await waitFor(() => expect(startManualLocalEndpoint).toHaveBeenCalledWith(null))
+  })
+
+  it('starts Cursor browser sign-in through the normal in-app path', async () => {
+    listOAuthProviders.mockResolvedValue({ providers: [provider('cursor', false, { flow: 'browser_poll' })] })
+    await renderProvidersSettings()
+    fireEvent.click(await screen.findByRole('button', { name: /Other providers/ }))
+    fireEvent.click(await screen.findByText('Cursor'))
+    await waitFor(() => expect(startManualProviderOAuth).toHaveBeenCalledWith('cursor'))
+  })
+
+  it('removes connected Cursor through the normal disconnect API without terminal affordances', async () => {
+    listOAuthProviders.mockResolvedValue({ providers: [provider('cursor', true, { flow: 'browser_poll' })] })
+    await renderProvidersSettings()
+    expect(screen.queryByRole('button', { name: /Disconnect Cursor/i })).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove Cursor' }))
+    await act(async () => fireEvent.click(await screen.findByRole('button', { name: 'Disconnect' })))
+    await waitFor(() => expect(disconnectOAuthProvider).toHaveBeenCalledWith('cursor'))
   })
 })

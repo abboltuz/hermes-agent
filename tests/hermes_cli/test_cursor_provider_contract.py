@@ -147,8 +147,10 @@ def test_picker_and_desktop_account_catalog_share_cursor_auth(cursor_home, monke
     )
 
     card = next(row for row in _build_oauth_catalog() if row["id"] == "cursor")
+    assert card["flow"] == "browser_poll"
     assert card["cli_command"] == "hermes auth add cursor"
-    assert _oauth_provider_disconnect_command(card) == "hermes cursor logout"
+    assert card.get("disconnect_command") is None
+    assert _oauth_provider_disconnect_command(card) is None
 
 
 def test_provider_model_catalog_uses_cursor_profile_live_fetch(cursor_home, monkeypatch):
@@ -259,5 +261,146 @@ def test_auxiliary_router_returns_sync_and_async_cursor_clients(cursor_home, mon
     finally:
         sync_client.close()
         import asyncio
-
         asyncio.run(async_client.close())
+
+
+def test_browser_poll_timeout_is_terminal_and_scrubs_session(cursor_home, monkeypatch):
+    from hermes_cli import web_server as ws
+
+    class Handshake:
+        login_url = "https://cursor.com/loginDeepControl?challenge=fixture"
+        uuid = "fixture-uuid"
+        verifier = "fixture-verifier"
+
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    sid, session = ws._new_oauth_session("cursor", "browser_poll", profile="selected")
+    session.update(handshake=Handshake(), uuid=Handshake.uuid, verifier=Handshake.verifier,
+                   expires_at=9999999999)
+    monkeypatch.setattr("agent.cursor_sdk_auth.poll_for_login_tokens", lambda **_: None)
+    monkeypatch.setattr("agent.cursor_bridge_transport.resolve_bridge_command", lambda: "/tmp/bridge")
+    ws._cursor_login_worker(sid)
+    assert session["status"] == "error"
+    assert "uuid" not in session and "verifier" not in session
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+
+
+def test_cursor_worker_bridge_failure_is_redacted_and_stops_before_auth(
+    cursor_home, monkeypatch
+):
+    from agent import cursor_bridge_transport
+    from agent.cursor_sdk_auth import create_login_handshake
+    from hermes_cli import web_server as ws
+
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    sid, session = ws._new_oauth_session("cursor", "browser_poll")
+    session.update(handshake=create_login_handshake(), expires_at=9999999999)
+    calls = []
+    monkeypatch.setattr(
+        cursor_bridge_transport, "resolve_bridge_command", lambda: None
+    )
+
+    def fail_download(**_kwargs):
+        raise RuntimeError("bridge-secret-fixture")
+
+    monkeypatch.setattr(cursor_bridge_transport, "download_bridge", fail_download)
+    monkeypatch.setattr(
+        "agent.cursor_sdk_auth.poll_for_login_tokens",
+        lambda **_: calls.append("poll"),
+    )
+    monkeypatch.setattr(
+        "agent.cursor_sdk_auth.mint_user_api_key",
+        lambda **_: calls.append("mint"),
+    )
+    monkeypatch.setattr(
+        "agent.cursor_sdk_auth.save_sdk_credentials",
+        lambda **_: calls.append("save"),
+    )
+
+    try:
+        ws._cursor_login_worker(sid)
+        assert calls == []
+        assert session["status"] == "error"
+        assert session["error_message"] == (
+            "Cursor sign-in could not be completed. Please try again."
+        )
+        assert "bridge-secret-fixture" not in session["error_message"]
+        assert "handshake" not in session
+    finally:
+        with ws._oauth_sessions_lock:
+            ws._oauth_sessions.clear()
+
+
+def test_gc_cancels_and_scrubs_cursor_worker(cursor_home):
+    from hermes_cli import web_server as ws
+
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    sid, session = ws._new_oauth_session("cursor", "browser_poll")
+    session.update(created_at=0, uuid="fixture-uuid", verifier="fixture-verifier")
+    ws._gc_oauth_sessions()
+    assert session["cancelled"] is True
+    assert session["cancel_event"].is_set()
+    assert "uuid" not in session and "verifier" not in session
+    with ws._oauth_sessions_lock:
+        assert sid not in ws._oauth_sessions
+        ws._oauth_sessions.clear()
+
+
+def test_cursor_worker_cancelled_during_email_never_mints_or_saves(cursor_home, monkeypatch):
+    from hermes_cli import web_server as ws
+    from agent import cursor_bridge_transport
+    from agent.cursor_sdk_auth import create_login_handshake
+
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    sid, session = ws._new_oauth_session("cursor", "browser_poll", profile="selected")
+    session.update(handshake=create_login_handshake(), expires_at=9999999999)
+    cancel_event = session["cancel_event"]
+    calls = []
+    monkeypatch.setattr(cursor_bridge_transport, "resolve_bridge_command", lambda: "/tmp/bridge")
+    monkeypatch.setattr("agent.cursor_sdk_auth.poll_for_login_tokens", lambda **_: {"accessToken": "token-fixture"})
+    monkeypatch.setattr("agent.cursor_sdk_auth.resolve_backend_url", lambda: "https://cursor.example")
+    def email(_url, _token):
+        cancel_event.set()
+        return "person@example.invalid"
+    monkeypatch.setattr("agent.cursor_sdk_auth.get_login_email", email)
+    monkeypatch.setattr("agent.cursor_sdk_auth.mint_user_api_key", lambda **_: calls.append("mint"))
+    monkeypatch.setattr("agent.cursor_sdk_auth.save_sdk_credentials", lambda **_: calls.append("save"))
+    try:
+        ws._cursor_login_worker(sid)
+        assert calls == []
+        assert session["status"] == "pending"
+    finally:
+        with ws._oauth_sessions_lock:
+            ws._oauth_sessions.clear()
+
+
+def test_cursor_worker_success_order_and_scrubs_secrets(cursor_home, monkeypatch):
+    from hermes_cli import web_server as ws
+    from agent import cursor_bridge_transport
+    from agent.cursor_sdk_auth import create_login_handshake
+
+    with ws._oauth_sessions_lock:
+        ws._oauth_sessions.clear()
+    sid, session = ws._new_oauth_session("cursor", "browser_poll", profile="selected")
+    (cursor_home / "profiles" / "selected").mkdir(parents=True)
+    session.update(handshake=create_login_handshake(), expires_at=9999999999)
+    events = []
+    monkeypatch.setattr(cursor_bridge_transport, "resolve_bridge_command", lambda: events.append("bridge") or "/tmp/bridge")
+    monkeypatch.setattr("agent.cursor_sdk_auth.poll_for_login_tokens", lambda **_: events.append("poll") or {"accessToken": "token-fixture"})
+    monkeypatch.setattr("agent.cursor_sdk_auth.resolve_backend_url", lambda: "https://cursor.example")
+    monkeypatch.setattr("agent.cursor_sdk_auth.get_login_email", lambda *_: events.append("email") or "person@example.invalid")
+    monkeypatch.setattr("agent.cursor_sdk_auth.mint_user_api_key", lambda **_: events.append("mint") or "api-fixture")
+    monkeypatch.setattr("agent.cursor_sdk_auth.save_sdk_credentials", lambda **_: events.append("save"))
+    try:
+        ws._cursor_login_worker(sid)
+        assert session["status"] == "approved"
+        assert events[:5] == ["bridge", "bridge", "poll", "email", "mint"]
+        assert events[-1] == "save"
+        assert "handshake" not in session and "api_key" not in session
+    finally:
+        with ws._oauth_sessions_lock:
+            ws._oauth_sessions.clear()
