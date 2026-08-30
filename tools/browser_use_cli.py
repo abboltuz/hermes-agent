@@ -852,7 +852,7 @@ BROWSER_EXEC_SCHEMA = {
             },
             "session": {
                 "type": "string",
-                "description": "Named isolated browser session (sets BU_NAME): each name gets its own harness daemon — and on cloud backends its own browser — so concurrent tasks don't clobber each other. Omit for the shared default session. Reuse the same name across calls to keep working in that session (and the name passed to start_remote_daemon(), if used).",
+                "description": "Named daemon/tab isolation (sets BU_NAME): each name gets its own harness daemon, and Hermes pins a separate tab on shared local/CDP browsers; cloud providers may additionally allocate a separate browser. This does not universally create a separate browser profile or storage partition. Omit for the shared default session and reuse the same name across related calls.",
             },
             "timeout_s": {
                 "type": "integer",

@@ -418,3 +418,124 @@ def test_check_fn_false_when_browser_requirements_fail(monkeypatch):
         bt, "_get_cdp_override_raw", lambda: "ws://localhost:9222/devtools/browser/x"
     )
     assert browser_cdp_tool._browser_cdp_check() is False
+
+
+def test_capture_screenshot_binary_result_stays_byte_identical(cdp_server):
+    screenshot_b64 = "iVBORw0KGgo/" + "gAAAA" + "A" * 60 + "=="
+    cdp_server.on(
+        "Page.captureScreenshot",
+        lambda params, sid: {"data": screenshot_b64},
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Page.captureScreenshot")
+    )
+
+    assert result["success"] is True
+    assert result["result"]["data"] == screenshot_b64
+
+
+def test_runtime_evaluate_cannot_spoof_binary_exemption(cdp_server):
+    fake_key = "sk-" + "CDPSPOOFEDFLAG1234567890"
+    cdp_server.on(
+        "Runtime.evaluate",
+        lambda params, sid: {
+            "result": {
+                "type": "object",
+                "value": {"base64Encoded": True, "data": fake_key},
+            }
+        },
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Runtime.evaluate")
+    )
+
+    assert result["success"] is True
+    assert "CDPSPOOFEDFLAG" not in json.dumps(result)
+
+
+def test_stream_resource_content_binary_result_stays_byte_identical(cdp_server):
+    chunk_b64 = "Q2FjaGU/" + "gAAAA" + "E" * 60 + "=="
+    cdp_server.on(
+        "Network.streamResourceContent",
+        lambda params, sid: {"bufferedData": chunk_b64},
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.streamResourceContent")
+    )
+
+    assert result["success"] is True
+    assert result["result"]["bufferedData"] == chunk_b64
+
+
+def test_get_response_body_only_exempts_flagged_binary(cdp_server):
+    body_b64 = "q9Z7" + "gAAAA" + "B" * 60 + "=="
+    cdp_server.on(
+        "Network.getResponseBody",
+        lambda params, sid: {"body": body_b64, "base64Encoded": True},
+    )
+    binary = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.getResponseBody")
+    )
+    assert binary["result"]["body"] == body_b64
+
+    fake_key = "sk-" + "CDPSECRETBODY1234567890"
+    cdp_server.on(
+        "Network.getResponseBody",
+        lambda params, sid: {
+            "body": f"leak {fake_key} here",
+            "base64Encoded": False,
+        },
+    )
+    text_result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.getResponseBody")
+    )
+    assert "CDPSECRETBODY" not in json.dumps(text_result)
+
+
+def test_get_request_post_data_only_exempts_flagged_binary(cdp_server):
+    post_b64 = "cG9zdA==" + "gAAAA" + "F" * 60 + "="
+    cdp_server.on(
+        "Network.getRequestPostData",
+        lambda params, sid: {"postData": post_b64, "base64Encoded": True},
+    )
+    binary = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.getRequestPostData")
+    )
+    assert binary["result"]["postData"] == post_b64
+
+    fake_key = "sk-" + "CDPPOSTDATASECRET1234567890"
+    cdp_server.on(
+        "Network.getRequestPostData",
+        lambda params, sid: {
+            "postData": f"leak {fake_key} here",
+            "base64Encoded": False,
+        },
+    )
+    text_result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.getRequestPostData")
+    )
+    assert "CDPPOSTDATASECRET" not in json.dumps(text_result)
+
+
+def test_nested_binary_path_is_exact_and_keeps_sibling_redaction(cdp_server):
+    fake_key = "sk-" + "CDPNESTEDSECRET1234567890"
+    body_b64 = "SUNBRQ/" + "gAAAA" + "G" * 60 + "=="
+    cdp_server.on(
+        "CacheStorage.requestCachedResponse",
+        lambda params, sid: {
+            "response": {
+                "body": body_b64,
+                "note": fake_key,
+            }
+        },
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="CacheStorage.requestCachedResponse")
+    )
+
+    assert result["result"]["response"]["body"] == body_b64
+    assert "CDPNESTEDSECRET" not in json.dumps(result)
