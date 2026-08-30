@@ -3182,30 +3182,67 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
-        class _SlowAliveCreateStream:
-            def __iter__(self):
-                for _ in range(5):
-                    time.sleep(0.03)
-                    yield SimpleNamespace(type="response.in_progress")
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, monkeypatch):
+        clock = iter((100.0, 100.0, 100.06))
+        monkeypatch.setattr("agent.auxiliary_client.time.monotonic", lambda: next(clock))
 
-            def close(self): pass
+        timers = []
+
+        class _ManualTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.started = False
+                self.cancelled = False
+                self.fired = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+        monkeypatch.setattr("agent.auxiliary_client.threading.Timer", _ManualTimer)
+        completion_consumed = False
+        closed = False
+
+        class _Stream:
+            def __iter__(self):
+                nonlocal completion_consumed
+                yield SimpleNamespace(type="response.in_progress")
+                completion_consumed = True
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(status="completed", id="done", usage=None),
+                )
+
+            def close(self):
+                pass
 
         class FakeResponses:
             def create(self, **kwargs):
-                return _SlowAliveCreateStream()
+                return _Stream()
 
-        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        def _close_client():
+            nonlocal closed
+            closed = True
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=_close_client)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert len(timers) == 1
+        assert timers[0].started
+        assert timers[0].cancelled
+        assert not timers[0].fired
+        assert closed
+        assert not completion_consumed
 
 
 class TestCodexAuxiliaryAdapterCacheScope:

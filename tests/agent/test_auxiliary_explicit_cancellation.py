@@ -192,6 +192,25 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
 
 def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None:
     """A cancelled Codex worker's delayed timer owns only its event stream."""
+    timers: list[Any] = []
+
+    class _ManualTimer:
+        def __init__(self, interval: float, function: Callable[[], Any]) -> None:
+            self.interval = interval
+            self.function = function
+            self.started = False
+            self.cancelled = False
+            self.fired = False
+            timers.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(aux.threading, "Timer", _ManualTimer)
     owner_started = threading.Event()
 
     class _SilentOwnerStream:
@@ -278,6 +297,10 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         owner.join(timeout=1)
         assert not owner.is_alive()
         assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
+        assert len(timers) == 1
+        assert timers[0].started
+        assert not timers[0].fired
+        assert not timers[0].cancelled
         # A real frontend clears the reusable host Event when the next turn
         # starts. The orphan must retain a frozen per-attempt cancellation cause.
         cancel_event.clear()
@@ -293,8 +316,9 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
 
         # Let the orphan's real adapter timer fire. It may close the attempt's
         # event stream to wake that worker, but never the process-shared client.
-        assert owner_stream.closed.wait(timeout=1)
-        time.sleep(0.03)
+        timers[0].fired = True
+        timers[0].function()
+        assert owner_stream.closed.is_set()
         assert not real_client.closed.is_set()
         with aux._client_cache_lock:
             assert aux._client_cache[cache_key][0] is wrapper
@@ -305,6 +329,7 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         )
         assert successive.choices[0].message.content == "ok"
     finally:
+        monkeypatch.undo()
         owner_stream.close()
         with aux._client_cache_lock:
             aux._client_cache.clear()
