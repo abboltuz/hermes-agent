@@ -1345,6 +1345,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                runtime_control=runtime_control,
             )
 
     _tool_original_args = dict(function_args)
