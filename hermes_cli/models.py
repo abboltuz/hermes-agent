@@ -4239,6 +4239,105 @@ _PROVIDER_MODELS_STALE_SERVE_MAX = 7 * 24 * 3600  # 7d
 _swr_refresh_inflight: set = set()
 _swr_refresh_lock = threading.Lock()
 
+# Process-local coordinator for automated Cursor catalog refreshes. Prefetch,
+# Cursor SWR, and the ordinary cached miss/stale path share one in-flight
+# attempt per (provider, credential fingerprint). A failed attempt suppresses
+# further raw discovery until the existing Cursor TTL boundary.
+_cursor_refresh_lock = threading.Lock()
+_cursor_refresh_inflight: dict[tuple[str, str], "_CursorRefreshAttempt"] = {}
+_cursor_refresh_failed_at: dict[tuple[str, str], float] = {}
+
+
+class _CursorRefreshAttempt:
+    __slots__ = ("event", "result")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: Optional[list[str]] = None
+
+
+def _cursor_refresh_key(fp: Optional[str] = None) -> tuple[str, str]:
+    return ("cursor", fp if fp is not None else _credential_fingerprint("cursor"))
+
+
+def _clear_cursor_refresh_failures(provider: Optional[str] = None) -> None:
+    requested = str(provider or "").strip().lower()
+    normalized = (
+        requested
+        if requested == "ollama"
+        else (normalize_provider(provider) or requested)
+    )
+    with _cursor_refresh_lock:
+        if provider is None:
+            _cursor_refresh_failed_at.clear()
+            return
+        if normalized != "cursor":
+            return
+        for key in [key for key in _cursor_refresh_failed_at if key[0] == "cursor"]:
+            _cursor_refresh_failed_at.pop(key, None)
+
+
+def _coordinate_cursor_catalog_refresh() -> Optional[list[str]]:
+    """Run or wait for one automated Cursor discovery attempt.
+
+    Waiters share the owner's result on success and failure. The in-flight
+    result is published before the record is removed so a pop-before-set
+    race cannot mint a second owner. After failure, no automated raw
+    discovery retries until ``provider_models_cache_ttl_seconds('cursor')``.
+    """
+    fp = _credential_fingerprint("cursor")
+    key = _cursor_refresh_key(fp)
+    ttl = provider_models_cache_ttl_seconds("cursor")
+    owner = False
+    attempt: Optional[_CursorRefreshAttempt] = None
+    with _cursor_refresh_lock:
+        inflight = _cursor_refresh_inflight.get(key)
+        if inflight is not None:
+            attempt = inflight
+        else:
+            failed_at = _cursor_refresh_failed_at.get(key)
+            now = time.time()
+            if failed_at is not None and (now - failed_at) < ttl:
+                return None
+            attempt = _CursorRefreshAttempt()
+            _cursor_refresh_inflight[key] = attempt
+            owner = True
+    if attempt is None:
+        return None
+    if not owner:
+        attempt.event.wait()
+        return attempt.result
+
+    discovered: Optional[list[str]] = None
+    try:
+        cache = _load_provider_models_cache()
+        entry = cache.get("cursor")
+        if (
+            isinstance(entry, dict)
+            and provider_models_cache_entry_is_fresh(entry, fp, provider="cursor")
+        ):
+            discovered = list(entry["models"])
+        else:
+            discovered = _cursor_discovered_models()
+            if discovered:
+                update_provider_cache_entry("cursor", discovered)
+                with _cursor_refresh_lock:
+                    _cursor_refresh_failed_at.pop(key, None)
+            else:
+                with _cursor_refresh_lock:
+                    _cursor_refresh_failed_at[key] = time.time()
+        attempt.result = discovered
+    except Exception:
+        with _cursor_refresh_lock:
+            _cursor_refresh_failed_at[key] = time.time()
+        attempt.result = None
+        discovered = None
+    attempt.event.set()
+    with _cursor_refresh_lock:
+        if _cursor_refresh_inflight.get(key) is attempt:
+            _cursor_refresh_inflight.pop(key, None)
+    return discovered
+
 
 def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
     """Kick a background refresh of *cache_key*'s model-id cache entry.
@@ -4261,7 +4360,9 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
 
     def _default_refresh():
         if cache_key == "cursor":
-            live = _cursor_discovered_models()
+            # Coordinator owns discovery and the thread-safe success write.
+            _coordinate_cursor_catalog_refresh()
+            return None
         else:
             live = provider_model_ids(cache_key, force_refresh=True)
         if not live and cache_key == "ollama":
@@ -4541,9 +4642,8 @@ def cached_provider_model_ids(
 
     # Cache miss / stale / forced refresh — call the live path.
     if normalized == "cursor":
-        discovered = _cursor_discovered_models()
+        discovered = _coordinate_cursor_catalog_refresh()
         if discovered:
-            update_provider_cache_entry(normalized, discovered)
             return list(discovered)
         if _cache_entry_valid(entry, fp):
             return list(entry["models"])
@@ -4601,6 +4701,7 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
         _OLLAMA_LOCAL_MODELS_CACHE.clear()
         _OLLAMA_LOCAL_PROBE_FAILURE_CACHE.clear()
         _OLLAMA_LOCAL_PROBE_REACHABLE.clear()
+        _clear_cursor_refresh_failures(provider)
         if provider is None:
             path = _provider_models_cache_path()
             if path.exists():

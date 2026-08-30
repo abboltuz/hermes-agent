@@ -2332,8 +2332,6 @@ def _scoped_key_env(name: str) -> str:
 #   After:  ~8s parallel (max single provider latency), rest served from cache
 
 _PARALLEL_PREFETCH_WORKERS = 8
-_prefetch_singleflight_lock = threading.Lock()
-_prefetch_singleflight: dict[str, threading.Event] = {}
 
 
 def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
@@ -2342,8 +2340,8 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     Only providers whose cache entry is stale or missing are fetched; fresh
     entries are skipped to avoid unnecessary network calls.  Successful writes
     are persisted by :func:`cached_provider_model_ids` under the cache lock.
-    Overlapping same-provider prefetch requests share one live attempt,
-    including the failure case.
+    Automated Cursor refreshes coalesce through the models.py coordinator.
+
 
     :param provider_slugs: Hermes provider IDs to prefetch (e.g. ``["openrouter",
         "anthropic", "deepseek"]``).  Unknown providers are silently skipped.
@@ -2382,22 +2380,9 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     import concurrent.futures
 
     def _fetch_one(slug: str) -> None:
-        owner = False
-        done: threading.Event | None = None
-        with _prefetch_singleflight_lock:
-            inflight = _prefetch_singleflight.get(slug)
-            if inflight is not None:
-                done = inflight
-            else:
-                done = threading.Event()
-                _prefetch_singleflight[slug] = done
-                owner = True
-        if not owner:
-            done.wait()
-            return
         try:
-            # Recheck freshness after acquiring ownership so a just-completed
-            # successful refresh is reused instead of issuing another attempt.
+            # Recheck freshness so a just-completed successful refresh is
+            # reused instead of issuing another attempt.
             latest = _load_provider_models_cache()
             entry = latest.get(slug)
             fp = _credential_fingerprint(slug)
@@ -2406,11 +2391,6 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
             cached_provider_model_ids(slug, force_refresh=True)
         except Exception:
             pass  # best-effort; picker falls back to curated list
-        finally:
-            with _prefetch_singleflight_lock:
-                if _prefetch_singleflight.get(slug) is done:
-                    _prefetch_singleflight.pop(slug, None)
-            done.set()
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(_PARALLEL_PREFETCH_WORKERS, len(stale_slugs)),
