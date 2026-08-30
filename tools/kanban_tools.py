@@ -166,6 +166,39 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _terminal_worker_run_id(
+    task_id: str,
+    *,
+    tool_name: str,
+) -> tuple[Optional[int], Optional[str]]:
+    """Resolve exact worker authority or reject incomplete identity.
+
+    Manual/orchestrator callers have no dispatcher task scope and retain the
+    existing status-based mutation path. Once a dispatcher-owned worker is
+    scoped to ``task_id``, however, terminal mutation must never fall back to
+    that path merely because its run identity is missing or malformed.
+    """
+    if (
+        os.environ.get("HERMES_KANBAN_TASK") != task_id
+        or not _is_dispatcher_owned_worker()
+    ):
+        return None, None
+
+    raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not raw:
+        return None, tool_error(
+            f"{tool_name} refused: dispatcher-owned worker identity is "
+            "missing HERMES_KANBAN_RUN_ID"
+        )
+    try:
+        return int(raw), None
+    except ValueError:
+        return None, tool_error(
+            f"{tool_name} refused: dispatcher-owned worker identity requires "
+            "HERMES_KANBAN_RUN_ID to be an integer"
+        )
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -764,6 +797,12 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    expected_run_id, run_identity_err = _terminal_worker_run_id(
+        tid,
+        tool_name="kanban_complete",
+    )
+    if run_identity_err:
+        return run_identity_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -788,7 +827,6 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
 
             try:
-                expected_run_id = _worker_run_id(tid)
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
@@ -864,6 +902,12 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    expected_run_id, run_identity_err = _terminal_worker_run_id(
+        tid,
+        tool_name="kanban_block",
+    )
+    if run_identity_err:
+        return run_identity_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -897,7 +941,6 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
-            expected_run_id = _worker_run_id(tid)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
@@ -974,6 +1017,12 @@ def _handle_request_review(args: dict, **kw) -> str:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
+    expected_run_id, run_identity_err = _terminal_worker_run_id(
+        tid,
+        tool_name="kanban_request_review",
+    )
+    if run_identity_err:
+        return run_identity_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -986,7 +1035,6 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
-            expected_run_id = _worker_run_id(tid)
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
@@ -1042,11 +1090,16 @@ def _handle_request_changes(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — describe the changes needed")
     reason = redact_sensitive_text(str(reason), force=True)
+    expected_run_id, run_identity_err = _terminal_worker_run_id(
+        tid,
+        tool_name="kanban_request_changes",
+    )
+    if run_identity_err:
+        return run_identity_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
-            expected_run_id = _worker_run_id(tid)
             ok, detail = kb.request_changes(
                 conn,
                 tid,

@@ -41,6 +41,14 @@ def _response(*, tool_calls=None, content: str = "", finish_reason: str = "tool_
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
+_TERMINAL_HANDLER_CASES = [
+    ("_handle_complete", {"summary": "verified implementation"}),
+    ("_handle_block", {"reason": "external dependency"}),
+    ("_handle_request_review", {"summary": "ready for review"}),
+    ("_handle_request_changes", {"reason": "add the missing regression"}),
+]
+
+
 def _register_sentinel() -> None:
     from tools.registry import registry
 
@@ -753,6 +761,119 @@ def test_sibling_worker_terminal_handlers_arm_same_exact_run_contract(
     assert transition.task_id == task_id
     assert transition.run_id == run_id
     assert transition.status == expected_status
+
+
+def _prepare_terminal_handler_case(worker_case, handler_name, monkeypatch):
+    agent, task_id, implementation_run_id = worker_case
+    from hermes_cli import kanban_db as kb
+
+    run_id = implementation_run_id
+    if handler_name == "_handle_request_changes":
+        conn = kb.connect()
+        try:
+            assert kb.request_review(
+                conn,
+                task_id,
+                summary="implementation ready",
+                reviewer="fence-worker",
+                expected_run_id=implementation_run_id,
+            )
+            review = kb.claim_review_task(
+                conn,
+                task_id,
+                claimer="fence-worker:review",
+            )
+            assert review is not None and review.current_run_id is not None
+            run_id = int(review.current_run_id)
+        finally:
+            conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    return agent, task_id
+
+
+def _terminal_db_snapshot(task_id):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        return (
+            vars(task).copy(),
+            [vars(run).copy() for run in kb.list_runs(conn, task_id=task_id)],
+            [vars(event).copy() for event in kb.list_events(conn, task_id)],
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(("handler_name", "arguments"), _TERMINAL_HANDLER_CASES)
+def test_dispatcher_terminal_handlers_fail_closed_without_run_id(
+    worker_case,
+    monkeypatch,
+    handler_name,
+    arguments,
+):
+    from agent.runtime_control import RuntimeControl
+    from tools import kanban_tools as kt
+
+    agent, task_id = _prepare_terminal_handler_case(
+        worker_case,
+        handler_name,
+        monkeypatch,
+    )
+    before = _terminal_db_snapshot(task_id)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    control = RuntimeControl.from_environment(session_id=agent.session_id)
+
+    result = json.loads(
+        getattr(kt, handler_name)(
+            arguments,
+            runtime_control=control,
+            session_id=agent.session_id,
+        )
+    )
+
+    assert "error" in result
+    assert "HERMES_KANBAN_RUN_ID" in result["error"]
+    assert "missing" in result["error"]
+    assert _terminal_db_snapshot(task_id) == before
+    assert control.kanban_terminal_transition is None
+
+
+@pytest.mark.parametrize(("handler_name", "arguments"), _TERMINAL_HANDLER_CASES)
+def test_dispatcher_terminal_handlers_fail_closed_with_malformed_run_id(
+    worker_case,
+    monkeypatch,
+    handler_name,
+    arguments,
+):
+    from agent.runtime_control import RuntimeControl
+    from tools import kanban_tools as kt
+
+    agent, task_id = _prepare_terminal_handler_case(
+        worker_case,
+        handler_name,
+        monkeypatch,
+    )
+    before = _terminal_db_snapshot(task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-an-integer")
+    control = RuntimeControl.from_environment(session_id=agent.session_id)
+
+    result = json.loads(
+        getattr(kt, handler_name)(
+            arguments,
+            runtime_control=control,
+            session_id=agent.session_id,
+        )
+    )
+
+    assert "error" in result
+    assert "HERMES_KANBAN_RUN_ID" in result["error"]
+    assert "integer" in result["error"]
+    assert _terminal_db_snapshot(task_id) == before
+    assert control.kanban_terminal_transition is None
 
 
 def test_stale_run_rejection_does_not_arm_fence(worker_case, monkeypatch):
