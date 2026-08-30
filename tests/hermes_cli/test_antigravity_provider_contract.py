@@ -54,6 +54,25 @@ def test_live_antigravity_catalog_is_used_by_picker(antigravity_home, monkeypatc
     assert not (antigravity_home / "provider_models_cache.json").exists()
 
 
+def test_cached_live_antigravity_catalog_is_uncached_and_not_persisted(
+    antigravity_home, monkeypatch
+):
+    from hermes_cli import models
+
+    _profile_obj, calls, fetch = _profile(monkeypatch)
+    live_models = ["antigravity-gemini-3-pro", "antigravity-claude-sonnet-4-6"]
+    fetch.result = live_models
+
+    def fail_cache_update(*args, **kwargs):
+        raise AssertionError("Antigravity must not enter the generic model cache")
+
+    monkeypatch.setattr(models, "update_provider_cache_entry", fail_cache_update)
+
+    assert models.cached_provider_model_ids("antigravity") == live_models
+    assert calls == [{}]
+    assert not (antigravity_home / "provider_models_cache.json").exists()
+
+
 def test_live_empty_is_authoritative_for_direct_and_cached_picker(
     antigravity_home, monkeypatch
 ):
