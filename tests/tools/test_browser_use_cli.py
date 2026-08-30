@@ -842,6 +842,13 @@ class TestSkillTextDescription:
 
 
 class TestBrowserExec:
+    def test_named_session_contract_does_not_promise_profile_isolation(self):
+        description = bu_cli.BROWSER_EXEC_SCHEMA["parameters"]["properties"]["session"]["description"]
+
+        assert "daemon/tab isolation" in description
+        assert "separate browser profile" in description
+        assert "Named isolated browser session" not in description
+
     def test_missing_cli_returns_install_hint(self, monkeypatch):
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         result = json.loads(bu_cli.browser_exec("print(page_info())"))

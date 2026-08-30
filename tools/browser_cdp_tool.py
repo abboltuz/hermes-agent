@@ -43,8 +43,29 @@ _CDP_PRIVATE_PAGE_ALLOWED_METHODS = {
 }
 
 
-def _redact_cdp_output(value: Any) -> Any:
-    """Redact browser-originated CDP result data before returning it."""
+_CDP_ALWAYS_BINARY_PATHS: Dict[str, tuple] = {
+    "Page.captureScreenshot": (("data",),),
+    "Page.printToPDF": (("data",),),
+    "Network.streamResourceContent": (("bufferedData",),),
+    "HeadlessExperimental.beginFrame": (("screenshotData",),),
+    "CacheStorage.requestCachedResponse": (("response", "body"),),
+}
+
+_CDP_FLAGGED_BINARY_PATHS: Dict[str, tuple] = {
+    "Network.getResponseBody": (("body",),),
+    "Fetch.getResponseBody": (("body",),),
+    "IO.read": (("data",),),
+    "Network.getRequestPostData": (("postData",),),
+}
+
+
+def _redact_cdp_output(
+    value: Any,
+    *,
+    always_paths: tuple = (),
+    flagged_paths: tuple = (),
+) -> Any:
+    """Redact semantic CDP text while preserving declared binary payloads."""
     from agent.redact import redact_sensitive_text
 
     if isinstance(value, str):
@@ -54,7 +75,34 @@ def _redact_cdp_output(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_redact_cdp_output(item) for item in value)
     if isinstance(value, dict):
-        return {key: _redact_cdp_output(item) for key, item in value.items()}
+        base64_flagged = value.get("base64Encoded") is True
+        redacted: Dict[str, Any] = {}
+        for key, item in value.items():
+            terminal_always = any(
+                len(path) == 1 and path[0] == key for path in always_paths
+            )
+            terminal_flagged = any(
+                len(path) == 1 and path[0] == key for path in flagged_paths
+            )
+            if isinstance(item, str) and (
+                terminal_always or (terminal_flagged and base64_flagged)
+            ):
+                redacted[key] = item
+            else:
+                redacted[key] = _redact_cdp_output(
+                    item,
+                    always_paths=tuple(
+                        path[1:]
+                        for path in always_paths
+                        if len(path) > 1 and path[0] == key
+                    ),
+                    flagged_paths=tuple(
+                        path[1:]
+                        for path in flagged_paths
+                        if len(path) > 1 and path[0] == key
+                    ),
+                )
+        return redacted
     return value
 
 # ``websockets`` is a direct hermes-agent dependency because the browser CDP
@@ -525,7 +573,11 @@ def browser_cdp(
     payload: Dict[str, Any] = {
         "success": True,
         "method": method,
-        "result": _redact_cdp_output(result),
+        "result": _redact_cdp_output(
+            result,
+            always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+            flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
+        ),
     }
     if target_id:
         payload["target_id"] = target_id
