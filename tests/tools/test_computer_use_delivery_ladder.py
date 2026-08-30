@@ -163,7 +163,7 @@ def test_text_response_surfaces_fields_additively():
                      path="ax", verified=False)
     payload = json.loads(_text_response(r))
     assert payload["effect"] == "suspected_noop"
-    assert payload["escalation"] == {"recommended": "foreground"}
+    assert payload["escalation"] == {"target": "foreground"}
     assert payload["code"] == "background_unavailable"
     assert payload["verified"] is False
 
@@ -177,6 +177,93 @@ def test_text_response_surfaces_fields_additively():
     }
     for k in ("effect", "escalation", "code", "verified", "path", "degraded", "delivery_mode"):
         assert k not in payload2
+
+
+@pytest.mark.parametrize(
+    ("effect", "decision"),
+    [
+        ("confirmed", "done"),
+        ("partial", "verify_fresh_state"),
+        ("unverifiable", "verify_fresh_state"),
+        ("suspected_noop", "escalate"),
+        ("refused", "escalate"),
+    ],
+)
+def test_current_driver_effects_have_distinct_public_verdicts(effect, decision):
+    from tools.computer_use.cua_backend import _action_result_from
+    from tools.computer_use.tool import _action_payload
+
+    result = _action_result_from(
+        "click",
+        True,
+        "driver result",
+        {},
+        {
+            "effect": effect,
+            "escalation": {"target": "pixel", "reason_code": "ax_unavailable"},
+        },
+    )
+
+    payload = _action_payload(result)
+
+    assert payload["effect"] == effect
+    assert payload["verdict"]["decision"] == decision
+    assert payload["escalation"] == {
+        "target": "pixel",
+        "reason_code": "ax_unavailable",
+    }
+    if decision == "escalate":
+        assert payload["verdict"] == {
+            "decision": "escalate",
+            "target": "pixel",
+            "reason_code": "ax_unavailable",
+        }
+
+
+@pytest.mark.parametrize(
+    ("result_kwargs", "decision"),
+    [
+        ({"ok": False, "effect": "confirmed"}, "escalate"),
+        ({"ok": True, "effect": "confirmed", "code": "refused_by_policy"}, "escalate"),
+        ({"ok": True, "effect": "refused", "verified": True}, "escalate"),
+        ({"ok": True, "effect": "partial", "verified": True}, "verify_fresh_state"),
+        ({"ok": True, "effect": "confirmed", "verified": False}, "done"),
+        ({"ok": True, "verified": True}, "done"),
+    ],
+)
+def test_effect_precedence_never_retries_success_or_accepts_refusal(
+    result_kwargs, decision
+):
+    from tools.computer_use.backend import ActionResult
+    from tools.computer_use.tool import _action_payload
+
+    payload = _action_payload(ActionResult(action="click", **result_kwargs))
+
+    assert payload["verdict"]["decision"] == decision
+
+
+def test_legacy_escalation_aliases_normalize_at_public_boundary():
+    from tools.computer_use.backend import ActionResult
+    from tools.computer_use.tool import _action_payload
+
+    payload = _action_payload(
+        ActionResult(
+            ok=True,
+            action="click",
+            effect="suspected_noop",
+            escalation={"recommended": "px", "reason": "empty tree"},
+        )
+    )
+
+    assert payload["escalation"] == {
+        "target": "pixel",
+        "reason_code": "empty tree",
+    }
+    assert payload["verdict"] == {
+        "decision": "escalate",
+        "target": "pixel",
+        "reason_code": "empty tree",
+    }
 
 
 # ---------------------------------------------------------------------------
