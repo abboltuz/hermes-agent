@@ -1397,6 +1397,7 @@ _PROVIDER_ALIASES = {
     "google": "gemini",
     "google-gemini": "gemini",
     "google-ai-studio": "gemini",
+    "google-antigravity": "antigravity",
     "google-vertex": "vertex",
     "vertex-ai": "vertex",
     "gcp-vertex": "vertex",
@@ -3891,6 +3892,22 @@ def _cursor_discovered_models() -> Optional[list[str]]:
     return models
 
 
+def _antigravity_discovered_models() -> Optional[list[str]]:
+    """Return the live Antigravity catalog, or ``None`` on discovery failure."""
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("antigravity")
+        if profile is None:
+            return None
+        live = profile.fetch_models()
+    except Exception:
+        return None
+    if live is None:
+        return None
+    return [str(item).strip() for item in live if str(item).strip()]
+
+
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
@@ -4138,6 +4155,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if _p and normalized == "cursor":
             live = _cursor_discovered_models()
             return live if live is not None else list(_PROVIDER_MODELS.get("cursor", []))
+        if _p and normalized == "antigravity":
+            live = _antigravity_discovered_models()
+            return live if live is not None else list(_p.fallback_models or ())
         if _p and _p.auth_type == "api_key" and _p.base_url:
             try:
                 creds = resolve_api_key_provider_credentials(normalized)
@@ -4648,6 +4668,10 @@ def cached_provider_model_ids(
     normalized = requested if requested == "ollama" else (normalize_provider(provider) or (provider or ""))
     if not normalized:
         return []
+    # Antigravity catalogs are profile-backed but intentionally uncached until
+    # account-scoped identity and entitlement cache semantics are implemented.
+    if normalized == "antigravity":
+        return provider_model_ids(normalized, force_refresh=force_refresh)
     ttl_seconds = provider_models_cache_ttl_seconds(normalized, ttl_seconds)
     if normalized == "ollama":
         ttl_seconds = min(ttl_seconds, _OLLAMA_LOCAL_MODELS_CACHE_TTL)
