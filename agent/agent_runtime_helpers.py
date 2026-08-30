@@ -2602,6 +2602,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         from agent.cursor_bridge_client import CursorBridgeClient
 
         return CursorBridgeClient(**client_kwargs)
+    if agent.provider == "antigravity" or str(client_kwargs.get("base_url", "")).startswith("sdkbridge://antigravity"):
+        from agent.antigravity_bridge_client import AntigravityBridgeClient
+
+        return AntigravityBridgeClient(**client_kwargs)
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 

@@ -6574,23 +6574,33 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
-    # ── Cursor subscription (official sdk.v1 bridge) ──────────────────
-    if provider == "cursor":
+    # ── Cursor / Antigravity subscription bridges ──────────────────
+    if provider in {"cursor", "antigravity"}:
         if not model:
-            logger.warning("resolve_provider_client: cursor requested without a model")
+            logger.warning("resolve_provider_client: %s requested without a model", provider)
             return None, None
-        from agent.cursor_sdk_auth import resolve_cursor_api_key
-        from agent.cursor_bridge_client import CursorBridgeClient, AsyncCursorBridgeClient
-        from agent.cursor_bridge_transport import resolve_bridge_command
-        cursor_key, _ = resolve_cursor_api_key()
-        command = resolve_bridge_command()
-        if not cursor_key or not command:
-            logger.warning("resolve_provider_client: cursor credential or bridge unavailable")
-            return None, None
-        if async_mode:
-            client = AsyncCursorBridgeClient(api_key=cursor_key, bridge_command=command)
+        if provider == "cursor":
+            from agent.cursor_sdk_auth import resolve_cursor_api_key
+            from agent.cursor_bridge_client import CursorBridgeClient, AsyncCursorBridgeClient
+            from agent.cursor_bridge_transport import resolve_bridge_command
+            credential, _ = resolve_cursor_api_key()
+            command = resolve_bridge_command()
+            if not credential or not command:
+                logger.warning("resolve_provider_client: cursor credential or bridge unavailable")
+                return None, None
+            client = (AsyncCursorBridgeClient if async_mode else CursorBridgeClient)(
+                api_key=credential, bridge_command=command
+            )
         else:
-            client = CursorBridgeClient(api_key=cursor_key, bridge_command=command)
+            from agent.antigravity_bridge_client import AntigravityBridgeClient, AsyncAntigravityBridgeClient
+            from agent.antigravity_bridge_transport import resolve_antigravity_bridge_command
+            command = resolve_antigravity_bridge_command()
+            if not command:
+                logger.warning("resolve_provider_client: Antigravity bridge unavailable")
+                return None, None
+            client = (AsyncAntigravityBridgeClient if async_mode else AntigravityBridgeClient)(
+                bridge_command=command
+            )
         return client, _normalize_resolved_model(model, provider)
 
     # ── xAI Grok OAuth (device code → Responses API) ───────────────
