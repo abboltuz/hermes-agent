@@ -485,7 +485,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     return registerPreviewNav(tabId, { back: goBack, forward: goForward, reload: reloadPreview })
   }, [goBack, goForward, isRemoteHtml, isWebPreview, reloadPreview, tabId])
 
-  // Publish the PAGE reader for this tab (the read_preview tool): extract the
+  // Publish the PAGE reader for desktop_preview action='read': extract the
   // rendered page's title + visible text from the webview. innerText (not
   // textContent) so hidden nodes and script/style bodies stay out, matching
   // what the user actually sees.

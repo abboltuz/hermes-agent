@@ -13,7 +13,7 @@ function fileTarget(path: string): PreviewTarget {
   return { kind: 'file', label: path, path, previewKind: 'text', source: path, url: `file://${path}` }
 }
 
-describe('readActivePreview (read_preview tool)', () => {
+describe("readActivePreview (desktop_preview action='read')", () => {
   // All URL targets share the singleton Browser tab id, so a reader registered
   // in one test would answer the next — unregister whatever a test installed.
   let cleanups: Array<() => void> = []

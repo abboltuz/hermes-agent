@@ -109,7 +109,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
       }
 
       if (event.type === 'preview.close') {
-        // Agent-driven close via close_preview. Same on-screen gate as open:
+        // Agent-driven close via desktop_preview action='close'. Same on-screen gate as open:
         // a session the user can see may tidy the pane it opened; a hidden
         // background turn must not dismiss the user's preview.
         const { url } = asRecord(event.payload)

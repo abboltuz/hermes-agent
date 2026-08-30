@@ -80,7 +80,7 @@ describe('preview routing', () => {
     vi.restoreAllMocks()
   })
 
-  describe('open_preview', () => {
+  describe("desktop_preview action='open'", () => {
     // The rail used to hold a session-keyed singleton alongside its tabs, written
     // under one session-id rule and reconciled under another. A live session with
     // no stored id yet resolved to '' on the write side, so the target was set and
@@ -123,7 +123,7 @@ describe('preview routing', () => {
       expect($previewTabs.get()).toHaveLength(0)
     })
 
-    // The turn that calls open_preview is often a TILE's session while focus
+    // The turn that opens a preview is often a TILE's session while focus
     // sits on main (the user asked, then clicked elsewhere). On-screen is the
     // bar — gating on focus made an explicit "open reddit" silently vanish.
     it('honors an open from an open tile session even when main holds focus', async () => {
@@ -171,7 +171,7 @@ describe('preview routing', () => {
       await waitFor(() => expect($previewTarget.get()?.renderMode).toBe('preview'))
     })
 
-    // Offer, don't hijack: only an explicit open_preview call opens the rail.
+    // Offer, don't hijack: only an explicit preview-open action opens the rail.
     it('does not infer a preview from assistant prose', async () => {
       render(<Harness />)
 
@@ -206,7 +206,7 @@ describe('preview routing', () => {
     })
   })
 
-  describe('close_preview', () => {
+  describe("desktop_preview action='close'", () => {
     it('closes the whole pane when no url is given', async () => {
       render(<Harness />)
 

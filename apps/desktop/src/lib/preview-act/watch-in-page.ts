@@ -924,7 +924,7 @@ export function watchInPage(doc: Document, holder: WatchHolder, stage: WatchStag
   const wide = stage === 'sweep' || stage === 'hold' || stage === 'strobe'
   const field = holder.field && holder.field.length ? holder.field : holder.nodes || []
   // The read draws the page's PROSE instead. The two sets barely overlap: what
-  // read_preview takes away is the text, and what the field is made of is the
+  // desktop_preview action='read' takes away is the text, and what the field is made of is the
   // controls. Gathered here rather than in the branch so the bail below can see
   // whether there was anything to read.
   const text = stage === 'read' ? prose() : []
