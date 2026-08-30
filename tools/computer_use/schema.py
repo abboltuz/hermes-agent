@@ -50,15 +50,6 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "list_apps",
                     "list_windows",
                     "focus_app",
-                    "cua_browser_state",
-                    "cua_browser_prepare",
-                    "cua_browser_navigate",
-                    "cua_browser_click",
-                    "cua_browser_type",
-                    "cua_browser_pointer",
-                    "cua_browser_dialog",
-                    "cua_browser_set_input_files",
-                    "cua_browser_download",
                 ],
                 "description": (
                     "Which action to perform. `capture` is free (no side "
@@ -84,10 +75,15 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "app": {
                 "type": "string",
                 "description": (
-                    "Optional. Limit capture/action to a specific app "
-                    "(by name, e.g. 'Safari', or bundle ID, "
-                    "'com.apple.Safari'). If omitted, operates on the "
-                    "frontmost app's window. Pass app='screen' to capture "
+                    "For capture, select one unique visible window belonging "
+                    "to this app (by name, e.g. 'Safari', or bundle ID, "
+                    "'com.apple.Safari'); ambiguity returns candidates. For "
+                    "focus_app this is the required app. On input actions app "
+                    "is a safety assertion against the sticky target from the "
+                    "last capture/focus_app, not a retargeting shortcut; an "
+                    "unknown or different target is refused. If omitted from "
+                    "capture, operates on the frontmost app's window. Pass "
+                    "app='screen' to capture "
                     "everything currently displayed (a composited "
                     "full-screen grab; image only, no clickable elements). "
                     "Pass app='desktop' to target the OS desktop/shell "
@@ -98,8 +94,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "pid": {
                 "type": "integer",
                 "description": (
-                    "Optional exact process target for action='capture'. Pair "
-                    "with window_id when discovery cannot resolve an X11 app."
+                    "Optional process target for action='capture'. If exactly "
+                    "one visible window belongs to the process it is selected; "
+                    "multiple windows fail closed with candidates. Pair with "
+                    "window_id for an exact target."
                 ),
             },
             "window_id": {
@@ -138,7 +136,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "The 1-based SOM index returned by the last "
                     "`capture(mode='som')` call. Strongly preferred over "
-                    "raw coordinates."
+                    "raw coordinates. For action='type', binds text to that "
+                    "captured element when the live Cua schema supports it. "
+                    "Targeted key delivery is refused rather than sent to the "
+                    "currently focused control."
                 ),
             },
             "coordinate": {
@@ -149,7 +150,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "Pixel coordinates [x, y] relative to the captured window "
                     "screenshot (top-left origin). Only use this if no element "
-                    "index is available."
+                    "index is available. Coordinate-targeted type/key are not "
+                    "supported and are refused explicitly."
                 ),
             },
             "button": {
@@ -260,105 +262,6 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "approval scope. Default false."
                 ),
             },
-            # ── cua-driver typed browser route ─────────────────────
-            "tab_id": {
-                "type": "string",
-                "description": "Opaque tab capability returned by cua_browser_state.",
-            },
-            "ref": {
-                "type": "string",
-                "description": "Current semantic ref from the latest cua_browser_state snapshot.",
-            },
-            "destination_ref": {
-                "type": "string",
-                "description": "Current destination ref for a typed pointer action.",
-            },
-            "url": {"type": "string", "description": "URL for cua_browser_navigate."},
-            "input_route": {
-                "type": "string",
-                "enum": ["trusted", "dom_event"],
-                "description": (
-                    "Typed-browser trust class. Defaults to trusted. dom_event "
-                    "is an explicit downgrade and is never selected silently."
-                ),
-            },
-            "snapshot_format": {
-                "type": "string",
-                "enum": ["semantic_v2", "dom_refs_v1"],
-                "description": "Typed-browser snapshot format; semantic_v2 is the default.",
-            },
-            "include_screenshot": {
-                "type": "boolean",
-                "description": (
-                    "For cua_browser_state, include the current browser screenshot "
-                    "as image content in the tool result. Defaults to false. "
-                    "Applies to snapshot calls only: passing pid/window_id makes "
-                    "the call a binding, which carries no page content and "
-                    "reports screenshot_deferred instead."
-                ),
-            },
-            "query": {"type": "string", "description": "Optional browser-state query."},
-            "scope_ref": {"type": "string", "description": "Optional current ref to scope a snapshot."},
-            "continuation": {"type": "string", "description": "Continuation minted by the current snapshot."},
-            "profile_mode": {
-                "type": "string",
-                "enum": ["isolated_new", "isolated_named", "existing_profile"],
-                "description": (
-                    "Browser preparation mode. existing_profile is decided by "
-                    "cua-driver's immutable permission mode: in standard mode "
-                    "it requires the user's config opt-in "
-                    "computer_use.grant_existing_profile: true (if refused, "
-                    "report that key to the user — you cannot grant it); "
-                    "bounded mode authorizes via the reviewed capability "
-                    "manifest; explicit Hermes YOLO uses a private "
-                    "unrestricted daemon."
-                ),
-            },
-            "profile_name": {"type": "string", "description": "Name for isolated_named setup."},
-            "allow_launch": {
-                "type": "boolean",
-                "description": "Explicitly allow launch of a driver-owned isolated browser.",
-            },
-            "browser_pointer_action": {
-                "type": "string",
-                "enum": ["hover", "right_click", "double_click", "scroll", "drag"],
-                "description": "Operation for cua_browser_pointer.",
-            },
-            "browser_dialog_action": {
-                "type": "string",
-                "enum": ["inspect", "accept", "dismiss"],
-                "description": "Page JavaScript dialog action; native prompts stay on the native ladder.",
-            },
-            "browser_type_mode": {
-                "type": "string",
-                "enum": ["insert_text", "keystrokes"],
-                "description": "Delivery form for cua_browser_type; defaults to insert_text.",
-            },
-            "replace": {
-                "type": "boolean",
-                "description": (
-                    "For cua_browser_type, select the target's complete value "
-                    "before typing so the supplied text replaces it. Defaults "
-                    "to false; true with empty text clears the field."
-                ),
-            },
-            "dialog_id": {"type": "string", "description": "Opaque page-dialog capability."},
-            "prompt_text": {"type": "string", "description": "Optional text for a page prompt dialog."},
-            "files": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Explicit paths for cua_browser_set_input_files.",
-            },
-            "destination_root": {
-                "type": "string",
-                "description": "Approved destination root for cua_browser_download.",
-            },
-            "delta_x": {"type": "number", "description": "Typed pointer horizontal delta."},
-            "delta_y": {"type": "number", "description": "Typed pointer vertical delta."},
-            "x": {"type": "number", "description": "Typed browser viewport x coordinate."},
-            "y": {"type": "number", "description": "Typed browser viewport y coordinate."},
-            "to_x": {"type": "number", "description": "Typed browser drag destination x."},
-            "to_y": {"type": "number", "description": "Typed browser drag destination y."},
             # ── return shape ───────────────────────────────────────
             "capture_after": {
                 "type": "boolean",

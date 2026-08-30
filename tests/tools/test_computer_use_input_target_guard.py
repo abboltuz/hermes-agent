@@ -37,7 +37,7 @@ def test_substring_variants_no_mismatch():
     assert _input_target_mismatch(_backend("chrome"), "Google-chrome") is None
 
 
-def test_unknown_current_target_fails_open():
+def test_unknown_current_target_has_no_provable_mismatch():
     assert _input_target_mismatch(_backend(None), "kate") is None
     assert _input_target_mismatch(_backend(""), "kate") is None
 
@@ -61,6 +61,16 @@ def test_type_with_mismatched_app_refused():
 def test_click_with_mismatched_app_refused():
     out = _dispatch_result(_backend("kcalc"), "click", {"element": 3, "app": "kate"})
     assert out["code"] == "input_target_mismatch"
+
+
+def test_supplied_app_with_unknown_sticky_target_is_refused():
+    backend = _backend(None)
+    backend.type_text = lambda text, **kw: _fake_action_result()
+
+    out = _dispatch_result(backend, "type", {"text": "777", "app": "kate"})
+
+    assert out["ok"] is False
+    assert out["code"] == "input_target_unverified"
 
 
 def _fake_action_result(action="type_text"):
