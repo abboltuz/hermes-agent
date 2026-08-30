@@ -100,7 +100,7 @@ def test_numeric_arguments_are_validated():
 
 def test_empty_answer_means_nothing_open():
     result = json.loads(ap.drive_preview_tool(action="elements", callback=lambda _p: ""))
-    assert "open_preview" in result["error"]
+    assert "desktop_preview" in result["error"]
 
 
 def test_passes_the_renderer_answer_through():

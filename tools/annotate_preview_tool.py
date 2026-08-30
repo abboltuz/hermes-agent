@@ -77,7 +77,7 @@ def annotate_preview_tool(
     if not raw:
         return tool_error(
             "The annotation timed out, or no GUI window answered. "
-            "Open a page with open_preview first."
+            "Open a page with desktop_preview action='open' first."
         )
 
     try:

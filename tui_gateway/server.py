@@ -7004,7 +7004,7 @@ def _agent_cbs(sid: str) -> dict:
             {k: v for k, v in (("start", start), ("count", count)) if v is not None},
             timeout=30,
         ),
-        # read_preview tool (desktop GUI): the renderer serializes the active
+        # desktop_preview read action: the renderer serializes the active
         # preview tab (a Browser webview's readable text, a file's identity)
         # and answers preview.read.respond. Longer timeout than the terminal
         # read — a URL tab extracts text from a live page.
@@ -11643,7 +11643,7 @@ _desktop_ui_wired = False
 
 
 def _wire_desktop_ui() -> None:
-    """Bridge desktop-only tools (open_preview, close_preview, focus_pane) to renderer events.
+    """Bridge desktop-only tools (desktop_preview, focus_pane) to renderer events.
 
     Idempotent. The tool hands back the turn's ``HERMES_UI_SESSION_ID`` as
     ``sid`` so the event routes to the window that asked (``_emit`` /

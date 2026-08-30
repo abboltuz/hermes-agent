@@ -84,10 +84,4 @@ OPEN_PREVIEW_SCHEMA = {
 }
 
 
-registry.register(
-    name="open_preview",
-    toolset="desktop_ui",
-    schema=OPEN_PREVIEW_SCHEMA,
-    handler=lambda args, **kw: open_preview_tool(url=args.get("url", ""), label=args.get("label", "")),
-    emoji="🖼️",
-)
+# Registration is consolidated into tools.preview_tool.

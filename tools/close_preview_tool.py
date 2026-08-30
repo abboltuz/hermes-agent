@@ -55,10 +55,4 @@ CLOSE_PREVIEW_SCHEMA = {
 }
 
 
-registry.register(
-    name="close_preview",
-    toolset="desktop_ui",
-    schema=CLOSE_PREVIEW_SCHEMA,
-    handler=lambda args, **kw: close_preview_tool(url=args.get("url") or ""),
-    emoji="🖼️",
-)
+# Registration is consolidated into tools.preview_tool.

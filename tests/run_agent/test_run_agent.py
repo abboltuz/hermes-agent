@@ -2447,7 +2447,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
-        ("read_preview", {}),
+        ("desktop_preview", {"action": "read"}),
         ("drive_preview", {"action": "elements"}),
         ("annotate_preview", {"action": "clear"}),
         ("read_window_below", {}),
@@ -2493,8 +2493,8 @@ class TestAgentRuntimePostHookOwnershipSync:
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(
-            "tools.read_preview_tool.read_preview_tool",
-            lambda **kwargs: '{"ok":true}',
+            "tools.preview_tool.dispatch_preview",
+            lambda args, **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(
             "tools.drive_preview_tool.drive_preview_tool",
