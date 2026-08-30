@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -255,19 +258,53 @@ ns.serve_forever()
     assert client._process is None
 
 
-def _write_blocking_bridge(path):
+def _wait_for_file(path, *, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if Path(path).is_file():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for marker {path}")
+
+
+def _reap_ledger_pids(ledger):
+    if not ledger.is_file():
+        return
+    for raw_pid in ledger.read_text(encoding="utf-8").splitlines():
+        try:
+            os.kill(int(raw_pid), signal.SIGTERM)
+        except (ProcessLookupError, ValueError):
+            pass
+
+
+def _write_blocking_bridge(path, *, entered_path=None, ledger_path=None,
+                           emit_readiness=True, readiness_delay: float = 0):
+    ledger_setup = (
+        f"from pathlib import Path; marker = Path({str(ledger_path)!r}).open('a', encoding='utf-8'); marker.write(str(__import__('os').getpid()) + '\\n'); marker.close()\n"
+        if ledger_path else ""
+    )
+    entered_setup = (
+        f"from pathlib import Path; Path({str(entered_path)!r}).touch()\n"
+        if entered_path else ""
+    )
+    readiness = (
+        f"time.sleep({readiness_delay}); print('antigravity-bridge ready ' + json.dumps({{'protocol': 'antigravity-openai-v1', 'host': '127.0.0.1', 'port': ns.server_port}}), flush=True)\n"
+        if emit_readiness else ""
+    )
     path.write_text(
-        """import json, time
+        f"""import json, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+{ledger_setup}
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({'data': []}).encode(); self.send_response(200)
+        body = json.dumps({{'data': []}}).encode(); self.send_response(200)
         self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
+        {entered_setup}
         while True: time.sleep(1)
     def log_message(self, *args): pass
 ns = ThreadingHTTPServer(('127.0.0.1', 0), H)
-print('antigravity-bridge ready ' + json.dumps({'protocol': 'antigravity-openai-v1', 'host': '127.0.0.1', 'port': ns.server_port}), flush=True)
+{readiness}
 ns.serve_forever()
 """,
         encoding="utf-8",
@@ -278,7 +315,8 @@ def test_antigravity_async_cancellation_reaps_concrete_child(tmp_path):
     from agent.antigravity_bridge_client import AsyncAntigravityBridgeClient
 
     child = tmp_path / "blocking_async_bridge.py"
-    _write_blocking_bridge(child)
+    entered = tmp_path / "post-entered"
+    _write_blocking_bridge(child, entered_path=entered)
 
     async def exercise():
         client = AsyncAntigravityBridgeClient(bridge_command=[sys.executable, str(child)])
@@ -287,11 +325,12 @@ def test_antigravity_async_cancellation_reaps_concrete_child(tmp_path):
         assert process is not None and process._process is not None
         child_process = process._process
         task = asyncio.create_task(client.chat.completions.create(model="x", messages=[]))
-        await asyncio.sleep(0.2)
+        await asyncio.to_thread(_wait_for_file, entered)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert child_process.poll() is not None
+        await client.close()
         await client.close()
 
     asyncio.run(exercise())
@@ -301,7 +340,8 @@ def test_antigravity_concurrent_first_use_has_one_owned_child(tmp_path):
     from agent.antigravity_bridge_client import AntigravityBridgeClient
 
     child = tmp_path / "blocking_concurrent_bridge.py"
-    _write_blocking_bridge(child)
+    ledger = tmp_path / "bridge-pids"
+    _write_blocking_bridge(child, ledger_path=ledger, readiness_delay=0.3)
     client = AntigravityBridgeClient(bridge_command=[sys.executable, str(child)])
     barrier = threading.Barrier(3)
     results = []
@@ -319,16 +359,73 @@ def test_antigravity_concurrent_first_use_has_one_owned_child(tmp_path):
     barrier.wait()
     for thread in threads:
         thread.join(timeout=5)
+    passed = False
     try:
         assert all(not isinstance(result, Exception) for result in results)
+        pids = {int(raw_pid) for raw_pid in ledger.read_text(encoding="utf-8").splitlines()}
+        assert len(pids) == 1
         process = client._process
         assert process is not None and process._process is not None
         child_process = process._process
         assert child_process.poll() is None
         client.close()
         assert child_process.poll() is not None
+        passed = True
     finally:
         client.close()
+        if not passed:
+            _reap_ledger_pids(ledger)
+
+
+def test_antigravity_abort_pending_readiness_reaps_starter_and_wakes_waiter(tmp_path):
+    from agent.antigravity_bridge_client import (
+        AntigravityBridgeClient, AntigravityBridgeError,
+    )
+    child = tmp_path / "pending_readiness_bridge.py"
+    started = tmp_path / "bridge-started"
+    _write_blocking_bridge(child, ledger_path=started, emit_readiness=False)
+    client = AntigravityBridgeClient(bridge_command=[sys.executable, str(child)])
+    barrier = threading.Barrier(3)
+    results = []
+
+    def call_list_models():
+        barrier.wait()
+        try:
+            results.append(client.list_models())
+        except Exception as exc:
+            results.append(exc)
+
+    threads = [threading.Thread(target=call_list_models) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    starting_process = None
+    passed = False
+    try:
+        _wait_for_file(started)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            wrapper = client._starting_process
+            if wrapper is not None and wrapper._process is not None:
+                starting_process = wrapper._process
+                break
+            time.sleep(0.02)
+        assert starting_process is not None
+        client.abort_inflight()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+        assert all(isinstance(result, AntigravityBridgeError) for result in results)
+        assert starting_process.poll() is not None
+        assert client.is_closed
+        assert client._process is None
+        passed = True
+    finally:
+        client.close()
+        if starting_process is not None and starting_process.poll() is None:
+            starting_process.terminate()
+        if not passed:
+            _reap_ledger_pids(started)
 
 
 def test_antigravity_loopback_bypasses_environment_proxy(monkeypatch):
