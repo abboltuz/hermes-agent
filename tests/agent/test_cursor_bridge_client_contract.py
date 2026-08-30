@@ -96,6 +96,11 @@ def _client_with_transport(*, stream_error=False, final_text=""):
 
 
 def test_loop_mode_exposes_only_host_custom_tools_and_stable_ids():
+    from openai.types.chat.chat_completion_message_tool_call import (
+        ChatCompletionMessageToolCall,
+        Function,
+    )
+
     client, fake = _client_with_transport()
     try:
         response = client.chat.completions.create(
@@ -113,8 +118,13 @@ def test_loop_mode_exposes_only_host_custom_tools_and_stable_ids():
     assert set(options["local"]["customTools"]) == {"safe_tool"}
     tool_call = response.choices[0].message.tool_calls[0]
     assert response.choices[0].finish_reason == "tool_calls"
+    assert type(tool_call) is ChatCompletionMessageToolCall
+    assert type(tool_call.function) is Function
     assert tool_call.id == "stable-tool-id"
     assert tool_call.function.name == "safe_tool"
+    assert dict(tool_call)["id"] == "stable-tool-id"
+    assert dict(tool_call.function)["name"] == "safe_tool"
+    assert tool_call.model_dump()["function"]["arguments"] == '{"value": "ok"}'
     assert fake.callback_result is not None
     assert fake.callback_result["status"] == "deferred"
 

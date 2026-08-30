@@ -35,6 +35,7 @@ import time
 import urllib.request
 from typing import Any, Optional
 
+from agent.openai_sdk_imports import load_openai_class
 from utils import base_url_hostname, normalize_proxy_url
 
 
@@ -273,8 +274,7 @@ def _load_openai_cls() -> type:
     """Import and cache ``openai.OpenAI``."""
     global _OPENAI_CLS_CACHE
     if _OPENAI_CLS_CACHE is None:
-        from openai import OpenAI as _cls
-        _OPENAI_CLS_CACHE = _cls
+        _OPENAI_CLS_CACHE = load_openai_class()
     return _OPENAI_CLS_CACHE
 
 

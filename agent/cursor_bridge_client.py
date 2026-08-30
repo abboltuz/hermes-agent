@@ -33,11 +33,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from openai.types.chat.chat_completion_message_tool_call import (
-    ChatCompletionMessageToolCall,
-    Function,
-)
-
 from agent.cursor_bridge_transport import (
     ConnectJsonTransport,
     CursorBridgeError,
@@ -48,6 +43,7 @@ from agent.cursor_bridge_wire import (
     decode_call_custom_tool_request,
     encode_call_custom_tool_response,
 )
+from agent.openai_sdk_imports import load_chat_completion_message_tool_call_types
 
 logger = logging.getLogger(__name__)
 
@@ -743,13 +739,15 @@ class CursorBridgeClient:
             )
 
         tool_calls = []
+        if captured:
+            tool_call_cls, function_cls = load_chat_completion_message_tool_call_types()
         for call in captured:
             call_id = str(call.get("toolCallId") or self._next_call_id())
-            tool_calls.append(ChatCompletionMessageToolCall(
+            tool_calls.append(tool_call_cls(
                 id=call_id,
                 response_item_id=None,
                 type="function",
-                function=Function(
+                function=function_cls(
                     name=str(call.get("toolName") or ""),
                     arguments=json.dumps(call.get("args") or {}, ensure_ascii=False),
                 ),

@@ -19,16 +19,17 @@ import time
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-
-from openai.types.chat.chat_completion_message_tool_call import (
-    ChatCompletionMessageToolCall,
-    Function,
-)
+from typing import TYPE_CHECKING, Any
 
 from agent.file_safety import get_read_block_error, get_write_denied_error, is_write_approval_required
+from agent.openai_sdk_imports import load_chat_completion_message_tool_call_types
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
+
+if TYPE_CHECKING:
+    from openai.types.chat.chat_completion_message_tool_call import (
+        ChatCompletionMessageToolCall,
+    )
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -294,12 +295,13 @@ def _build_openai_tool_call(
     arguments: str,
 ) -> ChatCompletionMessageToolCall:
     """Build an OpenAI-compatible tool-call object for downstream handling."""
-    return ChatCompletionMessageToolCall(
+    tool_call_cls, function_cls = load_chat_completion_message_tool_call_types()
+    return tool_call_cls(
         id=call_id,
         call_id=call_id,
         response_item_id=None,
         type="function",
-        function=Function(name=name, arguments=arguments),
+        function=function_cls(name=name, arguments=arguments),
     )
 
 
