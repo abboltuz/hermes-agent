@@ -23,9 +23,15 @@ def _reset_swr_state():
     import hermes_cli.models as models_mod
     with models_mod._swr_refresh_lock:
         models_mod._swr_refresh_inflight.clear()
+    with models_mod._cursor_refresh_lock:
+        models_mod._cursor_refresh_inflight.clear()
+        models_mod._cursor_refresh_failed_at.clear()
     yield
     with models_mod._swr_refresh_lock:
         models_mod._swr_refresh_inflight.clear()
+    with models_mod._cursor_refresh_lock:
+        models_mod._cursor_refresh_inflight.clear()
+        models_mod._cursor_refresh_failed_at.clear()
 
 
 class TestProviderModelsSWR:

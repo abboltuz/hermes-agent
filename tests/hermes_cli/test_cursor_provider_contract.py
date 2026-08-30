@@ -16,6 +16,19 @@ from agent.cursor_sdk_auth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_cursor_refresh_coordinator():
+    import hermes_cli.models as models_mod
+
+    with models_mod._cursor_refresh_lock:
+        models_mod._cursor_refresh_inflight.clear()
+        models_mod._cursor_refresh_failed_at.clear()
+    yield
+    with models_mod._cursor_refresh_lock:
+        models_mod._cursor_refresh_inflight.clear()
+        models_mod._cursor_refresh_failed_at.clear()
+
+
 @pytest.fixture
 def cursor_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
