@@ -84,6 +84,13 @@ class TestGuidanceConstants:
         assert "Do NOT type passwords, API keys" not in guidance
         assert "secrets — ever" not in guidance
 
+    def test_computer_use_guidance_has_no_retired_browser_route_or_grant(self):
+        guidance = computer_use_guidance("darwin")
+
+        assert "separate browser toolset" in guidance
+        assert "cua_browser_state" not in guidance
+        assert "computer_use.grant_existing_profile" not in guidance
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -1033,4 +1040,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-

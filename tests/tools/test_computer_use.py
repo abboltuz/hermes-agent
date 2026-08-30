@@ -50,6 +50,18 @@ class TestSchema:
             "focus_app",
         }
 
+    def test_schema_exposes_only_desktop_actions(self):
+        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
+
+        actions = set(COMPUTER_USE_SCHEMA["parameters"]["properties"]["action"]["enum"])
+        assert actions == {
+            "capture", "click", "double_click", "right_click", "middle_click",
+            "drag", "scroll", "type", "key", "set_value", "wait",
+            "list_apps", "list_windows", "focus_app",
+        }
+        properties = COMPUTER_USE_SCHEMA["parameters"]["properties"]
+        assert "browser_type_mode" not in properties
+
     def test_schema_max_elements_documents_default_and_upper_bound(self):
         """Schema description must agree with the runtime. The original PR
         text said "Default 100" without a corresponding `default` field, and
@@ -167,6 +179,50 @@ class TestDispatch:
         # No follow-up capture should have been issued.
         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
         assert len(capture_calls) == 0, "capture must not be called after a failed action"
+
+    @pytest.mark.parametrize(
+        ("args", "unexpected"),
+        [
+            ({"action": "click", "element": 1, "text": "ignored"}, "text"),
+            ({"action": "wait", "seconds": 0, "coordinate": [1, 2]}, "coordinate"),
+            ({"action": "list_apps", "capture_after": True}, "capture_after"),
+        ],
+    )
+    def test_model_visible_irrelevant_arguments_are_rejected_before_dispatch(
+        self, noop_backend, args, unexpected,
+    ):
+        from tools.computer_use.tool import handle_computer_use
+
+        parsed = json.loads(handle_computer_use(args))
+
+        assert parsed["code"] == "unexpected_action_arguments"
+        assert unexpected in parsed["unexpected"]
+        assert noop_backend.calls == []
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"action": "click", "element": 1, "coordinate": [5, 6]},
+            {
+                "action": "drag", "from_element": 1, "to_element": 2,
+                "from_coordinate": [1, 2], "to_coordinate": [3, 4],
+            },
+            {"action": "scroll", "element": 1, "coordinate": [5, 6]},
+            {
+                "action": "capture", "app": "Hermes", "pid": 10,
+                "window_id": 20,
+            },
+        ],
+    )
+    def test_conflicting_target_arguments_are_rejected_before_dispatch(
+        self, noop_backend, args,
+    ):
+        from tools.computer_use.tool import handle_computer_use
+
+        parsed = json.loads(handle_computer_use(args))
+
+        assert parsed["code"] == "conflicting_action_arguments"
+        assert noop_backend.calls == []
 
 # ---------------------------------------------------------------------------
 # Safety guards (type / key block lists)
@@ -1585,6 +1641,25 @@ class TestFocusAppFilterNoMatch:
         # _active_pid must remain unset so a subsequent click doesn't hit Fuwari.
         assert backend._active_pid is None
 
+    def test_focus_app_multiple_visible_matches_fail_with_candidates(self):
+        windows = [
+            {"app_name": "Hermes", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "Helper", "z_index": 9},
+            {"app_name": "Hermes", "pid": 100, "window_id": 2,
+             "is_on_screen": True, "title": "Main", "z_index": 1},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+
+        result = backend.focus_app("Hermes")
+
+        assert result.ok is False
+        assert result.code == "ambiguous_window_target"
+        assert [
+            item["window_id"] for item in result.meta["available_windows"]
+        ] == [1, 2]
+        assert backend._active_pid is None
+        assert backend._active_window_id is None
+
 
     def test_installed_only_metadata_cannot_target_a_pid_zero_window(self):
         windows = [
@@ -1810,9 +1885,9 @@ class TestClickButtonPassthrough:
 
     def test_coordinate_drag_and_scroll_keep_the_captured_window(self):
         backend = self._backend_with_active_target()
-        # Mock the capability check so x/y are included (they're gated
-        # behind the input.scroll.coordinates capability).
-        backend._session.supports_capability.return_value = True
+        backend._session.supports_input_property.side_effect = (
+            lambda tool, prop: prop in {"x", "y"}
+        )
 
         backend.drag(from_xy=(10, 20), to_xy=(30, 40))
         drag_name, drag_args = backend._session.call_tool.call_args.args
@@ -1832,6 +1907,33 @@ class TestClickButtonPassthrough:
         assert scroll_name == "scroll"
         assert scroll_args["window_id"] == 222
         assert scroll_args["x"] == 50 and scroll_args["y"] == 60
+
+    def test_drag_and_scroll_modifiers_are_wired_or_refused_by_live_schema(self):
+        backend = self._backend_with_active_target()
+        backend._session.supports_input_property.side_effect = (
+            lambda tool, prop: prop in {
+                "button", "modifier", "x", "y",
+            }
+        )
+
+        backend.drag(
+            from_xy=(10, 20), to_xy=(30, 40),
+            button="right", modifiers=["shift"],
+        )
+        _, drag_args = backend._session.call_tool.call_args.args
+        assert drag_args["button"] == "right"
+        assert drag_args["modifier"] == ["shift"]
+
+        backend.scroll(direction="down", modifiers=["shift"])
+        _, scroll_args = backend._session.call_tool.call_args.args
+        assert scroll_args["modifier"] == ["shift"]
+
+        backend._session.call_tool.reset_mock()
+        backend._session.supports_input_property.return_value = False
+        backend._session.supports_input_property.side_effect = None
+        refused = backend.scroll(direction="down", modifiers=["shift"])
+        assert refused.code == "scroll_modifiers_unsupported"
+        backend._session.call_tool.assert_not_called()
 
     def test_coordinate_actions_without_window_id_fail_closed(self):
         backend = self._backend_with_active_target()
@@ -2125,6 +2227,51 @@ class TestStructuredElementsConsumption:
         # Vision mode stays free of AX element noise.
         assert cap.elements == []
 
+    def test_vision_capture_falls_back_when_legacy_screenshot_returns_unknown_tool_error(self):
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend()
+        backend._session = MagicMock()
+        backend._session._has_tool.return_value = False
+        backend._session.capabilities_discovered = False
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42m"
+            "NkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        )
+
+        def fake_call_tool(name, args):
+            if name == "list_windows":
+                return {
+                    "data": "", "images": [], "image_mime_types": [],
+                    "structuredContent": {"windows": [{
+                        "app_name": "Demo", "pid": 9, "window_id": 1,
+                        "is_on_screen": True, "title": "Demo", "z_index": 0,
+                    }]}, "isError": False,
+                }
+            if name == "screenshot":
+                return {
+                    "data": "Unknown tool: screenshot", "images": [],
+                    "image_mime_types": [], "structuredContent": None,
+                    "isError": True,
+                }
+            if name == "get_window_state":
+                return {
+                    "data": "", "images": [png_b64],
+                    "image_mime_types": ["image/png"],
+                    "structuredContent": None, "isError": False,
+                }
+            raise AssertionError(name)
+
+        backend._session.call_tool.side_effect = fake_call_tool
+        cap = backend.capture(mode="vision")
+
+        assert [c.args[0] for c in backend._session.call_tool.call_args_list] == [
+            "list_windows", "screenshot", "get_window_state"
+        ]
+        assert cap.png_b64 == png_b64
+        assert backend._active_pid == 9
+        assert backend._active_window_id == 1
+
 class TestCapabilityDiscovery:
     """Surface 4 (NousResearch/hermes-agent#47072): the wrapper learns
     what cua-driver supports from the per-tool `capabilities[]` array on
@@ -2164,6 +2311,54 @@ class TestCapabilityDiscovery:
         # Unknown tool → False (instead of KeyError).
         assert session.supports_capability("anything", tool="never_registered") is False
 
+    def test_strict_mcp_sdk_preserves_vendor_capability_fields(self, monkeypatch):
+        """MCP 2.x strict models must not erase cua-driver vendor metadata."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        import mcp.types as mcp_types
+
+        from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
+
+        monkeypatch.setattr(
+            mcp_types.Tool,
+            "model_config",
+            dict(mcp_types.Tool.model_config, extra="ignore"),
+        )
+        raw = {
+            "tools": [{
+                "name": "click",
+                "description": "Click an element.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"element_token": {"type": "string"}},
+                },
+                "capabilities": [
+                    "accessibility.element_tokens",
+                    "input.pointer.click",
+                ],
+            }],
+            "capability_version": "1",
+            "schema_version": "1",
+        }
+        mcp_session = MagicMock()
+        mcp_session.send_request = AsyncMock(
+            side_effect=lambda request, result_type, **kwargs: result_type.model_validate(raw)
+        )
+        mcp_session.list_tools = AsyncMock(
+            side_effect=AssertionError("strict SDK must use vendor-preserving listing")
+        )
+
+        session = _CuaDriverSession(_AsyncBridge())
+        asyncio.run(session._populate_capabilities(mcp_session))
+
+        assert session._capabilities["click"] == {
+            "accessibility.element_tokens",
+            "input.pointer.click",
+        }
+        assert session._capability_version == "1"
+        assert session.supports_input_property("click", "element_token") is True
+
 
 class TestElementTokenAttachment:
     """Surface 6 (NousResearch/hermes-agent#47072): trycua/cua#1961 added
@@ -2199,6 +2394,7 @@ class TestElementTokenAttachment:
                 return cap in capabilities.get(tool, set())
             return any(cap in caps for caps in capabilities.values())
         backend._session.supports_capability = _supports
+        backend._session.supports_input_property = lambda tool, prop: False
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
@@ -2214,6 +2410,391 @@ class TestElementTokenAttachment:
         assert args["element_index"] == 5
         # The matching token rode along — cua-driver will prefer it.
         assert args["element_token"] == "s0001:5"
+
+    def test_schema_advertised_token_survives_missing_vendor_metadata(self):
+        backend = self._backend_with_session({"click": {"input.pointer.click"}})
+        backend._session.supports_input_property = (
+            lambda tool, prop: tool == "click" and prop == "element_token"
+        )
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        _, args = backend._session.call_tool.call_args.args
+        assert args["element_token"] == "s0001:5"
+
+    def test_snapshot_id_falls_back_when_element_token_is_unavailable(self):
+        backend = self._backend_with_session({"click": {"input.pointer.click"}})
+        backend._session.supports_input_property = (
+            lambda tool, prop: tool == "click" and prop == "snapshot_id"
+        )
+        backend._snapshot_id = "s00000001"
+
+        backend.click(element=5, button="left")
+
+        _, args = backend._session.call_tool.call_args.args
+        assert args["snapshot_id"] == "s00000001"
+        assert "element_token" not in args
+
+    def test_element_token_precedes_snapshot_id_when_both_are_available(self):
+        backend = self._backend_with_session({"click": {"input.pointer.click"}})
+        backend._session.supports_input_property = (
+            lambda tool, prop: tool == "click" and prop in {"element_token", "snapshot_id"}
+        )
+        backend._snapshot_tokens = {5: "s0001:5"}
+        backend._snapshot_id = "s00000001"
+
+        backend.click(element=5, button="left")
+
+        _, args = backend._session.call_tool.call_args.args
+        assert args["element_token"] == "s0001:5"
+        assert "snapshot_id" not in args
+
+    def test_capture_caches_snapshot_id_for_later_indexed_action(self):
+        from unittest.mock import MagicMock
+
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend()
+        backend._session = MagicMock()
+        backend._session.supports_capability = lambda cap, tool=None: False
+        backend._session.supports_input_property = lambda tool, prop: prop == "snapshot_id"
+        windows_payload = {"windows": [{
+            "app_name": "Calculator", "pid": 9, "window_id": 1,
+            "is_on_screen": True, "title": "Calculator", "z_index": 0,
+        }]}
+
+        def fake_call_tool(name, args):
+            if name == "list_windows":
+                return {
+                    "data": "", "images": [], "image_mime_types": [],
+                    "structuredContent": windows_payload, "isError": False,
+                }
+            if name == "get_window_state":
+                return {
+                    "data": "Calculator snapshot",
+                    "images": [], "image_mime_types": [],
+                    "structuredContent": {
+                        "snapshot_id": "sdeadbeef",
+                        "elements": [{
+                            "element_index": 5, "role": "button", "label": "7",
+                        }],
+                    },
+                    "isError": False,
+                }
+            return {
+                "data": "ok", "images": [], "image_mime_types": [],
+                "structuredContent": None, "isError": False,
+            }
+
+        backend._session.call_tool.side_effect = fake_call_tool
+        capture = backend.capture(mode="ax")
+        assert capture.elements[0].index == 5
+
+        backend.click(element=5, button="left")
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "click"
+        assert args["snapshot_id"] == "sdeadbeef"
+
+
+class TestSelectiveControlContract:
+    def _backend(self):
+        from unittest.mock import MagicMock
+
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend()
+        backend._session = MagicMock()
+        backend._session.call_tool.return_value = {
+            "data": "ok", "images": [], "image_mime_types": [],
+            "structuredContent": {"effect": "confirmed", "route": "ax"},
+            "isError": False,
+        }
+        backend._session.supports_capability = lambda cap, tool=None: False
+        backend._session.supports_input_property = lambda tool, prop: prop in {
+            "element_index", "element_token", "snapshot_id",
+        }
+        backend._active_pid = 10
+        backend._active_window_id = 20
+        return backend
+
+    def test_app_only_capture_refuses_multiple_visible_windows_with_candidates(self):
+        backend = self._backend()
+        backend._load_windows = lambda: [
+            {
+                "app_name": "Hermes", "pid": 10, "window_id": 1,
+                "off_screen": False, "title": "", "z_index": 100000,
+            },
+            {
+                "app_name": "Hermes", "pid": 10, "window_id": 2,
+                "off_screen": False, "title": "Hermes", "z_index": 1,
+            },
+        ]
+
+        capture = backend.capture(mode="ax", app="Hermes")
+
+        assert capture.error == "ambiguous_window_target"
+        assert [item["window_id"] for item in capture.available_windows] == [1, 2]
+        assert backend._active_pid is None
+        assert backend._active_window_id is None
+
+    def test_pid_only_capture_refuses_multiple_visible_windows_with_candidates(self):
+        backend = self._backend()
+        backend._load_windows = lambda: [
+            {
+                "app_name": "Hermes", "pid": 10, "window_id": 1,
+                "off_screen": False, "title": "Helper", "z_index": 9,
+            },
+            {
+                "app_name": "Hermes", "pid": 10, "window_id": 2,
+                "off_screen": False, "title": "Main", "z_index": 1,
+            },
+        ]
+
+        capture = backend.capture(mode="ax", pid=10)
+
+        assert capture.error == "ambiguous_window_target"
+        assert [item["window_id"] for item in capture.available_windows] == [1, 2]
+        assert backend._active_pid is None
+        assert backend._active_window_id is None
+
+    def test_pid_only_capture_uses_single_visible_window(self):
+        backend = self._backend()
+        backend._load_windows = lambda: [
+            {
+                "app_name": "Hermes", "pid": 10, "window_id": 2,
+                "off_screen": False, "title": "Main", "z_index": 1,
+            },
+        ]
+        backend._session.call_tool.return_value = {
+            "data": "", "images": [], "image_mime_types": [],
+            "structuredContent": {"elements": []}, "isError": False,
+        }
+
+        capture = backend.capture(mode="ax", pid=10)
+
+        assert capture.error is None
+        assert capture.pid == 10
+        assert capture.window_id == 2
+
+    def test_app_only_capture_ignores_offscreen_window_for_ambiguity(self):
+        backend = self._backend()
+        backend._load_windows = lambda: [
+            {
+                "app_name": "Hermes", "pid": 10, "window_id": 1,
+                "off_screen": False, "title": "Hermes", "z_index": 1,
+            },
+            {
+                "app_name": "Hermes", "pid": 10, "window_id": 2,
+                "off_screen": True, "title": "Hidden", "z_index": 0,
+            },
+        ]
+        backend._session.call_tool.return_value = {
+            "data": "", "images": [], "image_mime_types": [],
+            "structuredContent": {"elements": []}, "isError": False,
+        }
+
+        capture = backend.capture(mode="ax", app="Hermes")
+
+        assert capture.error is None
+        assert capture.window_id == 1
+
+    def test_exact_capture_reports_native_target_identity(self):
+        backend = self._backend()
+        backend._session.call_tool.return_value = {
+            "data": "", "images": [], "image_mime_types": [],
+            "structuredContent": {"elements": []}, "isError": False,
+        }
+
+        capture = backend.capture(mode="ax", pid=10, window_id=20)
+
+        assert capture.pid == 10
+        assert capture.window_id == 20
+
+    def test_element_targeted_type_reaches_cua_schema(self):
+        backend = self._backend()
+        backend._snapshot_tokens = {3: "snapshot:3"}
+
+        result = backend.type_text("hello", element=3)
+
+        assert result.ok is True
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "type_text"
+        assert args["element_index"] == 3
+        assert args["element_token"] == "snapshot:3"
+
+    def test_dispatch_rejects_unimplemented_keyboard_targets(self):
+        import json
+
+        from tools.computer_use.tool import _dispatch
+
+        backend = self._backend()
+        typed = json.loads(_dispatch(
+            backend, "type", {"text": "hello", "coordinate": [10, 20]},
+        ))
+        keyed = json.loads(_dispatch(
+            backend, "key", {"keys": "return", "element": 3},
+        ))
+
+        assert typed["code"] == "targeted_type_coordinate_unsupported"
+        assert keyed["code"] == "targeted_key_unsupported"
+        backend._session.call_tool.assert_not_called()
+
+    def test_double_click_omits_button_from_strict_schema(self):
+        backend = self._backend()
+        backend._session.supports_input_property = lambda tool, prop: prop != "button"
+
+        backend.click(x=5, y=6, click_count=2)
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "double_click"
+        assert "button" not in args
+
+    def test_strict_schema_omits_internal_session_and_rejects_unknown_fields(self):
+        from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
+
+        session = _CuaDriverSession(_AsyncBridge())
+        session._tool_schemas = {
+            "double_click": {
+                "type": "object",
+                "properties": {"pid": {}, "window_id": {}, "x": {}, "y": {}},
+                "additionalProperties": False,
+            },
+        }
+
+        assert session.prepare_tool_args(
+            "double_click",
+            {"pid": 1, "window_id": 2, "x": 3, "y": 4, "session": "internal"},
+        ) == {"pid": 1, "window_id": 2, "x": 3, "y": 4}
+        try:
+            session.prepare_tool_args("double_click", {"pid": 1, "button": "left"})
+        except ValueError as exc:
+            assert "button" in str(exc)
+        else:
+            raise AssertionError("unknown strict-schema field was not rejected")
+
+    def test_error_envelope_outranks_contradictory_confirmed_effect(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import _action_payload
+
+        payload = _action_payload(ActionResult(
+            ok=False,
+            action="click",
+            effect="confirmed",
+            code="transport_outcome_unknown",
+        ))
+
+        assert payload["verdict"]["decision"] == "escalate"
+
+    def test_current_route_delivery_and_evidence_are_public(self):
+        from tools.computer_use.cua_backend import _action_result_from
+        from tools.computer_use.tool import _action_payload
+
+        result = _action_result_from(
+            "click", True, "done", {},
+            {
+                "effect": "confirmed",
+                "route": "ax",
+                "delivery": {"status": "delivered"},
+                "evidence": {"kind": "ax_readback"},
+                "escalation": {"target": "foreground", "reason_code": "blocked"},
+            },
+        )
+        payload = _action_payload(result)
+
+        assert payload["route"] == "ax"
+        assert payload["delivery"] == {"status": "delivered"}
+        assert payload["evidence"] == {"kind": "ax_readback"}
+        assert payload["escalation"]["target"] == "foreground"
+
+    def test_current_escalation_target_drives_suspected_noop_verdict(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import _action_payload
+
+        payload = _action_payload(ActionResult(
+            ok=True,
+            action="click",
+            effect="suspected_noop",
+            escalation={"target": "foreground", "reason_code": "blocked"},
+        ))
+
+        assert payload["verdict"] == {
+            "decision": "escalate",
+            "recommended": "foreground",
+        }
+
+    def test_transport_restart_refuses_action_built_from_stale_target(self):
+        from unittest.mock import MagicMock
+
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend()
+        session = MagicMock()
+        backend._session = session
+        backend._active_pid = 10
+        backend._active_window_id = 20
+        session.supports_input_property.return_value = False
+        session.supports_capability.return_value = False
+        session.prepare_for_call.side_effect = lambda name: backend._handle_transport_reset()
+
+        result = backend.click(x=5, y=6)
+
+        assert result.ok is False
+        assert result.code == "stale_target_after_transport_reset"
+        session.call_tool.assert_not_called()
+
+    def test_capture_response_exposes_exact_target_and_ambiguity_candidates(self):
+        import json
+
+        from tools.computer_use.backend import CaptureResult
+        from tools.computer_use.tool import _capture_response
+
+        result = json.loads(_capture_response(CaptureResult(
+            mode="ax",
+            width=0,
+            height=0,
+            pid=10,
+            window_id=20,
+            error="ambiguous_window_target",
+            available_windows=[{"pid": 10, "window_id": 20, "title": "Main"}],
+        )))
+
+        assert result["pid"] == 10
+        assert result["window_id"] == 20
+        assert result["error"] == "ambiguous_window_target"
+        assert result["available_windows"][0]["title"] == "Main"
+
+    def test_element_drag_refuses_schema_that_accepts_coordinates_only(self):
+        backend = self._backend()
+        backend._session.supports_input_property = lambda tool, prop: prop in {
+            "from_x", "from_y", "to_x", "to_y",
+        }
+
+        result = backend.drag(from_element=1, to_element=2)
+
+        assert result.ok is False
+        assert result.code == "element_drag_unsupported"
+        backend._session.call_tool.assert_not_called()
+
+    def test_coordinate_scroll_refuses_instead_of_dropping_target(self):
+        backend = self._backend()
+        backend._session.supports_input_property = lambda tool, prop: prop not in {"x", "y"}
+        backend._session.supports_capability.return_value = False
+
+        result = backend.scroll(direction="down", x=5, y=6)
+
+        assert result.ok is False
+        assert result.code == "coordinate_scroll_unsupported"
+        backend._session.call_tool.assert_not_called()
+
+    def test_bare_scroll_keeps_exact_window_identity(self):
+        backend = self._backend()
+
+        backend.scroll(direction="down")
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "scroll"
+        assert args["window_id"] == 20
 
 
     def test_capture_refreshes_snapshot_tokens(self):
@@ -2370,6 +2951,33 @@ class TestCuaToolCoverageExpansion:
 
     # ── Recording / replay ──────────────────────────────────────
 
+    def test_replay_trajectory_uses_current_live_schema(self):
+        backend = self._backend()
+
+        backend.replay_trajectory(
+            directory="/tmp/trajectory",
+            delay_ms=125,
+            stop_on_error=False,
+        )
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "replay_trajectory"
+        assert args == {
+            "dir": "/tmp/trajectory",
+            "delay_ms": 125,
+            "stop_on_error": False,
+            "session": backend._session_id,
+        }
+
+    def test_install_ffmpeg_requires_and_forwards_confirmation(self):
+        backend = self._backend()
+
+        backend.install_ffmpeg(confirm=True)
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "install_ffmpeg"
+        assert args == {"confirm": True, "session": backend._session_id}
+
     # ── Config ──────────────────────────────────────────────────
 
 
@@ -2521,7 +3129,7 @@ class TestBoundsSpaceNote:
 
 
 class TestEscalationEnrichment:
-    """Browser-class background_unavailable refusals gain a typed-page hint."""
+    """Driver escalation remains authoritative for desktop control."""
 
     def _refusal(self, **overrides):
         from tools.computer_use.backend import ActionResult
@@ -2536,14 +3144,11 @@ class TestEscalationEnrichment:
         kw.update(overrides)
         return ActionResult(**kw)
 
-    def test_browser_text_refusal_gains_page_alternative(self):
+    def test_browser_text_refusal_is_not_redirected_to_retired_page_route(self):
         from tools.computer_use.tool import _enrich_escalation
 
         enriched = _enrich_escalation(self._refusal())
-        # Driver's recommendation is never overridden — only augmented.
-        assert enriched["recommended"] == "foreground"
-        assert enriched["alternative"] == "page"
-        assert "cua_browser_type" in enriched["alternative_hint"]
+        assert enriched == {"recommended": "foreground", "reason": "dropped"}
 
     def test_non_browser_target_untouched(self):
         from tools.computer_use.tool import _enrich_escalation
@@ -2569,7 +3174,9 @@ class TestEscalationEnrichment:
         from tools.computer_use.tool import _action_payload
 
         payload = _action_payload(self._refusal())
-        assert payload["escalation"]["alternative"] == "page"
+        assert payload["escalation"] == {
+            "recommended": "foreground", "reason": "dropped"
+        }
         assert payload["verdict"]["decision"] == "escalate"
 
 

@@ -56,6 +56,9 @@ class _FakeSession:
         self.calls.append((name, dict(args)))
         return self._out
 
+    def prepare_for_call(self, name: str) -> None:
+        """The real session refreshes transport/schema state before dispatch."""
+
     def supports_capability(self, capability: str, tool: Optional[str] = None) -> bool:
         return capability in self._caps
 
@@ -127,7 +130,9 @@ def test_degraded_capture_signal_preserved():
         "structuredContent": {"effect": "suspected_noop", "degraded": True,
                               "escalation": {"recommended": "px", "reason": "empty tree"}},
     }
-    be = _make_backend(_FakeSession(out))
+    be = _make_backend(_FakeSession(
+        out, input_properties={"scroll": {"element_index"}},
+    ))
     res = be.scroll(direction="down", element=1)
     assert res.degraded is True
     assert res.escalation["recommended"] == "px"
