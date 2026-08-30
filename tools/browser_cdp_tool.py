@@ -435,7 +435,11 @@ def _browser_cdp_via_supervisor(
         "method": method,
         "frame_id": frame_id,
         "session_id": child_sid,
-        "result": result_msg.get("result", {}),
+        "result": _redact_cdp_output(
+            result_msg.get("result", {}),
+            always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+            flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
+        ),
     }
     return json.dumps(payload, ensure_ascii=False)
 
