@@ -202,3 +202,64 @@ class TestCorruptCacheRowDegradation:
             out = mod.cached_provider_model_ids("openrouter")
         assert out == ["live-model"]
         live.assert_called_once()
+
+
+class TestCursorProviderCacheTTL:
+    """Cursor catalogs change with plan/entitlement, so a successful Cursor
+    cache row is fresh for five minutes while every other provider keeps the
+    existing one-hour contract. Both decisions must come from the shared
+    freshness authority used by the picker cache and parallel prefetch.
+    """
+
+    def _cache_entry(self, models, age_seconds, fp="fp"):
+        return {"fp": fp, "at": time.time() - age_seconds, "models": list(models)}
+
+    def test_cursor_entry_older_than_five_minutes_is_stale_while_other_providers_stay_fresh(self):
+        import hermes_cli.models as mod
+
+        age = 301  # just past five minutes, well under the one-hour TTL
+        cache = {
+            "cursor": self._cache_entry(["cursor-old"], age_seconds=age),
+            "openrouter": self._cache_entry(["or-old"], age_seconds=age),
+        }
+        with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
+             patch.object(mod, "_credential_fingerprint", return_value="fp"), \
+             patch.object(mod, "_spawn_swr_refresh") as spawn, \
+             patch.object(mod, "provider_model_ids") as live:
+            cursor_out = mod.cached_provider_model_ids("cursor")
+            openrouter_out = mod.cached_provider_model_ids("openrouter")
+
+        assert cursor_out == ["cursor-old"]
+        assert openrouter_out == ["or-old"]
+        live.assert_not_called()
+        spawn.assert_called_once_with("cursor")
+
+    def test_cursor_entry_younger_than_five_minutes_is_reused_without_live_fetch(self):
+        import hermes_cli.models as mod
+
+        cache = {"cursor": self._cache_entry(["cursor-fresh"], age_seconds=299)}
+        with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
+             patch.object(mod, "_credential_fingerprint", return_value="fp"), \
+             patch.object(mod, "_spawn_swr_refresh") as spawn, \
+             patch.object(mod, "provider_model_ids") as live:
+            out = mod.cached_provider_model_ids("cursor")
+
+        assert out == ["cursor-fresh"]
+        spawn.assert_not_called()
+        live.assert_not_called()
+
+    def test_failed_cursor_refresh_preserves_prior_usable_list(self):
+        import hermes_cli.models as mod
+
+        cache = {"cursor": self._cache_entry(["cursor-prior"], age_seconds=400)}
+        with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
+             patch.object(mod, "_credential_fingerprint", return_value="fp"), \
+             patch.object(mod, "_save_provider_models_cache") as save, \
+             patch.object(mod, "_spawn_swr_refresh") as spawn, \
+             patch.object(mod, "provider_model_ids", return_value=[]) as live:
+            out = mod.cached_provider_model_ids("cursor", force_refresh=True)
+
+        assert out == ["cursor-prior"]
+        live.assert_called_once()
+        spawn.assert_not_called()
+        save.assert_not_called()

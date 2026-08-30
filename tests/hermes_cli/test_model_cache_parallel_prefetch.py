@@ -138,6 +138,29 @@ class TestPrefetchProviderModelsParallel:
         assert "fresh_prov" not in fetch_calls
         assert "stale_prov" in fetch_calls
 
+    def test_cursor_stale_after_five_minutes_while_same_age_non_cursor_stays_fresh(self):
+        """A 6-minute Cursor row is prefetched; an equally aged OpenRouter row is not."""
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        age = 301
+        cache = {
+            "cursor": {"fp": "fp", "at": time.time() - age, "models": ["cursor-old"]},
+            "openrouter": {"fp": "fp", "at": time.time() - age, "models": ["or-old"]},
+        }
+        fetch_calls = []
+
+        def mock_fetch(slug, force_refresh=False):
+            fetch_calls.append((slug, force_refresh))
+            return [f"model_{slug}"]
+
+        with patch("hermes_cli.models._load_provider_models_cache", return_value=cache), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
+             patch("hermes_cli.models.update_provider_cache_entry"):
+            _prefetch_provider_models_parallel(["cursor", "openrouter"])
+
+        assert fetch_calls == [("cursor", True)]
+
     def test_fetches_in_parallel(self, monkeypatch):
         """Multiple providers are fetched concurrently, not serially."""
         from hermes_cli.model_switch import _prefetch_provider_models_parallel
@@ -234,6 +257,25 @@ class TestPrefetchIntegration:
                 pass
 
         prefetch.assert_not_called()
+
+    def test_prefetch_cursor_even_with_three_or_fewer_providers(self):
+        """A configured Cursor provider still enters bounded prefetch at ≤3 authed providers."""
+        from hermes_cli import model_switch
+
+        slugs = ["openrouter", "cursor"]
+
+        def mock_collect(data, curated, excluded):
+            return slugs
+
+        with patch.object(model_switch, "_collect_authed_provider_slugs", side_effect=mock_collect), \
+             patch.object(model_switch, "_prefetch_provider_models_parallel") as prefetch:
+            try:
+                model_switch.list_authenticated_providers()
+            except Exception:
+                pass
+
+        prefetch.assert_called_once()
+        assert prefetch.call_args[0][0] == ["cursor"]
 
     def test_prefetch_skipped_on_refresh(self):
         """When refresh=True, prefetch is skipped (serial path force-refreshes)."""

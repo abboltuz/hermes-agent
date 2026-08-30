@@ -4196,6 +4196,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     to a live fetch — the picker keeps working.
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
+# Cursor's advertised catalog can change when a plan/entitlement changes
+# without rotating credentials, so a successful Cursor row is only fresh
+# for five minutes. Every other provider keeps the one-hour window.
+_CURSOR_PROVIDER_MODELS_CACHE_TTL = 300  # 5m
 # Stale-while-revalidate window: an expired-but-same-credentials entry is
 # served IMMEDIATELY (picker opens stay instant) while a background daemon
 # thread re-fetches the live catalog and rewrites the disk cache for the
@@ -4412,6 +4416,40 @@ def _save_provider_models_cache(data: dict) -> None:
         pass
 
 
+def provider_models_cache_ttl_seconds(
+    provider: Optional[str],
+    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
+) -> int:
+    """Return the successful-catalog freshness window for *provider*.
+
+    This is the single authority for provider disk-cache TTL. Callers must
+    not duplicate a literal freshness rule alongside it.
+    """
+    requested = str(provider or "").strip().lower()
+    normalized = (
+        requested if requested == "ollama" else (normalize_provider(provider) or (provider or ""))
+    )
+    if normalized == "cursor":
+        return min(int(ttl_seconds), _CURSOR_PROVIDER_MODELS_CACHE_TTL)
+    return int(ttl_seconds)
+
+
+def provider_models_cache_entry_is_fresh(
+    entry: Any,
+    fp: str,
+    *,
+    provider: Optional[str],
+    now: Optional[float] = None,
+    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
+    allow_empty: bool = False,
+) -> bool:
+    """True when *entry* is a credential-matching row still inside TTL."""
+    if not _cache_entry_valid(entry, fp, allow_empty=allow_empty):
+        return False
+    age = (time.time() if now is None else now) - entry["at"]
+    return age < provider_models_cache_ttl_seconds(provider, ttl_seconds)
+
+
 def update_provider_cache_entry(provider: str, models: list[str]) -> None:
     """Thread-safe single-entry update of the provider-models disk cache.
 
@@ -4452,6 +4490,7 @@ def cached_provider_model_ids(
     normalized = requested if requested == "ollama" else (normalize_provider(provider) or (provider or ""))
     if not normalized:
         return []
+    ttl_seconds = provider_models_cache_ttl_seconds(normalized, ttl_seconds)
     if normalized == "ollama":
         ttl_seconds = min(ttl_seconds, _OLLAMA_LOCAL_MODELS_CACHE_TTL)
 

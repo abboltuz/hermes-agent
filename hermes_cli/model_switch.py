@@ -2356,8 +2356,8 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     from hermes_cli.models import (
         _load_provider_models_cache,
         _credential_fingerprint,
-        _PROVIDER_MODELS_CACHE_TTL,
         normalize_provider,
+        provider_models_cache_entry_is_fresh,
     )
 
     now = time.time()
@@ -2369,15 +2369,8 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
             continue
         entry = cache.get(normalized)
         fp = _credential_fingerprint(normalized)
-        if (
-            isinstance(entry, dict)
-            and entry.get("fp") == fp
-            and isinstance(entry.get("models"), list)
-            and entry["models"]
-        ):
-            age = now - float(entry.get("at", 0))
-            if age < _PROVIDER_MODELS_CACHE_TTL:
-                continue  # fresh, skip
+        if provider_models_cache_entry_is_fresh(entry, fp, provider=normalized, now=now):
+            continue  # fresh, skip
         stale_slugs.append(normalized)
 
     if not stale_slugs:
@@ -2642,6 +2635,7 @@ def list_authenticated_providers(
         OPENROUTER_MODELS, _PROVIDER_MODELS,
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
+        normalize_provider,
     )
 
     # Explicit refresh: drop every provider's cached model-id list so the
@@ -2792,17 +2786,29 @@ def list_authenticated_providers(
     # their model lists) and warming their cache entries in parallel makes
     # the subsequent serial calls hit fresh cache entries instead.
     #
-    # Skipped entirely when refresh=True (the serial path already force-refreshes)
-    # and when there are 3 or fewer authed providers (serial is fast enough;
-    # avoids thread-pool overhead for the common 1-2 provider case).
+    # Skipped entirely when refresh=True (the serial path already force-refreshes).
+    # Parallel-prefetch all authed providers when more than three are present.
+    # A configured Cursor provider is also prefetched in the ≤3 case so a
+    # five-minute Desktop revalidation can pick up a newly advertised catalog
+    # on the first poll rather than waiting for a second request. Non-Cursor
+    # small configurations keep the serial path.
     _prefetch_slugs: list[str] = []
     if not refresh:
         _prefetch_slugs = _collect_authed_provider_slugs(
             data, curated, excluded_providers or []
         )
+    _parallel_prefetch: list[str] = []
     if len(_prefetch_slugs) > 3:
+        _parallel_prefetch = _prefetch_slugs
+    elif _prefetch_slugs:
+        _parallel_prefetch = [
+            slug
+            for slug in _prefetch_slugs
+            if (normalize_provider(slug) or slug) == "cursor"
+        ]
+    if _parallel_prefetch:
         try:
-            _prefetch_provider_models_parallel(_prefetch_slugs)
+            _prefetch_provider_models_parallel(_parallel_prefetch)
         except Exception:
             pass  # best-effort; serial path still works as fallback
 
