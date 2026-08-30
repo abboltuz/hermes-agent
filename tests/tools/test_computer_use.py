@@ -2720,7 +2720,8 @@ class TestSelectiveControlContract:
 
         assert payload["verdict"] == {
             "decision": "escalate",
-            "recommended": "foreground",
+            "target": "foreground",
+            "reason_code": "blocked",
         }
 
     def test_transport_restart_refuses_action_built_from_stale_target(self):
@@ -3175,7 +3176,7 @@ class TestEscalationEnrichment:
 
         payload = _action_payload(self._refusal())
         assert payload["escalation"] == {
-            "recommended": "foreground", "reason": "dropped"
+            "target": "foreground", "reason_code": "dropped"
         }
         assert payload["verdict"]["decision"] == "escalate"
 

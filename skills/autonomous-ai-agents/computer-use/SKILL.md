@@ -112,10 +112,10 @@ but that is the first rung, not the only one. Every input action returns a
 structured verdict; read it and climb only when the driver tells you to.
 
 Returned fields (present when the driver supports them):
-- `effect`: `"confirmed"` (driver read the result back — done), `"unverifiable"`
-  (delivered, but confirm it yourself by re-capturing), or `"suspected_noop"`
-  (ran but almost certainly did nothing).
-- `escalation`: `{recommended: "px" | "foreground", reason}` — present
+- `effect`: `"confirmed"` (driver read the result back — done), `"partial"`
+  (some effect, requiring fresh verification), `"unverifiable"` (delivered,
+  but not confirmed), `"suspected_noop"`, or `"refused"`.
+- `escalation`: `{target: "pixel" | "foreground", reason_code}` — present
   only when there's a next rung to try.
 - `code`: a structured refusal like `"background_unavailable"` or
   `"foreground_unsupported"`.
@@ -125,11 +125,12 @@ Walk it in order:
 
 1. **Element, background (default).** `click(element=N)`. If `effect:"confirmed"`,
    you're done.
-2. **Fresh verification.** `effect:"unverifiable"` means inspect a fresh
-   capture/state before any retry. Do this even when `escalation.recommended`
-   is present; it is advisory, not proof that successful input should repeat.
-3. **Pixel, background.** After `effect:"suspected_noop"` or a structured
-   refusal recommends `"px"` (or a `degraded` capture has no elements), click
+2. **Fresh verification.** `effect:"partial"` or `effect:"unverifiable"`
+   means inspect fresh state before any retry. Do this even when
+   `escalation.target` is present; it is advisory, not proof that successful
+   input should repeat.
+3. **Pixel, background.** After `effect:"suspected_noop"` or `effect:"refused"`
+   with `escalation.target:"pixel"` (or a degraded capture has no elements), click
    by `coordinate=[x,y]` instead of `element`.
 4. **Foreground.** After `effect:"suspected_noop"`,
    `code:"background_unavailable"`, or a verified pixel no-op,
@@ -153,7 +154,7 @@ Walk it in order:
 
 ```
 computer_use(action="click", element=7)
-# → {effect: "suspected_noop", escalation: {recommended: "foreground", ...}}
+# → {effect: "suspected_noop", escalation: {target: "foreground", ...}}
 computer_use(action="click", element=7, delivery_mode="foreground")
 # → {effect: "unverifiable", path: "x11_pixel_fg"}   then re-capture to confirm
 ```
@@ -284,7 +285,7 @@ in your conversation context.
 | `cua-driver not installed` | Run `hermes computer-use install`, or `hermes tools` and enable Computer Use |
 | Captures consistently return empty / "no on-screen window" | On Linux: DISPLAY may not be set (X11) or you're on pure Wayland — ask the user to run `hermes computer-use doctor`. On Windows: you may be in Session 0 (SSH session) instead of the interactive desktop — see the cua-driver `WINDOWS.md` deep-dive |
 | Element index stale ("Element N not in cache") | SOM indices are only valid until the next `capture`. Re-capture before clicking. The wrapper carries opaque `element_token`s for stale-detection; you'll see an explicit error rather than a wrong click |
-| Click had no effect | Read the structured verdict. `effect:"unverifiable"` → fresh capture/state before retry, even with an escalation hint. `effect:"suspected_noop"` or a structured refusal → climb the recommended ladder: coordinate (px), then foreground. Browser chrome/native prompts remain native; page content is a separate toolset. Don't conclude the app is undrivable |
+| Click had no effect | Read the structured verdict. `effect:"partial"` or `effect:"unverifiable"` → fresh capture/state before retry, even with an escalation hint. `effect:"suspected_noop"` or `effect:"refused"` → follow `escalation.target`: pixel, then foreground. Browser chrome/native prompts remain native; page content is a separate toolset. Don't conclude the app is undrivable |
 | Type text disappears into a terminal emulator | cua-driver detects terminals (Ghostty, iTerm2, Terminal.app, Windows Terminal, mintty, etc.) and routes through key-event synthesis — should "just work" on a recent cua-driver. If it doesn't, ask the user to run `hermes computer-use doctor` |
 | `blocked pattern in type text` | You tried to `type` a shell command matching the dangerous-pattern block list (`curl ... \| bash`, `sudo rm -rf`, etc.). Break the command up or reconsider |
 | Anything else weird | **First action: ask the user to run `hermes computer-use doctor`.** It runs the cua-driver `health_report` MCP tool and prints a structured per-check matrix. Their output tells you (and them) exactly what's wrong |
