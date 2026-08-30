@@ -10,6 +10,7 @@ import asyncio
 import json
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -330,6 +331,106 @@ def test_frame_id_route_allowed_when_page_is_not_private(monkeypatch):
 
     assert result.get("success") is True
     assert len(supervisor_calls) == 1
+
+
+def _call_real_supervisor_route(monkeypatch, method, cdp_result):
+    class ImmediateFuture:
+        def __init__(self, coroutine):
+            self.coroutine = coroutine
+
+        def result(self, timeout):
+            return asyncio.run(self.coroutine)
+
+    class FakeLoop:
+        def is_running(self):
+            return True
+
+    class FakeSupervisor:
+        _loop = FakeLoop()
+
+        def snapshot(self):
+            return SimpleNamespace(
+                frame_tree={
+                    "top": {"frame_id": "top"},
+                    "children": [
+                        {"frame_id": "frame-1", "session_id": "session-1"}
+                    ],
+                }
+            )
+
+        async def _cdp(self, called_method, params, *, session_id, timeout):
+            assert called_method == method
+            assert session_id == "session-1"
+            return {"result": cdp_result}
+
+    import agent.async_utils as async_utils
+    import tools.browser_supervisor as browser_supervisor
+
+    supervisor = FakeSupervisor()
+    monkeypatch.setattr(
+        browser_supervisor.SUPERVISOR_REGISTRY,
+        "get",
+        lambda task_id: supervisor if task_id == "task-1" else None,
+    )
+    monkeypatch.setattr(
+        async_utils,
+        "safe_schedule_threadsafe",
+        lambda coroutine, loop: ImmediateFuture(coroutine),
+    )
+
+    return json.loads(
+        browser_cdp_tool._browser_cdp_via_supervisor(
+            task_id="task-1",
+            frame_id="frame-1",
+            method=method,
+            params={},
+            timeout=5.0,
+        )
+    )
+
+
+def test_frame_id_route_redacts_runtime_evaluate_semantic_text(monkeypatch):
+    semantic_secret = "sk-" + "SUPERVISORLEAK" + "1" * 20
+
+    result = _call_real_supervisor_route(
+        monkeypatch,
+        "Runtime.evaluate",
+        {"result": {"type": "string", "value": semantic_secret}},
+    )
+
+    assert result["success"] is True
+    assert "SUPERVISORLEAK" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("method", "cdp_result", "path"),
+    [
+        ("Page.captureScreenshot", {"data": None}, ("data",)),
+        ("Page.printToPDF", {"data": None}, ("data",)),
+        ("Network.streamResourceContent", {"bufferedData": None}, ("bufferedData",)),
+        ("HeadlessExperimental.beginFrame", {"screenshotData": None}, ("screenshotData",)),
+        ("CacheStorage.requestCachedResponse", {"response": {"body": None}}, ("response", "body")),
+        ("Network.getResponseBody", {"body": None, "base64Encoded": True}, ("body",)),
+        ("Fetch.getResponseBody", {"body": None, "base64Encoded": True}, ("body",)),
+        ("IO.read", {"data": None, "base64Encoded": True}, ("data",)),
+        ("Network.getRequestPostData", {"postData": None, "base64Encoded": True}, ("postData",)),
+    ],
+)
+def test_frame_id_route_preserves_declared_binary_fields(
+    monkeypatch, method, cdp_result, path
+):
+    binary_payload = "sk-" + "B" * 64
+    target = cdp_result
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = binary_payload
+
+    result = _call_real_supervisor_route(monkeypatch, method, cdp_result)
+
+    actual = result["result"]
+    for key in path:
+        actual = actual[key]
+    assert actual == binary_payload
 
 
 def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
