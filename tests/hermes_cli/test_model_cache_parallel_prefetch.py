@@ -349,6 +349,56 @@ class TestPrefetchProviderModelsParallel:
 
         assert calls == [("openrouter", True)]
 
+    def test_same_provider_prefetch_isolated_by_active_profile_context(self, tmp_path):
+        """Cross-profile requests run twice while same-profile work coalesces."""
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        release = threading.Event()
+        both_entered = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+        start = threading.Barrier(2)
+
+        def fetch(slug, force_refresh=False):
+            with calls_lock:
+                calls.append((slug, get_hermes_home()))
+                if len(calls) == 2:
+                    both_entered.set()
+            assert release.wait(timeout=2)
+            return ["live"]
+
+        def worker(home):
+            token = set_hermes_home_override(home)
+            try:
+                start.wait(timeout=2)
+                _prefetch_provider_models_parallel(["openrouter"])
+            finally:
+                reset_hermes_home_override(token)
+
+        with patch("hermes_cli.models._load_provider_models_cache", return_value={}), \
+             patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
+             patch("hermes_cli.models.cached_provider_model_ids", side_effect=fetch):
+            threads = [
+                threading.Thread(target=worker, args=(tmp_path / "profile-a",)),
+                threading.Thread(target=worker, args=(tmp_path / "profile-b",)),
+            ]
+            for thread in threads:
+                thread.start()
+            try:
+                assert both_entered.wait(timeout=2)
+            finally:
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=2)
+            assert all(not thread.is_alive() for thread in threads)
+
+        assert {home.name for _, home in calls} == {"profile-a", "profile-b"}
+
     def test_overlapping_stale_openrouter_prefetches_share_one_forced_discovery_on_failure(self):
         """Waiters share a failing OpenRouter owner attempt and still terminate."""
         from hermes_cli import model_switch

@@ -216,7 +216,7 @@ class TestProviderModelsSWR:
             mod._spawn_swr_refresh("openrouter")
 
         assert saved["openrouter"]["models"] == ["fresh1", "fresh2"]
-        assert "openrouter" not in mod._swr_refresh_inflight  # cleared on completion
+        assert not mod._swr_refresh_inflight  # exact profile-scoped tuple cleared on completion
 
 
 class TestCatalogSWR:

@@ -97,7 +97,7 @@ def test_cursor_profile_fingerprint_is_scoped_and_unscoped_resolution_fails_clos
             reset_secret_scope(scope_a_token)
             reset_hermes_home_override(home_a_token)
 
-        home_b_token = set_hermes_home_override(home_b)
+        home_b_token = set_hermes_home_override(home_a)
         scope_b_token = set_secret_scope({"CURSOR_API_KEY": "scoped-b"})
         try:
             fingerprint_b = models._credential_fingerprint("cursor")
@@ -106,8 +106,80 @@ def test_cursor_profile_fingerprint_is_scoped_and_unscoped_resolution_fails_clos
             reset_hermes_home_override(home_b_token)
 
         assert fingerprint_a != fingerprint_b
+
+        home_b_token = set_hermes_home_override(home_b)
+        scope_b_token = set_secret_scope({"CURSOR_API_KEY": "scoped-a"})
+        try:
+            coordinator_key_b = models._cursor_refresh_key(fingerprint_a)
+        finally:
+            reset_secret_scope(scope_b_token)
+            reset_hermes_home_override(home_b_token)
+        home_a_token = set_hermes_home_override(home_a)
+        scope_a_token = set_secret_scope({"CURSOR_API_KEY": "scoped-a"})
+        try:
+            coordinator_key_a = models._cursor_refresh_key(fingerprint_a)
+        finally:
+            reset_secret_scope(scope_a_token)
+            reset_hermes_home_override(home_a_token)
+        assert coordinator_key_a != coordinator_key_b
     finally:
         set_multiplex_active(was_multiplexed)
+
+
+def test_cursor_failure_clear_is_limited_to_active_profile(tmp_path):
+    """Explicit Cursor cache clears must not release another profile's throttle."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import models
+
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    with models._cursor_refresh_lock:
+        models._cursor_refresh_failed_at.update({
+            (str(home_a), "cursor", "a"): 1.0,
+            (str(home_b), "cursor", "b"): 2.0,
+        })
+
+    token = set_hermes_home_override(home_a)
+    try:
+        models.clear_provider_models_cache("cursor")
+    finally:
+        reset_hermes_home_override(token)
+
+    assert (str(home_a), "cursor", "a") not in models._cursor_refresh_failed_at
+    assert (str(home_b), "cursor", "b") in models._cursor_refresh_failed_at
+
+    with models._cursor_refresh_lock:
+        models._cursor_refresh_failed_at[(str(home_a), "cursor", "a-all")] = 3.0
+    token = set_hermes_home_override(home_a)
+    try:
+        models.clear_provider_models_cache()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert (str(home_a), "cursor", "a-all") not in models._cursor_refresh_failed_at
+    assert (str(home_b), "cursor", "b") in models._cursor_refresh_failed_at
+
+
+def test_active_home_identity_fallback_remains_profile_distinct(tmp_path, monkeypatch):
+    """Filesystem canonicalization errors must not collapse profile identity."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import models
+
+    monkeypatch.setattr(models.Path, "resolve", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("synthetic")))
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    token_a = set_hermes_home_override(home_a)
+    try:
+        identity_a = models._active_hermes_home_identity()
+    finally:
+        reset_hermes_home_override(token_a)
+    token_b = set_hermes_home_override(home_b)
+    try:
+        identity_b = models._active_hermes_home_identity()
+    finally:
+        reset_hermes_home_override(token_b)
+
+    assert identity_a != identity_b
 
 
 def test_credential_save_rejects_symlink_target(cursor_home):
