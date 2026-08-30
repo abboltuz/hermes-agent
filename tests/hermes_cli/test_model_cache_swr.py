@@ -10,6 +10,8 @@ and refreshed off-thread for the next open.
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 from unittest.mock import patch
 
@@ -254,12 +256,137 @@ class TestCursorProviderCacheTTL:
         cache = {"cursor": self._cache_entry(["cursor-prior"], age_seconds=400)}
         with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
              patch.object(mod, "_credential_fingerprint", return_value="fp"), \
-             patch.object(mod, "_save_provider_models_cache") as save, \
+             patch.object(mod, "update_provider_cache_entry") as persist, \
              patch.object(mod, "_spawn_swr_refresh") as spawn, \
-             patch.object(mod, "provider_model_ids", return_value=[]) as live:
+             patch.object(mod, "_cursor_discovered_models", return_value=None) as live:
             out = mod.cached_provider_model_ids("cursor", force_refresh=True)
 
         assert out == ["cursor-prior"]
         live.assert_called_once()
         spawn.assert_not_called()
-        save.assert_not_called()
+        persist.assert_not_called()
+
+
+def _write_provider_cache(path, payload):
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _read_provider_cache(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _patch_cursor_fetch_models(monkeypatch, result):
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("cursor")
+    assert profile is not None
+    if callable(result):
+        monkeypatch.setattr(profile, "fetch_models", result)
+    else:
+        monkeypatch.setattr(profile, "fetch_models", lambda **_kwargs: result)
+    return profile
+
+
+class TestCursorForcedDiscoveryCache:
+    """Forced Cursor revalidation must not treat static ['auto'] fallback as
+    a successful live catalog, and successful writes must not drop siblings.
+    """
+
+    def test_failed_forced_discovery_preserves_named_catalog_and_timestamp(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        original_at = time.time() - 400
+        fp = mod._credential_fingerprint("cursor")
+        _write_provider_cache(cache_path, {
+            "cursor": {"fp": fp, "at": original_at, "models": ["named-a", "named-b"]},
+        })
+        _patch_cursor_fetch_models(monkeypatch, None)
+
+        out = mod.cached_provider_model_ids("cursor", force_refresh=True)
+
+        assert out == ["named-a", "named-b"]
+        saved = _read_provider_cache(cache_path)
+        assert saved["cursor"]["models"] == ["named-a", "named-b"]
+        assert saved["cursor"]["at"] == original_at
+
+    def test_failed_forced_discovery_does_not_persist_static_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        _patch_cursor_fetch_models(monkeypatch, None)
+
+        forced = mod.cached_provider_model_ids("cursor", force_refresh=True)
+        ordinary = mod.cached_provider_model_ids("cursor")
+        picker_fallback = mod.provider_model_ids("cursor")
+
+        assert picker_fallback == ["auto"]
+        assert ordinary == ["auto"]
+        assert forced == ["auto"]
+        if cache_path.exists():
+            saved = _read_provider_cache(cache_path)
+            assert "cursor" not in saved
+
+    def test_successful_forced_discovery_stores_named_catalog_without_losing_siblings(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        fp = mod._credential_fingerprint("cursor")
+        _write_provider_cache(cache_path, {
+            "cursor": {
+                "fp": fp,
+                "at": time.time() - 400,
+                "models": ["named-a", "named-b"],
+            },
+        })
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_fetch(**_kwargs):
+            entered.set()
+            assert release.wait(timeout=2)
+            return ["named-new-a", "named-new-b"]
+
+        _patch_cursor_fetch_models(monkeypatch, fake_fetch)
+        results = []
+
+        worker = threading.Thread(
+            target=lambda: results.append(
+                mod.cached_provider_model_ids("cursor", force_refresh=True)
+            )
+        )
+        worker.start()
+        assert entered.wait(timeout=2)
+        mod.update_provider_cache_entry("anthropic", ["claude-sibling"])
+        release.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+        assert results == [["named-new-a", "named-new-b"]]
+        saved = _read_provider_cache(cache_path)
+        assert saved["cursor"]["models"] == ["named-new-a", "named-new-b"]
+        assert saved["anthropic"]["models"] == ["claude-sibling"]
+
+    def test_sdk_returned_auto_catalog_is_stored_as_live(self, tmp_path, monkeypatch):
+        import hermes_cli.models as mod
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        _patch_cursor_fetch_models(monkeypatch, ["auto"])
+
+        out = mod.cached_provider_model_ids("cursor", force_refresh=True)
+
+        assert out == ["auto"]
+        saved = _read_provider_cache(cache_path)
+        assert saved["cursor"]["models"] == ["auto"]
+        assert saved["cursor"]["at"] > time.time() - 5

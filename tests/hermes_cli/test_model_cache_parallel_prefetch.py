@@ -9,10 +9,23 @@ concurrently via ThreadPoolExecutor before the serial picker loop starts.
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 from unittest.mock import patch, MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_prefetch_singleflight():
+    from hermes_cli import model_switch
+
+    with model_switch._prefetch_singleflight_lock:
+        model_switch._prefetch_singleflight.clear()
+    yield
+    with model_switch._prefetch_singleflight_lock:
+        model_switch._prefetch_singleflight.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +223,207 @@ class TestPrefetchProviderModelsParallel:
         with patch("hermes_cli.models.cached_provider_model_ids") as fetch:
             _prefetch_provider_models_parallel([])
         fetch.assert_not_called()
+
+
+def _write_provider_cache(path, payload):
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _read_provider_cache(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _patch_cursor_fetch_models(monkeypatch, result):
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("cursor")
+    assert profile is not None
+    if callable(result):
+        monkeypatch.setattr(profile, "fetch_models", result)
+    else:
+        monkeypatch.setattr(profile, "fetch_models", lambda **_kwargs: result)
+    return profile
+
+
+class TestPrefetchCursorFallbackAndCoalesce:
+    """Composed prefetch must preserve a named Cursor catalog on discovery
+    failure, coalesce overlapping same-provider refreshes, and still expose a
+    successful live catalog on the ordinary same-pass read.
+    """
+
+    def test_prefetch_cursor_failure_preserves_named_entry_and_freshness(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        original_at = time.time() - 400
+        fp = mod._credential_fingerprint("cursor")
+        _write_provider_cache(cache_path, {
+            "cursor": {"fp": fp, "at": original_at, "models": ["named-a", "named-b"]},
+        })
+        _patch_cursor_fetch_models(monkeypatch, None)
+
+        _prefetch_provider_models_parallel(["cursor"])
+
+        saved = _read_provider_cache(cache_path)
+        assert saved["cursor"]["models"] == ["named-a", "named-b"]
+        assert saved["cursor"]["at"] == original_at
+
+    def test_overlapping_same_provider_prefetches_share_one_live_attempt_on_success(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        fp = mod._credential_fingerprint("cursor")
+        _write_provider_cache(cache_path, {
+            "cursor": {
+                "fp": fp,
+                "at": time.time() - 400,
+                "models": ["named-a", "named-b"],
+            },
+        })
+
+        release = threading.Event()
+        entered_live = threading.Event()
+        live_calls = []
+        start_prefetch = threading.Barrier(2)
+
+        def fake_fetch(**_kwargs):
+            live_calls.append("cursor")
+            entered_live.set()
+            assert release.wait(timeout=2)
+            return ["named-new"]
+
+        _patch_cursor_fetch_models(monkeypatch, fake_fetch)
+
+        def worker():
+            start_prefetch.wait(timeout=2)
+            _prefetch_provider_models_parallel(["cursor"])
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        assert entered_live.wait(timeout=2)
+        assert all(thread.is_alive() for thread in threads)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        assert all(not thread.is_alive() for thread in threads)
+        assert live_calls == ["cursor"]
+        assert _read_provider_cache(cache_path)["cursor"]["models"] == ["named-new"]
+
+    def test_overlapping_same_provider_prefetches_share_one_live_attempt_on_failure(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        original_at = time.time() - 400
+        fp = mod._credential_fingerprint("cursor")
+        _write_provider_cache(cache_path, {
+            "cursor": {"fp": fp, "at": original_at, "models": ["named-a", "named-b"]},
+        })
+
+        release = threading.Event()
+        entered_live = threading.Event()
+        live_calls = []
+        start_prefetch = threading.Barrier(2)
+
+        def fake_fetch(**_kwargs):
+            live_calls.append("cursor")
+            entered_live.set()
+            assert release.wait(timeout=2)
+            return None
+
+        _patch_cursor_fetch_models(monkeypatch, fake_fetch)
+
+        def worker():
+            start_prefetch.wait(timeout=2)
+            _prefetch_provider_models_parallel(["cursor"])
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        assert entered_live.wait(timeout=2)
+        assert all(thread.is_alive() for thread in threads)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        assert all(not thread.is_alive() for thread in threads)
+        assert live_calls == ["cursor"]
+        saved = _read_provider_cache(cache_path)
+        assert saved["cursor"]["models"] == ["named-a", "named-b"]
+        assert saved["cursor"]["at"] == original_at
+
+    def test_different_provider_prefetches_remain_parallel(self, tmp_path, monkeypatch):
+        import hermes_cli.models as mod
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        overlap = threading.Barrier(2)
+
+        def cursor_fetch(**_kwargs):
+            overlap.wait(timeout=2)
+            return ["cursor-live"]
+
+        _patch_cursor_fetch_models(monkeypatch, cursor_fetch)
+
+        def openrouter_ids(provider, *, force_refresh=False):
+            if str(provider) == "openrouter":
+                overlap.wait(timeout=2)
+                return ["or-live"]
+            return real_provider_model_ids(provider, force_refresh=force_refresh)
+
+        real_provider_model_ids = mod.provider_model_ids
+        monkeypatch.setattr(mod, "provider_model_ids", openrouter_ids)
+
+        def run_cursor():
+            _prefetch_provider_models_parallel(["cursor"])
+
+        def run_openrouter():
+            _prefetch_provider_models_parallel(["openrouter"])
+
+        threads = [
+            threading.Thread(target=run_cursor),
+            threading.Thread(target=run_openrouter),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+        assert all(not thread.is_alive() for thread in threads)
+
+    def test_successful_cursor_prefetch_visible_on_ordinary_same_pass_read(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.models as mod
+        from hermes_cli.model_switch import _prefetch_provider_models_parallel
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        fp = mod._credential_fingerprint("cursor")
+        _write_provider_cache(cache_path, {
+            "cursor": {
+                "fp": fp,
+                "at": time.time() - 400,
+                "models": ["named-a", "named-b"],
+            },
+        })
+        _patch_cursor_fetch_models(monkeypatch, ["named-new-a", "named-new-b"])
+
+        _prefetch_provider_models_parallel(["cursor"])
+        out = mod.cached_provider_model_ids("cursor")
+
+        assert out == ["named-new-a", "named-new-b"]
 
 
 # ---------------------------------------------------------------------------

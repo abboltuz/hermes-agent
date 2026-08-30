@@ -3868,6 +3868,28 @@ def _openai_discovery_base_url(provider: str) -> str:
     return "https://api.openai.com/v1"
 
 
+def _cursor_discovered_models() -> Optional[list[str]]:
+    """Return a live Cursor catalog, or ``None`` on discovery failure.
+
+    ``CursorProfile.fetch_models()`` uses ``None`` for "could not list
+    models". The static ``['auto']`` picker fallback is not a discovered
+    catalog and must not be treated as one.
+    """
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("cursor")
+        if profile is None:
+            return None
+        live = profile.fetch_models()
+    except Exception:
+        return None
+    if not live:
+        return None
+    models = [str(item).strip() for item in live if str(item).strip()]
+    return models or None
+
+
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
@@ -4113,7 +4135,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 
         _p = get_provider_profile(normalized)
         if _p and normalized == "cursor":
-            live = _p.fetch_models()
+            live = _cursor_discovered_models()
             return live or list(_PROVIDER_MODELS.get("cursor", []))
         if _p and _p.auth_type == "api_key" and _p.base_url:
             try:
@@ -4238,7 +4260,10 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
         _swr_refresh_inflight.add(cache_key)
 
     def _default_refresh():
-        live = provider_model_ids(cache_key, force_refresh=True)
+        if cache_key == "cursor":
+            live = _cursor_discovered_models()
+        else:
+            live = provider_model_ids(cache_key, force_refresh=True)
         if not live and cache_key == "ollama":
             base_url = _get_ollama_base_url()
             headers = _get_ollama_native_headers(base_url) or None
@@ -4515,14 +4540,18 @@ def cached_provider_model_ids(
             return list(entry["models"])
 
     # Cache miss / stale / forced refresh — call the live path.
+    if normalized == "cursor":
+        discovered = _cursor_discovered_models()
+        if discovered:
+            update_provider_cache_entry(normalized, discovered)
+            return list(discovered)
+        if _cache_entry_valid(entry, fp):
+            return list(entry["models"])
+        return list(_PROVIDER_MODELS.get("cursor", []))
+
     live = provider_model_ids(normalized, force_refresh=force_refresh)
     if live:
-        cache[normalized] = {
-            "fp": fp,
-            "at": now,
-            "models": list(live),
-        }
-        _save_provider_models_cache(cache)
+        update_provider_cache_entry(normalized, live)
         return list(live)
 
     if normalized == "ollama":

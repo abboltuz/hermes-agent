@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 
@@ -161,6 +162,37 @@ def test_provider_model_catalog_uses_cursor_profile_live_fetch(cursor_home, monk
     assert profile is not None
     monkeypatch.setattr(profile, "fetch_models", lambda **_kwargs: ["auto", "live-model"])
     assert models.provider_model_ids("cursor") == ["auto", "live-model"]
+
+
+def test_cursor_discovery_none_is_ordinary_auto_fallback_not_cached_live(cursor_home, monkeypatch):
+    from hermes_cli import models
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("cursor")
+    assert profile is not None
+    monkeypatch.setattr(profile, "fetch_models", lambda **_kwargs: None)
+
+    assert models.provider_model_ids("cursor") == ["auto"]
+    out = models.cached_provider_model_ids("cursor", force_refresh=True)
+    assert out == ["auto"]
+    cache_path = models._provider_models_cache_path()
+    if cache_path.exists():
+        saved = json.loads(cache_path.read_text(encoding="utf-8"))
+        assert "cursor" not in saved
+
+
+def test_cursor_sdk_auto_catalog_is_cached_as_live(cursor_home, monkeypatch):
+    from hermes_cli import models
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("cursor")
+    assert profile is not None
+    monkeypatch.setattr(profile, "fetch_models", lambda **_kwargs: ["auto"])
+
+    assert models.provider_model_ids("cursor") == ["auto"]
+    assert models.cached_provider_model_ids("cursor", force_refresh=True) == ["auto"]
+    saved = json.loads(models._provider_models_cache_path().read_text(encoding="utf-8"))
+    assert saved["cursor"]["models"] == ["auto"]
 
 
 def test_runtime_provider_resolves_profile_cursor_account(cursor_home, monkeypatch):
