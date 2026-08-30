@@ -61,8 +61,7 @@ const DRIVEN: readonly string[] = ['click', 'hover', 'press', 'type']
  *  from them would report every one of them as a failure. */
 const CLICKS: readonly string[] = ['click', 'type']
 
-const NOTHING_OPEN =
-  "No live page is open in the in-app browser — open one with desktop_preview action='open' first."
+const NOTHING_OPEN = "No live page is open in the in-app browser — open one with desktop_preview action='open' first."
 
 const NAVIGATED =
   'The page stopped answering right after — it is probably navigating. Call elements to see where you landed.'
