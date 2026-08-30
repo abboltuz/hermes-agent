@@ -43,6 +43,128 @@ def _standalone_archive() -> bytes:
     return buffer.getvalue()
 
 
+def test_archive_download_follows_trusted_signed_asset_redirect_without_credentials(monkeypatch):
+    payload = b"trusted bridge archive"
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, _limit):
+            return payload
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            assert request.full_url.startswith("https://github.com/")
+            assert dict(request.header_items()) == {"User-agent": "hermes-cli"}
+            assert timeout == 120
+            return FakeResponse()
+
+    monkeypatch.setattr(transport, "_build_archive_download_opener", lambda: FakeOpener())
+    monkeypatch.setattr(
+        transport._NO_REDIRECT_OPENER,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            transport.CursorBridgeError("unexpected HTTP redirect refused")
+        ),
+    )
+
+    assert transport._fetch_url(
+        "https://github.com/cursor/sdk-bridge/releases/download/v1.0.27/"
+        "cursor-sdk-bridge-standalone-darwin-arm64.tar.gz"
+    ) == payload
+
+
+def test_archive_redirect_preserves_signed_query_and_strips_credentials():
+    handler = transport._ArchiveRedirectHandler()
+    request = transport.urllib.request.Request(
+        "https://github.com/cursor/sdk-bridge/releases/download/v1.0.27/asset",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=secret",
+            "Proxy-Authorization": "Basic secret",
+            "X-Custom": "must-not-forward",
+        },
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://release-assets.githubusercontent.com/asset?X-Amz-Signature=signed",
+    )
+
+    assert redirected.full_url.endswith("?X-Amz-Signature=signed")
+    assert dict(redirected.header_items()) == {"User-agent": "hermes-cli"}
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("http://github.com/cursor/sdk-bridge/releases/download/v1/asset", "HTTPS"),
+        ("https://evil.example/asset", "trusted GitHub"),
+        ("https://user:pass@github.com/cursor/sdk-bridge/releases/download/v1/asset", "userinfo"),
+        ("https://github.com:444/cursor/sdk-bridge/releases/download/v1/asset", "unsafe port"),
+        ("https://github.com/cursor/sdk-bridge/releases/download/v1/asset#fragment", "fragment"),
+    ],
+)
+def test_archive_download_rejects_unsafe_initial_urls(url, message):
+    with pytest.raises(transport.CursorBridgeError, match=message):
+        transport._fetch_url(url)
+
+
+def test_archive_redirect_rejects_untrusted_destination():
+    handler = transport._ArchiveRedirectHandler()
+    request = transport.urllib.request.Request(
+        "https://github.com/cursor/sdk-bridge/releases/download/v1/asset"
+    )
+    with pytest.raises(transport.CursorBridgeError, match="destination is untrusted"):
+        handler.redirect_request(request, None, 302, "Found", {}, "https://evil.example/asset")
+
+
+def test_archive_redirect_rejects_downgrade_and_relative_destination():
+    handler = transport._ArchiveRedirectHandler()
+    request = transport.urllib.request.Request(
+        "https://github.com/cursor/sdk-bridge/releases/download/v1/asset"
+    )
+    for destination, message in (
+        ("http://release-assets.githubusercontent.com/asset", "HTTPS"),
+        ("/relative-asset", "HTTPS"),
+    ):
+        with pytest.raises(transport.CursorBridgeError, match=message):
+            handler.redirect_request(request, None, 302, "Found", {}, destination)
+
+
+def test_archive_redirect_rejects_excessive_chain():
+    handler = transport._ArchiveRedirectHandler()
+    request = transport.urllib.request.Request(
+        "https://github.com/cursor/sdk-bridge/releases/download/v1/asset"
+    )
+    for _ in range(transport._MAX_ARCHIVE_REDIRECTS):
+        request = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://release-assets.githubusercontent.com/asset?sig=signed",
+        )
+    with pytest.raises(transport.CursorBridgeError, match="exceeds limit"):
+        handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://release-assets.githubusercontent.com/asset?sig=signed",
+        )
+
+
 def test_download_bridge_uses_embedded_digest_and_atomic_install(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(transport, "bridge_platform", lambda: ("darwin", "arm64"))
