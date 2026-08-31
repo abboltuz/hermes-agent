@@ -87,6 +87,46 @@ def _mcp_field(obj, snake: str, camel: str, default=None):
     return default if value is _MISSING else value
 
 
+def _redact_private_cua_session_ids(value: str) -> str:
+    """Keep cua-driver's transport-owned session ids out of tool output."""
+    return re.sub(r"\bmcp-\d+-\d+\b", "private transport session", value)
+
+
+def _cua_error_fields(result: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
+    """Extract a stable public code/message/next-step from a failed call."""
+    structured = result.get("structuredContent")
+    structured = structured if isinstance(structured, dict) else {}
+    refusal = structured.get("refusal")
+    refusal = refusal if isinstance(refusal, dict) else {}
+
+    code = structured.get("code") or refusal.get("code")
+    if not isinstance(code, str) or not code:
+        code = "cua_driver_call_failed"
+    message = structured.get("message") or refusal.get("message")
+    if not isinstance(message, str) or not message:
+        data = result.get("data")
+        message = data if isinstance(data, str) and data else "cua-driver rejected the call"
+    next_step = structured.get("next_step")
+    if not isinstance(next_step, str) or not next_step:
+        next_step = None
+    return (
+        code,
+        _redact_private_cua_session_ids(message),
+        next_step,
+    )
+
+
+class CuaDriverCallError(RuntimeError):
+    """Structured logical cua-driver failure safe for model-visible output."""
+
+    def __init__(self, operation: str, result: Dict[str, Any]) -> None:
+        code, message, next_step = _cua_error_fields(result)
+        super().__init__(f"cua-driver {operation} failed: {message}")
+        self.code = code
+        self.operation = operation
+        self.next_step = next_step
+
+
 def _action_result_from(
     name: str,
     ok: bool,
@@ -2042,6 +2082,9 @@ class _CuaDriverSession:
         """Recognise cua-driver's explicit recoverable ended-session result."""
         if not isinstance(result, dict) or result.get("isError") is not True:
             return False
+        code, _message, _next_step = _cua_error_fields(result)
+        if code == "session_ended":
+            return True
         message = cls._logical_error_text(result).lower()
         return (
             "session" in message
@@ -2049,46 +2092,95 @@ class _CuaDriverSession:
             and "start_session" in message
         )
 
-    def _revive_declared_session_once(
+    @classmethod
+    def _private_session_recovery_failure(
+        cls,
+        name: str,
+        cause: Any,
+        detail: str,
+    ) -> Dict[str, Any]:
+        """Return a precise failure without leaking the proxy's private id."""
+        cause_code = "session_ended"
+        if isinstance(cause, dict):
+            cause_code, _message, _next_step = _cua_error_fields(cause)
+        message = (
+            f"cua-driver {name} could not recover its private transport "
+            "session; no result was returned. Retry the read-only call to "
+            "create a fresh computer-use transport."
+        )
+        return {
+            "data": message,
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": {
+                "ok": False,
+                "code": "cua_private_session_recovery_failed",
+                "message": message,
+                "operation": name,
+                "next_step": "retry_read_only_call",
+                "cause": {"code": cause_code},
+                "detail": _redact_private_cua_session_ids(detail),
+            },
+            "isError": True,
+        }
+
+    def _recover_private_session_once(
         self,
         name: str,
         args: Dict[str, Any],
         first_result: Dict[str, Any],
         timeout: float,
     ) -> Dict[str, Any]:
-        """Revive the stable session and replay one rejected tool call once."""
-        session_id = self._declared_session_id
-        if not session_id or name in self._LIFECYCLE_CALLS:
+        """Replace a tombstoned proxy and replay one read-only call once."""
+        if (
+            name in self._LIFECYCLE_CALLS
+            or not self._transport_replay_is_safe(name)
+        ):
             return first_result
 
         logger.warning(
-            "cua-driver session %s ended during %s; reviving and retrying once",
-            session_id,
+            "cua-driver private transport session ended during %s; "
+            "replacing the transport and retrying the read-only call once",
             name,
         )
-        revive_result = self._bridge.run(
-            self._call_tool_async("start_session", {"session": session_id}),
-            timeout=timeout,
-        )
-        if revive_result.get("isError") is True:
-            logger.warning(
-                "cua-driver session %s could not be revived: %s",
-                session_id,
-                self._logical_error_text(revive_result),
+        try:
+            with self._lock:
+                self._restart_session_locked()
+            restore_result = self._restore_declared_session_after_transport_reset(timeout)
+            if isinstance(restore_result, dict) and restore_result.get("isError") is True:
+                return self._private_session_recovery_failure(
+                    name,
+                    restore_result,
+                    "the public session label could not be restored",
+                )
+            retry_result = self._bridge.run(
+                self._call_tool_async(name, args),
+                timeout=timeout,
             )
-            return first_result
+        except Exception as exc:
+            logger.warning(
+                "cua-driver private transport recovery failed during %s: %s",
+                name,
+                _redact_private_cua_session_ids(str(exc)),
+            )
+            return self._private_session_recovery_failure(name, first_result, str(exc))
 
-        # Return the second result as-is. A second rejection is surfaced; no loop.
-        return self._bridge.run(
-            self._call_tool_async(name, args),
-            timeout=timeout,
-        )
+        if self._is_ended_session_result(retry_result):
+            return self._private_session_recovery_failure(
+                name,
+                retry_result,
+                "the replacement transport was also reported as ended",
+            )
+        return retry_result
 
-    def _restore_declared_session_after_transport_reset(self, timeout: float) -> None:
+    def _restore_declared_session_after_transport_reset(
+        self,
+        timeout: float,
+    ) -> Optional[Dict[str, Any]]:
         """Re-attach the public label inside a replacement private lifecycle."""
         session_id = getattr(self, "_declared_session_id", None)
         if not session_id:
-            return
+            return None
         result = self._bridge.run(
             self._call_tool_async("start_session", {"session": session_id}),
             timeout=timeout,
@@ -2099,6 +2191,7 @@ class _CuaDriverSession:
                 session_id,
                 self._logical_error_text(result),
             )
+        return result
 
     @staticmethod
     def _is_closed_session_error(exc: Exception) -> bool:
@@ -2463,7 +2556,7 @@ class _CuaDriverSession:
                 self._declared_session_id = declared_id
 
         if self._is_ended_session_result(result):
-            result = self._revive_declared_session_once(name, args, result, timeout)
+            result = self._recover_private_session_once(name, args, result, timeout)
 
         if (
             name == "end_session"
@@ -2921,10 +3014,7 @@ class CuaDriverBackend(ComputerUseBackend):
             ):
                 return out
             self._clear_active_target()
-            raise RuntimeError(
-                f"cua-driver {name} failed"
-                + (f": {message}" if isinstance(message, str) and message else "")
-            )
+            raise CuaDriverCallError(name, out)
         return out
 
     def _load_windows(self) -> List[Dict[str, Any]]:
@@ -3955,6 +4045,8 @@ class CuaDriverBackend(ComputerUseBackend):
     # ── Introspection ──────────────────────────────────────────────
     def list_apps(self) -> List[Dict[str, Any]]:
         out = self._session.call_tool("list_apps", {"session": self._session_id})
+        if out.get("isError") is True:
+            raise CuaDriverCallError("list_apps", out)
         structured = out.get("structuredContent")
         data = out.get("data")
 

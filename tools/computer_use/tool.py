@@ -693,6 +693,19 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             return _dispatch(backend, action, args)
     except Exception as e:
         logger.exception("computer_use %s failed", action)
+        code = getattr(e, "code", None)
+        if isinstance(code, str) and code:
+            operation = getattr(e, "operation", None)
+            failure = {
+                "ok": False,
+                "action": action,
+                "code": code,
+                "error": str(e) if operation == action else f"{action} failed: {e}",
+            }
+            next_step = getattr(e, "next_step", None)
+            if isinstance(next_step, str) and next_step:
+                failure["next_step"] = next_step
+            return json.dumps(failure)
         return json.dumps({"error": f"{action} failed: {e}"})
 
 
