@@ -114,7 +114,8 @@ def test_loop_mode_exposes_only_host_custom_tools_and_stable_ids():
 
     create = next(call for call in fake.calls if call[1] == "CreateAgent")
     options = create[2]["options"]
-    assert options["tools"] == {"names": []}
+    assert options["tools"] == {"names": ["mcp"]}
+    assert options["local"]["settingSources"] == []
     assert set(options["local"]["customTools"]) == {"safe_tool"}
     tool_call = response.choices[0].message.tool_calls[0]
     assert response.choices[0].finish_reason == "tool_calls"
@@ -143,6 +144,25 @@ def test_captured_tool_survives_bridge_cancellation_error():
 
     assert response.choices[0].finish_reason == "tool_calls"
     assert response.choices[0].message.tool_calls[0].id == "stable-tool-id"
+
+
+def test_tool_free_runs_remain_text_only():
+    client, fake = _client_with_transport(final_text="plain response")
+    try:
+        response = client.chat.completions.create(
+            model="auto",
+            messages=[{"role": "user", "content": "say hello"}],
+            timeout=2,
+        )
+    finally:
+        client.close()
+
+    create = next(call for call in fake.calls if call[1] == "CreateAgent")
+    options = create[2]["options"]
+    assert options["tools"] == {"names": []}
+    assert "customTools" not in options["local"]
+    assert "settingSources" not in options["local"]
+    assert response.choices[0].finish_reason == "stop"
 
 
 def test_harness_and_cursor_builtin_tools_fail_closed():

@@ -91,7 +91,8 @@ def test_cursor_provider_runs_real_agent_tool_loop(monkeypatch, tmp_path):
     assert fake.callback_result["status"] == "deferred"
     assert "[tool call] todo(" in fake.prompts[1]
     assert "Tool result:\n" in fake.prompts[1]
-    assert fake.create_options[0]["tools"] == {"names": []}
+    assert fake.create_options[0]["tools"] == {"names": ["mcp"]}
+    assert fake.create_options[0]["local"]["settingSources"] == []
     assert set(fake.create_options[0]["local"]["customTools"]) == {"todo"}
 
 
