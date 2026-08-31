@@ -2,7 +2,7 @@
 
 These tests exercise the supported Browser Harness process boundary: Hermes
 supplies isolated ``BH_RUNTIME_DIR`` / ``BH_TMP_DIR`` values and asks the CLI
-that created a daemon to reload that exact runtime.  A small Python CLI fixture
+environment that created a daemon to stop that exact runtime. A small fixture
 stands in for the external executable so the tests can spawn and reap a real
 child process without depending on a user's browser installation.
 """
@@ -97,7 +97,28 @@ class TestDialogSafeClickCompatibility:
                 release_gate.wait(2)
             return {}
 
-        namespace = {"cdp": cdp}
+        helpers.cdp = cdp
+
+        def stock_click(x, y, button="left", clicks=1):
+            helpers.cdp(
+                "Input.dispatchMouseEvent",
+                type="mousePressed",
+                x=x,
+                y=y,
+                button=button,
+                clickCount=clicks,
+            )
+            helpers.cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseReleased",
+                x=x,
+                y=y,
+                button=button,
+                clickCount=clicks,
+            )
+
+        stock_click.__bh_traced__ = True
+        namespace = {"cdp": cdp, "click_at_xy": stock_click}
         exec(bu_cli._dialog_safe_click_preamble(timeout_s=0.25), namespace)
         return namespace, calls, release_started, release_gate
 
@@ -144,7 +165,11 @@ class TestDialogSafeClickCompatibility:
         package.helpers = helpers
         monkeypatch.setitem(sys.modules, "browser_harness", package)
         monkeypatch.setitem(sys.modules, "browser_harness.helpers", helpers)
-        namespace = {"cdp": lambda *_args, **_kwargs: {}}
+        helpers.cdp = lambda *_args, **_kwargs: {}
+        namespace = {
+            "cdp": helpers.cdp,
+            "click_at_xy": lambda *_args, **_kwargs: None,
+        }
         exec(bu_cli._dialog_safe_click_preamble(timeout_s=0.1), namespace)
 
         with pytest.raises(
@@ -153,14 +178,77 @@ class TestDialogSafeClickCompatibility:
         ):
             namespace["click_at_xy"](10, 20)
 
+    def test_compatibility_layer_preserves_harness_trace_and_debug_behavior(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("BH_DEBUG_CLICKS", "1")
+        helpers = types.ModuleType("browser_harness.helpers")
+        helpers._send = lambda _request: {"dialog": None}
+        package = types.ModuleType("browser_harness")
+        package.helpers = helpers
+        monkeypatch.setitem(sys.modules, "browser_harness", package)
+        monkeypatch.setitem(sys.modules, "browser_harness.helpers", helpers)
+
+        dispatches = []
+        debug_overlays = []
+        observations = []
+
+        def helper_cdp(method, **params):
+            dispatches.append((method, params))
+            return {}
+
+        helpers.cdp = helper_cdp
+
+        def stock_click(x, y, button="left", clicks=1):
+            if os.environ.get("BH_DEBUG_CLICKS"):
+                debug_overlays.append((x, y, button, clicks))
+            helpers.cdp(
+                "Input.dispatchMouseEvent",
+                type="mousePressed",
+                x=x,
+                y=y,
+                button=button,
+                clickCount=clicks,
+            )
+            helpers.cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseReleased",
+                x=x,
+                y=y,
+                button=button,
+                clickCount=clicks,
+            )
+
+        def traced_click(*args, **kwargs):
+            result = stock_click(*args, **kwargs)
+            observations.append(("click_at_xy", args, kwargs))
+            return result
+
+        traced_click.__bh_traced__ = True
+        namespace = {"cdp": helper_cdp, "click_at_xy": traced_click}
+
+        exec(bu_cli._dialog_safe_click_preamble(timeout_s=0.25), namespace)
+        result = namespace["click_at_xy"](12, 34, button="left", clicks=1)
+
+        assert result is None
+        assert namespace["click_at_xy"].__bh_traced__ is True
+        assert debug_overlays == [(12, 34, "left", 1)]
+        assert observations == [("click_at_xy", (12, 34), {"button": "left", "clicks": 1})]
+        assert [params["type"] for _, params in dispatches] == [
+            "mousePressed",
+            "mouseReleased",
+        ]
+
     def test_control_wedge_exit_stops_exact_managed_runtime(
         self, tmp_path, monkeypatch
     ):
         cli = _python_cli(
             tmp_path,
             """
-            import sys
-            if '--reload' in sys.argv:
+            import os, pathlib, sys
+            if os.environ.get('BH_TMP_DIR', '').endswith('cleanup'):
+                sys.stdin.read()
+                print('[hermes-browser-cleanup] {"ok": true, "version": "0.1.10", "browser_kind": "cdp"}')
                 raise SystemExit(0)
             sys.stdin.read()
             print('HERMES_BROWSER_CONTROL_WEDGED: fixture', file=sys.stderr)
@@ -188,7 +276,9 @@ class TestConcurrentScreenshotArtifacts:
             tmp_path,
             f"""
             import os, pathlib, sys, time
-            if '--reload' in sys.argv:
+            if os.environ.get('BH_TMP_DIR', '').endswith('cleanup'):
+                sys.stdin.read()
+                print('[hermes-browser-cleanup] {{"ok": true, "version": "0.1.10", "browser_kind": "cdp"}}')
                 raise SystemExit(0)
             sys.stdin.read()
             root = pathlib.Path(os.environ.get('BH_TMP_DIR', {str(shared)!r}))
@@ -293,7 +383,9 @@ class TestPersistedLifecycleOwnership:
 
         monkeypatch.setattr(bu_cli, "_reload_browser_use_session", unexpected_reload)
 
-        assert bu_cli._reap_orphaned_browser_use_instances() == []
+        failures = bu_cli._reap_orphaned_browser_use_instances()
+        assert len(failures) == 1
+        assert "owner is unverifiable" in failures[0]
         assert not reload_called
         assert instance_root.is_dir()
         assert runtime_dir.is_dir()
@@ -307,12 +399,14 @@ class TestPersistedLifecycleOwnership:
             tmp_path,
             f"""
             import json, os, pathlib, sys
-            if '--reload' not in sys.argv:
+            if not os.environ.get('BH_TMP_DIR', '').endswith('cleanup'):
                 raise SystemExit(9)
+            sys.stdin.read()
             pathlib.Path({str(observed)!r}).write_text(json.dumps({{
                 'runtime': os.environ.get('BH_RUNTIME_DIR'),
                 'tmp': os.environ.get('BH_TMP_DIR'),
             }}))
+            print('[hermes-browser-cleanup] {{"ok": true, "version": "0.1.10", "browser_kind": "cdp"}}')
             """,
         )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: cli)
@@ -323,6 +417,53 @@ class TestPersistedLifecycleOwnership:
             "tmp": str(runtime_dir / "cleanup"),
         }
         assert not instance_root.exists()
+
+    def test_stale_reaper_claim_does_not_block_verified_dead_owner(
+        self, monkeypatch
+    ):
+        instance_root, runtime_dir = self._persisted_instance(live_owner=False)
+        (instance_root / bu_cli._REAP_LOCK_FILE).write_text(
+            json.dumps(
+                {
+                    "pid": 2_000_000_000,
+                    "process_started_at": 1.0,
+                    "claim_id": "crashed-reaper",
+                }
+            )
+        )
+        reloads = []
+
+        def successful_reload(state):
+            reloads.append(Path(state["runtime_dir"]))
+            return True, ""
+
+        monkeypatch.setattr(bu_cli, "_reload_browser_use_session", successful_reload)
+
+        assert bu_cli._reap_orphaned_browser_use_instances() == []
+        assert reloads == [runtime_dir]
+        assert not instance_root.exists()
+
+    def test_active_reaper_claim_is_never_stolen(self, monkeypatch):
+        instance_root, runtime_dir = self._persisted_instance(live_owner=False)
+        claim, busy, error = bu_cli._acquire_browser_use_reap_claim(instance_root)
+        assert claim is not None
+        assert busy is False
+        assert error == ""
+        reload_called = False
+
+        def unexpected_reload(_state):
+            nonlocal reload_called
+            reload_called = True
+            return True, ""
+
+        monkeypatch.setattr(bu_cli, "_reload_browser_use_session", unexpected_reload)
+        try:
+            assert bu_cli._reap_orphaned_browser_use_instances() == []
+            assert not reload_called
+            assert instance_root.is_dir()
+            assert runtime_dir.is_dir()
+        finally:
+            bu_cli._release_browser_use_reap_claim(claim)
 
 
 class TestLogicalSessionIdentity:
@@ -361,6 +502,86 @@ class TestLogicalSessionIdentity:
         assert bu_cli._browser_use_owner_pid == os.getpid()
 
 
+class TestOwnedTabLifecycle:
+    @pytest.mark.parametrize(
+        ("mode", "expected_target", "expected_origin", "create_calls"),
+        [
+            ("claim", "harness-target", "harness-dedicated", 0),
+            ("create", "hermes-target", "hermes-created", 1),
+        ],
+    )
+    def test_shared_session_persists_one_exact_owned_target(
+        self,
+        tmp_path,
+        monkeypatch,
+        mode,
+        expected_target,
+        expected_origin,
+        create_calls,
+    ):
+        target_file = tmp_path / bu_cli._TARGET_FILE
+        pid_file = tmp_path / "bu.pid"
+        pid_file.write_text("4242")
+        monkeypatch.setenv("HERMES_BH_TARGET_FILE", str(target_file))
+        monkeypatch.setenv("HERMES_BH_INSTANCE_ID", "fixture-instance")
+        monkeypatch.setenv("HERMES_BH_TARGET_MODE", mode)
+
+        targets = ["user-target"]
+        if mode == "claim":
+            targets.insert(0, "harness-target")
+        created = []
+        switched = []
+
+        helpers = types.ModuleType("browser_harness.helpers")
+        helpers._send = lambda payload: (
+            {"targetId": "harness-target"}
+            if payload == {"meta": "current_tab"}
+            else (_ for _ in ()).throw(AssertionError(payload))
+        )
+        ipc = types.ModuleType("browser_harness._ipc")
+        ipc.pid_path = lambda _name: pid_file
+        package = types.ModuleType("browser_harness")
+        package.helpers = helpers
+        package._ipc = ipc
+        monkeypatch.setitem(sys.modules, "browser_harness", package)
+        monkeypatch.setitem(sys.modules, "browser_harness.helpers", helpers)
+        monkeypatch.setitem(sys.modules, "browser_harness._ipc", ipc)
+
+        def cdp(method, **params):
+            if method == "Target.getTargets":
+                return {
+                    "targetInfos": [
+                        {"targetId": target, "type": "page"} for target in targets
+                    ]
+                }
+            if method == "Target.createTarget":
+                created.append(params)
+                targets.append("hermes-target")
+                return {"targetId": "hermes-target"}
+            if method == "Target.closeTarget":
+                targets.remove(params["targetId"])
+                return {"success": True}
+            raise AssertionError(method)
+
+        namespace = {"cdp": cdp, "switch_tab": switched.append}
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+        # A second call for the same daemon must reuse the persisted ownership
+        # rather than create or claim another target.
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+
+        marker = json.loads(target_file.read_text())
+        assert marker == {
+            "daemon_pid": "4242",
+            "instance_id": "fixture-instance",
+            "managed_by": "hermes-browser-use",
+            "origin": expected_origin,
+            "target_id": expected_target,
+        }
+        assert len(created) == create_calls
+        assert switched == (["hermes-target"] if mode == "create" else [])
+        assert "user-target" in targets
+
+
 @pytest.mark.live_system_guard_bypass
 class TestManagedDaemonLifecycle:
     _DAEMON_CLI = """
@@ -368,7 +589,8 @@ class TestManagedDaemonLifecycle:
         runtime = pathlib.Path(os.environ['BH_RUNTIME_DIR'])
         runtime.mkdir(parents=True, exist_ok=True)
         pid_path = runtime / 'fake-daemon.pid'
-        if '--reload' in sys.argv:
+        if os.environ.get('BH_TMP_DIR', '').endswith('cleanup'):
+            sys.stdin.read()
             if os.environ.get('FAKE_RELOAD_FAIL') == '1':
                 print('reload refused by fixture', file=sys.stderr)
                 raise SystemExit(7)
@@ -381,6 +603,7 @@ class TestManagedDaemonLifecycle:
             except ProcessLookupError:
                 pass
             pid_path.unlink(missing_ok=True)
+            print('[hermes-browser-cleanup] {"ok": true, "version": "0.1.10", "browser_kind": "cdp"}')
             raise SystemExit(0)
         if not pid_path.exists():
             daemon = subprocess.Popen(
@@ -446,9 +669,10 @@ class TestManagedDaemonLifecycle:
             tmp_path,
             """
             import os, sys, time
-            if '--reload' in sys.argv:
-                print('fixture reload failed', file=sys.stderr)
-                raise SystemExit(7)
+            if os.environ.get('BH_TMP_DIR', '').endswith('cleanup'):
+                sys.stdin.read()
+                print('[hermes-browser-cleanup] {"ok": false, "version": "0.1.10", "error": "fixture reload failed"}')
+                raise SystemExit(86)
             sys.stdin.read()
             time.sleep(30)
             """,
@@ -474,7 +698,9 @@ class TestManagedDaemonLifecycle:
             runtime = pathlib.Path(os.environ['BH_RUNTIME_DIR'])
             runtime.mkdir(parents=True, exist_ok=True)
             pid_path = runtime / 'bu.pid'
-            if '--reload' in sys.argv:
+            if os.environ.get('BH_TMP_DIR', '').endswith('cleanup'):
+                sys.stdin.read()
+                print('[hermes-browser-cleanup] {"ok": true, "version": "0.1.10", "browser_kind": "cdp"}')
                 raise SystemExit(0)
             if not pid_path.exists():
                 daemon = subprocess.Popen(
@@ -502,9 +728,245 @@ class TestManagedDaemonLifecycle:
             state["last_activity"] = 0.0
             failures = bu_cli._cleanup_browser_use_sessions(now=1000.0)
             assert len(failures) == 1
-            assert "exited 0" in failures[0]
+            assert "strict cleanup returned" in failures[0]
             assert "is still alive" in failures[0]
             assert str(state["runtime_dir"]) in bu_cli._browser_use_sessions
             assert not _wait_for_process_exit(pid, timeout=0.05)
         finally:
             _terminate_exact_pid(pid)
+
+    def test_reload_zero_cannot_hide_daemon_clean_shutdown_failure(
+        self, tmp_path
+    ):
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        hidden_failure = tmp_path / "hidden-failure.txt"
+        cli = _python_cli(
+            tmp_path,
+            f"""
+            import pathlib, sys
+            runtime = pathlib.Path({str(runtime)!r})
+            if '--reload' in sys.argv:
+                pathlib.Path({str(hidden_failure)!r}).write_text('billing cleanup failed')
+                for name in ('bu.sock', 'bu.port', 'bu.pid'):
+                    (runtime / name).unlink(missing_ok=True)
+                raise SystemExit(0)
+            # The corrected path executes a strict cleanup program. Model the
+            # daemon reporting an error even though it also disappears.
+            pathlib.Path({str(hidden_failure)!r}).write_text('billing cleanup failed')
+            for name in ('bu.sock', 'bu.port', 'bu.pid'):
+                (runtime / name).unlink(missing_ok=True)
+            print('[hermes-browser-cleanup] {{"ok": false, "error": "billing cleanup failed", "version": "0.1.10"}}')
+            raise SystemExit(86)
+            """,
+        )
+        for name in ("bu.sock", "bu.port"):
+            (runtime / name).write_text("fixture")
+
+        ok, detail = bu_cli._reload_browser_use_session(
+            {"runtime_dir": runtime, "command": cli, "session": "owned"}
+        )
+
+        assert hidden_failure.read_text() == "billing cleanup failed"
+        assert ok is False
+        assert "billing cleanup failed" in detail
+
+    def test_cleanup_never_autospawns_an_absent_daemon(self, tmp_path):
+        runtime = tmp_path / "absent-runtime"
+        runtime.mkdir()
+        spawned = tmp_path / "spawned.txt"
+        cli = _python_cli(
+            tmp_path,
+            f"""
+            import pathlib, sys
+            code = sys.stdin.read()
+            # Model the Harness run.py dispatch boundary: ordinary code calls
+            # ensure_daemon(), while an admin-shaped stop program does not.
+            if not code.lstrip().startswith('stop_remote_daemon('):
+                pathlib.Path({str(spawned)!r}).write_text('spawned')
+            print('[hermes-browser-cleanup] {{"ok": false, "error": "owned daemon did not answer an authenticated ping", "version": "0.1.10"}}')
+            raise SystemExit(86)
+            """,
+        )
+
+        ok, detail = bu_cli._reload_browser_use_session(
+            {
+                "runtime_dir": runtime,
+                "command": cli,
+                "session": "owned",
+                "instance_id": "fixture-instance",
+            }
+        )
+
+        assert ok is False
+        assert "did not answer" in detail
+        assert not spawned.exists()
+
+    @pytest.mark.parametrize(
+        ("browser_kind", "expected_ok", "shutdown_expected"),
+        [("cdp", True, True), ("cloud", False, False)],
+    )
+    def test_harness_019_cleanup_contract_is_explicit(
+        self,
+        tmp_path,
+        monkeypatch,
+        browser_kind,
+        expected_ok,
+        shutdown_expected,
+    ):
+        runtime = tmp_path / f"runtime-{browser_kind}"
+        runtime.mkdir()
+        shutdown_marker = tmp_path / f"shutdown-{browser_kind}.txt"
+        for name in ("bu.sock", "bu.port"):
+            (runtime / name).write_text("fixture")
+        monkeypatch.setenv("FIXTURE_BROWSER_KIND", browser_kind)
+        monkeypatch.setenv("FIXTURE_SHUTDOWN_MARKER", str(shutdown_marker))
+        cli = _python_cli(
+            tmp_path,
+            """
+            import os, pathlib, sys, types
+            runtime = pathlib.Path(os.environ['BH_RUNTIME_DIR'])
+            marker = pathlib.Path(os.environ['FIXTURE_SHUTDOWN_MARKER'])
+            kind = os.environ['FIXTURE_BROWSER_KIND']
+
+            admin = types.ModuleType('browser_harness.admin')
+            admin.NAME = os.environ.get('BU_NAME', 'default')
+            admin._version = lambda: '0.1.9'
+            def restart_daemon(name=None):
+                raise AssertionError('0.1.9 compatibility must use explicit IPC')
+            admin.restart_daemon = restart_daemon
+
+            ipc = types.ModuleType('browser_harness._ipc')
+            class Connection:
+                def close(self):
+                    pass
+            ipc.connect = lambda _name, timeout=5.0: (Connection(), None)
+            def request(_conn, _token, payload):
+                if payload.get('meta') == 'ping':
+                    return {'pong': True, 'pid': os.getpid(), 'browser_kind': kind}
+                if payload.get('meta') == 'shutdown':
+                    marker.write_text('shutdown-confirmed')
+                    for endpoint in ('bu.sock', 'bu.port', 'bu.pid'):
+                        (runtime / endpoint).unlink(missing_ok=True)
+                    return {'ok': True}
+                raise AssertionError(payload)
+            ipc.request = request
+
+            package = types.ModuleType('browser_harness')
+            package.admin = admin
+            package._ipc = ipc
+            sys.modules['browser_harness'] = package
+            sys.modules['browser_harness.admin'] = admin
+            sys.modules['browser_harness._ipc'] = ipc
+            exec(sys.stdin.read(), {'cdp': lambda *_args, **_kwargs: {}})
+            """,
+        )
+
+        ok, detail = bu_cli._reload_browser_use_session(
+            {
+                "runtime_dir": runtime,
+                "command": cli,
+                "session": "owned",
+                "instance_id": "fixture-instance",
+            }
+        )
+
+        assert ok is expected_ok
+        assert shutdown_marker.exists() is shutdown_expected
+        if browser_kind == "cloud":
+            assert "cannot confirm Browser Use Cloud" in detail
+            assert (runtime / "bu.sock").exists()
+        else:
+            assert detail == ""
+            assert not (runtime / "bu.sock").exists()
+
+    @pytest.mark.parametrize("session", ["owned", ""])
+    def test_cleanup_closes_exact_persisted_target_and_preserves_unrelated(
+        self, tmp_path, monkeypatch, session
+    ):
+        runtime = tmp_path / ("named-runtime" if session else "unnamed-runtime")
+        runtime.mkdir()
+        targets_path = tmp_path / ("named-targets.json" if session else "unnamed-targets.json")
+        targets_path.write_text(json.dumps(["owned-target", "user-target"]))
+        target_file = runtime / ".hermes-target.json"
+        target_file.write_text(
+            json.dumps(
+                {
+                    "managed_by": "hermes-browser-use",
+                    "instance_id": "fixture-instance",
+                    "daemon_pid": "4242",
+                    "origin": (
+                        "harness-dedicated" if session else "hermes-created"
+                    ),
+                    "target_id": "owned-target",
+                }
+            )
+        )
+        monkeypatch.setenv("FIXTURE_TARGETS_PATH", str(targets_path))
+        cli = _python_cli(
+            tmp_path,
+            """
+            import inspect, json, os, pathlib, sys, types
+            runtime = pathlib.Path(os.environ['BH_RUNTIME_DIR'])
+            targets_path = pathlib.Path(os.environ['FIXTURE_TARGETS_PATH'])
+            if '--reload' in sys.argv:
+                for name in ('bu.sock', 'bu.port', 'bu.pid'):
+                    (runtime / name).unlink(missing_ok=True)
+                raise SystemExit(0)
+
+            admin = types.ModuleType('browser_harness.admin')
+            admin.NAME = os.environ.get('BU_NAME', 'default')
+            admin._version = lambda: '0.1.10'
+            def restart_daemon(name=None, require_clean=False):
+                assert require_clean is True
+                for endpoint in ('bu.sock', 'bu.port', 'bu.pid'):
+                    (runtime / endpoint).unlink(missing_ok=True)
+            admin.restart_daemon = restart_daemon
+
+            ipc = types.ModuleType('browser_harness._ipc')
+            class Connection:
+                def close(self):
+                    pass
+            ipc.connect = lambda _name, timeout=5.0: (Connection(), None)
+            ipc.request = lambda _conn, _token, payload: {
+                'pong': True,
+                'pid': os.getpid(),
+                'browser_kind': 'cdp',
+            } if payload.get('meta') == 'ping' else {'ok': True}
+
+            package = types.ModuleType('browser_harness')
+            package.admin = admin
+            package._ipc = ipc
+            sys.modules['browser_harness'] = package
+            sys.modules['browser_harness.admin'] = admin
+            sys.modules['browser_harness._ipc'] = ipc
+
+            def cdp(method, **params):
+                targets = json.loads(targets_path.read_text())
+                if method == 'Target.getTargets':
+                    return {'targetInfos': [
+                        {'targetId': target, 'type': 'page'} for target in targets
+                    ]}
+                if method == 'Target.closeTarget':
+                    targets.remove(params['targetId'])
+                    targets_path.write_text(json.dumps(targets))
+                    return {'success': True}
+                raise AssertionError(method)
+
+            code = sys.stdin.read()
+            exec(code, {'cdp': cdp})
+            """,
+        )
+        monkeypatch.setattr(bu_cli, "_TARGET_FILE", target_file.name, raising=False)
+
+        ok, detail = bu_cli._reload_browser_use_session(
+            {
+                "runtime_dir": runtime,
+                "command": cli,
+                "session": session,
+                "instance_id": "fixture-instance",
+            }
+        )
+
+        assert ok is True, detail
+        assert json.loads(targets_path.read_text()) == ["user-target"]
