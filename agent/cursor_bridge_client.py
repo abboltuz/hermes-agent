@@ -669,10 +669,14 @@ class CursorBridgeClient:
         }
         if custom_tools:
             options["local"]["customTools"] = custom_tools
-        # AgentOptions.tools filters built-in tools only. An explicit empty
-        # ToolList disables Cursor shell/file/MCP capabilities while
-        # LocalAgentOptions.custom_tools remains the host-owned tool channel.
-        options["tools"] = {"names": []}
+            # Cursor SDK 1.0.27 exposes custom tools through its built-in MCP
+            # capability; isolate settings so external MCP servers cannot enter
+            # Hermes's tool channel.
+            options["local"]["settingSources"] = []
+            options["tools"] = {"names": ["mcp"]}
+        else:
+            # An empty tool allowlist keeps tool-free runs text-only.
+            options["tools"] = {"names": []}
 
         create_timeout = min(60.0, max(0.1, deadline - time.monotonic()))
         created = transport.unary(
