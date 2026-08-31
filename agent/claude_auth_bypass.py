@@ -1144,7 +1144,6 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
             kept.append({
                 "type": "text",
                 "text": _SYSTEM_IDENTITY,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             })
             if rest:
                 moved_texts.append(rest)
@@ -1156,7 +1155,6 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         kept.insert(0, {
             "type": "text",
             "text": _SYSTEM_IDENTITY,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         })
 
     api_kwargs["system"] = [billing_entry] + kept
