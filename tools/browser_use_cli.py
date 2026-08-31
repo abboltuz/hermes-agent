@@ -4,12 +4,19 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import atexit
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
+import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -76,6 +83,120 @@ _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
 _STDERR_CAP_CHARS = 4000
+_DIALOG_RELEASE_TIMEOUT_S = 5.0
+_LIFECYCLE_CHECK_INTERVAL_S = 30.0
+_LIFECYCLE_RELOAD_TIMEOUT_S = 20.0
+_LIFECYCLE_VERIFY_TIMEOUT_S = 3.0
+_OWNER_FILE = ".hermes-owner.json"
+_SESSION_FILE = ".hermes-session.json"
+_REAP_LOCK_FILE = ".hermes-reap.lock"
+
+# Browser Harness 0.1.9/0.1.10 waits synchronously for mouseReleased even
+# when that event opened a native JavaScript dialog.  The daemon can still
+# answer its pending-dialog metadata request on another IPC connection, so
+# dispatch release on a daemon thread and reconcile the two outcomes.  This
+# is a caller-side compatibility layer over Harness's existing CDP + IPC
+# protocol; it does not synthesize a DOM click or weaken trusted hit-testing.
+def _dialog_safe_click_preamble(
+    timeout_s: float = _DIALOG_RELEASE_TIMEOUT_S,
+) -> str:
+    timeout = max(0.05, float(timeout_s))
+    return f'''\
+# hermes: keep trusted CDP clicks responsive around native JS dialogs
+import json as _hermes_json
+import threading as _hermes_threading
+import time as _hermes_time
+from browser_harness import helpers as _hermes_bh_helpers
+
+def _hermes_pending_dialog():
+    try:
+        _send = getattr(_hermes_bh_helpers, "_send", None)
+        if callable(_send):
+            _reply = _send({{"meta": "pending_dialog"}})
+            return _reply.get("dialog") if isinstance(_reply, dict) else None
+        _info = page_info()
+        return _info.get("dialog") if isinstance(_info, dict) else None
+    except Exception as _exc:
+        raise RuntimeError(
+            "HERMES_BROWSER_CONTROL_WEDGED: Browser Harness IPC could not "
+            "inspect the pending JavaScript dialog: " + str(_exc)
+        ) from _exc
+
+def _hermes_dialog_notice(_dialog):
+    _notice = {{
+        "status": "dialog_pending",
+        "dialog": _dialog,
+        "next_action": (
+            "Inspect the dialog, then call "
+            "cdp('Page.handleJavaScriptDialog', accept=True/False, "
+            "promptText='...') before continuing."
+        ),
+    }}
+    print("[hermes-browser] " + _hermes_json.dumps(_notice, ensure_ascii=False))
+    return _notice
+
+def click_at_xy(x, y, button="left", clicks=1):
+    _already_pending = _hermes_pending_dialog()
+    if _already_pending:
+        raise RuntimeError(
+            "A JavaScript dialog is already pending; handle it with "
+            "Page.handleJavaScriptDialog before sending another click."
+        )
+    try:
+        cdp(
+            "Input.dispatchMouseEvent", type="mousePressed", x=x, y=y,
+            button=button, clickCount=clicks,
+        )
+    except BaseException as _exc:
+        raise RuntimeError(
+            "HERMES_BROWSER_INPUT_WEDGED: "
+            "Input.dispatchMouseEvent(mousePressed) failed: " + str(_exc)
+        ) from _exc
+
+    _pressed_dialog = _hermes_pending_dialog()
+    if _pressed_dialog:
+        return _hermes_dialog_notice(_pressed_dialog)
+
+    _done = _hermes_threading.Event()
+    _release_error = []
+
+    def _release():
+        try:
+            cdp(
+                "Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y,
+                button=button, clickCount=clicks,
+            )
+        except BaseException as _exc:
+            _release_error.append(_exc)
+        finally:
+            _done.set()
+
+    _hermes_threading.Thread(
+        target=_release, name="hermes-browser-mouse-release", daemon=True,
+    ).start()
+    _deadline = _hermes_time.monotonic() + {timeout!r}
+    while _hermes_time.monotonic() < _deadline:
+        if _done.wait(0.02):
+            if _release_error:
+                raise RuntimeError(
+                    "HERMES_BROWSER_INPUT_WEDGED: "
+                    "Input.dispatchMouseEvent(mouseReleased) failed: "
+                    + str(_release_error[0])
+                ) from _release_error[0]
+            return None
+        _dialog = _hermes_pending_dialog()
+        if _dialog:
+            return _hermes_dialog_notice(_dialog)
+
+    raise RuntimeError(
+        "HERMES_BROWSER_INPUT_WEDGED: "
+        "Input.dispatchMouseEvent(mouseReleased) did not complete within "
+        "{timeout:.2f}s and no JavaScript dialog was reported; the Chrome "
+        "CDP Input domain may be wedged. The exact Hermes-owned Harness "
+        "daemon will be stopped before this result is returned."
+    )
+
+'''
 
 # Filesystem-safe task ids for per-task workspace dirs.
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -439,6 +560,515 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Browser Harness lifecycle ownership
+# ---------------------------------------------------------------------------
+
+_browser_use_sessions: Dict[str, Dict[str, Any]] = {}
+_browser_use_lifecycle_lock = threading.RLock()
+_browser_use_cleanup_stop = threading.Event()
+_browser_use_cleanup_thread: Optional[threading.Thread] = None
+_browser_use_instance: Optional[Dict[str, Any]] = None
+_browser_use_owner_pid = os.getpid()
+
+
+def _reset_browser_use_lifecycle_after_fork() -> None:
+    """Discard inherited parent ownership in a freshly forked child.
+
+    A child must never run ``--reload`` for daemon state copied from its
+    parent. Locks and thread events are also process-local after a fork.
+    """
+    global _browser_use_cleanup_stop
+    global _browser_use_cleanup_thread
+    global _browser_use_instance
+    global _browser_use_lifecycle_lock
+    global _browser_use_owner_pid
+    global _browser_use_sessions
+
+    _browser_use_sessions = {}
+    _browser_use_lifecycle_lock = threading.RLock()
+    _browser_use_cleanup_stop = threading.Event()
+    _browser_use_cleanup_thread = None
+    _browser_use_instance = None
+    _browser_use_owner_pid = os.getpid()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_browser_use_lifecycle_after_fork)
+
+
+def _browser_use_inactivity_timeout() -> int:
+    """Resolve the same public timeout contract as the built-in backend."""
+    try:
+        from tools.browser_tool import _get_session_inactivity_timeout
+
+        return max(30, int(_get_session_inactivity_timeout()))
+    except Exception:
+        raw = os.environ.get("BROWSER_INACTIVITY_TIMEOUT", "120")
+        try:
+            return max(30, int(raw))
+        except (TypeError, ValueError):
+            return 120
+
+
+def _browser_use_process_start(pid: int) -> Optional[float]:
+    try:
+        import psutil
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+
+
+def _browser_use_owner_is_live(owner: Dict[str, Any]) -> Optional[bool]:
+    """Return live/dead only when owner identity can be verified.
+
+    ``None`` means malformed or temporarily unverifiable.  Orphan recovery
+    must fail closed in that case rather than treating inspection failure as
+    proof that another Hermes process is dead.
+    """
+    pid = owner.get("pid")
+    started = owner.get("process_started_at")
+    if type(pid) is not int or pid <= 0 or not isinstance(started, (int, float)):
+        return None
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        actual = float(psutil.Process(pid).create_time())
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:
+        return None
+    return abs(actual - float(started)) < 0.01
+
+
+def _ensure_private_dir(path: Path) -> Path:
+    """Create a non-symlinked owner-only directory or fail closed."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError(f"unsafe Browser Harness lifecycle path: {path}")
+    if os.name != "nt":
+        path.chmod(0o700)
+    return path
+
+
+def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(3)}"
+    )
+    tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    if os.name != "nt":
+        tmp.chmod(0o600)
+    os.replace(tmp, path)
+
+
+def _browser_use_profile_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home()).expanduser().resolve()
+    if os.name == "nt":
+        return home / "cache" / "browser-use" / "runtime"
+    # AF_UNIX paths are capped at 104 bytes on macOS. A profile digest keeps
+    # roots short while preserving profile isolation. /tmp is the canonical
+    # short socket root on macOS; Linux's tempfile root is normally /tmp.
+    tmp_root = Path("/tmp") if sys.platform == "darwin" else Path(tempfile.gettempdir())
+    profile = hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:12]
+    return tmp_root / f"hermes-bu-{profile}"
+
+
+def _browser_use_instance_state() -> Dict[str, Any]:
+    global _browser_use_instance
+
+    profile_root = _ensure_private_dir(_browser_use_profile_root())
+    pid = os.getpid()
+    with _browser_use_lifecycle_lock:
+        if (
+            _browser_use_instance is not None
+            and _browser_use_instance.get("pid") == pid
+            and _browser_use_instance.get("profile_root") == profile_root
+        ):
+            return _browser_use_instance
+
+        started = _browser_use_process_start(pid)
+        if started is None:
+            raise RuntimeError("could not verify the Hermes owner process identity")
+        instance_id = f"{pid}-{secrets.token_hex(6)}"
+        instance_root = _ensure_private_dir(profile_root / instance_id)
+        owner = {
+            "managed_by": "hermes-browser-use",
+            "instance_id": instance_id,
+            "pid": pid,
+            "process_started_at": started,
+        }
+        _atomic_json(instance_root / _OWNER_FILE, owner)
+        _browser_use_instance = {
+            **owner,
+            "profile_root": profile_root,
+            "instance_root": instance_root,
+        }
+        return _browser_use_instance
+
+
+def _browser_use_session_key(task_id: Optional[str], session: str) -> str:
+    # An explicit name is the public, cross-task browser identity already used
+    # by BU_NAME and provider cache keys. Keep one daemon for that same named
+    # browser. The unnamed default has no caller-supplied identity, so scope it
+    # to the Hermes task and never let unrelated tasks share harness state.
+    identity = f"named\0{session}" if session else f"task\0{task_id or 'default'}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def _write_browser_use_session_state(state: Dict[str, Any]) -> None:
+    _atomic_json(
+        state["runtime_dir"] / _SESSION_FILE,
+        {
+            "managed_by": "hermes-browser-use",
+            "instance_id": state["instance_id"],
+            "last_activity": float(state["last_activity"]),
+        },
+    )
+
+
+def _prepare_browser_use_lifecycle(
+    env: Dict[str, str],
+    command: List[str],
+    task_id: Optional[str],
+    session: str,
+    workspace: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Bind one invocation to an exact Hermes-owned Harness runtime.
+
+    Explicit BH_* paths are operator-owned. Hermes passes them through and
+    deliberately does not register, reload, reap, or remove those runtimes.
+    """
+    if env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR"):
+        return None, None
+
+    try:
+        instance = _browser_use_instance_state()
+        key = _browser_use_session_key(task_id, session)
+        runtime_dir = _ensure_private_dir(instance["instance_root"] / f"s-{key}")
+        artifact_base = (
+            Path(workspace)
+            if workspace
+            else instance["instance_root"] / "artifacts" / key
+        )
+        call_id = f"{time.time_ns():x}-{secrets.token_hex(5)}"
+        artifact_dir = _ensure_private_dir(
+            artifact_base / "browser-artifacts" / call_id
+        )
+    except Exception as exc:
+        return None, f"Could not create a private Browser Harness runtime: {exc}"
+
+    env["BH_RUNTIME_DIR"] = str(runtime_dir)
+    env["BH_TMP_DIR"] = str(artifact_dir)
+    env.pop("BH_RUNTIME_DIR_SHARED", None)
+    env.pop("BH_TMP_DIR_SHARED", None)
+
+    runtime_key = str(runtime_dir)
+    now = time.time()
+    with _browser_use_lifecycle_lock:
+        state = _browser_use_sessions.get(runtime_key)
+        if state is None:
+            state = {
+                "runtime_dir": runtime_dir,
+                "instance_id": instance["instance_id"],
+                "command": list(command),
+                "session": session,
+                "last_activity": now,
+                "operation_lock": threading.Lock(),
+            }
+            _browser_use_sessions[runtime_key] = state
+        else:
+            state["command"] = list(command)
+            state["last_activity"] = now
+        _write_browser_use_session_state(state)
+    _start_browser_use_cleanup_thread()
+    return state, None
+
+
+def _browser_use_reload_env(state: Dict[str, Any]) -> Dict[str, str]:
+    env = _base_subprocess_env()
+    env["BH_RUNTIME_DIR"] = str(state["runtime_dir"])
+    env["BH_TMP_DIR"] = str(state["runtime_dir"] / "cleanup")
+    env.pop("BH_RUNTIME_DIR_SHARED", None)
+    env.pop("BH_TMP_DIR_SHARED", None)
+    if state.get("session"):
+        env["BU_NAME"] = str(state["session"])
+    else:
+        env.pop("BU_NAME", None)
+    return env
+
+
+def _reload_browser_use_session(state: Dict[str, Any]) -> Tuple[bool, str]:
+    command = list(state.get("command") or [])
+    if not command:
+        return False, "browser-use command is unavailable"
+    runtime_dir = Path(state["runtime_dir"])
+    pid_path = runtime_dir / "bu.pid"
+    daemon_identity: Optional[Tuple[int, float]] = None
+    if pid_path.is_symlink():
+        return False, f"refusing symlinked Browser Harness pid file: {pid_path}"
+    try:
+        daemon_pid = int(pid_path.read_text(encoding="utf-8").strip())
+        daemon_started = _browser_use_process_start(daemon_pid)
+        if daemon_pid > 0 and daemon_started is not None:
+            daemon_identity = (daemon_pid, daemon_started)
+    except (OSError, TypeError, ValueError):
+        pass
+    try:
+        proc = subprocess.run(
+            command + ["--reload"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_browser_use_reload_env(state),
+            timeout=_LIFECYCLE_RELOAD_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            "browser-use --reload timed out after "
+            f"{_LIFECYCLE_RELOAD_TIMEOUT_S:.0f}s"
+        )
+    except OSError as exc:
+        return False, f"could not launch browser-use --reload: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if len(detail) > 800:
+            detail = detail[-800:]
+        return False, f"browser-use --reload exited {proc.returncode}: {detail}"
+
+    if daemon_identity is not None:
+        daemon_pid, daemon_started = daemon_identity
+        deadline = time.monotonic() + _LIFECYCLE_VERIFY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            actual = _browser_use_process_start(daemon_pid)
+            if actual is None or abs(actual - daemon_started) >= 0.01:
+                break
+            time.sleep(0.05)
+        else:
+            return False, (
+                "browser-use --reload exited 0 but exact owned daemon "
+                f"pid {daemon_pid} (start {daemon_started:.6f}) is still alive"
+            )
+
+    leftovers = [
+        path.name
+        for path in (runtime_dir / "bu.sock", runtime_dir / "bu.port", pid_path)
+        if path.exists() or path.is_symlink()
+    ]
+    if leftovers:
+        return False, (
+            "browser-use --reload exited 0 but owned runtime endpoints remain: "
+            + ", ".join(leftovers)
+        )
+    return True, ""
+
+
+def _forget_browser_use_session(state: Dict[str, Any]) -> None:
+    runtime_dir = state["runtime_dir"]
+    with _browser_use_lifecycle_lock:
+        _browser_use_sessions.pop(str(runtime_dir), None)
+    try:
+        (runtime_dir / _SESSION_FILE).unlink(missing_ok=True)
+        runtime_dir.rmdir()
+    except OSError:
+        # Harness may leave diagnostic files. They stay inside the exact
+        # private runtime and can be reclaimed by the dead-owner scan.
+        pass
+
+
+def _cleanup_browser_use_sessions(
+    *, now: Optional[float] = None, force: bool = False
+) -> List[str]:
+    current = time.time() if now is None else float(now)
+    timeout = _browser_use_inactivity_timeout()
+    with _browser_use_lifecycle_lock:
+        candidates = list(_browser_use_sessions.values())
+
+    failures: List[str] = []
+    for state in candidates:
+        if not force and current - float(state["last_activity"]) <= timeout:
+            continue
+        operation_lock = state["operation_lock"]
+        acquired = (
+            operation_lock.acquire(timeout=5)
+            if force
+            else operation_lock.acquire(blocking=False)
+        )
+        if not acquired:
+            continue
+        try:
+            # Re-check after acquiring: a call may have refreshed activity
+            # while the cleanup worker was waiting.
+            if not force and current - float(state["last_activity"]) <= timeout:
+                continue
+            ok, detail = _reload_browser_use_session(state)
+            if ok:
+                _forget_browser_use_session(state)
+            else:
+                message = f"Browser Harness cleanup failed for {state['runtime_dir']}: {detail}"
+                failures.append(message)
+                logger.warning(message)
+        finally:
+            operation_lock.release()
+    return failures
+
+
+def _browser_use_cleanup_worker() -> None:
+    while not _browser_use_cleanup_stop.wait(_LIFECYCLE_CHECK_INTERVAL_S):
+        try:
+            _cleanup_browser_use_sessions()
+            _reap_orphaned_browser_use_instances()
+        except Exception as exc:
+            logger.warning("Browser Harness lifecycle worker failed: %s", exc)
+
+
+def _start_browser_use_cleanup_thread() -> None:
+    global _browser_use_cleanup_thread
+    with _browser_use_lifecycle_lock:
+        if (
+            _browser_use_cleanup_thread is not None
+            and _browser_use_cleanup_thread.is_alive()
+        ):
+            return
+        _browser_use_cleanup_stop.clear()
+        _browser_use_cleanup_thread = threading.Thread(
+            target=_browser_use_cleanup_worker,
+            daemon=True,
+            name="browser-use-lifecycle",
+        )
+        _browser_use_cleanup_thread.start()
+    _reap_orphaned_browser_use_instances()
+
+
+def _stop_browser_use_cleanup_thread() -> None:
+    global _browser_use_cleanup_thread
+    _browser_use_cleanup_stop.set()
+    thread = _browser_use_cleanup_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=2)
+    _browser_use_cleanup_thread = None
+
+
+def _safe_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    if path.is_symlink():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _reap_orphaned_browser_use_instances() -> List[str]:
+    """Reap only dead Hermes instances under the current profile root."""
+    try:
+        profile_root = _browser_use_profile_root()
+    except Exception:
+        return []
+    if not profile_root.is_dir() or profile_root.is_symlink():
+        return []
+
+    current_root = (
+        _browser_use_instance.get("instance_root")
+        if _browser_use_instance is not None
+        else None
+    )
+    failures: List[str] = []
+    for instance_root in profile_root.iterdir():
+        if (
+            instance_root == current_root
+            or instance_root.is_symlink()
+            or not instance_root.is_dir()
+        ):
+            continue
+        owner = _safe_json_object(instance_root / _OWNER_FILE)
+        owner_is_live = _browser_use_owner_is_live(owner) if owner else None
+        if (
+            not owner
+            or owner.get("managed_by") != "hermes-browser-use"
+            or owner.get("instance_id") != instance_root.name
+            or owner_is_live is not False
+        ):
+            continue
+
+        lock_path = instance_root / _REAP_LOCK_FILE
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except OSError:
+            continue
+        all_reaped = True
+        try:
+            command = _find_cli()
+            for runtime_dir in instance_root.glob("s-*"):
+                if runtime_dir.is_symlink() or not runtime_dir.is_dir():
+                    all_reaped = False
+                    continue
+                persisted = _safe_json_object(runtime_dir / _SESSION_FILE)
+                if (
+                    not persisted
+                    or persisted.get("managed_by") != "hermes-browser-use"
+                    or persisted.get("instance_id") != instance_root.name
+                ):
+                    all_reaped = False
+                    continue
+                state = {
+                    "runtime_dir": runtime_dir,
+                    "command": list(command or []),
+                    "session": "",
+                }
+                ok, detail = _reload_browser_use_session(state)
+                if not ok:
+                    all_reaped = False
+                    failures.append(
+                        f"Browser Harness orphan cleanup failed for {runtime_dir}: {detail}"
+                    )
+                    continue
+                try:
+                    (runtime_dir / _SESSION_FILE).unlink(missing_ok=True)
+                    runtime_dir.rmdir()
+                except OSError:
+                    pass
+        finally:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                all_reaped = False
+        if all_reaped:
+            try:
+                (instance_root / _OWNER_FILE).unlink(missing_ok=True)
+                instance_root.rmdir()
+            except OSError:
+                pass
+    for failure in failures:
+        logger.warning(failure)
+    return failures
+
+
+def _reset_browser_use_lifecycle_for_tests() -> None:
+    global _browser_use_instance
+    _stop_browser_use_cleanup_thread()
+    _cleanup_browser_use_sessions(force=True)
+    with _browser_use_lifecycle_lock:
+        _browser_use_sessions.clear()
+        _browser_use_instance = None
+
+
+def _shutdown_browser_use_lifecycle() -> None:
+    _stop_browser_use_cleanup_thread()
+    failures = _cleanup_browser_use_sessions(force=True)
+    for failure in failures:
+        logger.error(failure)
+
+
+atexit.register(_shutdown_browser_use_lifecycle)
+
+
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     """Return the last screenshot path printed during this exec, or None.
 
@@ -644,18 +1274,26 @@ def browser_exec(
     if backend_err:
         return tool_error(backend_err)
 
-    # On a SHARED browser (local Chrome / CDP override) a fresh named daemon
-    # attaches to the first existing page — the same page a sibling daemon
-    # may hold. Pin each named session to a tab it created before running
-    # the model's code. Private per-name browsers (provider-keyed or BU
-    # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
-    if session and not private_browser:
-        code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
+
+    lifecycle_state, lifecycle_error = _prepare_browser_use_lifecycle(
+        env, cmd, task_id, session, workspace
+    )
+    if lifecycle_error:
+        return tool_error(lifecycle_error)
+
+    # A fresh daemon on a SHARED browser attaches to the first existing page.
+    # Every Hermes-managed logical session owns a runtime, so pin it to a tab
+    # it created even when the caller omitted an explicit BU_NAME. Private
+    # provider/cloud browsers skip this because the browser itself is already
+    # exclusive and the extra blank tab would leak.
+    if not private_browser and (session or lifecycle_state is not None):
+        code = _OWN_TAB_PREAMBLE + code
+    code = _dialog_safe_click_preamble() + code
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no
     # local Chrome/CDP endpoint is reachable (their API key authenticates it)
@@ -680,27 +1318,73 @@ def browser_exec(
         except Exception as e:
             logger.debug("Windows hide-flags unavailable: %s", e)
 
+    operation_context = (
+        lifecycle_state["operation_lock"]
+        if lifecycle_state is not None
+        else contextlib.nullcontext()
+    )
     started = time.time()
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
-        )
-    except subprocess.TimeoutExpired:
-        return tool_error(
-            f"browser-use exec timed out after {timeout}s. The daemon may "
-            "still be working; retry with a larger timeout_s (max "
-            f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
-            "append to workspace files — anything already written to the "
-            "workspace is preserved."
-        )
-    except OSError as e:
-        return tool_error(f"Failed to launch browser-use CLI: {e}")
+    daemon_cleanup: Optional[Dict[str, Any]] = None
+    with operation_context:
+        if lifecycle_state is not None:
+            lifecycle_state["last_activity"] = started
+            _write_browser_use_session_state(lifecycle_state)
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                **popen_extra,
+            )
+        except subprocess.TimeoutExpired:
+            detail = ""
+            if lifecycle_state is not None:
+                stopped, cleanup_detail = _reload_browser_use_session(
+                    lifecycle_state
+                )
+                if stopped:
+                    _forget_browser_use_session(lifecycle_state)
+                    detail = " The exact Hermes-owned Harness daemon was stopped."
+                else:
+                    detail = f" Exact daemon cleanup failed: {cleanup_detail}."
+            else:
+                detail = (
+                    " The Harness runtime is operator-owned, so Hermes did "
+                    "not stop or reap it."
+                )
+            return tool_error(
+                f"browser-use exec timed out after {timeout}s.{detail} "
+                "Split the work into several calls that append to workspace "
+                "files; anything already written there is preserved."
+            )
+        except OSError as e:
+            return tool_error(f"Failed to launch browser-use CLI: {e}")
+
+        stderr_full = (proc.stderr or "").strip()
+        if lifecycle_state is not None:
+            lifecycle_state["last_activity"] = time.time()
+            _write_browser_use_session_state(lifecycle_state)
+            if any(
+                marker in stderr_full
+                for marker in (
+                    "HERMES_BROWSER_INPUT_WEDGED:",
+                    "HERMES_BROWSER_CONTROL_WEDGED:",
+                )
+            ):
+                stopped, cleanup_detail = _reload_browser_use_session(
+                    lifecycle_state
+                )
+                daemon_cleanup = {
+                    "attempted": True,
+                    "success": stopped,
+                }
+                if cleanup_detail:
+                    daemon_cleanup["error"] = cleanup_detail
+                if stopped:
+                    _forget_browser_use_session(lifecycle_state)
 
     result = {
         "success": proc.returncode == 0,
@@ -711,6 +1395,8 @@ def browser_exec(
         result["workspace"] = workspace
     if session:
         result["session"] = session
+    if daemon_cleanup is not None:
+        result["daemon_cleanup"] = daemon_cleanup
     stderr = (proc.stderr or "").strip()
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
@@ -729,9 +1415,9 @@ def browser_exec(
 # The tool description is the CLI's skill, fetched from browser-use skill
 _HEADER_BASE = (
     "Drive a real web browser via the Browser Use CLI. The `code` argument "
-    "is piped verbatim to the `browser-use` CLI on stdin and executed as "
-    "full Python (standard library available) with the CLI's pre-imported "
-    "browser helpers; stdout comes back in the result. Start `code` with a "
+    "is executed as full Python (standard library available) after a small "
+    "Hermes compatibility bootstrap, with the CLI's pre-imported browser "
+    "helpers; stdout comes back in the result. Start `code` with a "
     "one-line comment describing the step for the user in plain, "
     "non-technical language, max 60 chars (e.g. `# Searching Amazon for "
     "paper towels`) — the UI displays it as the step label.\n\n"
@@ -744,7 +1430,13 @@ _HEADER_BASE = (
     "to assemble the final answer; define reusable functions in "
     "agent_helpers.py there — the harness auto-imports it into every call. "
     "Do aggregation in code, not in your head: dedupe, count, sort, and "
-    "format with Python inside the exec. Before giving a final answer on a "
+    "format with Python inside the exec. Screenshots use a distinct, "
+    "persistent artifact directory for every call, so keep and return the "
+    "exact path printed by that call. Native JavaScript dialogs are never "
+    "answered implicitly: `click_at_xy` returns and prints "
+    "`dialog_pending`; inspect it and call "
+    "`cdp('Page.handleJavaScriptDialog', accept=...)` before continuing. "
+    "Before giving a final answer on a "
     "multi-item task, verify the collected count against what was asked "
     "and go back for anything missing.\n\n"
     "Batch each sub-procedure (navigate, wait, extract, act) into one call "
@@ -852,7 +1544,7 @@ BROWSER_EXEC_SCHEMA = {
             },
             "session": {
                 "type": "string",
-                "description": "Named daemon/tab isolation (sets BU_NAME): each name gets its own harness daemon, and Hermes pins a separate tab on shared local/CDP browsers; cloud providers may additionally allocate a separate browser. This does not universally create a separate browser profile or storage partition. Omit for the shared default session and reuse the same name across related calls.",
+                "description": "Named daemon/tab isolation (sets BU_NAME): each name gets its own harness daemon, and Hermes pins a separate tab on shared local/CDP browsers; cloud providers may additionally allocate a separate browser. This does not universally create a separate browser profile or storage partition. Reusing a name reconnects to that logical session across tasks; omitting it uses a task-scoped default runtime.",
             },
             "timeout_s": {
                 "type": "integer",

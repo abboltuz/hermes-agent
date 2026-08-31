@@ -62,6 +62,20 @@ class TestSchema:
         properties = COMPUTER_USE_SCHEMA["parameters"]["properties"]
         assert "browser_type_mode" not in properties
 
+    @pytest.mark.parametrize(
+        "retired_action",
+        ["browser_prepare", "cua_browser_prepare", "cua_browser_state"],
+    )
+    def test_retired_browser_actions_are_refused_before_backend_dispatch(
+        self, noop_backend, retired_action
+    ):
+        from tools.computer_use.tool import handle_computer_use
+
+        result = json.loads(handle_computer_use({"action": retired_action}))
+
+        assert result == {"error": f"unknown action {retired_action!r}"}
+        assert noop_backend.calls == []
+
     def test_schema_max_elements_documents_default_and_upper_bound(self):
         """Schema description must agree with the runtime. The original PR
         text said "Default 100" without a corresponding `default` field, and

@@ -36,6 +36,7 @@ class _CDPServer:
 
     def __init__(self) -> None:
         self._handlers: Dict[str, Any] = {}
+        self._close_methods: set[str] = set()
         self._responses: List[Dict[str, Any]] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server: Any = None
@@ -48,6 +49,10 @@ class _CDPServer:
     def on(self, method: str, handler):
         """Register a handler ``handler(params, session_id) -> dict or Exception``."""
         self._handlers[method] = handler
+
+    def close_on(self, method: str) -> None:
+        """Close the transport after receiving ``method``, without a reply."""
+        self._close_methods.add(method)
 
     # --- lifecycle -------------------------------------------------------
 
@@ -67,6 +72,13 @@ class _CDPServer:
                         params = msg.get("params", {}) or {}
                         session_id = msg.get("sessionId")
                         self._responses.append(msg)
+
+                        if method in self._close_methods:
+                            await ws.close(
+                                code=1011,
+                                reason=f"fixture closed during {method}",
+                            )
+                            return
 
                         fn = self._handlers.get(method)
                         if fn is None:
@@ -205,6 +217,70 @@ def test_browser_level_redacts_secret_result(cdp_server):
 # ---------------------------------------------------------------------------
 # Happy-path: target-attached call
 # ---------------------------------------------------------------------------
+
+
+def test_dom_get_document_uses_fresh_target_attachment_per_call(cdp_server):
+    attach_count = 0
+
+    def attach(params, _session_id):
+        nonlocal attach_count
+        attach_count += 1
+        return {"sessionId": f"session-{params['targetId']}-{attach_count}"}
+
+    cdp_server.on("Target.attachToTarget", attach)
+    cdp_server.on(
+        "DOM.getDocument",
+        lambda _params, session_id: {
+            "root": {"nodeId": attach_count, "backendNodeId": 100 + attach_count},
+            "observedSession": session_id,
+        },
+    )
+
+    first = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="DOM.getDocument", target_id="page-a"
+        )
+    )
+    second = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="DOM.getDocument", target_id="page-b"
+        )
+    )
+
+    assert first["success"] is True
+    assert first["result"]["root"]["nodeId"] == 1
+    assert first["result"]["observedSession"] == "session-page-a-1"
+    assert second["success"] is True
+    assert second["result"]["root"]["nodeId"] == 2
+    assert second["result"]["observedSession"] == "session-page-b-2"
+    attaches = [
+        request
+        for request in cdp_server.received()
+        if request["method"] == "Target.attachToTarget"
+    ]
+    assert [item["params"]["targetId"] for item in attaches] == [
+        "page-a",
+        "page-b",
+    ]
+
+
+def test_dom_get_document_socket_close_is_error_not_success(cdp_server):
+    cdp_server.on(
+        "Target.attachToTarget",
+        lambda params, _session_id: {"sessionId": f"session-{params['targetId']}"},
+    )
+    cdp_server.close_on("DOM.getDocument")
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="DOM.getDocument", target_id="page-a", timeout=2
+        )
+    )
+
+    assert "error" in result
+    assert "WebSocket error" in result["error"]
+    assert "fixture closed during DOM.getDocument" in result["error"]
+    assert result["method"] == "DOM.getDocument"
 
 
 # ---------------------------------------------------------------------------

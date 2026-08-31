@@ -26,13 +26,22 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    reset = getattr(bu_cli, "_reset_browser_use_lifecycle_for_tests", None)
+    if reset is not None:
+        reset()
     yield
+    if reset is not None:
+        reset()
 
 
 def _fake_cli(tmp_path, body):
     """Write an executable fake browser-use CLI and return its path."""
     script = tmp_path / "browser-use"
-    script.write_text("#!/bin/sh\n" + body)
+    script.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"--reload\" ]; then exit 0; fi\n"
+        + body
+    )
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return str(script)
 
@@ -541,10 +550,10 @@ class TestOwnTabPreamble:
         # model code still present, after the preamble
         assert result["output"].index("_hermes_ensure_own_tab") < result["output"].index("print('payload')")
 
-    def test_unnamed_session_gets_no_preamble(self, tmp_path, monkeypatch):
+    def test_unnamed_managed_session_gets_own_tab_preamble(self, tmp_path, monkeypatch):
         result = self._run(tmp_path, monkeypatch, session="")
         assert result["success"] is True
-        assert "_hermes_ensure_own_tab" not in result["output"]
+        assert "_hermes_ensure_own_tab" in result["output"]
 
     def test_named_provider_browser_skips_preamble(self, tmp_path, monkeypatch):
         """Per-name provider browsers are private — preamble would leak a tab."""
@@ -864,7 +873,7 @@ class TestBrowserExec:
         result = json.loads(bu_cli.browser_exec('print("hi")'))
         assert result["success"] is True
         assert result["exit_code"] == 0
-        assert 'got:print("hi")' in result["output"]
+        assert result["output"].rstrip().endswith('print("hi")')
         assert "session" not in result
 
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):
