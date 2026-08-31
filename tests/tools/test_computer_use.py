@@ -1263,12 +1263,16 @@ class TestCuaDriverSessionReconnect:
         session._lock = threading.Lock()
         session._started = True
         session._capabilities = {}
+        session._tool_schemas = {}
         session._capability_version = ""
         session._ready_event = None  # populated by real _start_lifecycle
         session._shutdown_event = None
         session._lifecycle_future = None
         session._setup_error = None
         session._declared_session_id = None
+        session._transport_generation = 1
+        session._transport_reset_callback = None
+        session._timeout_suspect = False
         session._call_tool_async = lambda name, args: ("call", name, args)
         # Record what reconnect does — stop then start, in that order.
         session._reconnect_log = []
@@ -1456,6 +1460,232 @@ class TestCuaDriverSessionReconnect:
             ("call", "start_session", {"session": "hermes-label"}),
             ("call", "list_apps", {}),
         ]
+
+    class _PrivateLifecycleServer:
+        """Contract fixture for Cua's proxy-owned private MCP lifecycle."""
+
+        def __init__(self):
+            self.next_transport = 1
+            self.ended = set()
+            self.public_sessions = set()
+            self.opened = []
+            self.calls = []
+            self.poison_new_transports = False
+
+        def open_transport(self, permission_mode, capabilities):
+            transport = f"private-{self.next_transport}"
+            self.next_transport += 1
+            self.opened.append(
+                {
+                    "transport": transport,
+                    "permission_mode": permission_mode,
+                    "capabilities": frozenset(capabilities),
+                }
+            )
+            if self.poison_new_transports:
+                self.ended.add(transport)
+            return transport
+
+        def end_transport(self, transport):
+            self.ended.add(transport)
+
+        @staticmethod
+        def _ended_result(owner):
+            return {
+                "data": (
+                    f"session '{owner}' has ended; tool call was rejected. "
+                    "Call start_session with this id to revive it."
+                ),
+                "images": [],
+                "structuredContent": {
+                    "ok": False,
+                    "refusal": {
+                        "code": "session_ended",
+                        "message": "the private transport session has ended",
+                    },
+                },
+                "isError": True,
+            }
+
+        def call(self, transport, name, args):
+            self.calls.append((transport, name, dict(args)))
+            public = args.get("session")
+            owner = public or transport
+            if name == "start_session":
+                self.ended.discard(owner)
+                self.public_sessions.add(owner)
+                return {
+                    "data": "declared",
+                    "structuredContent": {"active": True},
+                    "isError": False,
+                }
+            if name == "end_session":
+                self.ended.add(owner)
+                self.public_sessions.discard(owner)
+                return {"data": "ended", "isError": False}
+            if owner in self.ended:
+                return self._ended_result(owner)
+            if name == "list_apps":
+                return {
+                    "data": "1 app",
+                    "structuredContent": {
+                        "apps": [{"name": "Fixture App", "pid": 4242}]
+                    },
+                    "isError": False,
+                }
+            if name == "list_windows":
+                return {
+                    "data": "1 window",
+                    "structuredContent": {
+                        "windows": [
+                            {
+                                "app_name": "Fixture App",
+                                "pid": 4242,
+                                "window_id": 7,
+                                "is_on_screen": True,
+                                "z_index": 1,
+                            }
+                        ]
+                    },
+                    "isError": False,
+                }
+            if name == "click":
+                return {"data": "clicked", "isError": False}
+            raise AssertionError(name)
+
+    def _make_private_lifecycle_backend(self):
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        server = self._PrivateLifecycleServer()
+
+        class ContractBridge:
+            def __init__(self):
+                self.transport = server.open_transport(
+                    "standard", {"read.discovery", "input.background"}
+                )
+
+            def run(self, value, timeout=None):
+                marker, name, args = value
+                assert marker == "call"
+                return server.call(self.transport, name, args)
+
+        bridge = ContractBridge()
+        session = self._make_session(bridge)
+        session._declared_session_id = "hermes-public"
+        server.public_sessions.add("hermes-public")
+        reset = MagicMock()
+        session._transport_reset_callback = reset
+
+        strict_schemas = {
+            "list_apps": {
+                "additionalProperties": False,
+                "properties": {},
+            },
+            "list_windows": {
+                "additionalProperties": False,
+                "properties": {
+                    "on_screen_only": {"type": "boolean"},
+                },
+            },
+        }
+        session._tool_schemas = dict(strict_schemas)
+
+        def stop_lifecycle():
+            session._reconnect_log.append("stop")
+
+        def start_lifecycle():
+            session._reconnect_log.append("start")
+            bridge.transport = server.open_transport(
+                "standard", {"read.discovery", "input.background"}
+            )
+            session._tool_schemas = dict(strict_schemas)
+            session._transport_generation += 1
+            session._notify_transport_reset()
+
+        session._stop_lifecycle_locked = stop_lifecycle
+        session._start_lifecycle_locked = start_lifecycle
+
+        backend = CuaDriverBackend()
+        backend._session = session
+        backend._session_id = "hermes-public"
+        return backend, session, server, bridge, reset
+
+    def test_private_lifecycle_recovery_replaces_transport_and_preserves_authority(
+        self,
+    ):
+        backend, session, server, bridge, reset = (
+            self._make_private_lifecycle_backend()
+        )
+
+        assert backend.list_apps() == [{"name": "Fixture App", "pid": 4242}]
+        ended_transport = bridge.transport
+        server.end_transport(ended_transport)
+
+        assert backend.list_apps() == [{"name": "Fixture App", "pid": 4242}]
+        assert bridge.transport != ended_transport
+        assert session._reconnect_log == ["stop", "start"]
+        assert reset.call_count == 1
+        assert [item["permission_mode"] for item in server.opened] == [
+            "standard",
+            "standard",
+        ]
+        assert [item["capabilities"] for item in server.opened] == [
+            frozenset({"read.discovery", "input.background"}),
+            frozenset({"read.discovery", "input.background"}),
+        ]
+        assert [name for _, name, _ in server.calls].count("list_apps") == 3
+
+    def test_distinct_external_transport_cannot_end_or_alias_private_lifecycle(self):
+        backend, session, server, bridge, _reset = (
+            self._make_private_lifecycle_backend()
+        )
+        hermes_transport = bridge.transport
+        external = server.open_transport("standard", {"read.discovery"})
+
+        server.call(external, "start_session", {"session": "external-public"})
+        server.end_transport(external)
+
+        assert backend.list_apps() == [{"name": "Fixture App", "pid": 4242}]
+        assert bridge.transport == hermes_transport
+        assert session._reconnect_log == []
+        assert hermes_transport not in server.ended
+
+    def test_unrecoverable_private_lifecycle_is_structured_not_false_empty(self):
+        from tools.computer_use import tool as computer_tool
+
+        backend, _session, server, bridge, _reset = (
+            self._make_private_lifecycle_backend()
+        )
+        server.end_transport(bridge.transport)
+        server.poison_new_transports = True
+        computer_tool._backend = backend
+
+        result = json.loads(
+            computer_tool.handle_computer_use({"action": "list_apps"})
+        )
+
+        assert result["ok"] is False
+        assert result["action"] == "list_apps"
+        assert result["code"] == "cua_private_session_recovery_failed"
+        assert "private transport session" in result["error"]
+        assert "apps" not in result
+        assert not any(owner in json.dumps(result) for owner in server.ended)
+        assert [name for _, name, _ in server.calls].count("list_apps") == 2
+
+    def test_ended_session_does_not_replay_mutation(self):
+        _backend, session, server, _bridge, _reset = (
+            self._make_private_lifecycle_backend()
+        )
+        server.ended.add("hermes-public")
+
+        result = session.call_tool(
+            "click", {"session": "hermes-public", "x": 20, "y": 30}
+        )
+
+        assert result["isError"] is True
+        assert result["structuredContent"]["refusal"]["code"] == "session_ended"
+        assert [name for _, name, _ in server.calls] == ["click"]
+        assert session._reconnect_log == []
 
 
     def test_cli_fallback_reads_screenshot_from_file(self, tmp_path, monkeypatch):
