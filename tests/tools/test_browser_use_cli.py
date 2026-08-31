@@ -39,7 +39,11 @@ def _fake_cli(tmp_path, body):
     script = tmp_path / "browser-use"
     script.write_text(
         "#!/bin/sh\n"
-        "if [ \"${1:-}\" = \"--reload\" ]; then exit 0; fi\n"
+        "case \"${BH_TMP_DIR:-}\" in\n"
+        "  */cleanup) cat >/dev/null; "
+        "printf '%s\\n' '[hermes-browser-cleanup] {\"ok\": true, \"version\": \"0.1.10\", \"browser_kind\": \"cdp\"}'; "
+        "exit 0;;\n"
+        "esac\n"
         + body
     )
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
