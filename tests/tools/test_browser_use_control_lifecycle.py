@@ -1193,6 +1193,127 @@ class TestManagedDaemonLifecycle:
         assert not hidden_failure.exists()
         assert (runtime / "bu.sock").exists()
 
+    def test_proven_010_cloud_shutdown_uses_strict_response_budget(
+        self, tmp_path, monkeypatch
+    ):
+        instance = tmp_path / "fixture-instance"
+        runtime = instance / "s-strict-budget"
+        runtime.mkdir(parents=True)
+        _write_owned_session_marker(runtime)
+        (runtime / "bu.sock").write_text("fixture")
+        (runtime / bu_cli._DAEMON_FILE).write_text(
+            json.dumps(
+                {
+                    "managed_by": "hermes-browser-use",
+                    "instance_id": "fixture-instance",
+                    "daemon_pid": "4242",
+                    "daemon_started": "strict-daemon-start",
+                    "harness_version": "0.1.10",
+                    "strict_cloud_shutdown": True,
+                }
+            )
+        )
+        observations_path = tmp_path / "strict-budget-observations.json"
+        monkeypatch.setenv("FIXTURE_OBSERVATIONS_PATH", str(observations_path))
+        cli = _python_cli(
+            tmp_path,
+            """
+            import json, os, pathlib, sys, types
+            runtime = pathlib.Path(os.environ['BH_RUNTIME_DIR'])
+            observations_path = pathlib.Path(
+                os.environ['FIXTURE_OBSERVATIONS_PATH']
+            )
+            pathlib.Path(os.environ['BH_TMP_DIR']).mkdir(parents=True, exist_ok=True)
+            observations = {
+                'timeouts': [],
+                'requests': [],
+                'tokens': [],
+                'shutdown_calls': 0,
+                'required_seconds': 46.5,
+            }
+
+            admin = types.ModuleType('browser_harness.admin')
+            admin._version = lambda: '0.1.10'
+            admin._process_start_time = lambda _pid: 'strict-daemon-start'
+
+            ipc = types.ModuleType('browser_harness._ipc')
+            class Connection:
+                def __init__(self, timeout):
+                    self.timeout = timeout
+                def close(self):
+                    pass
+            def connect(_name, timeout=5.0):
+                observations['timeouts'].append(timeout)
+                return Connection(timeout), 'authenticated-fixture-token'
+            ipc.connect = connect
+            def request(conn, token, payload):
+                assert token == 'authenticated-fixture-token'
+                observations['tokens'].append(token)
+                observations['requests'].append(payload.get('meta'))
+                if payload.get('meta') == 'ping':
+                    return {
+                        'pong': True,
+                        'pid': 4242,
+                        'browser_kind': 'cloud',
+                    }
+                if payload.get('meta') == 'shutdown':
+                    observations['shutdown_calls'] += 1
+                    observations_path.write_text(json.dumps(observations))
+                    if conn.timeout < observations['required_seconds']:
+                        raise TimeoutError(
+                            'strict cloud shutdown exceeded client timeout '
+                            f'{conn.timeout}'
+                        )
+                    for endpoint in ('bu.sock', 'bu.port', 'bu.pid'):
+                        (runtime / endpoint).unlink(missing_ok=True)
+                    return {'ok': True}
+                raise AssertionError(payload)
+            ipc.request = request
+
+            package = types.ModuleType('browser_harness')
+            package.admin = admin
+            package._ipc = ipc
+            sys.modules['browser_harness'] = package
+            sys.modules['browser_harness.admin'] = admin
+            sys.modules['browser_harness._ipc'] = ipc
+            exec(sys.stdin.read(), {'cdp': lambda *_args, **_kwargs: {}})
+            """,
+        )
+
+        ok, detail = bu_cli._reload_browser_use_session(
+            {
+                "runtime_dir": runtime,
+                "command": cli,
+                "session": "owned",
+                "instance_id": "fixture-instance",
+            }
+        )
+
+        observations = json.loads(observations_path.read_text())
+        assert observations["timeouts"] == [5.0, 50.0]
+        assert observations["requests"] == ["ping", "shutdown"]
+        assert observations["tokens"] == [
+            "authenticated-fixture-token",
+            "authenticated-fixture-token",
+        ]
+        assert observations["shutdown_calls"] == 1
+        assert ok is True, detail
+        persisted = json.loads((runtime / bu_cli._SESSION_FILE).read_text())
+        assert persisted["cleanup_state"] == "confirmed"
+        assert not any(
+            (runtime / endpoint).exists()
+            for endpoint in ("bu.sock", "bu.port", "bu.pid")
+        )
+        retired, retirement_detail = bu_cli._retire_browser_use_runtime(
+            {
+                "runtime_dir": runtime,
+                "instance_id": "fixture-instance",
+                "cleanup_state": "confirmed",
+            }
+        )
+        assert retired is True, retirement_detail
+        assert not runtime.exists()
+
     @pytest.mark.parametrize("cli_version", ["0.1.9", "0.1.10"])
     @pytest.mark.parametrize(
         ("live_started", "expected_ok"),
