@@ -45,6 +45,22 @@ def _python_cli(tmp_path: Path, source: str) -> list[str]:
     return [sys.executable, str(script)]
 
 
+def _write_owned_session_marker(
+    runtime_dir: Path, instance_id: str = "fixture-instance"
+) -> None:
+    (runtime_dir / bu_cli._SESSION_FILE).write_text(
+        json.dumps(
+            {
+                "managed_by": "hermes-browser-use",
+                "instance_id": instance_id,
+                "session": "",
+                "last_activity": 0.0,
+                "cleanup_state": "active",
+            }
+        )
+    )
+
+
 def _wait_for_process_exit(pid: int, timeout: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -435,7 +451,7 @@ class TestPersistedLifecycleOwnership:
 
         def successful_reload(state):
             reloads.append(Path(state["runtime_dir"]))
-            return True, ""
+            return bu_cli._mark_browser_use_cleanup_confirmed(state)
 
         monkeypatch.setattr(bu_cli, "_reload_browser_use_session", successful_reload)
 
@@ -464,6 +480,132 @@ class TestPersistedLifecycleOwnership:
             assert runtime_dir.is_dir()
         finally:
             bu_cli._release_browser_use_reap_claim(claim)
+
+    def test_cleanup_tmp_directory_is_fully_retired_without_losing_authority(
+        self, tmp_path, monkeypatch
+    ):
+        instance_root, runtime_dir = self._persisted_instance(live_owner=False)
+        cli = _python_cli(
+            tmp_path,
+            """
+            import json, os, pathlib, sys
+            cleanup = pathlib.Path(os.environ['BH_TMP_DIR'])
+            cleanup.mkdir(parents=True, exist_ok=True)
+            sys.stdin.read()
+            print('[hermes-browser-cleanup] ' + json.dumps({
+                'ok': True,
+                'version': '0.1.10',
+                'browser_kind': 'cdp',
+            }))
+            """,
+        )
+        state = {
+            "runtime_dir": runtime_dir,
+            "instance_id": instance_root.name,
+            "command": cli,
+            "session": "",
+            "last_activity": 0.0,
+            "operation_lock": threading.Lock(),
+        }
+        bu_cli._browser_use_sessions[str(runtime_dir)] = state
+
+        assert bu_cli._cleanup_browser_use_sessions(force=True) == []
+        assert not runtime_dir.exists()
+        assert str(runtime_dir) not in bu_cli._browser_use_sessions
+
+        reload_calls = []
+        monkeypatch.setattr(
+            bu_cli,
+            "_reload_browser_use_session",
+            lambda followup: reload_calls.append(followup) or (True, ""),
+        )
+        assert bu_cli._reap_orphaned_browser_use_instances() == []
+        assert reload_calls == []
+        assert not instance_root.exists()
+
+    def test_dead_owner_retires_empty_markerless_crash_window(self, monkeypatch):
+        instance_root, runtime_dir = self._persisted_instance(live_owner=False)
+        (runtime_dir / bu_cli._SESSION_FILE).unlink()
+        reload_calls = []
+        monkeypatch.setattr(
+            bu_cli,
+            "_reload_browser_use_session",
+            lambda state: reload_calls.append(state) or (True, ""),
+        )
+
+        assert bu_cli._reap_orphaned_browser_use_instances() == []
+        assert reload_calls == []
+        assert not runtime_dir.exists()
+        assert not instance_root.exists()
+
+    @pytest.mark.windows_only
+    def test_windows_reaper_retires_instance_with_native_lock_handle(
+        self, monkeypatch
+    ):
+        instance_root, runtime_dir = self._persisted_instance(live_owner=False)
+        session_path = runtime_dir / bu_cli._SESSION_FILE
+        persisted = json.loads(session_path.read_text())
+        persisted["cleanup_state"] = "confirmed"
+        session_path.write_text(json.dumps(persisted))
+
+        monkeypatch.setattr(
+            bu_cli,
+            "_reload_browser_use_session",
+            lambda _state: (_ for _ in ()).throw(
+                AssertionError("confirmed cleanup must not be repeated")
+            ),
+        )
+
+        assert bu_cli._reap_orphaned_browser_use_instances() == []
+        assert not runtime_dir.exists()
+        assert not instance_root.exists()
+
+    def test_retirement_rejects_unexpected_cleanup_content_and_keeps_marker(self):
+        _instance_root, runtime_dir = self._persisted_instance(live_owner=False)
+        session_path = runtime_dir / bu_cli._SESSION_FILE
+        persisted = json.loads(session_path.read_text())
+        persisted["cleanup_state"] = "confirmed"
+        session_path.write_text(json.dumps(persisted))
+        cleanup_dir = runtime_dir / "cleanup"
+        cleanup_dir.mkdir()
+        (cleanup_dir / "unexpected.txt").write_text("retain me")
+
+        retired, detail = bu_cli._retire_browser_use_runtime(
+            {
+                "runtime_dir": runtime_dir,
+                "instance_id": runtime_dir.parent.name,
+                "cleanup_state": "confirmed",
+            }
+        )
+
+        assert retired is False
+        assert "unexpected entries" in detail
+        assert session_path.exists()
+        assert (cleanup_dir / "unexpected.txt").read_text() == "retain me"
+
+    @pytest.mark.require_symlinks
+    def test_retirement_rejects_symlinked_cleanup_and_keeps_marker(self, tmp_path):
+        _instance_root, runtime_dir = self._persisted_instance(live_owner=False)
+        session_path = runtime_dir / bu_cli._SESSION_FILE
+        persisted = json.loads(session_path.read_text())
+        persisted["cleanup_state"] = "confirmed"
+        session_path.write_text(json.dumps(persisted))
+        outside = tmp_path / "outside-cleanup"
+        outside.mkdir()
+        (runtime_dir / "cleanup").symlink_to(outside, target_is_directory=True)
+
+        retired, detail = bu_cli._retire_browser_use_runtime(
+            {
+                "runtime_dir": runtime_dir,
+                "instance_id": runtime_dir.parent.name,
+                "cleanup_state": "confirmed",
+            }
+        )
+
+        assert retired is False
+        assert "cleanup path is unsafe" in detail
+        assert session_path.exists()
+        assert outside.is_dir()
 
 
 class TestLogicalSessionIdentity:
@@ -580,6 +722,94 @@ class TestOwnedTabLifecycle:
         assert len(created) == create_calls
         assert switched == (["hermes-target"] if mode == "create" else [])
         assert "user-target" in targets
+
+
+class TestDaemonContractLifecycle:
+    def test_stale_contract_without_endpoint_is_never_overwritten(self, tmp_path):
+        runtime = tmp_path / "instance" / "s-runtime"
+        runtime.mkdir(parents=True)
+        (runtime / bu_cli._DAEMON_FILE).write_text(
+            json.dumps(
+                {
+                    "managed_by": "hermes-browser-use",
+                    "instance_id": "instance",
+                    "daemon_pid": "4242",
+                    "daemon_started": "fixture-start",
+                    "harness_version": "0.1.9",
+                    "strict_cloud_shutdown": False,
+                }
+            )
+        )
+
+        assert (
+            bu_cli._browser_use_should_record_daemon_contract(
+                {"runtime_dir": runtime, "cleanup_state": "active"}
+            )
+            is False
+        )
+        assert (
+            bu_cli._browser_use_should_record_daemon_contract(
+                {"runtime_dir": runtime, "cleanup_state": "confirmed"}
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize(
+        ("version", "strict"), [("0.1.9", False), ("0.1.10", True)]
+    )
+    def test_new_daemon_records_exact_pid_and_spawning_package_contract(
+        self, tmp_path, monkeypatch, version, strict
+    ):
+        contract_file = tmp_path / bu_cli._DAEMON_FILE
+        pid_file = tmp_path / "bu.pid"
+        pid_file.write_text("4242")
+        monkeypatch.setenv("HERMES_BH_RECORD_DAEMON_CONTRACT", "1")
+        monkeypatch.setenv("HERMES_BH_DAEMON_CONTRACT_FILE", str(contract_file))
+        monkeypatch.setenv("HERMES_BH_INSTANCE_ID", "fixture-instance")
+
+        admin = types.ModuleType("browser_harness.admin")
+        admin._version = lambda: version
+        admin._process_start_time = lambda _pid: "fixture-start"
+        ipc = types.ModuleType("browser_harness._ipc")
+        ipc.pid_path = lambda _name: pid_file
+        package = types.ModuleType("browser_harness")
+        package.admin = admin
+        package._ipc = ipc
+        monkeypatch.setitem(sys.modules, "browser_harness", package)
+        monkeypatch.setitem(sys.modules, "browser_harness.admin", admin)
+        monkeypatch.setitem(sys.modules, "browser_harness._ipc", ipc)
+
+        exec(bu_cli._DAEMON_CONTRACT_PREAMBLE, {})
+
+        assert json.loads(contract_file.read_text()) == {
+            "daemon_pid": "4242",
+            "daemon_started": "fixture-start",
+            "harness_version": version,
+            "instance_id": "fixture-instance",
+            "managed_by": "hermes-browser-use",
+            "strict_cloud_shutdown": strict,
+        }
+
+    def test_existing_daemon_contract_is_not_rewritten_by_newer_cli(
+        self, tmp_path, monkeypatch
+    ):
+        contract_file = tmp_path / bu_cli._DAEMON_FILE
+        old_contract = {
+            "daemon_pid": "4242",
+            "daemon_started": "fixture-start",
+            "harness_version": "0.1.9",
+            "instance_id": "fixture-instance",
+            "managed_by": "hermes-browser-use",
+            "strict_cloud_shutdown": False,
+        }
+        contract_file.write_text(json.dumps(old_contract))
+        monkeypatch.setenv("HERMES_BH_RECORD_DAEMON_CONTRACT", "0")
+        monkeypatch.setenv("HERMES_BH_DAEMON_CONTRACT_FILE", str(contract_file))
+        monkeypatch.setenv("HERMES_BH_INSTANCE_ID", "fixture-instance")
+
+        exec(bu_cli._DAEMON_CONTRACT_PREAMBLE, {})
+
+        assert json.loads(contract_file.read_text()) == old_contract
 
 
 @pytest.mark.live_system_guard_bypass
@@ -816,6 +1046,7 @@ class TestManagedDaemonLifecycle:
     ):
         runtime = tmp_path / f"runtime-{browser_kind}"
         runtime.mkdir()
+        _write_owned_session_marker(runtime)
         shutdown_marker = tmp_path / f"shutdown-{browser_kind}.txt"
         for name in ("bu.sock", "bu.port"):
             (runtime / name).write_text("fixture")
@@ -880,12 +1111,184 @@ class TestManagedDaemonLifecycle:
             assert detail == ""
             assert not (runtime / "bu.sock").exists()
 
+    def test_harness_010_cli_rejects_unproven_019_cloud_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        runtime = tmp_path / "mixed-runtime"
+        runtime.mkdir()
+        (runtime / "bu.sock").write_text("fixture")
+        (runtime / ".hermes-daemon.json").write_text(
+            json.dumps(
+                {
+                    "managed_by": "hermes-browser-use",
+                    "instance_id": "fixture-instance",
+                    "daemon_pid": "4242",
+                    "daemon_started": "old-daemon-start",
+                    "harness_version": "0.1.9",
+                    "strict_cloud_shutdown": False,
+                }
+            )
+        )
+        hidden_failure = tmp_path / "hidden-cloud-failure.txt"
+        monkeypatch.setenv("FIXTURE_HIDDEN_FAILURE", str(hidden_failure))
+        cli = _python_cli(
+            tmp_path,
+            """
+            import os, pathlib, sys, types
+            runtime = pathlib.Path(os.environ['BH_RUNTIME_DIR'])
+            hidden = pathlib.Path(os.environ['FIXTURE_HIDDEN_FAILURE'])
+            pathlib.Path(os.environ['BH_TMP_DIR']).mkdir(parents=True, exist_ok=True)
+
+            ipc = types.ModuleType('browser_harness._ipc')
+            class Connection:
+                def close(self):
+                    pass
+            ipc.connect = lambda _name, timeout=5.0: (Connection(), None)
+            def request(_conn, _token, payload):
+                if payload.get('meta') == 'ping':
+                    return {
+                        'pong': True,
+                        'pid': 4242,
+                        'browser_kind': 'cloud',
+                    }
+                if payload.get('meta') == 'shutdown':
+                    # Model a v0.1.9 daemon: acknowledge first, then fail its
+                    # best-effort Cloud stop during finalization.
+                    hidden.write_text('v0.1.9 daemon cloud stop/billing cleanup failed')
+                    return {'ok': True}
+                raise AssertionError(payload)
+            ipc.request = request
+
+            admin = types.ModuleType('browser_harness.admin')
+            admin._version = lambda: '0.1.10'
+            def restart_daemon(name=None, require_clean=False):
+                assert require_clean is True
+                response = request(None, None, {'meta': 'shutdown'})
+                assert response == {'ok': True}
+                for endpoint in ('bu.sock', 'bu.port', 'bu.pid'):
+                    (runtime / endpoint).unlink(missing_ok=True)
+            admin.restart_daemon = restart_daemon
+
+            package = types.ModuleType('browser_harness')
+            package.admin = admin
+            package._ipc = ipc
+            sys.modules['browser_harness'] = package
+            sys.modules['browser_harness.admin'] = admin
+            sys.modules['browser_harness._ipc'] = ipc
+            exec(sys.stdin.read(), {'cdp': lambda *_args, **_kwargs: {}})
+            """,
+        )
+
+        ok, detail = bu_cli._reload_browser_use_session(
+            {
+                "runtime_dir": runtime,
+                "command": cli,
+                "session": "owned",
+                "instance_id": "fixture-instance",
+            }
+        )
+
+        assert ok is False
+        assert "does not prove strict cloud shutdown" in detail
+        assert not hidden_failure.exists()
+        assert (runtime / "bu.sock").exists()
+
+    @pytest.mark.parametrize("cli_version", ["0.1.9", "0.1.10"])
+    @pytest.mark.parametrize(
+        ("live_started", "expected_ok"),
+        [("strict-daemon-start", True), ("reused-daemon-start", False)],
+    )
+    def test_proven_010_cloud_daemon_cleans_with_either_supported_cli(
+        self, tmp_path, monkeypatch, cli_version, live_started, expected_ok
+    ):
+        runtime = tmp_path / f"proven-runtime-{cli_version}-{live_started}"
+        runtime.mkdir()
+        _write_owned_session_marker(runtime)
+        (runtime / "bu.sock").write_text("fixture")
+        (runtime / bu_cli._DAEMON_FILE).write_text(
+            json.dumps(
+                {
+                    "managed_by": "hermes-browser-use",
+                    "instance_id": "fixture-instance",
+                    "daemon_pid": "4242",
+                    "daemon_started": "strict-daemon-start",
+                    "harness_version": "0.1.10",
+                    "strict_cloud_shutdown": True,
+                }
+            )
+        )
+        shutdown_marker = tmp_path / f"shutdown-{cli_version}.txt"
+        monkeypatch.setenv("FIXTURE_CLI_VERSION", cli_version)
+        monkeypatch.setenv("FIXTURE_LIVE_STARTED", live_started)
+        monkeypatch.setenv("FIXTURE_SHUTDOWN_MARKER", str(shutdown_marker))
+        cli = _python_cli(
+            tmp_path,
+            """
+            import os, pathlib, sys, types
+            runtime = pathlib.Path(os.environ['BH_RUNTIME_DIR'])
+            shutdown_marker = pathlib.Path(os.environ['FIXTURE_SHUTDOWN_MARKER'])
+            pathlib.Path(os.environ['BH_TMP_DIR']).mkdir(parents=True, exist_ok=True)
+
+            admin = types.ModuleType('browser_harness.admin')
+            admin._version = lambda: os.environ['FIXTURE_CLI_VERSION']
+            admin._process_start_time = lambda _pid: os.environ['FIXTURE_LIVE_STARTED']
+
+            ipc = types.ModuleType('browser_harness._ipc')
+            class Connection:
+                def close(self):
+                    pass
+            ipc.connect = lambda _name, timeout=5.0: (Connection(), None)
+            def request(_conn, _token, payload):
+                if payload.get('meta') == 'ping':
+                    return {
+                        'pong': True,
+                        'pid': 4242,
+                        'browser_kind': 'cloud',
+                    }
+                if payload.get('meta') == 'shutdown':
+                    shutdown_marker.write_text('strict-cloud-stop-confirmed')
+                    for endpoint in ('bu.sock', 'bu.port', 'bu.pid'):
+                        (runtime / endpoint).unlink(missing_ok=True)
+                    return {'ok': True}
+                raise AssertionError(payload)
+            ipc.request = request
+
+            package = types.ModuleType('browser_harness')
+            package.admin = admin
+            package._ipc = ipc
+            sys.modules['browser_harness'] = package
+            sys.modules['browser_harness.admin'] = admin
+            sys.modules['browser_harness._ipc'] = ipc
+            exec(sys.stdin.read(), {'cdp': lambda *_args, **_kwargs: {}})
+            """,
+        )
+
+        ok, detail = bu_cli._reload_browser_use_session(
+            {
+                "runtime_dir": runtime,
+                "command": cli,
+                "session": "owned",
+                "instance_id": "fixture-instance",
+            }
+        )
+
+        assert ok is expected_ok, detail
+        if expected_ok:
+            assert shutdown_marker.read_text() == "strict-cloud-stop-confirmed"
+            persisted = json.loads((runtime / bu_cli._SESSION_FILE).read_text())
+            assert persisted["cleanup_state"] == "confirmed"
+        else:
+            assert "does not prove strict cloud shutdown" in detail
+            assert not shutdown_marker.exists()
+            assert (runtime / "bu.sock").exists()
+
     @pytest.mark.parametrize("session", ["owned", ""])
     def test_cleanup_closes_exact_persisted_target_and_preserves_unrelated(
         self, tmp_path, monkeypatch, session
     ):
         runtime = tmp_path / ("named-runtime" if session else "unnamed-runtime")
         runtime.mkdir()
+        _write_owned_session_marker(runtime)
         targets_path = tmp_path / ("named-targets.json" if session else "unnamed-targets.json")
         targets_path.write_text(json.dumps(["owned-target", "user-target"]))
         target_file = runtime / ".hermes-target.json"

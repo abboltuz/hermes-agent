@@ -140,6 +140,67 @@ _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
 """
 
+# A daemon can outlive the CLI package that spawned it. Record strict Cloud
+# shutdown authority only when Hermes observed this exact private runtime with
+# no daemon endpoint immediately before the CLI invocation. The preamble runs
+# after Harness has spawned/connected, so it can bind the spawning package
+# version to the daemon's exact PID without changing the external package.
+_DAEMON_CONTRACT_PREAMBLE = """\
+# hermes: bind daemon cleanup capability to the exact spawned process
+def _hermes_record_daemon_contract():
+    import json as _json, os as _os
+
+    if _os.environ.get("HERMES_BH_RECORD_DAEMON_CONTRACT") != "1":
+        return
+    _contract_file = _os.environ.get("HERMES_BH_DAEMON_CONTRACT_FILE")
+    _instance_id = _os.environ.get("HERMES_BH_INSTANCE_ID")
+    if not _contract_file or not _instance_id:
+        raise RuntimeError(
+            "HERMES_BROWSER_CONTROL_WEDGED: missing daemon-contract metadata"
+        )
+    try:
+        from browser_harness import _ipc as _bipc
+        from browser_harness import admin as _badmin
+
+        _name = _os.environ.get("BU_NAME", "default")
+        _daemon_pid = _bipc.pid_path(_name).read_text().strip()
+        if (
+            not _daemon_pid.isdigit()
+            or int(_daemon_pid) <= 0
+            or int(_daemon_pid) >= (1 << 31)
+        ):
+            raise RuntimeError("invalid Browser Harness daemon pid")
+        _daemon_started = _badmin._process_start_time(int(_daemon_pid))
+        if _daemon_started is None:
+            raise RuntimeError("could not fingerprint Browser Harness daemon process")
+        _version = str(_badmin._version() or "unknown")
+        try:
+            _parts = tuple(int(_part) for _part in _version.split(".")[:3])
+        except (TypeError, ValueError):
+            _parts = ()
+        _payload = {
+            "managed_by": "hermes-browser-use",
+            "instance_id": _instance_id,
+            "daemon_pid": _daemon_pid,
+            "daemon_started": _daemon_started,
+            "harness_version": _version,
+            "strict_cloud_shutdown": _parts >= (0, 1, 10),
+        }
+        _tmp = "%s.%s.tmp" % (_contract_file, _os.getpid())
+        with open(_tmp, "w", encoding="utf-8") as _fh:
+            _json.dump(_payload, _fh, sort_keys=True)
+        if _os.name != "nt":
+            _os.chmod(_tmp, 0o600)
+        _os.replace(_tmp, _contract_file)
+    except Exception as _exc:
+        raise RuntimeError(
+            "HERMES_BROWSER_CONTROL_WEDGED: could not bind cleanup authority "
+            "to the exact Browser Harness daemon: " + str(_exc)
+        ) from _exc
+_hermes_record_daemon_contract()
+del _hermes_record_daemon_contract
+"""
+
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
@@ -151,6 +212,7 @@ _LIFECYCLE_VERIFY_TIMEOUT_S = 3.0
 _OWNER_FILE = ".hermes-owner.json"
 _SESSION_FILE = ".hermes-session.json"
 _TARGET_FILE = ".hermes-target.json"
+_DAEMON_FILE = ".hermes-daemon.json"
 _REAP_LOCK_FILE = ".hermes-reap.lock"
 _CLEANUP_RESULT_PREFIX = "[hermes-browser-cleanup] "
 
@@ -824,6 +886,7 @@ def _write_browser_use_session_state(state: Dict[str, Any]) -> None:
             "instance_id": state["instance_id"],
             "session": str(state.get("session") or ""),
             "last_activity": float(state["last_activity"]),
+            "cleanup_state": str(state.get("cleanup_state") or "active"),
         },
     )
 
@@ -862,6 +925,7 @@ def _prepare_browser_use_lifecycle(
     env["BH_RUNTIME_DIR"] = str(runtime_dir)
     env["BH_TMP_DIR"] = str(artifact_dir)
     env["HERMES_BH_TARGET_FILE"] = str(runtime_dir / _TARGET_FILE)
+    env["HERMES_BH_DAEMON_CONTRACT_FILE"] = str(runtime_dir / _DAEMON_FILE)
     env["HERMES_BH_INSTANCE_ID"] = str(instance["instance_id"])
     env.pop("BH_RUNTIME_DIR_SHARED", None)
     env.pop("BH_TMP_DIR_SHARED", None)
@@ -877,6 +941,7 @@ def _prepare_browser_use_lifecycle(
                 "command": list(command),
                 "session": session,
                 "last_activity": now,
+                "cleanup_state": "active",
                 "operation_lock": threading.Lock(),
             }
             _browser_use_sessions[runtime_key] = state
@@ -886,6 +951,34 @@ def _prepare_browser_use_lifecycle(
         _write_browser_use_session_state(state)
     _start_browser_use_cleanup_thread()
     return state, None
+
+
+def _browser_use_runtime_has_endpoint(runtime_dir: Path) -> bool:
+    return any(
+        path.exists() or path.is_symlink()
+        for path in (
+            runtime_dir / "bu.sock",
+            runtime_dir / "bu.port",
+            runtime_dir / "bu.pid",
+        )
+    )
+
+
+def _browser_use_should_record_daemon_contract(state: Dict[str, Any]) -> bool:
+    runtime_dir = Path(state["runtime_dir"])
+    if _browser_use_runtime_has_endpoint(runtime_dir):
+        return False
+    marker_path = runtime_dir / _DAEMON_FILE
+    if not marker_path.exists() and not marker_path.is_symlink():
+        return True
+    # A prior confirmed shutdown proves the recorded daemon is gone; a new
+    # invocation may bind its replacement. An active/stale contract without
+    # an endpoint is never overwritten because its process may still exist.
+    return (
+        state.get("cleanup_state") == "confirmed"
+        and not marker_path.is_symlink()
+        and _safe_json_object(marker_path) is not None
+    )
 
 
 def _browser_use_reload_env(state: Dict[str, Any]) -> Dict[str, str]:
@@ -922,13 +1015,53 @@ def _browser_use_owned_target(state: Dict[str, Any]) -> Tuple[Optional[str], str
     return marker["target_id"], ""
 
 
+def _browser_use_version_has_strict_cloud_shutdown(version: str) -> bool:
+    try:
+        parts = tuple(int(part) for part in str(version).split(".")[:3])
+    except (TypeError, ValueError):
+        return False
+    return parts >= (0, 1, 10)
+
+
+def _browser_use_daemon_contract(
+    state: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    marker_path = Path(state["runtime_dir"]) / _DAEMON_FILE
+    if not marker_path.exists() and not marker_path.is_symlink():
+        return None, ""
+    marker = _safe_json_object(marker_path)
+    expected_instance = state.get("instance_id")
+    if (
+        not marker
+        or marker.get("managed_by") != "hermes-browser-use"
+        or not expected_instance
+        or marker.get("instance_id") != expected_instance
+        or not isinstance(marker.get("daemon_pid"), str)
+        or not marker["daemon_pid"].isdigit()
+        or int(marker["daemon_pid"]) <= 0
+        or int(marker["daemon_pid"]) >= (1 << 31)
+        or isinstance(marker.get("daemon_started"), bool)
+        or not isinstance(marker.get("daemon_started"), (int, float, str))
+        or str(marker["daemon_started"]) == ""
+        or not isinstance(marker.get("harness_version"), str)
+        or type(marker.get("strict_cloud_shutdown")) is not bool
+        or marker["strict_cloud_shutdown"]
+        != _browser_use_version_has_strict_cloud_shutdown(
+            marker["harness_version"]
+        )
+    ):
+        return None, f"daemon contract marker is malformed or unverifiable: {marker_path}"
+    return marker, ""
+
+
 def _browser_use_cleanup_program() -> str:
     """Program executed inside the installed Harness environment.
 
-    Harness 0.1.10 exposes strict daemon cleanup only through its Python admin
-    API, not ``--reload``. Harness 0.1.9 has no strict cloud-stop authority;
-    local/CDP shutdown is confirmable through its IPC response plus Hermes's
-    exact PID/endpoint verification.
+    A daemon may outlive its spawning CLI package. Cloud cleanup therefore
+    requires a durable capability marker bound to the live daemon PID, rather
+    than inferring daemon behavior from the current admin module. Local/CDP
+    shutdown remains confirmable through authenticated IPC plus exact
+    PID/endpoint verification.
     """
     prefix = json.dumps(_CLEANUP_RESULT_PREFIX)
     return f'''\
@@ -936,12 +1069,14 @@ stop_remote_daemon(None) if False else None
 # Both supported Harness run.py versions skip ensure_daemon() when code starts
 # with this admin expression. The call above is unreachable: cleanup must
 # inspect the existing owned daemon and must never auto-spawn one.
-import inspect as _inspect, json as _json, os as _os
+import json as _json, os as _os
 from browser_harness import admin as _admin
 from browser_harness import _ipc as _ipc
 
 _name = _os.environ.get("BU_NAME", "default")
 _owned_target = _os.environ.get("HERMES_BH_OWNED_TARGET_ID") or None
+_strict_cloud_pid = _os.environ.get("HERMES_BH_STRICT_CLOUD_DAEMON_PID") or None
+_strict_cloud_started = _os.environ.get("HERMES_BH_STRICT_CLOUD_DAEMON_STARTED") or None
 _result = {{"ok": False, "version": str(_admin._version() or "unknown")}}
 
 def _emit(_ok, _error="", **_extra):
@@ -969,14 +1104,23 @@ try:
         raise RuntimeError("owned daemon did not answer an authenticated ping")
     _kind = str(_ping.get("browser_kind") or "unknown")
     _result["browser_kind"] = _kind
-    _supports_strict = "require_clean" in _inspect.signature(
-        _admin.restart_daemon
-    ).parameters
-    if not _supports_strict and _kind == "cloud":
+    _ping_pid = _ping.get("pid")
+    _live_started = (
+        _admin._process_start_time(_ping_pid)
+        if _kind == "cloud" and type(_ping_pid) is int and _strict_cloud_pid
+        else None
+    )
+    if _kind == "cloud" and (
+        not _strict_cloud_pid
+        or not _strict_cloud_started
+        or str(_ping_pid) != _strict_cloud_pid
+        or str(_live_started) != _strict_cloud_started
+    ):
         raise RuntimeError(
-            "Browser Harness 0.1.9 cannot confirm Browser Use Cloud stop, "
-            "profile persistence, or billing cleanup; upgrade to 0.1.10+ "
-            "before Hermes can reap this owned cloud daemon safely"
+            "the live daemon does not prove strict cloud shutdown authority; "
+            "Hermes cannot confirm Browser Use Cloud stop, profile persistence, "
+            "or billing cleanup. Start this owned runtime with Browser Harness "
+            "0.1.10+ before retrying cleanup"
         )
 
     if _owned_target:
@@ -999,19 +1143,16 @@ try:
             )
         _result["target_closed"] = True
 
-    if _supports_strict:
-        _admin.restart_daemon(_name, require_clean=True)
-    else:
-        _shutdown = _request({{"meta": "shutdown"}})
-        if (
-            not isinstance(_shutdown, dict)
-            or _shutdown.get("ok") is not True
-            or bool(_shutdown.get("error"))
-        ):
-            _error = _shutdown.get("error") if isinstance(_shutdown, dict) else None
-            raise RuntimeError(
-                _error or "Browser Harness 0.1.9 daemon did not confirm shutdown"
-            )
+    # The live daemon owns the shutdown contract. Direct authenticated IPC
+    # avoids inferring its behavior from a newer/older current admin module.
+    _shutdown = _request({{"meta": "shutdown"}})
+    if (
+        not isinstance(_shutdown, dict)
+        or _shutdown.get("ok") is not True
+        or bool(_shutdown.get("error"))
+    ):
+        _error = _shutdown.get("error") if isinstance(_shutdown, dict) else None
+        raise RuntimeError(_error or "Browser Harness daemon did not confirm shutdown")
     _emit(True)
 except BaseException as _exc:
     _emit(False, _exc)
@@ -1029,6 +1170,31 @@ def _parse_browser_use_cleanup_result(stdout: str) -> Optional[Dict[str, Any]]:
             return None
         return parsed if isinstance(parsed, dict) else None
     return None
+
+
+def _mark_browser_use_cleanup_confirmed(state: Dict[str, Any]) -> Tuple[bool, str]:
+    runtime_dir = Path(state["runtime_dir"])
+    marker_path = runtime_dir / _SESSION_FILE
+    marker = _safe_json_object(marker_path)
+    if (
+        not marker
+        or marker.get("managed_by") != "hermes-browser-use"
+        or marker.get("instance_id") != state.get("instance_id")
+    ):
+        return False, (
+            "daemon cleanup was confirmed but durable runtime ownership is "
+            f"missing or unverifiable: {marker_path}"
+        )
+    marker["cleanup_state"] = "confirmed"
+    try:
+        _atomic_json(marker_path, marker)
+    except OSError as exc:
+        return False, (
+            "daemon cleanup was confirmed but retirement authority could not "
+            f"be persisted at {marker_path}: {exc}"
+        )
+    state["cleanup_state"] = "confirmed"
+    return True, ""
 
 
 def _reload_browser_use_session(state: Dict[str, Any]) -> Tuple[bool, str]:
@@ -1050,11 +1216,24 @@ def _reload_browser_use_session(state: Dict[str, Any]) -> Tuple[bool, str]:
     owned_target, target_error = _browser_use_owned_target(state)
     if target_error:
         return False, target_error
+    daemon_contract, contract_error = _browser_use_daemon_contract(state)
+    if contract_error:
+        return False, contract_error
     cleanup_env = _browser_use_reload_env(state)
     if owned_target:
         cleanup_env["HERMES_BH_OWNED_TARGET_ID"] = owned_target
     else:
         cleanup_env.pop("HERMES_BH_OWNED_TARGET_ID", None)
+    if daemon_contract and daemon_contract["strict_cloud_shutdown"]:
+        cleanup_env["HERMES_BH_STRICT_CLOUD_DAEMON_PID"] = daemon_contract[
+            "daemon_pid"
+        ]
+        cleanup_env["HERMES_BH_STRICT_CLOUD_DAEMON_STARTED"] = str(
+            daemon_contract["daemon_started"]
+        )
+    else:
+        cleanup_env.pop("HERMES_BH_STRICT_CLOUD_DAEMON_PID", None)
+        cleanup_env.pop("HERMES_BH_STRICT_CLOUD_DAEMON_STARTED", None)
     try:
         proc = subprocess.run(
             command,
@@ -1116,23 +1295,106 @@ def _reload_browser_use_session(state: Dict[str, Any]) -> Tuple[bool, str]:
             "strict cleanup returned but owned runtime endpoints remain: "
             + ", ".join(leftovers)
         )
-    if owned_target:
+    return _mark_browser_use_cleanup_confirmed(state)
+
+
+def _retire_browser_use_runtime(state: Dict[str, Any]) -> Tuple[bool, str]:
+    """Remove only the exact, confirmed, structurally empty owned runtime."""
+    runtime_dir = Path(state["runtime_dir"])
+    expected_instance = state.get("instance_id")
+    if (
+        not expected_instance
+        or not runtime_dir.name.startswith("s-")
+        or runtime_dir.parent.name != expected_instance
+        or runtime_dir.is_symlink()
+        or runtime_dir.parent.is_symlink()
+        or not runtime_dir.is_dir()
+    ):
+        return False, f"owned runtime path is unsafe or unverifiable: {runtime_dir}"
+
+    marker_path = runtime_dir / _SESSION_FILE
+    marker = _safe_json_object(marker_path)
+    if marker is None:
+        # Crash window after unlinking the final marker but before rmdir().
+        # In-memory confirmed state may finish only an exactly empty runtime,
+        # never one containing data. The dead-owner reaper has the equivalent
+        # empty-directory rule at its verified parent boundary.
+        try:
+            empty = not any(runtime_dir.iterdir())
+        except OSError as exc:
+            return False, (
+                f"could not inspect markerless owned runtime {runtime_dir}: {exc}"
+            )
+        if state.get("cleanup_state") == "confirmed" and empty:
+            try:
+                runtime_dir.rmdir()
+                return True, ""
+            except OSError as exc:
+                return False, f"could not retire empty owned runtime {runtime_dir}: {exc}"
+        return False, f"owned runtime marker is missing or unverifiable: {marker_path}"
+    if (
+        marker.get("managed_by") != "hermes-browser-use"
+        or marker.get("instance_id") != expected_instance
+        or marker.get("cleanup_state") != "confirmed"
+    ):
+        return False, f"owned runtime cleanup is not durably confirmed: {marker_path}"
+
+    cleanup_dir = runtime_dir / "cleanup"
+    allowed = {_SESSION_FILE, _TARGET_FILE, _DAEMON_FILE, cleanup_dir.name}
+    try:
+        unexpected = sorted(
+            child.name for child in runtime_dir.iterdir() if child.name not in allowed
+        )
+    except OSError as exc:
+        return False, (
+            f"could not inspect owned runtime before retirement {runtime_dir}: {exc}"
+        )
+    if unexpected:
+        return False, (
+            f"owned runtime contains unexpected entries and was retained: {runtime_dir}: "
+            + ", ".join(unexpected)
+        )
+
+    for marker_name in (_TARGET_FILE, _DAEMON_FILE):
+        marker_file = runtime_dir / marker_name
+        if marker_file.is_symlink() or (
+            marker_file.exists() and not marker_file.is_file()
+        ):
+            return False, f"owned runtime contains unsafe marker path: {marker_file}"
+    if cleanup_dir.is_symlink() or (cleanup_dir.exists() and not cleanup_dir.is_dir()):
+        return False, f"owned cleanup path is unsafe: {cleanup_dir}"
+    if cleanup_dir.exists():
+        try:
+            cleanup_entries = sorted(child.name for child in cleanup_dir.iterdir())
+        except OSError as exc:
+            return False, f"could not inspect owned cleanup directory {cleanup_dir}: {exc}"
+        if cleanup_entries:
+            return False, (
+                "owned cleanup directory contains unexpected entries and was retained: "
+                f"{cleanup_dir}: " + ", ".join(cleanup_entries)
+            )
+
+    try:
+        if cleanup_dir.exists():
+            cleanup_dir.rmdir()
         (runtime_dir / _TARGET_FILE).unlink(missing_ok=True)
+        (runtime_dir / _DAEMON_FILE).unlink(missing_ok=True)
+        # The session marker is the final ownership proof. Remove it only
+        # after every other bounded retirement step has completed.
+        marker_path.unlink()
+        runtime_dir.rmdir()
+    except OSError as exc:
+        return False, f"owned runtime retirement failed for {runtime_dir}: {exc}"
     return True, ""
 
 
-def _forget_browser_use_session(state: Dict[str, Any]) -> None:
-    runtime_dir = state["runtime_dir"]
+def _forget_browser_use_session(state: Dict[str, Any]) -> Tuple[bool, str]:
+    retired, detail = _retire_browser_use_runtime(state)
+    if not retired:
+        return False, detail
     with _browser_use_lifecycle_lock:
-        _browser_use_sessions.pop(str(runtime_dir), None)
-    try:
-        (runtime_dir / _SESSION_FILE).unlink(missing_ok=True)
-        (runtime_dir / _TARGET_FILE).unlink(missing_ok=True)
-        runtime_dir.rmdir()
-    except OSError:
-        # Harness may leave diagnostic files. They stay inside the exact
-        # private runtime and can be reclaimed by the dead-owner scan.
-        pass
+        _browser_use_sessions.pop(str(state["runtime_dir"]), None)
+    return True, ""
 
 
 def _cleanup_browser_use_sessions(
@@ -1160,11 +1422,25 @@ def _cleanup_browser_use_sessions(
             # while the cleanup worker was waiting.
             if not force and current - float(state["last_activity"]) <= timeout:
                 continue
-            ok, detail = _reload_browser_use_session(state)
-            if ok:
-                _forget_browser_use_session(state)
+            retired = False
+            if state.get("cleanup_state") == "confirmed":
+                ok, detail = True, ""
             else:
-                message = f"Browser Harness cleanup failed for {state['runtime_dir']}: {detail}"
+                ok, detail = _reload_browser_use_session(state)
+            if ok:
+                retired, detail = _forget_browser_use_session(state)
+                if retired:
+                    continue
+                message = (
+                    "Browser Harness runtime retirement failed for "
+                    f"{state['runtime_dir']}: {detail}"
+                )
+            else:
+                message = (
+                    f"Browser Harness cleanup failed for {state['runtime_dir']}: "
+                    f"{detail}"
+                )
+            if not ok or not retired:
                 failures.append(message)
                 logger.warning(message)
         finally:
@@ -1223,10 +1499,15 @@ def _acquire_browser_use_reap_claim(
 ) -> Tuple[Optional[Any], bool, str]:
     """Acquire a crash-released kernel lock for one orphan instance.
 
-    The marker file may survive a killed reaper; the OS lock cannot. ``busy``
-    means another live process currently owns the claim.
+    The lock file lives beside the instance, not inside it. This lets native
+    Windows retire the instance while its msvcrt handle remains open, while a
+    stable never-unlinked inode preserves the POSIX anti-replacement race
+    property. The file may survive a killed reaper; the kernel lock cannot.
+    ``busy`` means another live process currently owns the claim.
     """
-    lock_path = instance_root / _REAP_LOCK_FILE
+    lock_path = instance_root.parent / f".{instance_root.name}{_REAP_LOCK_FILE}"
+    if lock_path.is_symlink():
+        return None, False, f"refusing symlinked orphan-reaper claim: {lock_path}"
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -1353,43 +1634,76 @@ def _reap_orphaned_browser_use_instances() -> List[str]:
             for runtime_dir in instance_root.glob("s-*"):
                 if runtime_dir.is_symlink() or not runtime_dir.is_dir():
                     all_reaped = False
+                    failures.append(
+                        f"Browser Harness orphan runtime path is unsafe: {runtime_dir}"
+                    )
                     continue
                 persisted = _safe_json_object(runtime_dir / _SESSION_FILE)
+                if persisted is None:
+                    inspect_error = None
+                    try:
+                        markerless_empty = not any(runtime_dir.iterdir())
+                    except OSError as exc:
+                        markerless_empty = False
+                        inspect_error = (
+                            f"Browser Harness markerless runtime could not be inspected "
+                            f"for {runtime_dir}: {exc}"
+                        )
+                        failures.append(inspect_error)
+                    if markerless_empty:
+                        try:
+                            runtime_dir.rmdir()
+                            continue
+                        except OSError as exc:
+                            failures.append(
+                                f"Browser Harness empty markerless runtime could not be "
+                                f"retired for {runtime_dir}: {exc}"
+                            )
+                    elif inspect_error is None:
+                        failures.append(
+                            f"Browser Harness orphan runtime has no verifiable ownership "
+                            f"marker and was retained: {runtime_dir}"
+                        )
+                    all_reaped = False
+                    continue
                 if (
-                    not persisted
-                    or persisted.get("managed_by") != "hermes-browser-use"
+                    persisted.get("managed_by") != "hermes-browser-use"
                     or persisted.get("instance_id") != instance_root.name
                 ):
                     all_reaped = False
+                    failures.append(
+                        f"Browser Harness orphan runtime ownership is unverifiable: "
+                        f"{runtime_dir}"
+                    )
                     continue
                 state = {
                     "runtime_dir": runtime_dir,
                     "command": list(command or []),
                     "session": str(persisted.get("session") or ""),
                     "instance_id": instance_root.name,
+                    "cleanup_state": str(persisted.get("cleanup_state") or "active"),
                 }
-                ok, detail = _reload_browser_use_session(state)
+                if state["cleanup_state"] == "confirmed":
+                    ok, detail = True, ""
+                else:
+                    ok, detail = _reload_browser_use_session(state)
                 if not ok:
                     all_reaped = False
                     failures.append(
                         f"Browser Harness orphan cleanup failed for {runtime_dir}: {detail}"
                     )
                     continue
-                try:
-                    (runtime_dir / _SESSION_FILE).unlink(missing_ok=True)
-                    (runtime_dir / _TARGET_FILE).unlink(missing_ok=True)
-                    runtime_dir.rmdir()
-                except OSError as exc:
+                retired, detail = _retire_browser_use_runtime(state)
+                if not retired:
                     all_reaped = False
                     failures.append(
                         "Browser Harness orphan runtime could not be retired "
-                        f"after cleanup for {runtime_dir}: {exc}"
+                        f"after cleanup for {runtime_dir}: {detail}"
                     )
             scan_completed = True
         finally:
-            # Retire the claim path and instance while its inode is still
-            # locked. Releasing first would let a waiter acquire the old
-            # inode while a third reaper creates and locks a replacement.
+            # The claim file is a stable sibling of the instance and remains
+            # locked throughout retirement on every host, including Windows.
             if scan_completed and all_reaped:
                 try:
                     retained = {
@@ -1399,10 +1713,14 @@ def _reap_orphaned_browser_use_instances() -> List[str]:
                     }
                     if not retained:
                         (instance_root / _OWNER_FILE).unlink(missing_ok=True)
+                        # Legacy in-instance claim from pre-migration builds.
                         (instance_root / _REAP_LOCK_FILE).unlink(missing_ok=True)
                         instance_root.rmdir()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    failures.append(
+                        f"Browser Harness orphan instance could not be retired "
+                        f"for {instance_root}: {exc}"
+                    )
             _release_browser_use_reap_claim(claim)
     for failure in failures:
         logger.warning(failure)
@@ -1645,16 +1963,20 @@ def browser_exec(
     if lifecycle_error:
         return tool_error(lifecycle_error)
 
+    lifecycle_preamble = ""
+    if lifecycle_state is not None:
+        lifecycle_preamble += _DAEMON_CONTRACT_PREAMBLE
+
     # On shared browsers, claim one exact target under the managed lifecycle.
     # Named Harness daemons already create a dedicated tab; unnamed task
     # runtimes create one here. Operator-owned runtimes and private provider/
     # cloud browsers are never given a Hermes-owned target.
     if not private_browser and lifecycle_state is not None:
         env["HERMES_BH_TARGET_MODE"] = "claim" if session else "create"
-        code = _OWN_TAB_PREAMBLE + code
+        lifecycle_preamble += _OWN_TAB_PREAMBLE
     else:
         env.pop("HERMES_BH_TARGET_MODE", None)
-    code = _dialog_safe_click_preamble() + code
+    code = _dialog_safe_click_preamble() + lifecycle_preamble + code
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no
     # local Chrome/CDP endpoint is reachable (their API key authenticates it)
@@ -1688,8 +2010,15 @@ def browser_exec(
     daemon_cleanup: Optional[Dict[str, Any]] = None
     with operation_context:
         if lifecycle_state is not None:
+            record_contract = _browser_use_should_record_daemon_contract(
+                lifecycle_state
+            )
             lifecycle_state["last_activity"] = started
+            lifecycle_state["cleanup_state"] = "active"
             _write_browser_use_session_state(lifecycle_state)
+            env["HERMES_BH_RECORD_DAEMON_CONTRACT"] = (
+                "1" if record_contract else "0"
+            )
         try:
             proc = subprocess.run(
                 cmd,
@@ -1707,8 +2036,20 @@ def browser_exec(
                     lifecycle_state
                 )
                 if stopped:
-                    _forget_browser_use_session(lifecycle_state)
-                    detail = " The exact Hermes-owned Harness daemon was stopped."
+                    retired, retirement_detail = _forget_browser_use_session(
+                        lifecycle_state
+                    )
+                    if retired:
+                        detail = (
+                            " The exact Hermes-owned Harness daemon and runtime "
+                            "were retired."
+                        )
+                    else:
+                        detail = (
+                            " The exact Hermes-owned Harness daemon was stopped, "
+                            "but runtime retirement failed: "
+                            f"{retirement_detail}."
+                        )
                 else:
                     detail = f" Exact daemon cleanup failed: {cleanup_detail}."
             else:
@@ -1745,7 +2086,13 @@ def browser_exec(
                 if cleanup_detail:
                     daemon_cleanup["error"] = cleanup_detail
                 if stopped:
-                    _forget_browser_use_session(lifecycle_state)
+                    retired, retirement_detail = _forget_browser_use_session(
+                        lifecycle_state
+                    )
+                    daemon_cleanup["success"] = retired
+                    if not retired:
+                        daemon_cleanup["daemon_stopped"] = True
+                        daemon_cleanup["error"] = retirement_detail
 
     result = {
         "success": proc.returncode == 0,
