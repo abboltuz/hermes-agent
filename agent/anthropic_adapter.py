@@ -3282,3 +3282,21 @@ def create_anthropic_message(
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
     return messages_api.create(**create_kwargs)
+
+
+# ── Auto-apply Claude Code OAuth bypass ────────────────────────────────
+# When the claude_auth_bypass module is present in the source tree, apply
+# its patches automatically at import time.  No .pth file, bootstrap, or
+# install.sh needed — the bypass is part of the source code.
+#
+# The bypass adds billing-header signing, system prompt relocation,
+# Stainless SDK spoof, tool-name namespacing, rate-limit auto-wait,
+# and thinking-replay hardening.  All of these are OAuth-only and have
+# zero effect on API-key-authenticated requests.
+try:
+    from agent.claude_auth_bypass import apply_patches as _apply_bypass
+    import sys as _sys
+
+    _apply_bypass(_sys.modules[__name__])
+except Exception:
+    pass
