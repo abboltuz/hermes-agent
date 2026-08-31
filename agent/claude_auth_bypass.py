@@ -1036,6 +1036,38 @@ def _prepend_to_first_user_message(
 # ---------------------------------------------------------------------------
 
 
+def _cache_ttl_seconds(ttl: str) -> int:
+    """Convert a cache TTL string like '5m' or '1h' to seconds for ordering."""
+    if not isinstance(ttl, str) or not ttl:
+        return 0
+    ttl = ttl.strip().lower()
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    unit = ttl[-1]
+    if unit in multipliers:
+        try:
+            return int(ttl[:-1]) * multipliers[unit]
+        except ValueError:
+            return 0
+    return 0
+
+
+def _reorder_system_by_cache_ttl(system: List[Any]) -> None:
+    """Stable-sort system blocks so cache_control TTLs are ascending.
+    
+    Blocks without cache_control come first, then shorter TTLs, then longer.
+    Anthropic requires this ordering; a 1h block before a 5m block is HTTP 400.
+    """
+    def _sort_key(entry: Any) -> int:
+        if not isinstance(entry, dict):
+            return 0
+        cc = entry.get("cache_control")
+        if isinstance(cc, dict) and cc.get("type") == "ephemeral":
+            return _cache_ttl_seconds(cc.get("ttl", ""))
+        return 0
+    
+    system.sort(key=_sort_key)
+
+
 def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
     """Apply all OAuth bypass transforms in place.
 
@@ -1127,6 +1159,11 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         })
 
     api_kwargs["system"] = [billing_entry] + kept
+
+    # Reorder system blocks so cache_control TTLs are ascending
+    # (shorter TTLs before longer TTLs).  Anthropic requires this
+    # ordering; a 1h block before a 5m block triggers HTTP 400.
+    _reorder_system_by_cache_ttl(api_kwargs["system"])
 
     if moved_texts:
         _prepend_to_first_user_message(messages, moved_texts)
