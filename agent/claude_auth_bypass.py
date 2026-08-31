@@ -1159,19 +1159,15 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
 
     api_kwargs["system"] = [billing_entry] + kept
 
-    # DEBUG: log system blocks to diagnose cache_control ordering
-    import logging as _logging
-    _logging.getLogger("anthropic_billing_bypass").warning(
-        "DEBUG system blocks: %s",
-        [(i, b.get("cache_control") if isinstance(b, dict) else None,
-          str(b.get("text", ""))[:60] if isinstance(b, dict) else str(b)[:60])
-         for i, b in enumerate(api_kwargs["system"])]
-    )
-
-    # Reorder system blocks so cache_control TTLs are descending
-    # (shorter TTLs before longer TTLs).  Anthropic requires this
-    # ordering; a 1h block before a 5m block triggers HTTP 400.
-    _reorder_system_by_cache_ttl(api_kwargs["system"])
+    # Strip all cache_control from system blocks.  The Anthropic API
+    # enforces TTL ordering (longer before shorter), and blocks from
+    # Hermes's prompt caching may conflict with the bypass's identity
+    # block.  Removing cache_control from the system blocks is safe
+    # because the billing header and identity are the only blocks that
+    # matter for the bypass.
+    for _block in api_kwargs["system"]:
+        if isinstance(_block, dict):
+            _block.pop("cache_control", None)
 
     if moved_texts:
         _prepend_to_first_user_message(messages, moved_texts)
