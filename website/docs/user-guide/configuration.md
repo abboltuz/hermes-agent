@@ -2314,7 +2314,10 @@ Configure browser automation behavior:
 
 ```yaml
 browser:
-  inactivity_timeout: 120        # Seconds before auto-closing idle sessions
+  # Seconds before auto-closing idle built-in or Hermes-owned Browser Use
+  # harness sessions. Explicit BH_RUNTIME_DIR / BH_TMP_DIR paths are operator-
+  # owned and are never closed or reaped by Hermes.
+  inactivity_timeout: 120
   command_timeout: 30             # Timeout in seconds for browser commands (screenshot, navigate, etc.)
   record_sessions: false         # Auto-record browser sessions as WebM videos to ~/.hermes/browser_recordings/
   # Optional CDP override — when set, Hermes attaches directly to your own
