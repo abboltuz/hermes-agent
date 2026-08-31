@@ -1159,7 +1159,16 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
 
     api_kwargs["system"] = [billing_entry] + kept
 
-    # Reorder system blocks so cache_control TTLs are ascending
+    # DEBUG: log system blocks to diagnose cache_control ordering
+    import logging as _logging
+    _logging.getLogger("anthropic_billing_bypass").warning(
+        "DEBUG system blocks: %s",
+        [(i, b.get("cache_control") if isinstance(b, dict) else None,
+          str(b.get("text", ""))[:60] if isinstance(b, dict) else str(b)[:60])
+         for i, b in enumerate(api_kwargs["system"])]
+    )
+
+    # Reorder system blocks so cache_control TTLs are descending
     # (shorter TTLs before longer TTLs).  Anthropic requires this
     # ordering; a 1h block before a 5m block triggers HTTP 400.
     _reorder_system_by_cache_ttl(api_kwargs["system"])
