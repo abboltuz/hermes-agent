@@ -1145,7 +1145,14 @@ try:
 
     # The live daemon owns the shutdown contract. Direct authenticated IPC
     # avoids inferring its behavior from a newer/older current admin module.
-    _shutdown = _request({{"meta": "shutdown"}})
+    # A proven v0.1.10 cloud daemon may use three 15-second provider attempts
+    # plus retry backoff before it can confirm strict cleanup. Match Harness's
+    # strict admin response budget while keeping ping and non-cloud shutdowns
+    # on the short fail-fast timeout.
+    _shutdown = _request(
+        {{"meta": "shutdown"}},
+        _timeout=50.0 if _kind == "cloud" else 5.0,
+    )
     if (
         not isinstance(_shutdown, dict)
         or _shutdown.get("ok") is not True
