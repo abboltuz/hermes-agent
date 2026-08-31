@@ -1052,10 +1052,11 @@ def _cache_ttl_seconds(ttl: str) -> int:
 
 
 def _reorder_system_by_cache_ttl(system: List[Any]) -> None:
-    """Stable-sort system blocks so cache_control TTLs are ascending.
+    """Stable-sort system blocks so cache_control TTLs are descending.
     
-    Blocks without cache_control come first, then shorter TTLs, then longer.
-    Anthropic requires this ordering; a 1h block before a 5m block is HTTP 400.
+    Blocks without cache_control come first, then longer TTLs, then shorter.
+    Anthropic requires longer TTLs before shorter ones; a 1h block after a
+    5m block triggers HTTP 400.
     """
     def _sort_key(entry: Any) -> int:
         if not isinstance(entry, dict):
@@ -1065,7 +1066,7 @@ def _reorder_system_by_cache_ttl(system: List[Any]) -> None:
             return _cache_ttl_seconds(cc.get("ttl", ""))
         return 0
     
-    system.sort(key=_sort_key)
+    system.sort(key=_sort_key, reverse=True)
 
 
 def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
