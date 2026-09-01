@@ -11,6 +11,7 @@ export const ANTIGRAVITY_RPC_METHODS = {
 const MAX_PROJECT_ID_LENGTH = 4096
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const ACCOUNT_ID_PATTERN = new RegExp(`^acct_${UUID_PATTERN.source.slice(1, -1)}$`)
+const MALFORMED_PERCENT_ESCAPE = /%(?![0-9a-f]{2})/i
 
 export interface AntigravityAccount {
   enabled: boolean
@@ -112,7 +113,7 @@ function isSafeText(value: unknown, maximumLength = 4096): value is string {
 }
 
 function isApprovedOAuthUrl(value: unknown): value is string {
-  if (!isSafeText(value, 8192)) {
+  if (!isSafeText(value, 8192) || MALFORMED_PERCENT_ESCAPE.test(value)) {
     return false
   }
 

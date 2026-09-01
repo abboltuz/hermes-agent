@@ -192,6 +192,7 @@ describe('createAntigravityRpc', () => {
   it.each([
     ['javascript URL', 'javascript:alert(1)'],
     ['malformed URL', 'https://accounts.google.com:bad-port/o/oauth2/v2/auth'],
+    ['malformed percent-encoded query', 'https://accounts.google.com/o/oauth2/v2/auth?x=%'],
     ['non-HTTPS URL', 'http://accounts.google.com/o/oauth2/v2/auth'],
     ['foreign host URL', 'https://accounts.google.evil.test/o/oauth2/v2/auth'],
     ['wrong authorization path', 'https://accounts.google.com/o/oauth2/auth'],
