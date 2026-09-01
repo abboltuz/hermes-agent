@@ -25,6 +25,10 @@ vi.mock('@/store/onboarding', () => ({
   startManualLocalEndpoint: (reason: null | string) => startManualLocalEndpoint(reason)
 }))
 
+vi.mock('./antigravity-accounts', () => ({
+  AntigravityAccounts: () => <div data-testid="antigravity-accounts" />
+}))
+
 function provider(id: string, loggedIn: boolean, patch: Partial<OAuthProvider> = {}): OAuthProvider {
   return {
     cli_command: `hermes auth add ${id}`,
@@ -96,6 +100,7 @@ describe('ProvidersSettings', () => {
   it('disconnects a connected provider account and refreshes the accounts list', async () => {
     await renderProvidersSettings()
 
+    expect(screen.getByTestId('antigravity-accounts')).toBeTruthy()
     const remove = await screen.findByRole('button', { name: 'Remove Nous Portal' })
     await act(async () => {
       fireEvent.click(remove)

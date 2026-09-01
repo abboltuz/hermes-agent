@@ -1307,7 +1307,10 @@ export const zh: Translations = {
         title: '本地 / 自定义端点',
         description: '将 Hermes 指向任意 OpenAI 兼容端点（Zyphra、vLLM、llama.cpp、Ollama 等）。'
       },
-      loading: '正在加载提供方...'
+      loading: '正在加载提供方...',
+      antigravity: {
+        title: 'Antigravity 账号', description: '管理 Antigravity 账号，不会显示账号凭据。', projectId: '项目 ID', connect: '连接账号', connectFailed: '无法开始 Antigravity 登录', loadFailed: '无法加载 Antigravity 账号。', mutationFailed: '无法更新 Antigravity 账号。', emptyTitle: '没有 Antigravity 账号', empty: '连接账号即可开始。', enabled: '已启用', disabled: '已停用', priority: '优先级', priorityFor: account => `Antigravity 账号 ${account} 的优先级`, priorityInvalid: '优先级必须介于 1 和 999999 之间。', savePriority: '保存优先级', enableAccount: account => `启用 Antigravity 账号 ${account}`, accountLabel: account => `Antigravity 账号 ${account}`, removeAccount: account => `移除 Antigravity 账号 ${account}`, removeConfirm: '移除此 Antigravity 账号？'
+      }
     },
     sessions: {
       loading: '正在加载已归档会话…',

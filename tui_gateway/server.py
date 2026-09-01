@@ -232,6 +232,13 @@ _LONG_HANDLERS = frozenset(
         # Billing/usage reads each do a blocking portal HTTP fetch (state + usage
         # is two serial round-trips); keep them off the main stdin loop so a slow
         # portal can't stall approval.respond / session.interrupt / other RPCs.
+        "antigravity.accounts.list",
+        "antigravity.accounts.enabled",
+        "antigravity.accounts.priority",
+        "antigravity.accounts.remove",
+        "antigravity.oauth.start",
+        "antigravity.oauth.poll",
+        "antigravity.oauth.cancel",
         "billing.state",
         "subscription.state",
         # Subscription change (V3): preview + the pending-change mutations + upgrade
@@ -1431,6 +1438,10 @@ def _close_sessions_for_transport(
     return reaped, detached
 
 
+def _shutdown_antigravity_services() -> None:
+    """Placeholder replaced by the Antigravity RPC method module at import end."""
+
+
 def _shutdown_sessions() -> None:
     try:
         _release_gateway_wake_owner()
@@ -1440,6 +1451,10 @@ def _shutdown_sessions() -> None:
         sids = list(_sessions)
     for sid in sids:
         _close_session_by_id(sid, end_reason="tui_shutdown")
+    try:
+        _shutdown_antigravity_services()
+    except Exception:
+        logger.warning("Antigravity account service shutdown failed")
 
 
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
@@ -17046,6 +17061,7 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
+    methods_antigravity as _methods_antigravity,
     methods_browser_control as _methods_browser_control,
     methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete,
@@ -17058,6 +17074,7 @@ from . import (  # noqa: E402
 )
 
 for _m in (
+    _methods_antigravity,
     _methods_browser_control,
     _methods_session,
     _methods_prompt,
