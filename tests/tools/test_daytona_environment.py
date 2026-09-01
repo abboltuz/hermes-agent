@@ -65,6 +65,10 @@ def make_env(daytona_sdk, monkeypatch):
     monkeypatch.setattr("tools.credential_files.get_credential_file_mounts", lambda: [])
     monkeypatch.setattr("tools.credential_files.get_skills_directory_mount", lambda **kw: None)
     monkeypatch.setattr("tools.credential_files.iter_skills_files", lambda **kw: [])
+    # The suite's autouse fixture disables network-backed lazy installation.
+    # This test supplies the SDK through sys.modules, so bypass only the
+    # installation preflight; constructor behavior below remains real.
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
     def _factory(
         sandbox=None,
