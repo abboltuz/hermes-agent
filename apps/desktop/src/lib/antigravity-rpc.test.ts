@@ -5,7 +5,7 @@ import { ANTIGRAVITY_RPC_METHODS, type AntigravityGatewayRequest, createAntigrav
 const ACCOUNT_ID = 'acct_123e4567-e89b-12d3-a456-426614174000'
 const SESSION_ID = '123e4567-e89b-12d3-a456-426614174000'
 const AUTH_URL =
-  'https://accounts.google.com/o/oauth2/v2/auth?client_id=desktop-client&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback'
+  'https://accounts.google.com/o/oauth2/v2/auth?client_id=desktop-client&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback&scope=openid&code_challenge=challenge&code_challenge_method=S256&state=state&access_type=offline&prompt=consent'
 
 const snapshot = {
   accounts: [{ enabled: true, id: ACCOUNT_ID, priority: 1 }]
@@ -220,9 +220,13 @@ describe('createAntigravityRpc', () => {
     })
   })
 
-  it('preserves an approved Google OAuth URL exactly as returned', async () => {
+  it.each([
+    ['canonical scheme and host', AUTH_URL],
+    ['uppercase host', AUTH_URL.replace('accounts.google.com', 'ACCOUNTS.GOOGLE.COM')],
+    ['uppercase scheme', AUTH_URL.replace('https:', 'HTTPS:')]
+  ])('preserves an approved Google OAuth URL with %s exactly as returned', async (_name, authUrl) => {
     const approvedOAuth: AntigravityGatewayRequest = vi.fn(async () => ({
-      auth_url: AUTH_URL,
+      auth_url: authUrl,
       expires_at: 123,
       flow: 'browser_poll',
       poll_interval_ms: 1000,
@@ -231,7 +235,7 @@ describe('createAntigravityRpc', () => {
     }))
 
     await expect(createAntigravityRpc(approvedOAuth, () => 'alpha').startOAuth('project-a')).resolves.toMatchObject({
-      authUrl: AUTH_URL,
+      authUrl,
       sessionId: SESSION_ID
     })
   })
