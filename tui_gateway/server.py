@@ -232,6 +232,13 @@ _LONG_HANDLERS = frozenset(
         # Billing/usage reads each do a blocking portal HTTP fetch (state + usage
         # is two serial round-trips); keep them off the main stdin loop so a slow
         # portal can't stall approval.respond / session.interrupt / other RPCs.
+        "antigravity.accounts.list",
+        "antigravity.accounts.enabled",
+        "antigravity.accounts.priority",
+        "antigravity.accounts.remove",
+        "antigravity.oauth.start",
+        "antigravity.oauth.poll",
+        "antigravity.oauth.cancel",
         "billing.state",
         "subscription.state",
         # Subscription change (V3): preview + the pending-change mutations + upgrade

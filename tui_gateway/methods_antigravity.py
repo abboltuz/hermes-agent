@@ -30,6 +30,10 @@ _ANTIGRAVITY_INTERNAL_FAILURE = (5202, "Antigravity account service failed")
 _MAX_SAFE_INTEGER = (1 << 53) - 1
 _antigravity_services: dict[str, Any] = {}
 _antigravity_services_lock = threading.RLock()
+_antigravity_services_condition = threading.Condition(_antigravity_services_lock)
+_antigravity_services_pending: set[str] = set()
+_antigravity_services_closures = 0
+_antigravity_services_shutdown = False
 
 
 def _antigravity_unbound_factory() -> Any:
@@ -89,13 +93,44 @@ def _antigravity_default_service_factory():
 
 
 def _antigravity_service():
+    """Return a profile-local service without racing shutdown admission."""
+    global _antigravity_services_closures
     key = _antigravity_profile_key()
-    with _antigravity_services_lock:
+    with _antigravity_services_condition:
+        while key in _antigravity_services_pending:
+            _antigravity_services_condition.wait()
+        if _antigravity_services_shutdown:
+            raise RuntimeError("Antigravity account service is shutting down")
         service = _antigravity_services.get(key)
-        if service is None:
-            service = _antigravity_service_factory()
+        if service is not None:
+            return service
+        _antigravity_services_pending.add(key)
+
+    try:
+        service = _antigravity_service_factory()
+    except Exception:
+        with _antigravity_services_condition:
+            _antigravity_services_pending.remove(key)
+            _antigravity_services_condition.notify_all()
+        raise
+
+    with _antigravity_services_condition:
+        if not _antigravity_services_shutdown:
             _antigravity_services[key] = service
-        return service
+            _antigravity_services_pending.remove(key)
+            _antigravity_services_condition.notify_all()
+            return service
+        _antigravity_services_closures += 1
+
+    try:
+        service.close()
+    except Exception:
+        logger.warning("Antigravity account service cleanup failed")
+    with _antigravity_services_condition:
+        _antigravity_services_pending.remove(key)
+        _antigravity_services_closures -= 1
+        _antigravity_services_condition.notify_all()
+    raise RuntimeError("Antigravity account service is shutting down")
 
 
 def _antigravity_failure(rid, exc: Exception) -> dict:
@@ -114,15 +149,25 @@ def _antigravity_call(rid, callback):
 
 
 def _shutdown_antigravity_services() -> None:
-    """Close every profile-local service once; never expose cleanup failures."""
-    with _antigravity_services_lock:
+    """Close every service exactly once and reject later service admission."""
+    global _antigravity_services_closures, _antigravity_services_shutdown
+    with _antigravity_services_condition:
+        _antigravity_services_shutdown = True
         services = list(_antigravity_services.values())
         _antigravity_services.clear()
+        _antigravity_services_closures += len(services)
+        _antigravity_services_condition.notify_all()
     for service in services:
         try:
             service.close()
         except Exception:
             logger.warning("Antigravity account service cleanup failed")
+        with _antigravity_services_condition:
+            _antigravity_services_closures -= 1
+            _antigravity_services_condition.notify_all()
+    with _antigravity_services_condition:
+        while _antigravity_services_pending or _antigravity_services_closures:
+            _antigravity_services_condition.wait()
 
 
 @method("antigravity.accounts.list")
@@ -215,6 +260,12 @@ def register(server) -> None:
     """Bind handlers and profile-local lifecycle state onto ``server``."""
     server._antigravity_services = {}
     server._antigravity_services_lock = threading.RLock()
+    server._antigravity_services_condition = threading.Condition(
+        server._antigravity_services_lock
+    )
+    server._antigravity_services_pending = set()
+    server._antigravity_services_closures = 0
+    server._antigravity_services_shutdown = False
     server._antigravity_service_factory = _antigravity_default_service_factory
     server._ANTIGRAVITY_INVALID_PARAMS = _ANTIGRAVITY_INVALID_PARAMS
     server._ANTIGRAVITY_BRIDGE_FAILURE = _ANTIGRAVITY_BRIDGE_FAILURE
@@ -248,3 +299,35 @@ def register(server) -> None:
             ),
         )
     _registry.install(server)
+
+    def validate_profile(handler):
+        def wrapper(rid, params):
+            profile = params.get("profile") if isinstance(params, dict) else None
+            if profile is None or (isinstance(profile, str) and not profile.strip()):
+                return handler(rid, params)
+            if not isinstance(profile, str):
+                return server._err(rid, *server._ANTIGRAVITY_INVALID_PARAMS)
+            try:
+                from hermes_cli import profiles as profiles_mod
+
+                canonical = profiles_mod.normalize_profile_name(profile)
+                profiles_mod.validate_profile_name(canonical)
+                home = Path(profiles_mod.get_profile_dir(canonical)).resolve()
+                if canonical == "default":
+                    if home != profiles_mod._get_default_hermes_home().resolve():
+                        raise ValueError("default profile home mismatch")
+                else:
+                    root = profiles_mod._get_profiles_root().resolve()
+                    if home != root / canonical:
+                        raise ValueError("profile home escapes profiles root")
+            except Exception:
+                return server._err(rid, *server._ANTIGRAVITY_INVALID_PARAMS)
+            scoped_params = dict(params)
+            scoped_params["profile"] = canonical
+            return handler(rid, scoped_params)
+
+        return wrapper
+
+    for name, handler in tuple(server._methods.items()):
+        if name.startswith("antigravity."):
+            server._methods[name] = validate_profile(handler)
