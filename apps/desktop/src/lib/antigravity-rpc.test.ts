@@ -4,6 +4,8 @@ import { ANTIGRAVITY_RPC_METHODS, type AntigravityGatewayRequest, createAntigrav
 
 const ACCOUNT_ID = 'acct_123e4567-e89b-12d3-a456-426614174000'
 const SESSION_ID = '123e4567-e89b-12d3-a456-426614174000'
+const AUTH_URL =
+  'https://accounts.google.com/o/oauth2/v2/auth?client_id=desktop-client&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback'
 
 const snapshot = {
   accounts: [{ enabled: true, id: ACCOUNT_ID, priority: 1 }]
@@ -24,7 +26,7 @@ function requestStub(): AntigravityGatewayRequest {
 
       case ANTIGRAVITY_RPC_METHODS.start:
         return {
-          auth_url: 'https://accounts.example.test/authorize',
+          auth_url: AUTH_URL,
           expires_at: 123,
           flow: 'browser_poll',
           poll_interval_ms: 1000,
@@ -187,6 +189,45 @@ describe('createAntigravityRpc', () => {
     )
   })
 
+  it.each([
+    ['javascript URL', 'javascript:alert(1)'],
+    ['malformed URL', 'https://accounts.google.com:bad-port/o/oauth2/v2/auth'],
+    ['non-HTTPS URL', 'http://accounts.google.com/o/oauth2/v2/auth'],
+    ['foreign host URL', 'https://accounts.google.evil.test/o/oauth2/v2/auth'],
+    ['wrong authorization path', 'https://accounts.google.com/o/oauth2/auth'],
+    ['credential-bearing URL', 'https://user:password@accounts.google.com/o/oauth2/v2/auth'],
+    ['fragment-bearing URL', 'https://accounts.google.com/o/oauth2/v2/auth#fragment']
+  ])('rejects a hostile OAuth %s without exposing it', async (_name, authUrl) => {
+    const hostileOAuth: AntigravityGatewayRequest = vi.fn(async () => ({
+      auth_url: authUrl,
+      expires_at: 123,
+      flow: 'browser_poll',
+      poll_interval_ms: 1000,
+      session_id: SESSION_ID,
+      status: 'pending'
+    }))
+
+    await expect(createAntigravityRpc(hostileOAuth, () => 'alpha').startOAuth('project-a')).rejects.toThrow(
+      'Invalid Antigravity response.'
+    )
+  })
+
+  it('preserves an approved Google OAuth URL exactly as returned', async () => {
+    const approvedOAuth: AntigravityGatewayRequest = vi.fn(async () => ({
+      auth_url: AUTH_URL,
+      expires_at: 123,
+      flow: 'browser_poll',
+      poll_interval_ms: 1000,
+      session_id: SESSION_ID,
+      status: 'pending'
+    }))
+
+    await expect(createAntigravityRpc(approvedOAuth, () => 'alpha').startOAuth('project-a')).resolves.toMatchObject({
+      authUrl: AUTH_URL,
+      sessionId: SESSION_ID
+    })
+  })
+
   it('rejects hostile values and malformed backend envelopes without trusting them', async () => {
     const hostile = Object.create({ accounts: snapshot.accounts })
     const request: AntigravityGatewayRequest = vi.fn(async () => hostile)
@@ -203,7 +244,7 @@ describe('createAntigravityRpc', () => {
     )
 
     const malformedOAuth: AntigravityGatewayRequest = vi.fn(async () => ({
-      auth_url: 'https://accounts.example.test/authorize',
+      auth_url: AUTH_URL,
       expires_at: 123,
       flow: 'browser_poll',
       poll_interval_ms: 1000,

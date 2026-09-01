@@ -111,6 +111,28 @@ function isSafeText(value: unknown, maximumLength = 4096): value is string {
   )
 }
 
+function isApprovedOAuthUrl(value: unknown): value is string {
+  if (!isSafeText(value, 8192)) {
+    return false
+  }
+
+  try {
+    const url = new URL(value)
+
+    return (
+      url.protocol === 'https:' &&
+      url.hostname === 'accounts.google.com' &&
+      (url.port === '' || url.port === '443') &&
+      url.pathname === '/o/oauth2/v2/auth' &&
+      url.username === '' &&
+      url.password === '' &&
+      url.hash === ''
+    )
+  } catch {
+    return false
+  }
+}
+
 function isUuid(value: unknown): value is string {
   return typeof value === 'string' && UUID_PATTERN.test(value)
 }
@@ -189,7 +211,7 @@ function parseOAuthStart(value: unknown): AntigravityOAuthStart {
   }
 
   if (
-    !isSafeText(envelope.auth_url) ||
+    !isApprovedOAuthUrl(envelope.auth_url) ||
     typeof envelope.expires_at !== 'number' ||
     !Number.isSafeInteger(envelope.expires_at) ||
     !isSafeText(envelope.flow, 128) ||
