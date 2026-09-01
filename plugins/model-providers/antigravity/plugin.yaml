@@ -1,0 +1,5 @@
+name: antigravity
+kind: model-provider
+version: 1.0.0
+description: Google Antigravity subscription — runs Hermes turns through a managed local OpenAI-compatible bridge
+author: Cekasha

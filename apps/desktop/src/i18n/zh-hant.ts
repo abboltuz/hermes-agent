@@ -995,7 +995,10 @@ export const zhHant = defineLocale({
         title: '本地 / 自訂端點',
         description: '將 Hermes 指向任意 OpenAI 相容端點（Zyphra、vLLM、llama.cpp、Ollama 等）。'
       },
-      loading: '正在載入提供方...'
+      loading: '正在載入提供方...',
+      antigravity: {
+        title: 'Antigravity 帳號', description: '管理 Antigravity 帳號，不會顯示帳號憑證。', projectId: '專案 ID', connect: '連結帳號', connectFailed: '無法開始 Antigravity 登入', loadFailed: '無法載入 Antigravity 帳號。', mutationFailed: '無法更新 Antigravity 帳號。', emptyTitle: '沒有 Antigravity 帳號', empty: '連結帳號即可開始。', enabled: '已啟用', disabled: '已停用', priority: '優先順序', priorityFor: account => `Antigravity 帳號 ${account} 的優先順序`, priorityInvalid: '優先順序必須介於 1 和 999999 之間。', savePriority: '儲存優先順序', enableAccount: account => `啟用 Antigravity 帳號 ${account}`, accountLabel: account => `Antigravity 帳號 ${account}`, removeAccount: account => `移除 Antigravity 帳號 ${account}`, removeConfirm: '移除此 Antigravity 帳號？'
+      }
     },
     sessions: {
       loading: '正在載入已封存工作階段…',

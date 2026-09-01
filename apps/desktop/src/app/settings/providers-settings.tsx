@@ -25,6 +25,7 @@ import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
 import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 
+import { AntigravityAccounts } from './antigravity-accounts'
 import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
 import { CustomEndpointsSettings } from './custom-endpoints-settings'
 import { SettingsCategoryHeading, useEnvCredentials } from './env-credentials'
@@ -516,6 +517,7 @@ export function ProvidersSettings({
         onWantApiKey={() => onViewChange('keys')}
         providers={oauthProviders}
       />
+      <AntigravityAccounts />
     </SettingsContent>
   )
 }

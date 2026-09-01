@@ -34,6 +34,7 @@ Substrate facts (verified May 2026):
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Any, Optional
 
 
@@ -199,6 +200,12 @@ def build_models_payload(
         for_picker=for_picker,
         excluded_providers=ctx.excluded_providers or [],
     )
+
+    managed_row = _antigravity_provider_row(rows, ctx)
+    if managed_row is not None:
+        rows = [managed_row] + [
+            row for row in rows if str(row.get("slug", "")).lower() != "antigravity"
+        ]
 
     moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:
@@ -591,6 +598,103 @@ def _apply_custom_aliases(rows: list[dict]) -> None:
 # ─── Internal: row post-processing ──────────────────────────────────────
 
 
+def _excluded_provider_slugs(ctx: ConfigContext) -> set[str]:
+    """Return the normalized catalog exclusions for every post-processing pass."""
+    return {
+        str(provider).strip().lower()
+        for provider in (ctx.excluded_providers or [])
+        if str(provider).strip()
+    }
+
+
+def _antigravity_is_explicitly_configured(ctx: ConfigContext) -> bool:
+    """Apply the standard enabled-provider rule to normalized config keys."""
+    from hermes_cli.config import is_provider_enabled
+
+    return any(
+        is_provider_enabled(config)
+        for name, config in (ctx.user_providers or {}).items()
+        if str(name).strip().lower() == "antigravity"
+    )
+
+
+_MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH = 96
+_ANTIGRAVITY_PICKER_MODEL_ID = re.compile(
+    r"^(?:antigravity-)?(?:"
+    r"gemini-[1-9](?:\.\d)?-(?:pro|flash|ultra|nano|lite)(?:-(?:preview|thinking|experimental|exp|latest))?"
+    r"|claude-(?:(?:opus|sonnet|haiku)-[1-9](?:-[1-9])?(?:-(?:latest|thinking|beta|preview))?"
+    r"|[1-9](?:-[1-9])?-(?:opus|sonnet|haiku)(?:-\d{8})?(?:-(?:latest|thinking|beta|preview))?)"
+    r")$"
+)
+
+
+def _safe_antigravity_model_ids(model_ids: list[str]) -> list[str]:
+    """Keep only bounded Gemini/Claude model IDs for picker responses.
+
+    The bridge is an external process boundary. After the provider helper has
+    selected Gemini/Claude families, require their published ID grammar rather
+    than accepting arbitrary family-prefixed text. This prevents bridge
+    markers, URIs, and credential-shaped payloads from reaching GUI clients.
+    """
+    return [
+        model_id
+        for model_id in model_ids
+        if len(model_id) <= _MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH
+        and _ANTIGRAVITY_PICKER_MODEL_ID.fullmatch(model_id.lower())
+    ]
+
+
+def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | None:
+    """Build Antigravity's configured managed-transport row.
+
+    Antigravity intentionally has no API-key environment variable: accounts
+    live in its profile-scoped bridge service. A current selection or explicit
+    ``providers.antigravity`` entry is therefore sufficient to render its
+    native picker row. An unconfigured install remains a canonical setup
+    skeleton via :func:`_append_unconfigured_rows`.
+    """
+    slug = "antigravity"
+    if any(str(row.get("slug", "")).lower() == slug for row in rows):
+        return None
+
+    if slug in _excluded_provider_slugs(ctx):
+        return None
+
+    current = str(ctx.current_provider or "").strip().lower() == slug
+    explicitly_configured = _antigravity_is_explicitly_configured(ctx)
+    if not current and not explicitly_configured:
+        return None
+
+    try:
+        from agent.antigravity_bridge_client import filter_antigravity_models
+        from hermes_cli.models import cached_provider_model_ids
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(slug)
+        if profile is None:
+            return None
+        discovered = cached_provider_model_ids(slug)
+        models = _safe_antigravity_model_ids(
+            filter_antigravity_models(
+                [{"id": model_id} for model_id in discovered if isinstance(model_id, str)]
+            ) or []
+        )
+        return {
+            "slug": slug,
+            "name": profile.display_name or "Google Antigravity",
+            "is_current": current,
+            "is_user_defined": False,
+            "models": models,
+            "total_models": len(models),
+            "source": "managed",
+        }
+    except Exception:
+        # The provider's direct catalog path owns its fallback semantics. A
+        # genuinely unavailable profile simply remains absent rather than
+        # leaking bridge details into picker responses.
+        return None
+
+
 def _append_unconfigured_rows(
     rows: list[dict],
     ctx: ConfigContext,
@@ -608,11 +712,12 @@ def _append_unconfigured_rows(
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
 
     seen = {r["slug"].lower() for r in rows}
+    excluded = _excluded_provider_slugs(ctx)
     cur = (ctx.current_provider or "").lower()
     cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
-        if entry.slug.lower() in seen:
+        if entry.slug.lower() in seen or entry.slug.lower() in excluded:
             continue
         if current_only and entry.slug.lower() != cur:
             continue
@@ -729,6 +834,11 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
         if current_slug and slug == current_slug:
             kept.append(row)
             continue
+        if slug == "antigravity" and _antigravity_is_explicitly_configured(ctx):
+            # Antigravity is configured through its managed profile/account
+            # service, not an API-key environment variable.
+            kept.append(row)
+            continue
         if slug == "moa":
             # MoA is a virtual routing mode, not an independently configured
             # provider. Hide it from explicit-only pickers unless it is the
@@ -834,7 +944,11 @@ def _apply_picker_hints(rows: list[dict]) -> None:
         if not is_skeleton or row.get("is_user_defined"):
             continue
         cfg = PROVIDER_REGISTRY.get(row["slug"])
-        auth_type = cfg.auth_type if cfg else "api_key"
+        auth_type = (
+            "external_process"
+            if row["slug"] == "antigravity"
+            else (cfg.auth_type if cfg else "api_key")
+        )
         key_env = (
             cfg.api_key_env_vars[0]
             if (cfg and cfg.api_key_env_vars)
