@@ -195,6 +195,9 @@ describe('createAntigravityRpc', () => {
     ['malformed percent-encoded query', 'https://accounts.google.com/o/oauth2/v2/auth?x=%'],
     ['non-HTTPS URL', 'http://accounts.google.com/o/oauth2/v2/auth'],
     ['foreign host URL', 'https://accounts.google.evil.test/o/oauth2/v2/auth'],
+    ['percent-encoded hostname', 'https://%61ccounts.google.com/o/oauth2/v2/auth'],
+    ['literal dot-segment path', 'https://accounts.google.com/o/oauth2/v2/x/../auth'],
+    ['percent-encoded dot-segment path', 'https://accounts.google.com/o/oauth2/v2/%2e/auth'],
     ['wrong authorization path', 'https://accounts.google.com/o/oauth2/auth'],
     ['credential-bearing URL', 'https://user:password@accounts.google.com/o/oauth2/v2/auth'],
     ['fragment-bearing URL', 'https://accounts.google.com/o/oauth2/v2/auth#fragment']
@@ -208,9 +211,13 @@ describe('createAntigravityRpc', () => {
       status: 'pending'
     }))
 
-    await expect(createAntigravityRpc(hostileOAuth, () => 'alpha').startOAuth('project-a')).rejects.toThrow(
-      'Invalid Antigravity response.'
-    )
+    const startOAuth = createAntigravityRpc(hostileOAuth, () => 'alpha').startOAuth('project-a')
+
+    await expect(startOAuth).rejects.toThrow('Invalid Antigravity response.')
+    await startOAuth.catch(error => {
+      expect(error).toMatchObject({ message: 'Invalid Antigravity response.' })
+      expect(error.message).not.toContain(authUrl)
+    })
   })
 
   it('preserves an approved Google OAuth URL exactly as returned', async () => {
