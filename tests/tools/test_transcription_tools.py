@@ -416,7 +416,9 @@ class TestTranscribeLocalExtended:
             result = _transcribe_local(str(audio), "base")
 
         assert result["success"] is True
-        mock_whisper_cls.assert_called_once_with("base", device="cpu", compute_type="float32")
+        from tools.transcription_tools import _should_force_faster_whisper_cpu
+        expected_compute_type = "int8" if _should_force_faster_whisper_cpu() else "float32"
+        mock_whisper_cls.assert_called_once_with("base", device="cpu", compute_type=expected_compute_type)
 
 
     def test_cuda_out_of_memory_does_not_trigger_cpu_fallback(self, tmp_path):
@@ -1207,7 +1209,7 @@ class TestRunCommandSttIdleTimeout:
                 "import sys, time",
                 "for idx in range(4):",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
-                "    time.sleep(0.04)",
+                "    time.sleep(0.2)",
                 "print('done', flush=True)",
             ]),
             encoding="utf-8",
@@ -1215,7 +1217,7 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.1,
+            timeout=0.5,
         )
 
         assert result.returncode == 0

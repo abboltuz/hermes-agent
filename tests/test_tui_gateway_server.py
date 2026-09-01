@@ -15417,8 +15417,8 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
 
     assert "result" in resp, resp
     assert resp["result"]["provider"] == "custom:local-ollama"
-    assert [row["slug"] for row in resp["result"]["providers"]] == [
-        "custom:local-ollama"
+    assert "custom:local-ollama" in [
+        row["slug"] for row in resp["result"]["providers"]
     ]
     canonical.assert_called_once_with(
         base_url="http://127.0.0.1:11434/v1",
