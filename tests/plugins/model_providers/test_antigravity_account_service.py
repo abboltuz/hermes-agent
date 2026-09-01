@@ -276,6 +276,105 @@ async def test_async_cancellation_is_delegated_once_to_client_abort_semantics(sa
     assert client.abort_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_async_close_waiters_share_one_cleanup_until_it_finishes(safe_values):
+    _, AsyncAntigravityAccountService = _service_module()
+    client = _set_values(FakeAsyncClient(), safe_values)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def blocking_close():
+        client.close_calls += 1
+        entered.set()
+        await release.wait()
+        cleanup_finished.set()
+
+    client.close = blocking_close
+    service = AsyncAntigravityAccountService(client=client)
+    first_close = asyncio.create_task(service.close())
+    await entered.wait()
+    second_close = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+
+    assert client.close_calls == 1
+    assert not second_close.done()
+    assert not cleanup_finished.is_set()
+
+    release.set()
+    await asyncio.gather(first_close, second_close)
+    await service.close()
+
+    assert cleanup_finished.is_set()
+    assert client.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_close_survives_initiating_waiter_cancellation(safe_values):
+    _, AsyncAntigravityAccountService = _service_module()
+    client = _set_values(FakeAsyncClient(), safe_values)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def blocking_close():
+        client.close_calls += 1
+        entered.set()
+        await release.wait()
+        cleanup_finished.set()
+
+    client.close = blocking_close
+    service = AsyncAntigravityAccountService(client=client)
+    initiating_close = asyncio.create_task(service.close())
+    await entered.wait()
+    initiating_close.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await initiating_close
+
+    later_close = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    assert client.close_calls == 1
+    assert not later_close.done()
+
+    release.set()
+    await later_close
+
+    assert cleanup_finished.is_set()
+    assert client.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_close_propagates_the_same_cleanup_failure_to_all_waiters(safe_values):
+    _, AsyncAntigravityAccountService = _service_module()
+    client = _set_values(FakeAsyncClient(), safe_values)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    error = AntigravityBridgeError("safe close failure")
+
+    async def failing_close():
+        client.close_calls += 1
+        entered.set()
+        await release.wait()
+        raise error
+
+    client.close = failing_close
+    service = AsyncAntigravityAccountService(client=client)
+    first_close = asyncio.create_task(service.close())
+    await entered.wait()
+    second_close = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    release.set()
+
+    results = await asyncio.gather(first_close, second_close, return_exceptions=True)
+
+    assert results == [error, error]
+    assert client.close_calls == 1
+    with pytest.raises(AntigravityBridgeError) as raised:
+        await service.close()
+    assert raised.value is error
+
+
 def test_service_import_keeps_antigravity_provider_registry_contract():
     AntigravityAccountService, _ = _service_module()
     from providers import get_provider_profile

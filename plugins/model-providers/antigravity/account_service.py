@@ -7,6 +7,7 @@ statuses unchanged.  They do not select accounts or retain credentials.
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -111,6 +112,7 @@ class AsyncAntigravityAccountService:
             factory = client_factory or AsyncAntigravityBridgeClient
             self._client = factory(**client_kwargs)
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     async def list_accounts(self) -> dict[str, Any]:
         return await self._client.list_accounts()
@@ -135,10 +137,10 @@ class AsyncAntigravityAccountService:
 
     async def close(self) -> None:
         """Close the owned client once, including asynchronous context exits."""
-        if self._closed:
-            return
-        self._closed = True
-        await self._client.close()
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._client.close())
+        await asyncio.shield(self._close_task)
 
     async def __aenter__(self) -> "AsyncAntigravityAccountService":
         return self
