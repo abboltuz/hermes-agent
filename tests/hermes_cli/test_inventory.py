@@ -766,6 +766,74 @@ def test_antigravity_configured_row_honors_excluded_providers():
     assert {row["slug"] for row in payload["providers"]} == {"nous"}
 
 
+def test_antigravity_exclusion_suppresses_current_and_unconfigured_rows():
+    """An excluded provider never reappears during fallback-row post-processing."""
+    current = ConfigContext(
+        current_provider="antigravity",
+        current_model="antigravity-gemini-3-pro",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        excluded_providers=[" ANTIGRAVITY "],
+    )
+    unconfigured = ConfigContext(
+        current_provider="nous",
+        current_model="",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        excluded_providers=["antigravity"],
+    )
+
+    with _list_auth_returning([]):
+        current_payload = build_models_payload(current, explicit_only=True)
+        unconfigured_payload = build_models_payload(unconfigured, include_unconfigured=True)
+
+    assert "antigravity" not in {row["slug"] for row in current_payload["providers"]}
+    assert "antigravity" not in {row["slug"] for row in unconfigured_payload["providers"]}
+
+
+def test_antigravity_picker_drops_malformed_bridge_model_ids():
+    """Picker payloads retain only safe Gemini/Claude model identifiers."""
+    live = [
+        "antigravity-gemini-3-pro",
+        "claude-sonnet-4-6",
+        "claude-bridge-marker-INVENTORY_PROBE",
+        "gemini-sdkbridge://antigravity?credential=INVENTORY_PROBE",
+        "gemini-3-pro\ncredential=INVENTORY_PROBE",
+    ]
+    ctx = _empty_ctx(provider="antigravity", model="antigravity-gemini-3-pro")
+
+    with (
+        _list_auth_returning([]),
+        patch("hermes_cli.models.cached_provider_model_ids", return_value=live),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True)
+
+    row = next(row for row in payload["providers"] if row["slug"] == "antigravity")
+    assert row["models"] == ["antigravity-gemini-3-pro", "claude-sonnet-4-6"]
+    assert "bridge" not in str(row).lower()
+    assert "credential" not in str(row).lower()
+
+
+def test_antigravity_explicit_only_normalizes_configured_provider_key():
+    """Explicit-only preserves a managed row for a normalized config key."""
+    ctx = ConfigContext(
+        current_provider="nous",
+        current_model="",
+        current_base_url="",
+        user_providers={" ANTIGRAVITY ": {}},
+        custom_providers=[],
+    )
+
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx, explicit_only=True)
+
+    row = next(row for row in payload["providers"] if row["slug"] == "antigravity")
+    assert row["is_current"] is False
+    assert row["source"] == "managed"
+
+
 # ─── _apply_featured (one-flagship-per-lab shortlist) ──────────────────
 
 

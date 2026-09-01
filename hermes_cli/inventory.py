@@ -597,6 +597,46 @@ def _apply_custom_aliases(rows: list[dict]) -> None:
 # ─── Internal: row post-processing ──────────────────────────────────────
 
 
+def _excluded_provider_slugs(ctx: ConfigContext) -> set[str]:
+    """Return the normalized catalog exclusions for every post-processing pass."""
+    return {
+        str(provider).strip().lower()
+        for provider in (ctx.excluded_providers or [])
+        if str(provider).strip()
+    }
+
+
+def _antigravity_is_explicitly_configured(ctx: ConfigContext) -> bool:
+    """Apply the standard enabled-provider rule to normalized config keys."""
+    from hermes_cli.config import is_provider_enabled
+
+    return any(
+        is_provider_enabled(config)
+        for name, config in (ctx.user_providers or {}).items()
+        if str(name).strip().lower() == "antigravity"
+    )
+
+
+def _safe_antigravity_model_ids(model_ids: list[str]) -> list[str]:
+    """Keep picker-safe agentic model IDs after provider-family filtering.
+
+    The bridge is an external process boundary. Its model inventory is allowed
+    to choose among Gemini/Claude models, not to serialize transport markers,
+    URI fragments, or credential-shaped text into a GUI response.
+    """
+    forbidden_parts = {"apikey", "bridge", "credential", "sdkbridge", "secret", "token"}
+    safe: list[str] = []
+    for model_id in model_ids:
+        normalized = model_id.lower()
+        if any(char not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for char in normalized):
+            continue
+        parts = set(normalized.replace(".", "-").split("-"))
+        if parts & forbidden_parts:
+            continue
+        safe.append(model_id)
+    return safe
+
+
 def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | None:
     """Build Antigravity's configured managed-transport row.
 
@@ -610,29 +650,11 @@ def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | No
     if any(str(row.get("slug", "")).lower() == slug for row in rows):
         return None
 
-    excluded = {
-        str(provider).strip().lower()
-        for provider in (ctx.excluded_providers or [])
-        if provider
-    }
-    if slug in excluded:
+    if slug in _excluded_provider_slugs(ctx):
         return None
 
     current = str(ctx.current_provider or "").strip().lower() == slug
-    provider_config = next(
-        (
-            config
-            for name, config in (ctx.user_providers or {}).items()
-            if str(name).strip().lower() == slug
-        ),
-        None,
-    )
-    if provider_config is None:
-        explicitly_configured = False
-    else:
-        from hermes_cli.config import is_provider_enabled
-
-        explicitly_configured = is_provider_enabled(provider_config)
+    explicitly_configured = _antigravity_is_explicitly_configured(ctx)
     if not current and not explicitly_configured:
         return None
 
@@ -645,9 +667,11 @@ def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | No
         if profile is None:
             return None
         discovered = cached_provider_model_ids(slug)
-        models = filter_antigravity_models(
-            [{"id": model_id} for model_id in discovered if isinstance(model_id, str)]
-        ) or []
+        models = _safe_antigravity_model_ids(
+            filter_antigravity_models(
+                [{"id": model_id} for model_id in discovered if isinstance(model_id, str)]
+            ) or []
+        )
         return {
             "slug": slug,
             "name": profile.display_name or "Google Antigravity",
@@ -681,11 +705,12 @@ def _append_unconfigured_rows(
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
 
     seen = {r["slug"].lower() for r in rows}
+    excluded = _excluded_provider_slugs(ctx)
     cur = (ctx.current_provider or "").lower()
     cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
-        if entry.slug.lower() in seen:
+        if entry.slug.lower() in seen or entry.slug.lower() in excluded:
             continue
         if current_only and entry.slug.lower() != cur:
             continue
@@ -802,7 +827,7 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
         if current_slug and slug == current_slug:
             kept.append(row)
             continue
-        if slug == "antigravity" and isinstance(ctx.user_providers, dict) and slug in ctx.user_providers:
+        if slug == "antigravity" and _antigravity_is_explicitly_configured(ctx):
             # Antigravity is configured through its managed profile/account
             # service, not an API-key environment variable.
             kept.append(row)
