@@ -553,7 +553,7 @@ ACCOUNT_ID = "acct_11111111-1111-4111-8111-111111111111"
 OAUTH_ID = "22222222-2222-4222-8222-222222222222"
 PUBLIC_AUTH_URL = (
     "https://accounts.google.com/o/oauth2/v2/auth?client_id=public-client"
-    "&response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
+    "&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback"
     "&scope=openid&code_challenge=public-challenge&code_challenge_method=S256"
     "&state=public-state&access_type=offline&prompt=consent"
 )
@@ -743,3 +743,93 @@ server.serve_forever()
         assert client.cancel_oauth(OAUTH_ID) == {"status": "cancelled"}
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("auth_url", [
+    "https://accounts.google.com/o/oauth2/v2/auth",
+    f"{PUBLIC_AUTH_URL}&client_id=duplicate",
+    f"{PUBLIC_AUTH_URL}&client_secret=private-marker",
+    PUBLIC_AUTH_URL.replace("public-client", "%ZZ"),
+    PUBLIC_AUTH_URL.replace("accounts.google.com", "accounts.google.com:99999"),
+    PUBLIC_AUTH_URL.replace("response_type=code", "response_type=token"),
+    PUBLIC_AUTH_URL.replace("redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback", "redirect_uri=http%3A%2F%2Flocalhost%2Fother"),
+    PUBLIC_AUTH_URL.replace("code_challenge_method=S256", "code_challenge_method=plain"),
+    f"{PUBLIC_AUTH_URL}&unexpected=value",
+])
+def test_antigravity_oauth_facade_rejects_nonpublic_auth_url_contract(auth_url):
+    from agent.antigravity_bridge_transport import AntigravityBridgeError
+
+    client, _transport = _account_client({
+        ("POST", "/v1/accounts/oauth/start"): {
+            "sessionId": OAUTH_ID, "authUrl": auth_url, "status": "pending",
+            "expiresAt": 1, "pollIntervalMs": 1,
+        },
+    })
+    with pytest.raises(AntigravityBridgeError) as exc_info:
+        client.start_oauth()
+    assert str(exc_info.value) == "invalid Antigravity bridge response"
+
+
+def test_antigravity_facade_rejects_hostile_json_subclasses_without_leaking_markers():
+    from agent.antigravity_bridge_transport import AntigravityBridgeError
+
+    marker = "hostile-private-marker"
+
+    class HostileDict(dict):
+        def __getitem__(self, key):
+            raise RuntimeError(marker)
+
+    class HostileList(list):
+        def __iter__(self):
+            raise RuntimeError(marker)
+
+    class HostileText(str):
+        pass
+
+    class HostileInt(int):
+        pass
+
+    base = _public_snapshot()
+    hostile_responses = [
+        HostileDict(base),
+        {**base, "accounts": HostileList(base["accounts"])},
+        {**base, "accounts": [{**base["accounts"][0], "email": HostileText("safe@example.test")}], "current": {"claude": ACCOUNT_ID, "gemini": None}},
+        {**base, "accounts": [{**base["accounts"][0], "priority": HostileInt(1)}]},
+        {**base, "accounts": [{**base["accounts"][0], "quota": {"claude": HostileDict({"remainingFraction": 0.5, "resetTime": None, "modelCount": 1})}}]},
+        {**base, "current": {"claude": HostileText(ACCOUNT_ID), "gemini": None}},
+    ]
+    for response in hostile_responses:
+        client, _transport = _account_client({("GET", "/v1/accounts"): response})
+        with pytest.raises(AntigravityBridgeError) as exc_info:
+            client.list_accounts()
+        assert str(exc_info.value) == "invalid Antigravity bridge response"
+        assert marker not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("total", 0), ("enabled", 0), ("available", 0), ("limited", 1), ("connected", False),
+])
+def test_antigravity_account_facade_rejects_incoherent_aggregates(field, value):
+    from agent.antigravity_bridge_transport import AntigravityBridgeError
+
+    snapshot = _public_snapshot()
+    snapshot[field] = value
+    client, _transport = _account_client({("GET", "/v1/accounts"): snapshot})
+    with pytest.raises(AntigravityBridgeError, match="invalid Antigravity bridge response"):
+        client.list_accounts()
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_antigravity_account_facade_rejects_dangling_or_disabled_current_account(dangling):
+    from agent.antigravity_bridge_transport import AntigravityBridgeError
+
+    snapshot = _public_snapshot()
+    if dangling:
+        snapshot["current"]["claude"] = "acct_11111111-1111-4111-8111-111111111112"
+    else:
+        snapshot["accounts"][0]["enabled"] = False
+        snapshot["accounts"][0]["status"] = "disabled"
+        snapshot["enabled"] = snapshot["available"] = 0
+    client, _transport = _account_client({("GET", "/v1/accounts"): snapshot})
+    with pytest.raises(AntigravityBridgeError, match="invalid Antigravity bridge response"):
+        client.list_accounts()
