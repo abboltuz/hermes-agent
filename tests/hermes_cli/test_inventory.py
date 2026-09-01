@@ -801,6 +801,10 @@ def test_antigravity_picker_drops_malformed_bridge_model_ids():
         "claude-bridge-marker-INVENTORY_PROBE",
         "gemini-sdkbridge://antigravity?credential=INVENTORY_PROBE",
         "gemini-3-pro\ncredential=INVENTORY_PROBE",
+        "gemini-api-key-sk-live-inventoryprobe",
+        "gemini-password-inventoryprobe",
+        "gemini-bearer-inventoryprobe",
+        "claude-sessionid-inventoryprobe",
     ]
     ctx = _empty_ctx(provider="antigravity", model="antigravity-gemini-3-pro")
 

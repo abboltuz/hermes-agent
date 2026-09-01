@@ -34,6 +34,7 @@ Substrate facts (verified May 2026):
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Any, Optional
 
 
@@ -617,24 +618,28 @@ def _antigravity_is_explicitly_configured(ctx: ConfigContext) -> bool:
     )
 
 
-def _safe_antigravity_model_ids(model_ids: list[str]) -> list[str]:
-    """Keep picker-safe agentic model IDs after provider-family filtering.
+_ANTIGRAVITY_PICKER_MODEL_ID = re.compile(
+    r"^(?:antigravity-)?(?:"
+    r"gemini-\d+(?:\.\d+)?(?:-(?:pro|flash|ultra|nano|lite|preview|thinking|experimental|exp|latest|\d{2}))*"
+    r"|claude-(?:(?:opus|sonnet|haiku)-\d+(?:-\d+)*(?:-(?:latest|thinking|beta|preview))?"
+    r"|(?:\d+(?:-\d+)*-(?:opus|sonnet|haiku))(?:-\d{6,8})?(?:-(?:latest|thinking|beta|preview))?)"
+    r")$"
+)
 
-    The bridge is an external process boundary. Its model inventory is allowed
-    to choose among Gemini/Claude models, not to serialize transport markers,
-    URI fragments, or credential-shaped text into a GUI response.
+
+def _safe_antigravity_model_ids(model_ids: list[str]) -> list[str]:
+    """Keep only bounded Gemini/Claude model IDs for picker responses.
+
+    The bridge is an external process boundary. After the provider helper has
+    selected Gemini/Claude families, require their published ID grammar rather
+    than accepting arbitrary family-prefixed text. This prevents bridge
+    markers, URIs, and credential-shaped payloads from reaching GUI clients.
     """
-    forbidden_parts = {"apikey", "bridge", "credential", "sdkbridge", "secret", "token"}
-    safe: list[str] = []
-    for model_id in model_ids:
-        normalized = model_id.lower()
-        if any(char not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for char in normalized):
-            continue
-        parts = set(normalized.replace(".", "-").split("-"))
-        if parts & forbidden_parts:
-            continue
-        safe.append(model_id)
-    return safe
+    return [
+        model_id
+        for model_id in model_ids
+        if _ANTIGRAVITY_PICKER_MODEL_ID.fullmatch(model_id.lower())
+    ]
 
 
 def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | None:
