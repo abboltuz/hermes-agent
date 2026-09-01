@@ -64,6 +64,10 @@ export interface AntigravityRpc {
   startOAuth(projectId: string, options?: AntigravityRequestOptions): Promise<AntigravityOAuthStart>
 }
 
+interface AccountsEnvelope {
+  accounts: unknown
+}
+
 interface SnapshotEnvelope {
   snapshot: unknown
 }
@@ -122,7 +126,7 @@ function isPriority(value: unknown): value is number {
 function requiredProfile(getActiveProfile: () => string): string {
   const profile = getActiveProfile()
 
-  if (!isSafeText(profile, 255)) {
+  if (!isSafeText(profile, 255) || profile.trim().length === 0) {
     throw invalidRequest()
   }
 
@@ -151,7 +155,13 @@ function parseSnapshot(value: unknown): AntigravityAccountsSnapshot {
 }
 
 function parseAccountsEnvelope(value: unknown): AntigravityAccountsSnapshot {
-  return parseSnapshot(value)
+  if (!isPlainRecord(value)) {
+    throw invalidResponse()
+  }
+
+  const envelope: AccountsEnvelope = { accounts: value.accounts }
+
+  return parseSnapshot(envelope.accounts)
 }
 
 function parseSnapshotEnvelope(value: unknown): AntigravityAccountsSnapshot {

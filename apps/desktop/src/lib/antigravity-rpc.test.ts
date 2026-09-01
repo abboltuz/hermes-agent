@@ -13,7 +13,7 @@ function requestStub(): AntigravityGatewayRequest {
   const responseForMethod = (method: string): unknown => {
     switch (method) {
       case ANTIGRAVITY_RPC_METHODS.list:
-        return snapshot
+        return { accounts: snapshot }
 
       case ANTIGRAVITY_RPC_METHODS.enabled:
 
@@ -121,6 +121,17 @@ describe('createAntigravityRpc', () => {
   })
 
   it.each([
+    ['no active profile', ''],
+    ['whitespace-only active profile', '   ']
+  ])('rejects %s before invoking the request function', async (_name, profile) => {
+    const request = requestStub()
+    const api = createAntigravityRpc(request, () => profile)
+
+    await expect(api.listAccounts()).rejects.toThrow('Invalid Antigravity request.')
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it.each([
     ['account id with a bad prefix', (api: ReturnType<typeof createAntigravityRpc>) => api.removeAccount('account_x')],
     [
       'account id with uppercase UUID',
@@ -152,6 +163,28 @@ describe('createAntigravityRpc', () => {
 
     await expect(invoke(api)).rejects.toThrow('Invalid Antigravity request.')
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('requires the approved nested accounts envelope and rejects legacy, deeper, and hostile shapes', async () => {
+    const directLegacy: AntigravityGatewayRequest = vi.fn(async () => snapshot)
+
+    await expect(createAntigravityRpc(directLegacy, () => 'alpha').listAccounts()).rejects.toThrow(
+      'Invalid Antigravity response.'
+    )
+
+    const deeperEnvelope: AntigravityGatewayRequest = vi.fn(async () => ({ accounts: { accounts: snapshot } }))
+
+    await expect(createAntigravityRpc(deeperEnvelope, () => 'alpha').listAccounts()).rejects.toThrow(
+      'Invalid Antigravity response.'
+    )
+
+    const hostileInnerEnvelope: AntigravityGatewayRequest = vi.fn(async () => ({
+      accounts: Object.create({ accounts: snapshot.accounts })
+    }))
+
+    await expect(createAntigravityRpc(hostileInnerEnvelope, () => 'alpha').listAccounts()).rejects.toThrow(
+      'Invalid Antigravity response.'
+    )
   })
 
   it('rejects hostile values and malformed backend envelopes without trusting them', async () => {
