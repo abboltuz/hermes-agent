@@ -820,6 +820,27 @@ def test_antigravity_picker_drops_malformed_bridge_model_ids():
     assert "credential" not in str(row).lower()
 
 
+def test_antigravity_picker_rejects_oversized_or_numeric_suffix_model_ids():
+    """The bridge cannot grow picker payloads with unbounded numeric model IDs."""
+    live = [
+        "antigravity-gemini-3-pro",
+        "claude-sonnet-4-6",
+        "gemini-3-pro-99",
+        "gemini-999999999999999999999999999999999999999999999999-pro",
+        "gemini-3-pro" + "-99" * 1_001,
+    ]
+    ctx = _empty_ctx(provider="antigravity", model="antigravity-gemini-3-pro")
+
+    with (
+        _list_auth_returning([]),
+        patch("hermes_cli.models.cached_provider_model_ids", return_value=live),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True)
+
+    row = next(row for row in payload["providers"] if row["slug"] == "antigravity")
+    assert row["models"] == ["antigravity-gemini-3-pro", "claude-sonnet-4-6"]
+
+
 def test_antigravity_explicit_only_normalizes_configured_provider_key():
     """Explicit-only preserves a managed row for a normalized config key."""
     ctx = ConfigContext(

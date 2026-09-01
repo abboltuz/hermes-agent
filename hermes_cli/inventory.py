@@ -618,11 +618,12 @@ def _antigravity_is_explicitly_configured(ctx: ConfigContext) -> bool:
     )
 
 
+_MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH = 96
 _ANTIGRAVITY_PICKER_MODEL_ID = re.compile(
     r"^(?:antigravity-)?(?:"
-    r"gemini-\d+(?:\.\d+)?(?:-(?:pro|flash|ultra|nano|lite|preview|thinking|experimental|exp|latest|\d{2}))*"
-    r"|claude-(?:(?:opus|sonnet|haiku)-\d+(?:-\d+)*(?:-(?:latest|thinking|beta|preview))?"
-    r"|(?:\d+(?:-\d+)*-(?:opus|sonnet|haiku))(?:-\d{6,8})?(?:-(?:latest|thinking|beta|preview))?)"
+    r"gemini-[1-9](?:\.\d)?-(?:pro|flash|ultra|nano|lite)(?:-(?:preview|thinking|experimental|exp|latest))?"
+    r"|claude-(?:(?:opus|sonnet|haiku)-[1-9](?:-[1-9])?(?:-(?:latest|thinking|beta|preview))?"
+    r"|[1-9](?:-[1-9])?-(?:opus|sonnet|haiku)(?:-\d{8})?(?:-(?:latest|thinking|beta|preview))?)"
     r")$"
 )
 
@@ -638,7 +639,8 @@ def _safe_antigravity_model_ids(model_ids: list[str]) -> list[str]:
     return [
         model_id
         for model_id in model_ids
-        if _ANTIGRAVITY_PICKER_MODEL_ID.fullmatch(model_id.lower())
+        if len(model_id) <= _MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH
+        and _ANTIGRAVITY_PICKER_MODEL_ID.fullmatch(model_id.lower())
     ]
 
 
