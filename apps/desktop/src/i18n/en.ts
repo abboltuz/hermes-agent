@@ -1114,7 +1114,28 @@ export const en: Translations = {
         title: 'Local / custom endpoint',
         description: 'Point Hermes at any OpenAI-compatible endpoint (Zyphra, vLLM, llama.cpp, Ollama, etc).'
       },
-      loading: 'Loading providers...'
+      loading: 'Loading providers...',
+      antigravity: {
+        title: 'Antigravity accounts',
+        description: 'Manage the accounts used by Antigravity without exposing account credentials.',
+        projectId: 'Project ID',
+        connect: 'Connect account',
+        connectFailed: 'Could not start Antigravity sign-in',
+        loadFailed: 'Could not load Antigravity accounts.',
+        mutationFailed: 'Could not update Antigravity account.',
+        emptyTitle: 'No Antigravity accounts',
+        empty: 'Connect an account to get started.',
+        enabled: 'Enabled',
+        disabled: 'Disabled',
+        priority: 'Priority',
+        priorityFor: account => `Priority for Antigravity account ${account}`,
+        priorityInvalid: 'Priority must be between 1 and 999999.',
+        savePriority: 'Save priority',
+        enableAccount: account => `Enable Antigravity account ${account}`,
+        accountLabel: account => `Antigravity account ${account}`,
+        removeAccount: account => `Remove Antigravity account ${account}`,
+        removeConfirm: 'Remove this Antigravity account?'
+      }
     },
     sessions: {
       loading: 'Loading archived sessions…',

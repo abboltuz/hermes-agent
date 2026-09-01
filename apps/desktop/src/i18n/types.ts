@@ -962,6 +962,27 @@ export interface Translations {
         description: string
       }
       loading: string
+      antigravity: {
+        title: string
+        description: string
+        projectId: string
+        connect: string
+        connectFailed: string
+        loadFailed: string
+        mutationFailed: string
+        emptyTitle: string
+        empty: string
+        enabled: string
+        disabled: string
+        priority: string
+        priorityFor: (account: string) => string
+        priorityInvalid: string
+        savePriority: string
+        enableAccount: (account: string) => string
+        accountLabel: (account: string) => string
+        removeAccount: (account: string) => string
+        removeConfirm: string
+      }
     }
     sessions: {
       loading: string
