@@ -51,12 +51,14 @@ const rpc: Record<keyof AntigravityRpc, ReturnType<typeof vi.fn>> = {
 }
 
 function deferred<T>() {
+  let reject!: (reason?: unknown) => void
   let resolve!: (value: T) => void
-  const promise = new Promise<T>(innerResolve => {
+  const promise = new Promise<T>((innerResolve, innerReject) => {
     resolve = innerResolve
+    reject = innerReject
   })
 
-  return { promise, resolve }
+  return { promise, reject, resolve }
 }
 
 async function renderAccounts() {
@@ -108,6 +110,25 @@ describe('AntigravityAccounts', () => {
     await waitFor(() => expect(rpc.listAccounts).toHaveBeenCalledTimes(2))
     expect(createAntigravityRpc).toHaveBeenCalledWith(requestGateway, expect.any(Function))
     expect(createAntigravityRpc.mock.calls[0][1]()).toBe('default')
+  })
+
+  it('renders an initial load failure and lets the user retry it', async () => {
+    const initialList = deferred<{ accounts: AntigravityAccount[] }>()
+    rpc.listAccounts.mockReturnValueOnce(initialList.promise).mockResolvedValueOnce(snapshot([account('1')]))
+    await renderAccounts()
+
+    await act(async () => {
+      initialList.reject(new Error('private bridge diagnostic'))
+    })
+    expect(await screen.findByText('Could not load Antigravity accounts.')).toBeTruthy()
+    expect(screen.queryByText('Loading…')).toBeNull()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    })
+
+    expect(await screen.findByRole('switch', { name: /enable antigravity account/i })).toBeTruthy()
+    expect(rpc.listAccounts).toHaveBeenCalledTimes(2)
   })
 
   it('prevents duplicate mutations and preserves the row after a failed enabled update', async () => {
@@ -176,6 +197,20 @@ describe('AntigravityAccounts', () => {
     expect(rpc.cancelOAuth).toHaveBeenCalledWith(oauthStart.sessionId)
   })
 
+  it('prevents a duplicate OAuth start while the first start is pending', async () => {
+    const start = deferred<typeof oauthStart>()
+    rpc.startOAuth.mockReturnValueOnce(start.promise)
+    await renderAccounts()
+    await screen.findByText('Antigravity accounts')
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+    })
+
+    expect(rpc.startOAuth).toHaveBeenCalledTimes(1)
+  })
+
   it('cancels OAuth when the settings surface unmounts', async () => {
     const view = await renderAccounts()
     await screen.findByText('Antigravity accounts')
@@ -185,6 +220,53 @@ describe('AntigravityAccounts', () => {
     view.unmount()
 
     expect(rpc.cancelOAuth).toHaveBeenCalledWith(oauthStart.sessionId)
+  })
+
+  it('cancels a pending OAuth start without opening or polling after unmount', async () => {
+    const start = deferred<typeof oauthStart>()
+    rpc.startOAuth.mockReturnValueOnce(start.promise)
+    const view = await renderAccounts()
+    await screen.findByText('Antigravity accounts')
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+    })
+    await waitFor(() => expect(rpc.startOAuth).toHaveBeenCalledTimes(1))
+    view.unmount()
+
+    await act(async () => {
+      start.resolve(oauthStart)
+    })
+
+    await waitFor(() => expect(rpc.cancelOAuth).toHaveBeenCalledWith(oauthStart.sessionId))
+    expect(openExternalLink).not.toHaveBeenCalled()
+    expect(rpc.pollOAuth).not.toHaveBeenCalled()
+    expect(createAntigravityRpc.mock.calls.at(-1)?.[1]()).toBe('default')
+  })
+
+  it('cancels a pending OAuth start under its original profile after a profile transition', async () => {
+    const start = deferred<typeof oauthStart>()
+    rpc.startOAuth.mockReturnValueOnce(start.promise)
+    await renderAccounts()
+    await screen.findByText('Antigravity accounts')
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+    })
+    await waitFor(() => expect(rpc.startOAuth).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      $activeGatewayProfile.set('other')
+    })
+    await waitFor(() => expect(rpc.listAccounts).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
+      start.resolve(oauthStart)
+    })
+
+    await waitFor(() => expect(rpc.cancelOAuth).toHaveBeenCalledWith(oauthStart.sessionId))
+    expect(openExternalLink).not.toHaveBeenCalled()
+    expect(rpc.pollOAuth).not.toHaveBeenCalled()
+    expect(createAntigravityRpc.mock.calls.at(-1)?.[1]()).toBe('default')
   })
 
   it('clears rows and ignores stale account responses when the active profile changes', async () => {

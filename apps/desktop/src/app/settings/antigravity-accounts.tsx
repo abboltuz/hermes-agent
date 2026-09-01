@@ -23,6 +23,11 @@ import { EmptyState, ListRow, SettingsSection } from './primitives'
 const MAX_PRIORITY = 999_999
 const COMPLETE_OAUTH_STATUSES = new Set(['approved', 'complete', 'completed', 'success', 'succeeded'])
 
+interface PendingOAuthStart {
+  controller: AbortController
+  profile: string
+}
+
 interface OAuthFlow {
   controller: AbortController
   profile: string
@@ -58,6 +63,7 @@ function AntigravityAccountsForProfile() {
   const [connecting, setConnecting] = useState(false)
   const generation = useRef(0)
   const oauth = useRef<OAuthFlow | null>(null)
+  const pendingOAuthStart = useRef<PendingOAuthStart | null>(null)
 
   const applySnapshot = useCallback((snapshot: AntigravityAccountsSnapshot, expectedProfile: string, expectedGeneration: number) => {
     if (expectedProfile !== $activeGatewayProfile.get() || expectedGeneration !== generation.current) {
@@ -88,8 +94,17 @@ function AntigravityAccountsForProfile() {
   }, [applySnapshot, rpc])
 
   const cancelOAuth = useCallback(
-    (flow = oauth.current) => {
+    (flow = oauth.current, updateState = true) => {
+      const pending = pendingOAuthStart.current
+      if (pending) {
+        pendingOAuthStart.current = null
+        pending.controller.abort()
+      }
+
       if (!flow) {
+        if (updateState && pending) {
+          setConnecting(false)
+        }
         return
       }
 
@@ -100,7 +115,9 @@ function AntigravityAccountsForProfile() {
       flow.controller.abort()
       const scopedRpc = createAntigravityRpc(requestGateway, () => flow.profile)
       void scopedRpc.cancelOAuth(flow.sessionId).catch(() => undefined)
-      setConnecting(false)
+      if (updateState) {
+        setConnecting(false)
+      }
     },
     [requestGateway]
   )
@@ -114,7 +131,7 @@ function AntigravityAccountsForProfile() {
 
     return () => {
       controller.abort()
-      cancelOAuth()
+      cancelOAuth(undefined, false)
     }
   }, [cancelOAuth, refresh])
 
@@ -200,39 +217,42 @@ function AntigravityAccountsForProfile() {
   )
 
   const connect = async () => {
-    if (connecting) {
+    if (connecting || pendingOAuthStart.current) {
       return
     }
 
-    const expectedProfile = $activeGatewayProfile.get()
-    const controller = new AbortController()
+    const pending: PendingOAuthStart = {
+      controller: new AbortController(),
+      profile: $activeGatewayProfile.get()
+    }
+    pendingOAuthStart.current = pending
     setConnecting(true)
 
     try {
-      const start = await rpc.startOAuth(projectId.trim(), { signal: controller.signal })
+      const start = await rpc.startOAuth(projectId.trim(), { signal: pending.controller.signal })
 
-      if (expectedProfile !== $activeGatewayProfile.get()) {
-        const scopedRpc = createAntigravityRpc(requestGateway, () => expectedProfile)
-        void scopedRpc.cancelOAuth(start.sessionId, { signal: controller.signal }).catch(() => undefined)
-
+      if (pendingOAuthStart.current !== pending || pending.profile !== $activeGatewayProfile.get()) {
+        const scopedRpc = createAntigravityRpc(requestGateway, () => pending.profile)
+        void scopedRpc.cancelOAuth(start.sessionId).catch(() => undefined)
         return
       }
 
+      pendingOAuthStart.current = null
       // startOAuth validates the authorization URL before this presentation layer receives it.
       openExternalLink(start.authUrl)
       const flow: OAuthFlow = {
-        controller,
-        profile: expectedProfile,
+        controller: pending.controller,
+        profile: pending.profile,
         sessionId: start.sessionId,
         timer: setInterval(() => void poll(flow), start.pollIntervalMs)
       }
       oauth.current = flow
     } catch (reason) {
-      if (!isAbort(reason)) {
-        notifyError(reason, copy.connectFailed)
-      }
-    } finally {
-      if (oauth.current === null) {
+      if (pendingOAuthStart.current === pending) {
+        pendingOAuthStart.current = null
+        if (!isAbort(reason)) {
+          notifyError(reason, copy.connectFailed)
+        }
         setConnecting(false)
       }
     }
@@ -269,17 +289,17 @@ function AntigravityAccountsForProfile() {
             </Button>
           )}
         </div>
-        {accounts === null ? (
-          <div aria-live="polite" className="py-5 text-center text-sm text-muted-foreground" role="status">
-            <Loader2 className="mr-2 inline size-4 animate-spin" />
-            {t.common.loading}
-          </div>
-        ) : error ? (
+        {error ? (
           <div className="grid justify-items-center gap-3 py-5 text-center">
             <EmptyState description={copy.loadFailed} title={t.common.error} />
             <Button onClick={() => void refresh()} size="sm" type="button" variant="outline">
               {t.common.retry}
             </Button>
+          </div>
+        ) : accounts === null ? (
+          <div aria-live="polite" className="py-5 text-center text-sm text-muted-foreground" role="status">
+            <Loader2 className="mr-2 inline size-4 animate-spin" />
+            {t.common.loading}
           </div>
         ) : accounts.length === 0 ? (
           <EmptyState description={copy.empty} title={copy.emptyTitle} />
