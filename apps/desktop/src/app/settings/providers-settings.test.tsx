@@ -26,7 +26,7 @@ vi.mock('@/store/onboarding', () => ({
 }))
 
 vi.mock('./antigravity-accounts', () => ({
-  AntigravityAccounts: () => <div data-testid="antigravity-accounts" />
+  AntigravityAccounts: () => <section data-testid="antigravity-accounts">Managed Antigravity accounts</section>
 }))
 
 function provider(id: string, loggedIn: boolean, patch: Partial<OAuthProvider> = {}): OAuthProvider {
@@ -240,12 +240,50 @@ describe('ProvidersSettings', () => {
     await waitFor(() => expect(startManualLocalEndpoint).toHaveBeenCalledWith(null))
   })
 
-  it('starts Cursor browser sign-in through the normal in-app path', async () => {
-    listOAuthProviders.mockResolvedValue({ providers: [provider('cursor', false, { flow: 'browser_poll' })] })
+  it('keeps Antigravity on its dedicated account surface while normal providers retain generic onboarding', async () => {
+    listOAuthProviders.mockResolvedValue({
+      providers: [
+        provider('antigravity', false, {
+          cli_command: 'hermes auth add antigravity',
+          flow: 'external',
+          name: 'Google Antigravity'
+        }),
+        provider('cursor', false, { flow: 'browser_poll' })
+      ]
+    })
+
     await renderProvidersSettings()
+
+    const accounts = screen.getByTestId('antigravity-accounts')
     fireEvent.click(await screen.findByRole('button', { name: /Other providers/ }))
-    fireEvent.click(await screen.findByText('Cursor'))
+    const cursor = await screen.findByText('Cursor')
+
+    expect(accounts.compareDocumentPosition(cursor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.queryByText('Google Antigravity')).toBeNull()
+    expect(screen.queryByText('hermes auth add antigravity')).toBeNull()
+
+    fireEvent.click(cursor)
+
     await waitFor(() => expect(startManualProviderOAuth).toHaveBeenCalledWith('cursor'))
+    expect(startManualProviderOAuth).not.toHaveBeenCalledWith('antigravity')
+  })
+
+  it('keeps the Accounts view available when Antigravity is the only OAuth provider', async () => {
+    listOAuthProviders.mockResolvedValue({
+      providers: [
+        provider('antigravity', false, {
+          cli_command: 'hermes auth add antigravity',
+          flow: 'external',
+          name: 'Google Antigravity'
+        })
+      ]
+    })
+
+    await renderProvidersSettings()
+
+    expect(await screen.findByTestId('antigravity-accounts')).toBeTruthy()
+    expect(screen.queryByText('Google Antigravity')).toBeNull()
+    expect(startManualProviderOAuth).not.toHaveBeenCalledWith('antigravity')
   })
 
   it('removes connected Cursor through the normal disconnect API without terminal affordances', async () => {

@@ -449,6 +449,7 @@ export function ProvidersSettings({
   }
 
   const hasOauth = oauthProviders.length > 0
+  const genericOauthProviders = oauthProviders.filter(provider => provider.id !== 'antigravity')
   // The sidebar subnav owns the Accounts/API-keys split now; with no OAuth
   // providers there's nothing for the "Accounts" view to show, so fall to keys.
   const showApiKeys = view === 'keys' || (!hasOauth && view !== 'custom-endpoints')
@@ -510,14 +511,14 @@ export function ProvidersSettings({
 
   return (
     <SettingsContent>
+      <AntigravityAccounts />
       <OAuthPicker
         disconnecting={disconnecting}
         onDisconnect={provider => void handleDisconnect(provider)}
         onTerminalDisconnect={provider => void handleTerminalDisconnect(provider)}
         onWantApiKey={() => onViewChange('keys')}
-        providers={oauthProviders}
+        providers={genericOauthProviders}
       />
-      <AntigravityAccounts />
     </SettingsContent>
   )
 }
