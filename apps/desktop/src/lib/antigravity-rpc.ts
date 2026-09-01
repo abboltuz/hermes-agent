@@ -64,10 +64,6 @@ export interface AntigravityRpc {
   startOAuth(projectId: string, options?: AntigravityRequestOptions): Promise<AntigravityOAuthStart>
 }
 
-interface AccountsEnvelope {
-  accounts: unknown
-}
-
 interface SnapshotEnvelope {
   snapshot: unknown
 }
@@ -155,13 +151,7 @@ function parseSnapshot(value: unknown): AntigravityAccountsSnapshot {
 }
 
 function parseAccountsEnvelope(value: unknown): AntigravityAccountsSnapshot {
-  if (!isPlainRecord(value)) {
-    throw invalidResponse()
-  }
-
-  const envelope: AccountsEnvelope = { accounts: value.accounts }
-
-  return parseSnapshot(envelope.accounts)
+  return parseSnapshot(value)
 }
 
 function parseSnapshotEnvelope(value: unknown): AntigravityAccountsSnapshot {

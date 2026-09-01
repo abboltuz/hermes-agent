@@ -13,7 +13,7 @@ function requestStub(): AntigravityGatewayRequest {
   const responseForMethod = (method: string): unknown => {
     switch (method) {
       case ANTIGRAVITY_RPC_METHODS.list:
-        return { accounts: snapshot }
+        return snapshot
 
       case ANTIGRAVITY_RPC_METHODS.enabled:
 
