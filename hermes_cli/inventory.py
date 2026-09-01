@@ -610,8 +610,29 @@ def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | No
     if any(str(row.get("slug", "")).lower() == slug for row in rows):
         return None
 
+    excluded = {
+        str(provider).strip().lower()
+        for provider in (ctx.excluded_providers or [])
+        if provider
+    }
+    if slug in excluded:
+        return None
+
     current = str(ctx.current_provider or "").strip().lower() == slug
-    explicitly_configured = isinstance(ctx.user_providers, dict) and slug in ctx.user_providers
+    provider_config = next(
+        (
+            config
+            for name, config in (ctx.user_providers or {}).items()
+            if str(name).strip().lower() == slug
+        ),
+        None,
+    )
+    if provider_config is None:
+        explicitly_configured = False
+    else:
+        from hermes_cli.config import is_provider_enabled
+
+        explicitly_configured = is_provider_enabled(provider_config)
     if not current and not explicitly_configured:
         return None
 

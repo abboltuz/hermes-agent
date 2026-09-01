@@ -719,6 +719,53 @@ def test_antigravity_configured_provider_preserves_fallback_and_unconfigured_sem
     assert "bridge" not in str(skeleton).lower()
 
 
+def test_antigravity_disabled_config_is_hidden_unless_it_is_current():
+    """A disabled managed provider follows ordinary picker enable semantics."""
+    disabled = ConfigContext(
+        current_provider="openrouter",
+        current_model="",
+        current_base_url="",
+        user_providers={"antigravity": {"enabled": False}},
+        custom_providers=[],
+    )
+    current = ConfigContext(
+        current_provider="antigravity",
+        current_model="antigravity-gemini-3-pro",
+        current_base_url="",
+        user_providers={"antigravity": {"enabled": False}},
+        custom_providers=[],
+    )
+
+    with _list_auth_returning([]):
+        disabled_payload = build_models_payload(disabled, explicit_only=True)
+        current_payload = build_models_payload(current, explicit_only=True)
+
+    disabled_slugs = {row["slug"] for row in disabled_payload["providers"]}
+    current_row = next(
+        row for row in current_payload["providers"] if row["slug"] == "antigravity"
+    )
+    assert "antigravity" not in disabled_slugs
+    assert current_row["is_current"] is True
+
+
+def test_antigravity_configured_row_honors_excluded_providers():
+    """Catalog exclusions apply equally to managed provider row injection."""
+    ctx = ConfigContext(
+        current_provider="nous",
+        current_model="",
+        current_base_url="",
+        user_providers={"antigravity": {}},
+        custom_providers=[],
+        excluded_providers=[" ANTIGRAVITY "],
+    )
+    rows = [_nous_row()]
+
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx, explicit_only=True)
+
+    assert {row["slug"] for row in payload["providers"]} == {"nous"}
+
+
 # ─── _apply_featured (one-flagship-per-lab shortlist) ──────────────────
 
 
