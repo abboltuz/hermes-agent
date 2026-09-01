@@ -95,6 +95,16 @@ def _rpc(server, method: str, params: dict[str, Any]) -> dict[str, Any]:
     return server.handle_request({"jsonrpc": "2.0", "id": method, "method": method, "params": params})
 
 
+def _install_accepted_profiles(monkeypatch, tmp_path, *names: str) -> dict[str, Path]:
+    profiles = importlib.import_module("hermes_cli.profiles")
+    root = tmp_path / "profiles"
+    homes = {name: root / name for name in names}
+    for home in homes.values():
+        home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: root)
+    return homes
+
+
 def test_registers_all_antigravity_rpc_methods_for_real_json_rpc_dispatch(server):
     assert {
         "antigravity.accounts.list",
@@ -117,8 +127,7 @@ def test_registers_all_antigravity_rpc_methods_for_real_json_rpc_dispatch(server
 
 
 def test_account_and_oauth_calls_delegate_under_the_requested_profile(server, monkeypatch, tmp_path):
-    homes = {"alpha": tmp_path / "alpha"}
-    homes["alpha"].mkdir()
+    homes = _install_accepted_profiles(monkeypatch, tmp_path, "alpha")
     instances: list[FakeAccountService] = []
     monkeypatch.setattr(server, "_profile_home", lambda profile: homes.get(profile))
     monkeypatch.setattr(
@@ -155,24 +164,70 @@ def test_account_and_oauth_calls_delegate_under_the_requested_profile(server, mo
     ]
 
 
-def test_antigravity_rejects_path_shaped_profile_before_service_allocation(server, monkeypatch, tmp_path):
-    factory_calls = []
-    monkeypatch.setattr(server, "_antigravity_service_factory", lambda: factory_calls.append(True))
+def test_antigravity_profile_selector_rejects_missing_or_hostile_names_before_scope_or_allocation(
+    server, monkeypatch, tmp_path
+):
+    profiles = importlib.import_module("hermes_cli.profiles")
+    launch_home = Path(server._hermes_home).resolve()
+    launch_service_home = Path(server.get_hermes_home()).resolve()
+    profiles_root = tmp_path / "profiles"
+    alpha_home = profiles_root / "alpha"
+    alpha_home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: launch_home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
 
-    for profile in (str(tmp_path), "../outside"):
+    profile_home_calls = []
+
+    def profile_home(profile):
+        profile_home_calls.append(profile)
+        return alpha_home if profile == "alpha" else None
+
+    factory_homes = []
+    instances: list[FakeAccountService] = []
+
+    def factory():
+        home = Path(server.get_hermes_home()).resolve()
+        factory_homes.append(home)
+        instance = FakeAccountService("alpha" if home == alpha_home else "launch")
+        instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(server, "_profile_home", profile_home)
+    monkeypatch.setattr(server, "_antigravity_service_factory", factory)
+
+    for profile in ("ghost", "Ghost", str(tmp_path), "../outside", "alpha/..", r"alpha\\outside"):
         response = _rpc(server, "antigravity.accounts.list", {"profile": profile})
         assert response["error"] == {
             "code": -32602,
             "message": "invalid Antigravity parameters",
         }
 
-    assert factory_calls == []
+    assert profile_home_calls == []
+    assert factory_homes == []
+
+    assert _rpc(server, "antigravity.accounts.list", {"profile": "AlPhA"})["result"] == {
+        "accounts": {"accounts": [{"id": "alpha"}]}
+    }
+    assert _rpc(server, "antigravity.accounts.list", {})["result"] == {
+        "accounts": {"accounts": [{"id": "launch"}]}
+    }
+    assert _rpc(server, "antigravity.accounts.list", {"profile": " "})["result"] == {
+        "accounts": {"accounts": [{"id": "launch"}]}
+    }
+    assert _rpc(server, "antigravity.accounts.list", {"profile": "Default"})["result"] == {
+        "accounts": {"accounts": [{"id": "launch"}]}
+    }
+
+    assert profile_home_calls == ["alpha", None, " ", "default"]
+    assert factory_homes == [alpha_home, launch_service_home]
+    assert [instance.calls for instance in instances] == [
+        [("list_accounts",)],
+        [("list_accounts",), ("list_accounts",), ("list_accounts",)],
+    ]
 
 
 def test_profile_registry_reuses_only_its_own_service_and_shutdown_closes_once(server, monkeypatch, tmp_path):
-    homes = {name: tmp_path / name for name in ("alpha", "beta")}
-    for home in homes.values():
-        home.mkdir()
+    homes = _install_accepted_profiles(monkeypatch, tmp_path, "alpha", "beta")
     instances: list[FakeAccountService] = []
     monkeypatch.setattr(server, "_profile_home", lambda profile: homes.get(profile))
     monkeypatch.setattr(
@@ -227,9 +282,7 @@ def test_service_failures_are_mapped_to_fixed_safe_errors_without_leaking_detail
 
 
 def test_shutdown_observes_cleanup_failure_without_leaking_or_stopping_other_services(server, monkeypatch, caplog, tmp_path):
-    homes = {name: tmp_path / name for name in ("first", "second")}
-    for home in homes.values():
-        home.mkdir()
+    homes = _install_accepted_profiles(monkeypatch, tmp_path, "first", "second")
     monkeypatch.setattr(server, "_profile_home", lambda profile: homes.get(profile))
     services = [
         FakeAccountService("first", close_fail=RuntimeError("secret cleanup marker")),
@@ -311,8 +364,7 @@ def test_shutdown_waits_for_and_closes_an_inflight_service_allocation(server, mo
 def test_antigravity_dispatch_uses_pool_and_preserves_request_profile_scope(
     server, monkeypatch, tmp_path
 ):
-    home = tmp_path / "alpha"
-    home.mkdir()
+    home = _install_accepted_profiles(monkeypatch, tmp_path, "alpha")["alpha"]
     started = threading.Event()
     release = threading.Event()
     writes = []

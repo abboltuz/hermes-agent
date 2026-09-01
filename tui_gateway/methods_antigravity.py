@@ -312,14 +312,23 @@ def register(server) -> None:
 
                 canonical = profiles_mod.normalize_profile_name(profile)
                 profiles_mod.validate_profile_name(canonical)
-                home = Path(profiles_mod.get_profile_dir(canonical)).resolve()
+                home = Path(profiles_mod.get_profile_dir(canonical)).resolve(strict=True)
                 if canonical == "default":
-                    if home != profiles_mod._get_default_hermes_home().resolve():
+                    if (
+                        not home.is_dir()
+                        or home != profiles_mod._get_default_hermes_home().resolve(strict=True)
+                    ):
                         raise ValueError("default profile home mismatch")
                 else:
-                    root = profiles_mod._get_profiles_root().resolve()
-                    if home != root / canonical:
-                        raise ValueError("profile home escapes profiles root")
+                    root = profiles_mod._get_profiles_root().resolve(strict=True)
+                    candidate = root / canonical
+                    if (
+                        candidate.parent != root
+                        or candidate.is_symlink()
+                        or not candidate.is_dir()
+                        or home != candidate.resolve(strict=True)
+                    ):
+                        raise ValueError("profile home is not an accepted profile directory")
             except Exception:
                 return server._err(rid, *server._ANTIGRAVITY_INVALID_PARAMS)
             scoped_params = dict(params)
