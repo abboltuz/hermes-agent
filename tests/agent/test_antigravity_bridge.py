@@ -10,6 +10,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -83,7 +84,8 @@ def test_antigravity_error_redacts_bearer_token():
 
 def test_antigravity_http_errors_never_expose_upstream_body_or_token():
     from agent.antigravity_bridge_transport import (
-        AntigravityBridgeEndpoint, AntigravityBridgeError, AntigravityHTTPTransport,
+        AntigravityBridgeEndpoint, AntigravityBridgeError, AntigravityBridgeHTTPError,
+        AntigravityHTTPTransport,
     )
 
     class ErrorHandler(BaseHTTPRequestHandler):
@@ -103,8 +105,11 @@ def test_antigravity_http_errors_never_expose_upstream_body_or_token():
         transport = AntigravityHTTPTransport(
             AntigravityBridgeEndpoint(f"http://127.0.0.1:{server.server_port}", token)
         )
-        with pytest.raises(AntigravityBridgeError) as exc_info:
+        with pytest.raises(AntigravityBridgeHTTPError) as exc_info:
             transport.request("GET", "/v1/models")
+        assert isinstance(exc_info.value, AntigravityBridgeHTTPError)
+        assert isinstance(exc_info.value, AntigravityBridgeError)
+        assert exc_info.value.status_code == 502
         assert str(exc_info.value) == "bridge HTTP 502"
         assert "private-account-id" not in str(exc_info.value)
         assert token not in str(exc_info.value)
@@ -522,3 +527,219 @@ def test_antigravity_command_resolution_fails_closed_for_missing_managed_artifac
     from agent.antigravity_bridge_transport import resolve_antigravity_bridge_command
 
     assert resolve_antigravity_bridge_command() is None
+
+
+class _AccountTransport:
+    def __init__(self, responses: dict[tuple[str, str], Any]):
+        self.responses = responses
+        self.calls: list[tuple[str, str, Any]] = []
+
+    def json_request(self, method: str, path: str, payload: Any = None, **_kwargs: Any) -> Any:
+        self.calls.append((method, path, payload))
+        return self.responses[(method, path)]
+
+
+def _account_client(responses: dict[tuple[str, str], Any]):
+    from agent.antigravity_bridge_client import AntigravityBridgeClient
+
+    client = AntigravityBridgeClient(bridge_command="unused")
+    transport = _AccountTransport(responses)
+    client._process = object()  # type: ignore[assignment]
+    cast(Any, client)._AntigravityBridgeClient__transport = transport
+    return client, transport
+
+
+ACCOUNT_ID = "acct_11111111-1111-4111-8111-111111111111"
+OAUTH_ID = "22222222-2222-4222-8222-222222222222"
+PUBLIC_AUTH_URL = (
+    "https://accounts.google.com/o/oauth2/v2/auth?client_id=public-client"
+    "&response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
+    "&scope=openid&code_challenge=public-challenge&code_challenge_method=S256"
+    "&state=public-state&access_type=offline&prompt=consent"
+)
+
+
+def _public_snapshot() -> dict[str, Any]:
+    return {
+        "total": 1,
+        "enabled": 1,
+        "available": 1,
+        "limited": 0,
+        "connected": True,
+        "current": {"claude": ACCOUNT_ID, "gemini": None},
+        "accounts": [{
+            "id": ACCOUNT_ID,
+            "email": "safe@example.test",
+            "enabled": True,
+            "priority": 1,
+            "status": "available",
+            "addedAt": 10,
+            "lastUsed": 11,
+            "statusUntil": None,
+            "quota": {
+                "claude": {"remainingFraction": 0.5, "resetTime": "tomorrow", "modelCount": 1},
+            },
+        }],
+    }
+
+
+def test_antigravity_account_facade_uses_exact_routes_payloads_and_detaches_results():
+    snapshot = _public_snapshot()
+    client, transport = _account_client({
+        ("GET", "/v1/accounts"): snapshot,
+        ("PUT", f"/v1/accounts/{ACCOUNT_ID}/enabled"): snapshot,
+        ("PUT", f"/v1/accounts/{ACCOUNT_ID}/priority"): snapshot,
+        ("DELETE", f"/v1/accounts/{ACCOUNT_ID}"): snapshot,
+    })
+
+    listed = client.list_accounts()
+    assert client.set_account_enabled(ACCOUNT_ID, False)["accounts"][0]["enabled"] is True
+    assert client.set_account_priority(ACCOUNT_ID, 2)["accounts"][0]["priority"] == 1
+    assert client.remove_account(ACCOUNT_ID)["total"] == 1
+    assert transport.calls == [
+        ("GET", "/v1/accounts", None),
+        ("PUT", f"/v1/accounts/{ACCOUNT_ID}/enabled", {"enabled": False}),
+        ("PUT", f"/v1/accounts/{ACCOUNT_ID}/priority", {"priority": 2}),
+        ("DELETE", f"/v1/accounts/{ACCOUNT_ID}", None),
+    ]
+    listed["accounts"][0]["quota"]["claude"]["model_count"] = 99
+    assert snapshot["accounts"][0]["quota"]["claude"]["modelCount"] == 1
+
+
+def test_antigravity_account_facade_rejects_invalid_arguments_without_a_transport_call():
+    from agent.antigravity_bridge_transport import AntigravityBridgeError
+
+    client, transport = _account_client({})
+    invalid_ids = ["", "acct_not-a-uuid", "acct_AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", f"{ACCOUNT_ID}/escape"]
+    for account_id in invalid_ids:
+        for operation in (
+            lambda: client.set_account_enabled(account_id, True),
+            lambda: client.set_account_priority(account_id, 1),
+            lambda: client.remove_account(account_id),
+        ):
+            with pytest.raises(AntigravityBridgeError) as exc_info:
+                operation()
+            assert str(exc_info.value) == "invalid Antigravity bridge request"
+    for operation in (
+        lambda: client.set_account_enabled(ACCOUNT_ID, 1),
+        lambda: client.set_account_priority(ACCOUNT_ID, True),
+        lambda: client.set_account_priority(ACCOUNT_ID, 0),
+        lambda: client.start_oauth("bad\nproject"),
+    ):
+        with pytest.raises(AntigravityBridgeError, match="invalid Antigravity bridge request"):
+            operation()
+    assert transport.calls == []
+
+
+def test_antigravity_oauth_facade_materializes_only_safe_public_fields():
+    start = {"sessionId": OAUTH_ID, "authUrl": PUBLIC_AUTH_URL, "status": "pending", "expiresAt": 999, "pollIntervalMs": 1000}
+    client, transport = _account_client({
+        ("POST", "/v1/accounts/oauth/start"): start,
+        ("GET", f"/v1/accounts/oauth/{OAUTH_ID}"): {"status": "approved"},
+        ("DELETE", f"/v1/accounts/oauth/{OAUTH_ID}"): {"status": "error", "errorCode": "provider_denied"},
+    })
+
+    assert client.start_oauth() == {"session_id": OAUTH_ID, "auth_url": PUBLIC_AUTH_URL, "flow": "browser_poll", "status": "pending", "expires_at": 999, "poll_interval_ms": 1000}
+    assert client.poll_oauth(OAUTH_ID) == {"status": "approved"}
+    assert client.cancel_oauth(OAUTH_ID) == {"status": "error", "error_code": "provider_denied"}
+    assert transport.calls == [
+        ("POST", "/v1/accounts/oauth/start", {}),
+        ("GET", f"/v1/accounts/oauth/{OAUTH_ID}", None),
+        ("DELETE", f"/v1/accounts/oauth/{OAUTH_ID}", None),
+    ]
+
+
+def test_antigravity_facade_rejects_hostile_bridge_data_without_leaking_it():
+    from agent.antigravity_bridge_transport import AntigravityBridgeError
+
+    marker = "private-bridge-secret"
+    snapshot = _public_snapshot()
+    snapshot["accounts"][0]["refreshToken"] = marker
+    start = {"sessionId": OAUTH_ID, "authUrl": f"{PUBLIC_AUTH_URL}&verifier={marker}", "status": "pending", "expiresAt": 1, "pollIntervalMs": 1}
+    client, _transport = _account_client({
+        ("GET", "/v1/accounts"): snapshot,
+        ("POST", "/v1/accounts/oauth/start"): start,
+        ("GET", f"/v1/accounts/oauth/{OAUTH_ID}"): {"status": "error", "errorCode": marker},
+    })
+    for operation in (client.list_accounts, client.start_oauth, lambda: client.poll_oauth(OAUTH_ID)):
+        with pytest.raises(AntigravityBridgeError) as exc_info:
+            operation()
+        assert str(exc_info.value) == "invalid Antigravity bridge response"
+        assert marker not in str(exc_info.value)
+
+
+def test_antigravity_async_account_and_oauth_facade_matches_sync_contract():
+    from agent.antigravity_bridge_client import AsyncAntigravityBridgeClient
+
+    async def exercise():
+        client = AsyncAntigravityBridgeClient(bridge_command="unused")
+        sync, transport = _account_client({
+            ("GET", "/v1/accounts"): _public_snapshot(),
+            ("POST", "/v1/accounts/oauth/start"): {"sessionId": OAUTH_ID, "authUrl": PUBLIC_AUTH_URL, "status": "pending", "expiresAt": 9, "pollIntervalMs": 1},
+        })
+        client._sync = sync
+        assert (await client.list_accounts())["total"] == 1
+        assert (await client.start_oauth())["session_id"] == OAUTH_ID
+        assert transport.calls == [
+            ("GET", "/v1/accounts", None),
+            ("POST", "/v1/accounts/oauth/start", {}),
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_antigravity_account_and_oauth_facade_crosses_real_subprocess_boundary(tmp_path):
+    from agent.antigravity_bridge_client import AntigravityBridgeClient
+
+    child = tmp_path / "account_oauth_bridge.py"
+    child.write_text(
+        f'''import json, os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+token = os.environ["HERMES_ANTIGRAVITY_BRIDGE_TOKEN"]
+account_id = {ACCOUNT_ID!r}
+oauth_id = {OAUTH_ID!r}
+auth_url = {PUBLIC_AUTH_URL!r}
+snapshot = {{"total": 1, "enabled": 1, "available": 1, "limited": 0, "connected": True, "current": {{"claude": account_id, "gemini": None}}, "accounts": [{{"id": account_id, "email": "safe@example.test", "enabled": True, "priority": 1, "status": "available", "addedAt": 1, "lastUsed": 2, "statusUntil": None, "quota": {{}}}}]}}
+class H(BaseHTTPRequestHandler):
+    def reply(self, value):
+        body = json.dumps(value).encode(); self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def authorized(self): return self.headers.get("Authorization") == "Bearer " + token
+    def do_GET(self):
+        if not self.authorized(): self.send_error(401); return
+        if self.path == "/v1/accounts": self.reply(snapshot); return
+        if self.path == "/v1/accounts/oauth/" + oauth_id: self.reply({{"status": "approved"}}); return
+        self.send_error(404)
+    def do_PUT(self):
+        if not self.authorized(): self.send_error(401); return
+        length = int(self.headers.get("Content-Length", "0")); body = json.loads(self.rfile.read(length))
+        if self.path == "/v1/accounts/" + account_id + "/enabled" and body == {{"enabled": False}}: self.reply(snapshot); return
+        if self.path == "/v1/accounts/" + account_id + "/priority" and body == {{"priority": 2}}: self.reply(snapshot); return
+        self.send_error(400)
+    def do_DELETE(self):
+        if not self.authorized(): self.send_error(401); return
+        if self.path == "/v1/accounts/" + account_id: self.reply(snapshot); return
+        if self.path == "/v1/accounts/oauth/" + oauth_id: self.reply({{"status": "cancelled"}}); return
+        self.send_error(404)
+    def do_POST(self):
+        if not self.authorized(): self.send_error(401); return
+        length = int(self.headers.get("Content-Length", "0")); body = json.loads(self.rfile.read(length))
+        if self.path == "/v1/accounts/oauth/start" and body == {{}}: self.reply({{"sessionId": oauth_id, "authUrl": auth_url, "status": "pending", "expiresAt": 9, "pollIntervalMs": 1}}); return
+        self.send_error(400)
+    def log_message(self, *args): pass
+server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+print("antigravity-bridge ready " + json.dumps({{"protocol": "antigravity-openai-v1", "host": "127.0.0.1", "port": server.server_port}}), flush=True)
+server.serve_forever()
+''',
+        encoding="utf-8",
+    )
+    client = AntigravityBridgeClient(bridge_command=[sys.executable, str(child)])
+    try:
+        assert client.list_accounts()["accounts"][0]["email"] == "safe@example.test"
+        assert client.set_account_enabled(ACCOUNT_ID, False)["total"] == 1
+        assert client.set_account_priority(ACCOUNT_ID, 2)["total"] == 1
+        assert client.remove_account(ACCOUNT_ID)["total"] == 1
+        assert client.start_oauth()["session_id"] == OAUTH_ID
+        assert client.poll_oauth(OAUTH_ID) == {"status": "approved"}
+        assert client.cancel_oauth(OAUTH_ID) == {"status": "cancelled"}
+    finally:
+        client.close()

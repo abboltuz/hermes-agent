@@ -29,6 +29,14 @@ class AntigravityBridgeError(RuntimeError):
     """A safe, user-facing bridge failure."""
 
 
+class AntigravityBridgeHTTPError(AntigravityBridgeError):
+    """A bridge HTTP failure with only its safe status available to callers."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"bridge HTTP {status_code}")
+
+
 def redact_antigravity_text(text: str, token: str = "") -> str:
     result = str(text)
     if token:
@@ -201,7 +209,10 @@ class AntigravityHTTPTransport:
             with opener.open(request, timeout=timeout) as response:
                 data = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
-            raise AntigravityBridgeError(f"bridge HTTP {exc.code}") from None
+            code = exc.code
+            if isinstance(code, bool) or not isinstance(code, int) or not 100 <= code <= 599:
+                raise AntigravityBridgeError("Antigravity bridge request failed") from None
+            raise AntigravityBridgeHTTPError(code) from None
         except (urllib.error.URLError, OSError) as exc:
             raise AntigravityBridgeError("Antigravity bridge request failed") from exc
         if len(data) > MAX_RESPONSE_BYTES:
