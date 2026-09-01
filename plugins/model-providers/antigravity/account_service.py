@@ -94,6 +94,15 @@ class AntigravityAccountService:
         return False
 
 
+def _observe_close_task_exception(task: asyncio.Task[None]) -> None:
+    """Retrieve a terminal close failure without changing later await semantics."""
+    try:
+        task.exception()
+    except BaseException:
+        # A done callback must never surface an exception through the event loop.
+        pass
+
+
 class AsyncAntigravityAccountService:
     """Asynchronously delegate account management to one owned bridge client."""
 
@@ -140,6 +149,7 @@ class AsyncAntigravityAccountService:
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(self._client.close())
+            self._close_task.add_done_callback(_observe_close_task_exception)
         await asyncio.shield(self._close_task)
 
     async def __aenter__(self) -> "AsyncAntigravityAccountService":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 from typing import Any
 
@@ -342,6 +343,46 @@ async def test_async_close_survives_initiating_waiter_cancellation(safe_values):
 
     assert cleanup_finished.is_set()
     assert client.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_close_observes_failing_cleanup_after_sole_waiter_cancellation(safe_values):
+    _, AsyncAntigravityAccountService = _service_module()
+    client = _set_values(FakeAsyncClient(), safe_values)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    error = AntigravityBridgeError("safe close failure")
+
+    async def failing_close():
+        client.close_calls += 1
+        entered.set()
+        await release.wait()
+        raise error
+
+    client.close = failing_close
+    service = AsyncAntigravityAccountService(client=client)
+    loop = asyncio.get_running_loop()
+    contexts = []
+    original_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    try:
+        initiating_close = asyncio.create_task(service.close())
+        await entered.wait()
+        initiating_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await initiating_close
+
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        del service
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(original_handler)
+
+    assert client.close_calls == 1
+    assert not any(context.get("message") == "Task exception was never retrieved" for context in contexts)
 
 
 @pytest.mark.asyncio
