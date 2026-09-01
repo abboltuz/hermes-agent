@@ -638,6 +638,87 @@ def test_list_authenticated_providers_refresh_busts_cache():
         assert clear.call_count == 1
 
 
+# ─── Antigravity managed-provider inventory ─────────────────────────────
+
+
+def test_antigravity_current_provider_uses_filtered_live_catalog_without_api_key():
+    """A configured Antigravity subscription is a native picker row.
+
+    Its managed bridge is not an API-key endpoint, so the row must not depend
+    on a dummy credential. The inventory still filters a bridge result before
+    returning it to web and TUI consumers.
+    """
+    from agent.antigravity_bridge_client import filter_antigravity_models
+
+    live = [
+        "antigravity-gemini-3-pro",
+        "antigravity-claude-sonnet-4-6",
+        "embedding-001",
+        "bridge-secret-token",
+    ]
+    expected = filter_antigravity_models([{"id": model_id} for model_id in live]) or []
+    ctx = _empty_ctx(provider="antigravity", model="antigravity-gemini-3-pro")
+
+    with (
+        _list_auth_returning([]),
+        patch("hermes_cli.models.cached_provider_model_ids", return_value=live),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+
+    row = next(row for row in payload["providers"] if row["slug"] == "antigravity")
+    assert row["name"] == "Google Antigravity"
+    assert row["models"] == expected
+    assert row["total_models"] == len(expected)
+    assert row["is_current"] is True
+    assert row["authenticated"] is True
+    assert "key_env" not in row
+    assert "warning" not in row
+    assert "bridge" not in str(row).lower()
+    assert "secret" not in str(row).lower()
+
+
+def test_antigravity_configured_provider_preserves_fallback_and_unconfigured_semantics():
+    """Configured Antigravity gets its curated fallback; a setup skeleton does not."""
+    from agent.antigravity_bridge_client import CURATED_FALLBACK_MODELS
+
+    configured = ConfigContext(
+        current_provider="",
+        current_model="",
+        current_base_url="",
+        user_providers={"antigravity": {}},
+        custom_providers=[],
+    )
+    with (
+        _list_auth_returning([]),
+        patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=list(CURATED_FALLBACK_MODELS),
+        ),
+    ):
+        configured_payload = build_models_payload(
+            configured, explicit_only=True, picker_hints=True
+        )
+    configured_row = next(
+        row for row in configured_payload["providers"] if row["slug"] == "antigravity"
+    )
+    assert configured_row["models"] == sorted(CURATED_FALLBACK_MODELS)
+    assert configured_row["authenticated"] is True
+
+    unconfigured = _empty_ctx(provider="openrouter")
+    with _list_auth_returning([]):
+        unconfigured_payload = build_models_payload(
+            unconfigured, include_unconfigured=True, picker_hints=True
+        )
+    skeleton = next(
+        row for row in unconfigured_payload["providers"] if row["slug"] == "antigravity"
+    )
+    assert skeleton["models"] == []
+    assert skeleton["authenticated"] is False
+    assert skeleton["auth_type"] == "external_process"
+    assert skeleton["key_env"] == ""
+    assert "bridge" not in str(skeleton).lower()
+
+
 # ─── _apply_featured (one-flagship-per-lab shortlist) ──────────────────
 
 

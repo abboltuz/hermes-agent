@@ -200,6 +200,12 @@ def build_models_payload(
         excluded_providers=ctx.excluded_providers or [],
     )
 
+    managed_row = _antigravity_provider_row(rows, ctx)
+    if managed_row is not None:
+        rows = [managed_row] + [
+            row for row in rows if str(row.get("slug", "")).lower() != "antigravity"
+        ]
+
     moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:
         rows = [moa_row] + [r for r in rows if str(r.get("slug", "")).lower() != "moa"]
@@ -591,6 +597,52 @@ def _apply_custom_aliases(rows: list[dict]) -> None:
 # ─── Internal: row post-processing ──────────────────────────────────────
 
 
+def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | None:
+    """Build Antigravity's configured managed-transport row.
+
+    Antigravity intentionally has no API-key environment variable: accounts
+    live in its profile-scoped bridge service. A current selection or explicit
+    ``providers.antigravity`` entry is therefore sufficient to render its
+    native picker row. An unconfigured install remains a canonical setup
+    skeleton via :func:`_append_unconfigured_rows`.
+    """
+    slug = "antigravity"
+    if any(str(row.get("slug", "")).lower() == slug for row in rows):
+        return None
+
+    current = str(ctx.current_provider or "").strip().lower() == slug
+    explicitly_configured = isinstance(ctx.user_providers, dict) and slug in ctx.user_providers
+    if not current and not explicitly_configured:
+        return None
+
+    try:
+        from agent.antigravity_bridge_client import filter_antigravity_models
+        from hermes_cli.models import cached_provider_model_ids
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(slug)
+        if profile is None:
+            return None
+        discovered = cached_provider_model_ids(slug)
+        models = filter_antigravity_models(
+            [{"id": model_id} for model_id in discovered if isinstance(model_id, str)]
+        ) or []
+        return {
+            "slug": slug,
+            "name": profile.display_name or "Google Antigravity",
+            "is_current": current,
+            "is_user_defined": False,
+            "models": models,
+            "total_models": len(models),
+            "source": "managed",
+        }
+    except Exception:
+        # The provider's direct catalog path owns its fallback semantics. A
+        # genuinely unavailable profile simply remains absent rather than
+        # leaking bridge details into picker responses.
+        return None
+
+
 def _append_unconfigured_rows(
     rows: list[dict],
     ctx: ConfigContext,
@@ -729,6 +781,11 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
         if current_slug and slug == current_slug:
             kept.append(row)
             continue
+        if slug == "antigravity" and isinstance(ctx.user_providers, dict) and slug in ctx.user_providers:
+            # Antigravity is configured through its managed profile/account
+            # service, not an API-key environment variable.
+            kept.append(row)
+            continue
         if slug == "moa":
             # MoA is a virtual routing mode, not an independently configured
             # provider. Hide it from explicit-only pickers unless it is the
@@ -834,7 +891,11 @@ def _apply_picker_hints(rows: list[dict]) -> None:
         if not is_skeleton or row.get("is_user_defined"):
             continue
         cfg = PROVIDER_REGISTRY.get(row["slug"])
-        auth_type = cfg.auth_type if cfg else "api_key"
+        auth_type = (
+            "external_process"
+            if row["slug"] == "antigravity"
+            else (cfg.auth_type if cfg else "api_key")
+        )
         key_env = (
             cfg.api_key_env_vars[0]
             if (cfg and cfg.api_key_env_vars)
