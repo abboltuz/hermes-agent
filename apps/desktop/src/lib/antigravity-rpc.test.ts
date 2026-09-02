@@ -57,7 +57,7 @@ describe('createAntigravityRpc', () => {
     await expect(api.setAccountEnabled(ACCOUNT_ID, false, { signal })).resolves.toEqual(snapshot)
     await expect(api.setAccountPriority(ACCOUNT_ID, 2, { signal })).resolves.toEqual(snapshot)
     await expect(api.removeAccount(ACCOUNT_ID, { signal })).resolves.toEqual(snapshot)
-    await expect(api.startOAuth('project-a', { signal })).resolves.toMatchObject({
+    await expect(api.startOAuth({ signal })).resolves.toMatchObject({
       sessionId: SESSION_ID,
       status: 'pending'
     })
@@ -89,7 +89,7 @@ describe('createAntigravityRpc', () => {
     expect(request).toHaveBeenNthCalledWith(
       5,
       'antigravity.oauth.start',
-      { profile: 'alpha', project_id: 'project-a' },
+      { profile: 'alpha' },
       undefined,
       signal
     )
@@ -122,11 +122,11 @@ describe('createAntigravityRpc', () => {
     expect(request).toHaveBeenNthCalledWith(2, 'antigravity.accounts.list', { profile: 'beta' }, undefined, undefined)
   })
 
-  it('starts OAuth without project_id when the optional project ID is blank', async () => {
+  it('starts OAuth with options only and never includes project_id', async () => {
     const request = requestStub()
     const api = createAntigravityRpc(request, () => 'alpha')
 
-    await expect(api.startOAuth('')).resolves.toMatchObject({ sessionId: SESSION_ID, status: 'pending' })
+    await expect(api.startOAuth()).resolves.toMatchObject({ sessionId: SESSION_ID, status: 'pending' })
 
     expect(request).toHaveBeenCalledWith(ANTIGRAVITY_RPC_METHODS.start, { profile: 'alpha' }, undefined, undefined)
     const oauthStartCall = vi.mocked(request).mock.calls.find(([method]) => method === ANTIGRAVITY_RPC_METHODS.start)
@@ -167,9 +167,7 @@ describe('createAntigravityRpc', () => {
       (api: ReturnType<typeof createAntigravityRpc>) => api.setAccountPriority(ACCOUNT_ID, Number.MAX_SAFE_INTEGER + 1)
     ],
     ['fractional priority', (api: ReturnType<typeof createAntigravityRpc>) => api.setAccountPriority(ACCOUNT_ID, 1.5)],
-    ['non-string project id', (api: ReturnType<typeof createAntigravityRpc>) => Reflect.apply(api.startOAuth, api, [1])],
-    ['overlong project id', (api: ReturnType<typeof createAntigravityRpc>) => api.startOAuth('x'.repeat(4097))],
-    ['control-character project id', (api: ReturnType<typeof createAntigravityRpc>) => api.startOAuth('bad\nproject')],
+
     [
       'malformed OAuth poll session id',
       (api: ReturnType<typeof createAntigravityRpc>) => api.pollOAuth('not-a-session')
@@ -230,7 +228,7 @@ describe('createAntigravityRpc', () => {
       status: 'pending'
     }))
 
-    const startOAuth = createAntigravityRpc(hostileOAuth, () => 'alpha').startOAuth('project-a')
+    const startOAuth = createAntigravityRpc(hostileOAuth, () => 'alpha').startOAuth()
 
     await expect(startOAuth).rejects.toThrow('Invalid Antigravity response.')
     await startOAuth.catch(error => {
@@ -253,7 +251,7 @@ describe('createAntigravityRpc', () => {
       status: 'pending'
     }))
 
-    await expect(createAntigravityRpc(approvedOAuth, () => 'alpha').startOAuth('project-a')).resolves.toMatchObject({
+    await expect(createAntigravityRpc(approvedOAuth, () => 'alpha').startOAuth()).resolves.toMatchObject({
       authUrl,
       sessionId: SESSION_ID
     })
@@ -283,7 +281,7 @@ describe('createAntigravityRpc', () => {
       status: 1
     }))
 
-    await expect(createAntigravityRpc(malformedOAuth, () => 'alpha').startOAuth('project-a')).rejects.toThrow(
+    await expect(createAntigravityRpc(malformedOAuth, () => 'alpha').startOAuth()).rejects.toThrow(
       'Invalid Antigravity response.'
     )
   })

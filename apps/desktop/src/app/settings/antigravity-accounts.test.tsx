@@ -62,12 +62,12 @@ function deferred<T>() {
   return { promise, reject, resolve }
 }
 
-async function renderAccounts() {
+async function renderAccounts(onConfigSaved?: () => void) {
   const { AntigravityAccounts } = await import('./antigravity-accounts')
 
   return render(
     <>
-      <AntigravityAccounts />
+      <AntigravityAccounts onConfigSaved={onConfigSaved} />
       <ConfirmHost />
     </>
   )
@@ -172,17 +172,53 @@ describe('AntigravityAccounts', () => {
     expect(screen.queryByRole('switch', { name: /enable antigravity account/i })).toBeNull()
   })
 
-  it('starts OAuth only through the typed client and cancels its poll lifecycle', async () => {
+  it('invalidates model options after successful removal but not a failed removal', async () => {
+    const onConfigSaved = vi.fn()
+    await renderAccounts(onConfigSaved)
+    await screen.findByRole('switch', { name: /enable antigravity account/i })
+
+    fireEvent.click(screen.getByRole('button', { name: /remove antigravity account/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(onConfigSaved).toHaveBeenCalledTimes(1))
+
+    rpc.listAccounts.mockResolvedValueOnce(snapshot([account('1')]))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await screen.findByRole('switch', { name: /enable antigravity account/i })
+    rpc.removeAccount.mockRejectedValueOnce(new Error('private bridge diagnostic'))
+    fireEvent.click(screen.getByRole('button', { name: /remove antigravity account/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(rpc.removeAccount).toHaveBeenCalledTimes(2))
+    expect(onConfigSaved).toHaveBeenCalledTimes(1)
+  })
+
+  it('invalidates model options after approved OAuth only when its active-profile snapshot applies', async () => {
+    const onConfigSaved = vi.fn()
+    await renderAccounts(onConfigSaved)
+    await screen.findByText('Antigravity accounts')
+    vi.useFakeTimers()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+    })
+    rpc.pollOAuth.mockResolvedValueOnce({ status: 'approved' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+      await Promise.resolve()
+    })
+    expect(onConfigSaved).toHaveBeenCalledTimes(1)
+  })
+
+  it('starts OAuth only through the typed client without rendering a Project ID field and cancels its poll lifecycle', async () => {
     await renderAccounts()
     await screen.findByText('Antigravity accounts')
 
-    fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'safe-project' } })
+    expect(screen.queryByLabelText('Project ID')).toBeNull()
     vi.useFakeTimers()
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
     })
 
-    expect(rpc.startOAuth).toHaveBeenCalledWith('safe-project', expect.anything())
+    expect(rpc.startOAuth).toHaveBeenCalledWith(expect.anything())
     expect(openExternalLink).toHaveBeenCalledWith(oauthStart.authUrl)
     expect(requestGateway).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy()
@@ -198,7 +234,7 @@ describe('AntigravityAccounts', () => {
     expect(rpc.cancelOAuth).toHaveBeenCalledWith(oauthStart.sessionId)
   })
 
-  it('starts OAuth from the initial blank optional Project ID', async () => {
+  it('starts OAuth without a project_id own-property', async () => {
     const realRpc = await vi.importActual<typeof AntigravityRpcModule>('@/lib/antigravity-rpc')
     createAntigravityRpc.mockImplementation((request, getActiveProfile) => realRpc.createAntigravityRpc(request, getActiveProfile))
     requestGateway.mockImplementation(async method => {
