@@ -157,45 +157,11 @@ lives at `$LOCALAPPDATA/hermes/patches/sitecustomize.py` (outside any repo).
 6. **Tool pair repair**: Orphaned `tool_use` / `tool_result` blocks (left by long conversations or partial summaries) are stripped before signing — prevents HTTP 400 (upstream PR #136)
 7. **Haiku effort stripping**: `effort` parameter is removed for haiku models that reject it with HTTP 400 (upstream PR #126)
 8. **Temperature fix**: Strips non-default `temperature` on Opus 4.6 adaptive thinking, which otherwise rejects with HTTP 400
-9. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
-10. **Window-aware rate-limit auto-wait** (v1.5.9+): when Anthropic returns HTTP 429 mid-agent, reads the `anthropic-ratelimit-unified-{5h,1d,7d}-status` / `-reset` headers to identify which subscription window tripped, picks the **longest** waiting window (sleeping through a 7d reset also clears 5h), and applies a **per-window** safety cap (`HERMES_RL_AUTOWAIT_MAX_5H_S`=6h, `_1D_S`=26h, `_7D_S`=7.5d). The legacy 6h cap is kept as the fallback when no window-specific status is present. Per-window caps can be tuned via env vars.
+10. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
 
 Installed through a `.pth` file in the venv's site-packages that imports a small bootstrap module at interpreter startup, which in turn registers a `MetaPathFinder` hook for `agent.anthropic_adapter`. No source modifications.
 
 The `.pth` shim runs *before* `site.py` imports `sitecustomize`, on every platform. An earlier version of this installer wrote a `sitecustomize.py` into site-packages directly, which failed silently on Debian/Ubuntu — those distros ship `/usr/lib/pythonX.Y/sitecustomize.py` for apport and it wins import priority over the venv-local one, so the bypass hook never ran. The current installer auto-migrates legacy installs.
-
-## Subscription rate-limit auto-wait (Claude Pro/Max windows: 5h, 1d, 7d)
-
-When a long agent run exhausts a Claude Pro/Max usage window mid-flight,
-api.anthropic.com returns HTTP 429 with a reset time in the
-`anthropic-ratelimit-unified-*-reset` headers.  Hermes core's retry loop
-caps backoff at 120s and abandons the run, surfacing "rate-limiting
-requests" on Telegram and killing the session.
-
-This patch wraps the two API-call entry points on `run_agent.AIAgent` so a
-genuine subscription-window 429 instead **sleeps until the window resets**
-(interruptibly, in short chunks) and then retries the same call transparently.
-It picks the **longest** throttled window (e.g. a 7d hit also clears the 5h
-window, so a single sleep covers both) and applies a **per-window** safety
-cap (5h=6h, 1d=26h, 7d=7.5d). Behaviour is tunable via env vars:
-
-| Env var | Default | Meaning |
-|---------|---------|---------|
-| `HERMES_RL_AUTOWAIT` | `1` | `0` disables auto-wait entirely |
-| `HERMES_RL_AUTOWAIT_MAX_S` | `21600` | fallback cap (s) when no window detected |
-| `HERMES_RL_AUTOWAIT_MAX_5H_S` | `21600` | 5h-window safety cap (6h) |
-| `HERMES_RL_AUTOWAIT_MAX_1D_S` | `93600` | 1d-window safety cap (26h) |
-| `HERMES_RL_AUTOWAIT_MAX_7D_S` | `648000` | 7d-window safety cap (7.5d) |
-| `HERMES_RL_AUTOWAIT_BUFFER_S` | `5` | pad added after reset |
-| `HERMES_RL_AUTOWAIT_DEFAULT_S` | `300` | wait when no reset header found |
-
-The wait loop also calls `agent._touch_activity(...)` every ~25s so the
-gateway's inactivity watchdog doesn't kill the agent mid-wait.  Idempotent
-and never breaks the billing path: if anything goes wrong, the original
-call/exception behaviour is preserved.
-
-Ported from kristianvast/hermes-claude-auth PR #27 (window-aware auto-wait);
-the fingerprint parity fix below from PR #21.
 
 ## Fingerprint parity (avoids "extra usage" billing)
 
@@ -290,7 +256,6 @@ billing pay-per-token:
    ```
    [anthropic_billing_bypass] Bypass installed
    [anthropic_billing_bypass] Transport unwrap hook installed
-   [anthropic_billing_bypass] Rate-limit auto-wait installed
    ```
 2. **No `extra usage` errors** — if you see `HTTP 400 You're out of extra
    usage` or `HTTP 429 ... extra usage required`, the fingerprint drifted and
@@ -424,25 +389,9 @@ Not merged:
 
 ### Rate-limit / 429 behaviour
 
-- **Auto-wait won't kick in / 429 reaches the user immediately**: the patch
-  is disabled. Re-enable with `HERMES_RL_AUTOWAIT=1` (the default). It
-  requires the `sitecustomize.py` hook to be installed (run `./install.sh`
-  and check with `./install.sh --check`).
-- **Auto-wait bails with "this is bigger than safety-cap" on a weekly limit**:
-  you're on an older build (< v1.5.9). v1.5.9 added window-aware
-  detection — it now reads `anthropic-ratelimit-unified-7d-status` /
-  `-reset` and waits up to `HERMES_RL_AUTOWAIT_MAX_7D_S` (default 7.5d).
-  Upgrade: `cd ~/hermes-claude-auth && git pull && ./install.sh`.
-- **Want a shorter / longer wait for a specific window**: tune the
-  per-window cap via env vars (values in seconds, units in
-  `~/.hermes/.env` or your systemd unit):
-  - `HERMES_RL_AUTOWAIT_MAX_5H_S` (default `21600` = 6h)
-  - `HERMES_RL_AUTOWAIT_MAX_1D_S` (default `93600` = 26h)
-  - `HERMES_RL_AUTOWAIT_MAX_7D_S` (default `648000` = 7.5d)
-  - `HERMES_RL_AUTOWAIT_MAX_S` — fallback when the 429 has no
-    window-specific status header (default `21600` = 6h).
-  Setting any of the `MAX_*_S` vars to a value `<= 0` falls back to the
-  default; to *disable* auto-wait entirely, use `HERMES_RL_AUTOWAIT=0`.
+HTTP 429 responses are handled by Hermes core's bounded provider retry/error
+path and are surfaced to the active chat. This installer does not wait for a
+subscription quota reset or retry requests independently.
 
 ## Credits
 - [griffinmartin/opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth), the original TypeScript implementation for opencode (MIT)
