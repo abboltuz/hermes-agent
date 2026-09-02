@@ -416,11 +416,12 @@ def emergency_context_cut(
     generation: int,
     watermark: int = 0,
     min_reclaim_tokens: int = 0,
+    wire_fit: Callable[[Sequence[Mapping[str, Any]]], bool] | None = None,
 ) -> CutResult:
     original = [dict(message) for message in messages]
     min_reclaim_tokens = max(0, int(min_reclaim_tokens))
     original_projection_tokens = estimate_projection_tokens(original)
-    if min_reclaim_tokens == 0 and budget.fits(original):
+    if min_reclaim_tokens == 0 and budget.fits(original) and (wire_fit is None or wire_fit(original)):
         return CutResult(original, "emergency_context_cut", True)
     capsule = build_policy_capsule(original, session_id=session_id, watermark=watermark, generation=generation)
     system = [dict(m) for m in original if m.get("role") == "system" and not m.get("_compression_capsule")][:1]
@@ -458,6 +459,7 @@ def emergency_context_cut(
         return (
             validate_projection(candidate_messages).valid
             and budget.fits(candidate_messages)
+            and (wire_fit is None or wire_fit(candidate_messages))
             and reclaimed >= min_reclaim_tokens
         )
 
@@ -479,7 +481,7 @@ def emergency_context_cut(
     validation = validate_projection(candidate)
     if meets_target(candidate):
         return CutResult(candidate, "emergency_context_cut", True, identity)
-    if validation.valid and budget.fits(candidate):
+    if validation.valid and budget.fits(candidate) and (wire_fit is None or wire_fit(candidate)):
         return CutResult(
             original,
             "context_projection_min_reclaim_unmet",
@@ -487,7 +489,9 @@ def emergency_context_cut(
             identity,
             "minimum reclaim target cannot be met by eligible bodies",
         )
-    if not budget.fits(system + [capsule.message()] + human):
+    if not budget.fits(system + [capsule.message()] + human) or (
+        wire_fit is not None and not wire_fit(system + [capsule.message()] + human)
+    ):
         return CutResult(original, "context_projection_unfit", False, identity, "irreducible system/tool/policy/user floor exceeds safe input budget")
     # A malformed retained tail is never sent; return the safe floor and let the
     # caller rebuild the next tool group rather than inventing a pairing.
@@ -546,6 +550,15 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     ):
         return wire_request
     coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
+    def _candidate_wire_fits(candidate_messages: Sequence[Mapping[str, Any]]) -> bool:
+        candidate_request = dict(request)
+        candidate_request["messages"] = list(candidate_messages)
+        return _wire_request_fits(
+            agent,
+            _strip_provider_private(candidate_request),
+            output_reserve=output_reserve,
+            safety_margin=safety_margin,
+        )
     result = emergency_context_cut(
         messages,
         budget,
@@ -553,6 +566,7 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         generation=int(getattr(agent, "_compression_generation", 0) or 0),
         watermark=int(getattr(agent, "_session_watermark", 0) or 0),
         min_reclaim_tokens=0,
+        wire_fit=_candidate_wire_fits,
     )
     request["messages"] = result.messages
     wire_request = _strip_provider_private(request)

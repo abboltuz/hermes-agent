@@ -4498,6 +4498,28 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
+                # A projection refusal is deterministic for this exact request.
+                # Retrying it unchanged cannot alter the fit predicate, and may
+                # rotate credentials/routes needlessly without a larger context.
+                # Return one typed terminal result before generic retry handling.
+                try:
+                    from agent.compression_v3 import ContextProjectionUnfit
+                except Exception:  # pragma: no cover - import is stable in production
+                    ContextProjectionUnfit = ()
+                if ContextProjectionUnfit and isinstance(api_error, ContextProjectionUnfit):
+                    _unfit_summary = agent._summarize_api_error(api_error)
+                    agent._buffer_vprint(
+                        f"❌ Request refused before provider call: {_unfit_summary}"
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _unfit_summary,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "error_type": type(api_error).__name__,
+                    }
+
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
                 #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste

@@ -2225,15 +2225,41 @@ class AIAgent:
                             if key not in {"_row_id", "_db_persisted"}
                             and not str(key).startswith("_")
                         }
-                    for live, stored in zip(messages, durable):
+                    def _projection_only_system(item):
+                        if not isinstance(item, dict) or item.get("role") != "system":
+                            return False
+                        content = str(item.get("content", ""))
+                        return bool(
+                            item.get("_compression_capsule")
+                            or item.get("_compression_recovery")
+                            or content.startswith("[POLICY CAPSULE]")
+                            or content.startswith("[COMPACTION RECOVERY")
+                        )
+                    durable_rows = [
+                        item for item in durable
+                        if isinstance(item, dict) and not _projection_only_system(item)
+                    ]
+                    live_rows = [
+                        item for item in messages
+                        if isinstance(item, dict) and not _projection_only_system(item)
+                    ]
+                    durable_index = 0
+                    for live in live_rows:
+                        if durable_index >= len(durable_rows):
+                            break
+                        stored = durable_rows[durable_index]
+                        durable_index += 1
                         if (
-                            isinstance(live, dict)
-                            and isinstance(stored, dict)
-                            and live.get("role") != "system"
+                            live.get("_row_id") is None
                             and _identity_view(live) == _identity_view(stored)
                             and isinstance(stored.get("_row_id"), int)
                         ):
                             live["_row_id"] = stored["_row_id"]
+                        elif live.get("_row_id") is None:
+                            # Stop backfilling at the first mismatch.  Assigning
+                            # later rows would make an ambiguous projection look
+                            # durable and could bind recovery to the wrong row.
+                            break
                 except Exception:
                     # Missing identity remains fail-closed at recovery bind.
                     pass

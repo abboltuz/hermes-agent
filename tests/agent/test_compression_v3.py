@@ -140,6 +140,41 @@ def test_budget_includes_wire_floor_and_blocks_unfit_projection():
     assert budget.fits([{"role": "user", "content": "x" * 200}]) is False
 
 
+def test_emergency_cut_recomputes_final_wire_fit_while_demoting():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    for i in range(7):
+        messages.extend(_round(i, body="bulk-" + ("x" * 800)))
+    budget = CompressionBudget(6000, 10, 10)
+    wire_sizes = []
+    def wire_fit(candidate):
+        size = len(json.dumps(candidate, ensure_ascii=True))
+        wire_sizes.append(size)
+        return size <= 8000
+    cut = emergency_context_cut(
+        messages,
+        budget,
+        session_id="wire-fit",
+        generation=1,
+        wire_fit=wire_fit,
+    )
+    assert cut.provider_call_allowed is True
+    assert len(json.dumps(cut.messages, ensure_ascii=True)) <= 8000
+    assert wire_sizes
+    assert wire_sizes[-1] <= 8000
+
+
+def test_emergency_cut_refuses_when_final_wire_floor_is_irreducible():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    cut = emergency_context_cut(
+        messages,
+        CompressionBudget(6000, 10, 10),
+        session_id="wire-floor",
+        generation=1,
+        wire_fit=lambda candidate: False,
+    )
+    assert cut.provider_call_allowed is False
+    assert cut.outcome == "context_projection_unfit"
+
 def test_emergency_cut_preserves_current_group_and_latest_six_rounds():
     messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
     for i in range(8):
