@@ -2339,6 +2339,47 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect($messages.get()).toHaveLength(500)
   })
 
+  it('keeps REST history after resume rejection and grafts a later runtime projection', async () => {
+    const persisted = Array.from({ length: 3 }, (_, index) => ({
+      content: `persisted-${index}`,
+      role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+      timestamp: index + 1
+    }))
+    setSessions([storedSession({ id: 'stored-A', message_count: persisted.length })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: persisted, session_id: 'stored-A' } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        throw new Error('resume unavailable')
+      }
+      return {} as never
+    })
+
+    let resumedState: ClientSessionState | undefined
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={value => (resume = value)}
+        onStateUpdate={(_sessionId, state) => (resumedState = state)}
+        requestGateway={requestGateway}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect($messages.get()).toHaveLength(persisted.length)
+    expect(JSON.stringify($messages.get())).toContain('persisted-0')
+
+    // A runtime projection arriving after the rejected resume layers onto the
+    // already-painted snapshot instead of blanking it first.
+    setMessages([
+      ...$messages.get(),
+      { id: 'runtime-projection', role: 'assistant', parts: [{ type: 'text', text: 'runtime graft' }] }
+    ])
+    expect(JSON.stringify($messages.get())).toContain('persisted-0')
+    expect(JSON.stringify($messages.get())).toContain('runtime graft')
+    expect(resumedState).toBeUndefined()
+  })
   it('honours a warm cache entry whose stored id matches and refreshes its persisted transcript', async () => {
     // Correctly-wired mapping: 'rt-A' <-> 'stored-A'. The fast-path should trust
     // it and never reach session.resume. session.activate refreshes the live
