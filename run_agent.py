@@ -8242,6 +8242,27 @@ class AIAgent:
                 return _run(active_fence)
 
             idle_timeout, total_ceiling = resolve_context_compression_timeouts()
+            # Hard-pressure entry points have one absolute remote/pre-commit
+            # budget. Progress and route fallback may consume that budget but
+            # never extend it. Manual /compress and maintenance callers keep
+            # their configured timeout semantics.
+            from agent.conversation_compression import (
+                HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                is_hard_pressure_compression_trigger,
+            )
+            if is_hard_pressure_compression_trigger(trigger):
+                # A disabled general timeout must not disable the safety
+                # wrapper on provider-bound automatic pressure paths.
+                idle_timeout = min(
+                    idle_timeout if idle_timeout > 0
+                    else HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                    HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                )
+                total_ceiling = min(
+                    total_ceiling if total_ceiling > 0
+                    else HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                    HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                )
             if idle_timeout <= 0:
                 return _run(active_fence)
 

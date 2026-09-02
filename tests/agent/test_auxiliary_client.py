@@ -24,6 +24,8 @@ from agent.auxiliary_client import (
     _get_provider_chain,
     _is_payment_error,
     _is_rate_limit_error,
+    _is_timeout_error,
+    _is_compression_route_local_failure,
     _is_model_not_found_error,
     _is_model_incompatible_error,
     _refresh_nous_recommended_model,
@@ -1615,6 +1617,98 @@ class TestCallLlmPaymentFallback:
         # Labelled as an auth error, not mis-tagged as a connection error.
         assert mock_fb.call_args.kwargs.get("reason") == "auth error"
 
+
+
+class TestCompressionFallbackContinuation:
+    """Compression retries route-local failures without repeating routes."""
+
+    @staticmethod
+    def _response(text):
+        return _DummyResponse(text)
+
+    @staticmethod
+    def _payment_error():
+        error = Exception("Payment Required: insufficient credits")
+        error.status_code = 402
+        return error
+
+    def test_sync_402_fallback_candidate_advances_once(self):
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = self._payment_error()
+        first = MagicMock()
+        first.chat.completions.create.side_effect = self._payment_error()
+        second = MagicMock()
+        second.chat.completions.create.return_value = self._response("second")
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "primary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "primary-model")), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   side_effect=[(first, "first-model", "route-a"),
+                                (second, "second-model", "route-b")]) as discover:
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+
+        assert result.choices[0].message.content == "second"
+        assert first.chat.completions.create.call_count == 1
+        assert second.chat.completions.create.call_count == 1
+        assert [call.kwargs["reason"] for call in discover.call_args_list] == [
+            "payment error", "fallback route failure"
+        ]
+
+    def test_async_402_fallback_candidate_advances_once(self):
+        async def exercise():
+            primary = MagicMock()
+            primary.chat.completions.create = AsyncMock(side_effect=self._payment_error())
+            first = MagicMock()
+            first.chat.completions.create = AsyncMock(side_effect=self._payment_error())
+            second = MagicMock()
+            second.chat.completions.create = AsyncMock(return_value=self._response("second-async"))
+
+            with patch("agent.auxiliary_client._resolve_task_provider_model",
+                       return_value=("auto", "primary-model", None, None, None)), \
+                 patch("agent.auxiliary_client._get_cached_client",
+                       return_value=(primary, "primary-model")), \
+                 patch("agent.auxiliary_client._try_configured_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_main_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_payment_fallback",
+                       side_effect=[(first, "first-model", "route-a"),
+                                    (second, "second-model", "route-b")]), \
+                 patch("agent.auxiliary_client._to_async_client",
+                       side_effect=lambda client, model, **_: (client, model)):
+                result = await async_call_llm(
+                    task="compression", messages=[{"role": "user", "content": "x"}]
+                )
+            assert result.choices[0].message.content == "second-async"
+            assert first.chat.completions.create.call_count == 1
+            assert second.chat.completions.create.call_count == 1
+
+        import asyncio
+        asyncio.run(exercise())
+
+    def test_timeout_is_explicit_compression_route_local_failure(self):
+        class SummaryTimeout(Exception):
+            pass
+
+        error = SummaryTimeout("summary request timed out")
+        assert _is_timeout_error(error)
+        assert _is_compression_route_local_failure(error)
+
+    def test_discovery_excludes_already_attempted_route(self):
+        candidate = MagicMock()
+        with patch("agent.auxiliary_client._get_provider_chain",
+                   return_value=[("route-a", lambda: (candidate, "model-a"))]):
+            result = _try_payment_fallback(
+                "primary", task="compression", attempted_labels={"route-a"}
+            )
+        assert result == (None, None, "")
+        assert not candidate.called
 
 
 class TestStaleFallbackCandidateSkip:

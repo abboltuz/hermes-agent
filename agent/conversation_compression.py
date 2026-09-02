@@ -726,6 +726,19 @@ class CompressionCommitFence:
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
 
+# Automatic hard-pressure compression is a safety path: remote retries must
+# never postpone the deterministic final cut beyond this absolute ceiling.
+HARD_PRESSURE_COMPRESSION_MAX_SECONDS = 120.0
+_HARD_PRESSURE_COMPRESSION_TRIGGERS = frozenset({
+    "preflight_auto", "pre_api_auto", "mid_loop_pressure",
+    "payload_413_recovery", "context_overflow_recovery",
+})
+
+
+def is_hard_pressure_compression_trigger(trigger: Optional[str]) -> bool:
+    """Return whether *trigger* is an automatic provider-bound hard path."""
+    return trigger in _HARD_PRESSURE_COMPRESSION_TRIGGERS
+
 # Shared daemon pool for sync compress_context timeout wraps — analogous to
 # asyncio's default executor used by gateway session hygiene's
 # ``loop.run_in_executor(None, ...)``, but daemon so a fence-cancelled hung

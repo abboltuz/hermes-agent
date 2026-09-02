@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.conversation_compression import (
     CompressionCommitFence,
+    is_hard_pressure_compression_trigger,
     resolve_context_compression_timeouts,
     run_compress_context_with_progress_timeout,
 )
@@ -43,6 +44,59 @@ class TestResolveContextCompressionTimeouts:
         )
         assert idle == 90.0
         assert ceiling == 90.0
+
+    @pytest.mark.parametrize("trigger, expected", [
+        ("preflight_auto", True), ("pre_api_auto", True),
+        ("mid_loop_pressure", True), ("payload_413_recovery", True),
+        ("context_overflow_recovery", True), ("manual", False), (None, False),
+    ])
+    def test_classifies_only_automatic_hard_pressure_triggers(self, trigger, expected):
+        assert is_hard_pressure_compression_trigger(trigger) is expected
+
+
+class TestAIAgentCompressionTimeoutSelection:
+    @staticmethod
+    def _agent():
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        agent.session_id = None
+        agent._cached_system_prompt = "cached"
+        agent._conversation_root_id = lambda: None
+        return agent
+
+    def test_hard_pressure_forces_wrapper_when_general_timeout_disabled(self):
+        agent = self._agent()
+        wrapper = MagicMock(return_value=([], "prompt"))
+        direct = MagicMock()
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0.0, 600.0),
+        ), patch(
+            "agent.conversation_compression.run_compress_context_with_progress_timeout",
+            wrapper,
+        ), patch("agent.conversation_compression.compress_context", direct):
+            result = agent._compress_context([], "system", trigger="preflight_auto")
+
+        assert result == ([], "prompt")
+        assert wrapper.call_args.kwargs["idle_timeout_seconds"] == 120.0
+        assert wrapper.call_args.kwargs["total_ceiling_seconds"] == 120.0
+        direct.assert_not_called()
+
+    def test_manual_disabled_timeout_remains_direct(self):
+        agent = self._agent()
+        direct = MagicMock(return_value=([], "system"))
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0.0, 600.0),
+        ), patch(
+            "agent.conversation_compression.run_compress_context_with_progress_timeout",
+        ) as wrapper, patch("agent.conversation_compression.compress_context", direct):
+            result = agent._compress_context([], "system", trigger="manual")
+
+        assert result == ([], "system")
+        direct.assert_called_once()
+        wrapper.assert_not_called()
 
 
 class TestRunCompressContextWithProgressTimeout:
