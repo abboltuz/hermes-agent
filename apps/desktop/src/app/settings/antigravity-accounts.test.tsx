@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ConfirmHost } from '@/components/confirm-host'
 import type { AntigravityAccount, AntigravityRpc } from '@/lib/antigravity-rpc'
+import type * as AntigravityRpcModule from '@/lib/antigravity-rpc'
 import { $confirmRequest } from '@/store/confirm'
 import { $activeGatewayProfile } from '@/store/profile'
 
@@ -195,6 +196,43 @@ describe('AntigravityAccounts', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     })
     expect(rpc.cancelOAuth).toHaveBeenCalledWith(oauthStart.sessionId)
+  })
+
+  it('starts OAuth from the initial blank optional Project ID', async () => {
+    const realRpc = await vi.importActual<typeof AntigravityRpcModule>('@/lib/antigravity-rpc')
+    createAntigravityRpc.mockImplementation((request, getActiveProfile) => realRpc.createAntigravityRpc(request, getActiveProfile))
+    requestGateway.mockImplementation(async method => {
+      if (method === 'antigravity.accounts.list') {
+        return { accounts: snapshot([account('1')]) }
+      }
+
+      if (method === 'antigravity.oauth.start') {
+        return {
+          auth_url: oauthStart.authUrl,
+          expires_at: oauthStart.expiresAt,
+          flow: oauthStart.flow,
+          poll_interval_ms: oauthStart.pollIntervalMs,
+          session_id: oauthStart.sessionId,
+          status: oauthStart.status
+        }
+      }
+
+      throw new Error('unexpected gateway method')
+    })
+    await renderAccounts()
+    await screen.findByText('Antigravity accounts')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith(
+        'antigravity.oauth.start',
+        { profile: 'default' },
+        undefined,
+        expect.anything()
+      )
+    )
+    expect(openExternalLink).toHaveBeenCalledWith(oauthStart.authUrl)
   })
 
   it('prevents a duplicate OAuth start while the first start is pending', async () => {

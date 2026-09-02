@@ -122,6 +122,15 @@ describe('createAntigravityRpc', () => {
     expect(request).toHaveBeenNthCalledWith(2, 'antigravity.accounts.list', { profile: 'beta' }, undefined, undefined)
   })
 
+  it('starts OAuth without project_id when the optional project ID is blank', async () => {
+    const request = requestStub()
+    const api = createAntigravityRpc(request, () => 'alpha')
+
+    await expect(api.startOAuth('')).resolves.toMatchObject({ sessionId: SESSION_ID, status: 'pending' })
+
+    expect(request).toHaveBeenCalledWith(ANTIGRAVITY_RPC_METHODS.start, { profile: 'alpha' }, undefined, undefined)
+  })
+
   it.each([
     ['no active profile', ''],
     ['whitespace-only active profile', '   ']
@@ -148,7 +157,7 @@ describe('createAntigravityRpc', () => {
       (api: ReturnType<typeof createAntigravityRpc>) => api.setAccountPriority(ACCOUNT_ID, Number.MAX_SAFE_INTEGER + 1)
     ],
     ['fractional priority', (api: ReturnType<typeof createAntigravityRpc>) => api.setAccountPriority(ACCOUNT_ID, 1.5)],
-    ['empty project id', (api: ReturnType<typeof createAntigravityRpc>) => api.startOAuth('')],
+    ['non-string project id', (api: ReturnType<typeof createAntigravityRpc>) => Reflect.apply(api.startOAuth, api, [1])],
     ['overlong project id', (api: ReturnType<typeof createAntigravityRpc>) => api.startOAuth('x'.repeat(4097))],
     ['control-character project id', (api: ReturnType<typeof createAntigravityRpc>) => api.startOAuth('bad\nproject')],
     [

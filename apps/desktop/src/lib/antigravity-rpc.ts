@@ -326,11 +326,13 @@ export function createAntigravityRpc(
       )
     },
     startOAuth: async (projectId, options) => {
-      if (!isSafeText(projectId, MAX_PROJECT_ID_LENGTH)) {
+      if (projectId !== '' && !isSafeText(projectId, MAX_PROJECT_ID_LENGTH)) {
         throw invalidRequest()
       }
 
-      return parseOAuthStart(await request(ANTIGRAVITY_RPC_METHODS.start, { project_id: projectId }, options))
+      const params = projectId === '' ? undefined : { project_id: projectId }
+
+      return parseOAuthStart(await request(ANTIGRAVITY_RPC_METHODS.start, params, options))
     }
   }
 }
