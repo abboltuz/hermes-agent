@@ -42,16 +42,50 @@ def estimate_projection_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
 
 
 def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
-    """Conservative bound for the complete provider-shaped JSON payload."""
+    """Return a no-underestimate bound for the complete provider wire.
+
+    Provider-specific tokenizers are not available at this layer.  Escaped JSON
+    UTF-8 bytes are therefore used as the fallback bound: a provider token
+    cannot encode fewer than one serialized byte.  This intentionally refuses
+    some requests that would fit under a real tokenizer, but never permits an
+    oversized wire through a divisor heuristic.
+    """
     public = {
         key: value for key, value in request.items()
         if not str(key).startswith("_") and not str(key).startswith("__")
     }
     serialized = json.dumps(public, ensure_ascii=True, sort_keys=True, default=str)
-    # Escaped JSON length is deliberately conservative for Unicode and covers
-    # Responses instructions/input, system blocks, tools, and route fields.
-    serialized_bound = (len(serialized.encode("utf-8")) + 2) // 3
+    # Escaped JSON covers structural framing, route fields, instructions/input,
+    # messages, tools and nested schemas.  Keep the one-byte-per-token upper
+    # bound exact rather than dividing by an assumed tokenizer ratio.
+    serialized_bound = max(1, len(serialized.encode("utf-8")))
     return max(_tokens(public), serialized_bound)
+
+
+def _strip_provider_private(value: Any) -> Any:
+    """Copy provider data while removing durable/compression sidecars.
+
+    The live transcript is never passed through this function in place.  Only
+    the request copy is sanitized, including nested content blocks and tool
+    envelopes.  Transport control keys (for example ``__bedrock_region__``)
+    are intentionally preserved; they are consumed by dispatch before the
+    SDK call and are not transcript sidecars.
+    """
+    if isinstance(value, Mapping):
+        cleaned = {}
+        for key, child in value.items():
+            name = str(key)
+            if name in {"_row_id", "_db_persisted"} or name.startswith(
+                ("_compression", "_micro_compact")
+            ):
+                continue
+            cleaned[key] = _strip_provider_private(child)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_provider_private(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_provider_private(child) for child in value)
+    return value
 
 
 def _wire_request_fits(agent: Any, request: Mapping[str, Any], *, output_reserve: int, safety_margin: int) -> bool:
@@ -473,7 +507,11 @@ def emergency_context_cut(
 
 def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Apply the v3 fit gate to the actual provider-bound request."""
+    # Keep sidecars available to compression/recovery, and sanitize only the
+    # copy used for fit accounting and provider return. Removing row IDs before
+    # the cut would make durable recovery binding fail closed.
     request = dict(api_kwargs)
+    wire_request = _strip_provider_private(request)
     messages = request.get("messages")
     compressor = getattr(agent, "context_compressor", None)
     context_window = getattr(agent, "_config_context_length", None)
@@ -491,22 +529,22 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     # They still must pass the final provider-wire guard before dispatch.
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
         if not _wire_request_fits(
-            agent, request, output_reserve=output_reserve, safety_margin=safety_margin
+            agent, wire_request, output_reserve=output_reserve, safety_margin=safety_margin
         ):
             raise ContextProjectionUnfit(CutResult(
                 [], "context_projection_unfit", False,
                 reason="final provider wire payload exceeds safe context budget",
             ))
-        return request
+        return wire_request
     if not isinstance(context_window, int) or context_window <= 0:
-        return request
+        return wire_request
     tools = request.get("tools") or ()
     tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
     budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
     if budget.fits(messages) and _wire_request_fits(
-        agent, request, output_reserve=output_reserve, safety_margin=safety_margin
+        agent, wire_request, output_reserve=output_reserve, safety_margin=safety_margin
     ):
-        return request
+        return wire_request
     coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
     result = emergency_context_cut(
         messages,
@@ -517,8 +555,9 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         min_reclaim_tokens=0,
     )
     request["messages"] = result.messages
+    wire_request = _strip_provider_private(request)
     if not result.provider_call_allowed or not budget.fits(result.messages) or not _wire_request_fits(
-        agent, request, output_reserve=output_reserve, safety_margin=safety_margin
+        agent, wire_request, output_reserve=output_reserve, safety_margin=safety_margin
     ):
         if result.provider_call_allowed:
             result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="final provider wire payload exceeds safe context budget")
@@ -530,8 +569,9 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     ):
         raise ContextProjectionUnfit(replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="durable recovery registration failed"))
     coordinator.active_projection = [dict(message) for message in result.messages]
-    request["messages"] = result.messages
-    return request
+    # Binding may replace the provisional recovery marker in retained rows;
+    # serialize only after that owner-process mutation is complete.
+    return _strip_provider_private(request)
 
 
 @dataclass(frozen=True)

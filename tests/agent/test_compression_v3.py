@@ -21,10 +21,45 @@ from agent.compression_v3 import (
     prune_tool_pressure_projection,
     estimate_projection_tokens,
 )
+from agent.compression_v3 import _provider_wire_token_bound
 from agent.compression_v3 import _bind_recovery_identity
 
 
 HUMAN = {"origin_kind": "human_user", "turn_kind": "prompt", "trust_kind": "user_authorized"}
+
+
+def test_provider_wire_bound_uses_escaped_bytes_without_underestimate():
+    request = {
+        "instructions": 'ASCII compact id 😀 中文 "quotes" \\n',
+        "input": [{"role": "user", "content": [{"type": "text", "text": "\\ud800"}]}],
+        "tools": [{"type": "function", "name": "x", "parameters": {"required": ["x"]}}],
+        "max_output_tokens": 17,
+    }
+    serialized = json.dumps(request, ensure_ascii=True, sort_keys=True, default=str)
+    assert _provider_wire_token_bound(request) >= len(serialized.encode("utf-8"))
+
+
+def test_prepare_api_request_strips_private_sidecars_recursively():
+    agent = type("Agent", (), {"_config_context_length": 100_000, "_compression_safety_margin": 0})()
+    request = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "ok", "_row_id": 3}], "_row_id": 2, "_db_persisted": True}],
+        "tools": [{"type": "function", "function": {"name": "x", "_compression_capsule": True}}],
+        "input": [{"role": "user", "content": {"nested": {"_row_id": 4}}}],
+        "max_tokens": 1,
+    }
+    prepared = prepare_api_request(agent, request)
+
+    def walk(value):
+        if isinstance(value, dict):
+            assert not any(key in {"_row_id", "_db_persisted", "_compression_capsule"} for key in value)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(prepared)
+    assert request["messages"][0]["_row_id"] == 2
 
 
 def _round(number: int, *, body: str = "result"):
