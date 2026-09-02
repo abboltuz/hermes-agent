@@ -1806,6 +1806,27 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Compression v3 background policy and route are frozen at agent creation.
+    # The worker receives only this scalar route snapshot; it never resolves
+    # ambient config or consults the live agent.
+    try:
+        from agent.compression_v3 import resolve_background_compression_config
+        agent._compression_v3_background_config = resolve_background_compression_config(
+            (_agent_cfg.get("compression") or {}).get("background", {})
+        )
+        _compression_route = (_agent_cfg.get("auxiliary") or {}).get("compression", {})
+        if isinstance(_compression_route, dict):
+            agent._compression_v3_route = {
+                key: _compression_route.get(key)
+                for key in ("provider", "model", "base_url", "max_tokens", "schema_hash")
+                if _compression_route.get(key) is not None
+            }
+        else:
+            agent._compression_v3_route = {}
+    except Exception:
+        agent._compression_v3_background_config = None
+        agent._compression_v3_route = {}
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

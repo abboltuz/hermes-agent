@@ -20,6 +20,8 @@ from agent.compression_v3 import (
     prepare_api_request,
     prune_tool_pressure_projection,
     estimate_projection_tokens,
+    build_background_snapshot,
+    run_background_compression_worker,
 )
 
 
@@ -612,3 +614,24 @@ def test_production_turn_executes_tools_prunes_projection_and_preserves_sessiond
         if agent is not None:
             agent.close()
         db.close()
+
+
+def test_real_background_worker_uses_frozen_route_and_returns_candidate(monkeypatch):
+    import agent.auxiliary_client as auxiliary_client
+
+    calls = []
+    response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="keep the decision"))])
+    monkeypatch.setattr(auxiliary_client, "call_llm", lambda **kwargs: calls.append(kwargs) or response)
+    snapshot = build_background_snapshot(
+        "session", 2, 9,
+        [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "do this"}],
+        policy_capsule={}, route={"provider": "fast", "model": "small", "base_url": "http://frozen"},
+        deadline=10**12,
+    )
+    result = run_background_compression_worker(snapshot)
+    assert calls[0]["provider"] == "fast"
+    assert calls[0]["model"] == "small"
+    assert calls[0]["base_url"] == "http://frozen"
+    assert result.session_id == "session"
+    assert result.messages[-1]["content"] == "do this"
+    assert validate_projection(result.messages).valid

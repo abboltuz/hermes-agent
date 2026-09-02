@@ -586,6 +586,29 @@ def emergency_context_cut(
     return CutResult(original, "context_projection_unfit", False, identity, validation.reason)
 
 
+def _compression_v3_maybe_schedule(agent: Any, messages: Sequence[Mapping[str, Any]], *, current_tokens: int) -> None:
+    """Admit one background summary at an owner-thread pressure boundary."""
+    from agent.compression_v3 import background_route_eligible, build_background_snapshot, run_background_compression_worker
+    policy = getattr(agent, "_compression_v3_background_config", None)
+    route = getattr(agent, "_compression_v3_route", None)
+    main = {"provider": getattr(agent, "provider", ""), "model": getattr(agent, "model", ""), "base_url": getattr(agent, "base_url", "")}
+    if not policy or not getattr(policy, "enabled", False) or not background_route_eligible(policy, route, main):
+        return
+    context_window = getattr(agent, "_config_context_length", None)
+    if not isinstance(context_window, int) or context_window <= 0 or current_tokens < context_window * policy.start_ratio:
+        return
+    stable = build_background_snapshot(
+        str(getattr(agent, "session_id", "") or ""),
+        int(getattr(agent, "_compression_generation", 0) or 0),
+        int(getattr(agent, "_session_watermark", 0) or 0),
+        messages,
+        policy_capsule={}, route=route,
+        deadline=time.monotonic() + min(float(policy.hard_wait_seconds), BACKGROUND_HARD_WAIT_MAX_SECONDS),
+    )
+    coordinator = ensure_compression_coordinator(agent, trigger="pre_send_pressure", urgency=1)
+    coordinator.start_background(stable, run_background_compression_worker)
+
+
 def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Apply the v3 fit gate to the actual provider-bound request."""
     request = dict(api_kwargs)
@@ -607,9 +630,20 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     tools = request.get("tools") or ()
     tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
     budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
+    _compression_v3_maybe_schedule(
+        agent, messages, current_tokens=estimate_projection_tokens(messages) + tool_tokens
+    )
     if budget.fits(messages):
         return request
     coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
+    candidate = coordinator.wait_background(
+        min(getattr(getattr(agent, "_compression_v3_background_config", None), "hard_wait_seconds", 0.0), BACKGROUND_HARD_WAIT_MAX_SECONDS)
+    )
+    if isinstance(candidate, CompressionCandidate) and coordinator.adopt_background_result(candidate, generation=int(getattr(agent, "_compression_generation", 0) or 0), watermark=int(getattr(agent, "_session_watermark", 0) or 0)):
+        if budget.fits(candidate.messages):
+            request["messages"] = [dict(message) for message in candidate.messages]
+            coordinator.active_projection = request["messages"]
+            return request
     result = emergency_context_cut(
         messages,
         budget,
@@ -663,6 +697,49 @@ class CompressionCandidate:
     messages: list[dict[str, Any]]
 
 
+def _thaw(value: Any) -> Any:
+    """Reconstruct plain values from recursively frozen snapshot data."""
+    if isinstance(value, tuple):
+        if all(isinstance(item, tuple) and len(item) == 2 for item in value):
+            return {str(key): _thaw(item) for key, item in value}
+        return [_thaw(item) for item in value]
+    return value
+
+
+def run_background_compression_worker(snapshot: BackgroundCompressionSnapshot) -> CompressionCandidate:
+    """Summarize a frozen snapshot without access to live agent state."""
+    route = _thaw(snapshot.route)
+    if not isinstance(route, Mapping) or not route.get("provider") or not route.get("model"):
+        raise RuntimeError("background compression route is invalid")
+    messages = [_thaw(message) for message in snapshot.messages]
+    from agent.auxiliary_client import call_llm
+    prompt = (
+        "Summarize this conversation faithfully. Preserve decisions, constraints, "
+        "identifiers, and unresolved work. Return only the summary.\n\n"
+        + json.dumps(messages, ensure_ascii=False, default=str)
+    )
+    response = call_llm(
+        task="compression", provider=str(route["provider"]), model=str(route["model"]),
+        base_url=route.get("base_url") or None, messages=[{"role": "user", "content": prompt}],
+        max_tokens=int(route.get("max_tokens") or 4096),
+        timeout=max(0.0, snapshot.deadline - time.monotonic()),
+    )
+    choices = getattr(response, "choices", None) or []
+    message = getattr(choices[0], "message", None) if choices else None
+    summary = getattr(message, "content", None)
+    if not isinstance(summary, str) or not summary.strip():
+        raise RuntimeError("background compression returned empty summary")
+    retained = [dict(m) for m in messages if m.get("role") == "system"]
+    retained.append({"role": "assistant", "content": "[COMPRESSION SUMMARY]\n" + summary.strip()})
+    latest = next((dict(m) for m in reversed(messages) if m.get("role") == "user" and is_human_intent(m)), None)
+    if latest is not None:
+        retained.append(latest)
+    if not validate_projection(retained).valid:
+        raise RuntimeError("background compression produced invalid projection")
+    return CompressionCandidate(snapshot.session_id, snapshot.generation, snapshot.watermark,
+                                snapshot.prefix_fingerprint, str(route.get("schema_hash") or ""), retained)
+
+
 @dataclass(frozen=True)
 class CompressionSnapshot:
     """Immutable fence describing the stable prefix a worker may read."""
@@ -709,7 +786,7 @@ class CompressionCoordinator:
         self._active_admission: tuple[int, str] | None = None
         self._terminal_generations: set[tuple[int, str]] = set()
         self._pending_request: CompressionRequest | None = None
-        self._background_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="compression-background")
+        self._background_executor = None
         self._background_future: concurrent.futures.Future | None = None
         self._background_snapshot: BackgroundCompressionSnapshot | None = None
         self._background_closed = False
@@ -826,6 +903,10 @@ class CompressionCoordinator:
             self._background_result = None
             self._background_result_ready = False
             self.telemetry.append("background_started")
+            if self._background_executor is None:
+                self._background_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="compression-background"
+                )
             self._background_future = self._background_executor.submit(worker, snapshot)
             return self._background_future
 
@@ -880,7 +961,8 @@ class CompressionCoordinator:
             future = self._background_future
             if future is not None:
                 future.cancel()
-        self._background_executor.shutdown(wait=False, cancel_futures=True)
+        if self._background_executor is not None:
+            self._background_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1) -> CompressionCoordinator:
