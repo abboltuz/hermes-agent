@@ -2688,6 +2688,115 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    def test_summary_gate_blocks_irreducible_codex_request_before_responses_sdk(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._cached_system_prompt = "policy"
+        agent._config_context_length = 1
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 1
+        calls = []
+        agent._run_codex_stream = lambda request: calls.append(request)
+
+        with pytest.raises(ContextProjectionUnfit):
+            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+
+        assert calls == []
+
+    def test_summary_gate_is_reapplied_to_codex_retry_before_responses_sdk(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._cached_system_prompt = "policy"
+        provider_calls = []
+        agent._run_codex_stream = lambda request: (provider_calls.append(request), SimpleNamespace(
+            status="completed",
+            output=[SimpleNamespace(type="message", status="completed", content=[SimpleNamespace(type="output_text", text="")])],
+        ))[1]
+        original_context = agent._config_context_length
+        gate_calls = 0
+        from agent.compression_v3 import prepare_api_request
+
+        def gate_then_shrink(current_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 3:
+                current_agent._config_context_length = 1
+            return prepare_api_request(current_agent, request)
+
+        try:
+            with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
+                with patch("agent.relay_llm.complete_logical_call") as complete_logical:
+                    with pytest.raises(ContextProjectionUnfit):
+                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    complete_logical.assert_called_once_with(
+                        complete_logical.call_args.args[0], outcome="failed"
+                    )
+        finally:
+            agent._config_context_length = original_context
+
+        assert len(provider_calls) == 1
+        assert gate_calls == 3
+
+    def test_summary_gate_blocks_irreducible_anthropic_request_before_messages_sdk(self, agent):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.base_url = "https://api.anthropic.com"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "claude-3-5-sonnet"
+        agent._cached_system_prompt = "policy"
+        agent._config_context_length = 1
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 1
+        calls = []
+        agent._anthropic_messages_create = lambda request, **kwargs: calls.append(request)
+
+        with pytest.raises(ContextProjectionUnfit):
+            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+
+        assert calls == []
+
+    def test_summary_gate_is_reapplied_to_anthropic_retry_before_messages_sdk(self, agent):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.base_url = "https://api.anthropic.com"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "claude-3-5-sonnet"
+        agent._cached_system_prompt = "policy"
+        provider_calls = []
+        agent._anthropic_messages_create = lambda request, **kwargs: (provider_calls.append(request), SimpleNamespace(content=[], stop_reason="end_turn", usage=None))[1]
+        original_context = agent._config_context_length
+        gate_calls = 0
+        from agent.compression_v3 import prepare_api_request
+
+        def gate_then_shrink(current_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 3:
+                current_agent._config_context_length = 1
+            return prepare_api_request(current_agent, request)
+
+        try:
+            with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
+                with patch("agent.relay_llm.complete_logical_call") as complete_logical:
+                    with pytest.raises(ContextProjectionUnfit):
+                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    complete_logical.assert_called_once_with(
+                        complete_logical.call_args.args[0], outcome="failed"
+                    )
+        finally:
+            agent._config_context_length = original_context
+
+        assert len(provider_calls) == 1
+        assert gate_calls == 3
+
     def test_summary_gate_blocks_irreducible_openai_request_before_sdk(self, agent):
         agent._cached_system_prompt = "policy"
         agent._config_context_length = 1
