@@ -1024,7 +1024,7 @@ def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1
         else:
             registry_key = (logical_id, id(agent))
             coordinator = registry.get(registry_key)
-            if not isinstance(coordinator, CompressionCoordinator):
+            if not isinstance(coordinator, CompressionCoordinator) or coordinator.closed:
                 coordinator = CompressionCoordinator(session_id=logical_id)
                 registry[registry_key] = coordinator
     setattr(agent, "_compression_coordinator", coordinator)
