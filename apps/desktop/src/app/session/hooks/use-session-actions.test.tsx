@@ -2318,7 +2318,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledTimes(1))
     expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
-    expect($messages.get()).toHaveLength(0)
+    await waitFor(() => expect($messages.get()).toHaveLength(500))
     expect(requestGatewayMock).toHaveBeenCalledWith(
       'session.resume',
       expect.objectContaining({
