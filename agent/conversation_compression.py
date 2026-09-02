@@ -1276,7 +1276,7 @@ def _adopt_live_compression_child(
     child = row_getter(session_db, child_session_id)
     if not isinstance(child, dict) or child.get("ended_at") is not None:
         return None
-    recovered = loader(session_db, child_session_id)
+    recovered = loader(session_db, child_session_id, include_row_ids=True)
     if not isinstance(recovered, list) or not recovered:
         return None
     # Revalidate after loading: the tip may have rotated or a competing
@@ -3055,7 +3055,7 @@ def _compress_context_impl(
                 type(_lock_db), "get_messages_as_conversation", None
             )
             if callable(durable_loader):
-                durable_parent = durable_loader(_lock_db, _lock_sid)
+                durable_parent = durable_loader(_lock_db, _lock_sid, include_row_ids=True)
                 if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
                     # The in-memory transcript carries the CURRENT turn's
                     # un-persisted user tail (anchored by
@@ -3103,7 +3103,7 @@ def _compress_context_impl(
                     else:
                         # Re-read after the flush so the adopted snapshot
                         # carries the just-persisted tail.
-                        durable_parent = durable_loader(_lock_db, _lock_sid)
+                        durable_parent = durable_loader(_lock_db, _lock_sid, include_row_ids=True)
                     if (
                         _preflush_ok
                         and isinstance(durable_parent, list)

@@ -21,6 +21,7 @@ from agent.compression_v3 import (
     prune_tool_pressure_projection,
     estimate_projection_tokens,
 )
+from agent.compression_v3 import _bind_recovery_identity
 
 
 HUMAN = {"origin_kind": "human_user", "turn_kind": "prompt", "trust_kind": "user_authorized"}
@@ -241,6 +242,37 @@ def test_irreducible_floor_returns_typed_unfit_without_provider_call():
     assert result.outcome == "context_projection_unfit"
     assert result.provider_call_allowed is False
     assert result.messages == messages
+
+
+def test_recovery_binding_uses_exact_sidecar_ids_not_history_content():
+    registered = {}
+
+    class DB:
+        def register_compression_recovery(self, session_id, ids, **kwargs):
+            registered["ids"] = ids
+            return "canonical"
+
+    source = [
+        {"role": "assistant", "content": "duplicate", "reasoning": "current", "_row_id": 3},
+        {"role": "tool", "content": "same", "tool_call_id": "c", "_row_id": 4},
+    ]
+    retained = [dict(source[1])]
+    retained[0]["content"] = "[COMPACTION RECOVERY PENDING] session=s anchor=opaque"
+    agent = SimpleNamespace(_session_db=DB(), session_id="s")
+
+    assert _bind_recovery_identity(agent, source, retained, "opaque", 1, 3) == "canonical"
+    assert registered["ids"] == [3]
+
+
+def test_responses_wire_floor_is_rejected_before_provider():
+    agent = type("Agent", (), {"session_id": "s", "_config_context_length": 100, "_compression_safety_margin": 10})()
+    request = {
+        "instructions": "i" * 1000,
+        "input": [{"role": "user", "content": "u" * 1000}],
+        "max_output_tokens": 10,
+    }
+    with pytest.raises(ContextProjectionUnfit):
+        prepare_api_request(agent, request)
 
 
 def test_pre_send_gate_without_persistence_returns_typed_unfit():

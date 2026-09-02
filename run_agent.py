@@ -2207,6 +2207,36 @@ class AIAgent:
                 if not isinstance(seed_ids, set):
                     seed_ids = set()
             self._flushed_db_message_session_id = current_session_id
+            # Preserve exact row identity when a caller supplies a durable
+            # history snapshot without the optional private sidecar.  This is
+            # an ordered, full-message proof against the active DB snapshot,
+            # never a content-key scan across inactive history.
+            if current_session_id and any(
+                isinstance(item, dict) and "_row_id" not in item
+                for item in messages
+            ):
+                try:
+                    durable = self._session_db.get_messages_as_conversation(
+                        current_session_id, include_row_ids=True
+                    )
+                    def _identity_view(item):
+                        return {
+                            key: value for key, value in item.items()
+                            if key not in {"_row_id", "_db_persisted"}
+                            and not str(key).startswith("_")
+                        }
+                    for live, stored in zip(messages, durable):
+                        if (
+                            isinstance(live, dict)
+                            and isinstance(stored, dict)
+                            and live.get("role") != "system"
+                            and _identity_view(live) == _identity_view(stored)
+                            and isinstance(stored.get("_row_id"), int)
+                        ):
+                            live["_row_id"] = stored["_row_id"]
+                except Exception:
+                    # Missing identity remains fail-closed at recovery bind.
+                    pass
             history_ids = {
                 id(item) for item in (conversation_history or [])
                 if isinstance(item, dict)
@@ -2408,7 +2438,7 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
+                _inserted_ids = self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
                     compression_lock_holder=getattr(
@@ -2421,7 +2451,11 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    return_message_ids=True,
                 )
+                if isinstance(_inserted_ids, list):
+                    for _written, _row_id in zip(_batch_msgs, _inserted_ids):
+                        _written["_row_id"] = _row_id
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

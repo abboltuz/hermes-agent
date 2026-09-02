@@ -41,6 +41,29 @@ def estimate_projection_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
     return sum(_tokens(dict(message)) for message in messages)
 
 
+def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
+    """Conservative bound for the complete provider-shaped JSON payload."""
+    public = {
+        key: value for key, value in request.items()
+        if not str(key).startswith("_") and not str(key).startswith("__")
+    }
+    serialized = json.dumps(public, ensure_ascii=True, sort_keys=True, default=str)
+    # Escaped JSON length is deliberately conservative for Unicode and covers
+    # Responses instructions/input, system blocks, tools, and route fields.
+    serialized_bound = (len(serialized.encode("utf-8")) + 2) // 3
+    return max(_tokens(public), serialized_bound)
+
+
+def _wire_request_fits(agent: Any, request: Mapping[str, Any], *, output_reserve: int, safety_margin: int) -> bool:
+    context_window = getattr(agent, "_config_context_length", None)
+    if not isinstance(context_window, int) or context_window <= 0:
+        compressor = getattr(agent, "context_compressor", None)
+        context_window = getattr(compressor, "context_length", None)
+    if not isinstance(context_window, int) or context_window <= 0:
+        return True
+    return _provider_wire_token_bound(request) + output_reserve + safety_margin <= context_window
+
+
 def _has_incomplete_tool_group(messages: Sequence[Mapping[str, Any]]) -> bool:
     """Return whether the projection ends with an unanswered tool call."""
     calls = _tool_call_ids(messages)
@@ -211,34 +234,29 @@ def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], ret
     register = getattr(db, "register_compression_recovery", None)
     if not db or not session_id or not callable(register):
         return None
-    def key(message: Mapping[str, Any]) -> str:
-        return json.dumps({k: message.get(k) for k in ("role", "content", "tool_call_id", "tool_calls", "tool_name")}, sort_keys=True, default=str)
-    remaining = {}
-    for message in retained:
-        remaining[key(message)] = remaining.get(key(message), 0) + 1
-    demoted = {}
-    for message in source:
-        # System prompts/capsules are projection-only and have no canonical
-        # transcript row to index.
-        if message.get("role") == "system":
-            continue
-        item_key = key(message)
-        if remaining.get(item_key, 0):
-            remaining[item_key] -= 1
-        else:
-            demoted[item_key] = demoted.get(item_key, 0) + 1
+    def durable_id(message: Mapping[str, Any]) -> int | None:
+        value = message.get("_row_id")
+        return value if isinstance(value, int) and value > 0 else None
+
     try:
-        rows = db.get_messages(session_id, include_inactive=True)
+        # Compression snapshots loaded from SessionDB carry the exact private
+        # row marker.  The marker is never sent to a provider and is absent on
+        # synthetic projection-only rows; refusing missing demotions is safer
+        # than aliasing an older duplicate found by content.
+        retained_ids = {row_id for message in retained if (row_id := durable_id(message)) is not None}
         ids = []
-        for row in rows:
-            item_key = key(row)
-            if demoted.get(item_key, 0):
-                demoted[item_key] -= 1
-                ids.append(row.get("id"))
-        if not ids or any(count for count in demoted.values()):
+        for message in source:
+            if message.get("role") == "system":
+                continue
+            row_id = durable_id(message)
+            if row_id is None:
+                return None
+            if row_id not in retained_ids:
+                ids.append(row_id)
+        if not ids:
             return None
         fingerprint = hashlib.sha256(
-            json.dumps([key(message) for message in source], ensure_ascii=False).encode()
+            json.dumps([durable_id(message) for message in source], ensure_ascii=False).encode()
         ).hexdigest()
         canonical = register(
             session_id, ids, generation=generation, watermark=watermark,
@@ -457,24 +475,37 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     """Apply the v3 fit gate to the actual provider-bound request."""
     request = dict(api_kwargs)
     messages = request.get("messages")
-    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
-        return request
     compressor = getattr(agent, "context_compressor", None)
     context_window = getattr(agent, "_config_context_length", None)
     if not isinstance(context_window, int) or context_window <= 0:
         context_window = getattr(compressor, "context_length", None)
-    if not isinstance(context_window, int) or context_window <= 0:
-        return request
     output_reserve = request.get("max_tokens", request.get("max_completion_tokens", 0))
+    if "max_output_tokens" in request:
+        output_reserve = request["max_output_tokens"]
     if not isinstance(output_reserve, int) or output_reserve < 0:
         output_reserve = 0
     safety_margin = getattr(agent, "_compression_safety_margin", 1024)
     if not isinstance(safety_margin, int) or safety_margin < 0:
         safety_margin = 1024
+    # Native Responses-shaped payloads have no canonical ``messages`` list.
+    # They still must pass the final provider-wire guard before dispatch.
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        if not _wire_request_fits(
+            agent, request, output_reserve=output_reserve, safety_margin=safety_margin
+        ):
+            raise ContextProjectionUnfit(CutResult(
+                [], "context_projection_unfit", False,
+                reason="final provider wire payload exceeds safe context budget",
+            ))
+        return request
+    if not isinstance(context_window, int) or context_window <= 0:
+        return request
     tools = request.get("tools") or ()
     tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
     budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
-    if budget.fits(messages):
+    if budget.fits(messages) and _wire_request_fits(
+        agent, request, output_reserve=output_reserve, safety_margin=safety_margin
+    ):
         return request
     coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
     result = emergency_context_cut(
@@ -485,9 +516,12 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         watermark=int(getattr(agent, "_session_watermark", 0) or 0),
         min_reclaim_tokens=0,
     )
-    if not result.provider_call_allowed or not budget.fits(result.messages):
+    request["messages"] = result.messages
+    if not result.provider_call_allowed or not budget.fits(result.messages) or not _wire_request_fits(
+        agent, request, output_reserve=output_reserve, safety_margin=safety_margin
+    ):
         if result.provider_call_allowed:
-            result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="emergency projection remains above safe input budget")
+            result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="final provider wire payload exceeds safe context budget")
         raise ContextProjectionUnfit(result)
     if result.recovery_identity and not _bind_recovery_identity(
         agent, messages, result.messages, result.recovery_identity,

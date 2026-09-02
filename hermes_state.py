@@ -10705,7 +10705,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
-    ) -> int:
+        return_message_ids: bool = False,
+    ) -> int | List[int]:
         """Append multiple messages atomically in ONE write transaction.
 
         ``messages`` is a list of dicts in the same shape
@@ -10738,15 +10739,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         if chunk_rows is not None and len(messages) > chunk_rows:
             inserted_total = 0
+            inserted_ids: list[int] = []
             for start in range(0, len(messages), chunk_rows):
-                inserted_total += self.append_messages_batch(
+                result = self.append_messages_batch(
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
                     turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    return_message_ids=return_message_ids,
                 )
-            return inserted_total
+                if return_message_ids:
+                    inserted_ids.extend(result if isinstance(result, list) else [])
+                    inserted_total += len(result) if isinstance(result, list) else result
+                else:
+                    inserted_total += result if isinstance(result, int) else 0
+            return inserted_ids if return_message_ids else inserted_total
 
         def _do(conn):
             self._check_transcript_write_guards(
@@ -10771,6 +10779,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
+            if return_message_ids:
+                rows = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    (session_id, inserted),
+                ).fetchall()
+                return [int(row[0]) for row in reversed(rows)]
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
