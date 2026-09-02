@@ -217,6 +217,10 @@ def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], ret
         remaining[key(message)] = remaining.get(key(message), 0) + 1
     demoted = {}
     for message in source:
+        # System prompts/capsules are projection-only and have no canonical
+        # transcript row to index.
+        if message.get("role") == "system":
+            continue
         item_key = key(message)
         if remaining.get(item_key, 0):
             remaining[item_key] -= 1
