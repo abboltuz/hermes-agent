@@ -90,6 +90,172 @@ def test_shared_dispatch_refuses_oversized_native_wire_before_client_call(api_mo
     assert calls == []
 
 
+def test_codex_responses_final_boundary_refuses_instructions_input_before_sdk(monkeypatch):
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    calls = []
+    codex_calls = []
+    agent = SimpleNamespace(
+        api_mode="codex_responses", provider="openai-codex",
+        _config_context_length=32, _compression_safety_margin=0,
+        _run_codex_stream=lambda request, **_kwargs: codex_calls.append(request),
+    )
+    request = {
+        "instructions": "policy " * 100,
+        "input": [{"role": "user", "content": "task " * 100}],
+        "tools": [], "max_output_tokens": 8,
+    }
+
+    with pytest.raises(ContextProjectionUnfit):
+        _dispatch_nonstreaming_api_request(
+            agent, request, make_client=lambda *args, **kwargs: calls.append(args)
+        )
+    assert calls == []
+    assert codex_calls == []
+
+
+def test_anthropic_messages_final_boundary_refuses_system_messages_tools_before_sdk():
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    calls = []
+    anthropic_calls = []
+    agent = SimpleNamespace(
+        api_mode="anthropic_messages", provider="anthropic",
+        _config_context_length=32, _compression_safety_margin=0,
+        _anthropic_messages_create=lambda request, **_kwargs: anthropic_calls.append(request),
+    )
+    request = {
+        "system": "policy " * 100,
+        "messages": [{"role": "user", "content": "task " * 100}],
+        "tools": [{"name": "large", "input_schema": {"type": "object"}}],
+        "max_tokens": 8,
+    }
+
+    with pytest.raises(ContextProjectionUnfit):
+        _dispatch_nonstreaming_api_request(
+            agent, request, make_client=lambda *args, **kwargs: calls.append(args)
+        )
+    assert calls == []
+    assert anthropic_calls == []
+
+
+def test_bedrock_converse_final_boundary_refuses_control_wire_before_boto3(monkeypatch):
+    from agent import bedrock_adapter
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    calls = []
+    converse_calls = []
+    agent = SimpleNamespace(
+        api_mode="bedrock_converse", provider="bedrock",
+        _config_context_length=32, _compression_safety_margin=0,
+    )
+    request = {
+        "__bedrock_region__": "us-east-1", "__bedrock_converse__": True,
+        "system": [{"text": "policy " * 100}],
+        "messages": [{"role": "user", "content": [{"text": "task " * 100}]}],
+        "inferenceConfig": {"maxTokens": 8},
+    }
+
+    monkeypatch.setattr(
+        bedrock_adapter, "_get_bedrock_runtime_client",
+        lambda _region: SimpleNamespace(
+            converse=lambda **kwargs: converse_calls.append(kwargs)
+        ),
+    )
+    with pytest.raises(ContextProjectionUnfit):
+        _dispatch_nonstreaming_api_request(
+            agent, request, make_client=lambda *args, **kwargs: calls.append(args)
+        )
+    assert calls == []
+    assert converse_calls == []
+
+
+def test_openai_chat_nonstreaming_final_boundary_refuses_before_completions(monkeypatch):
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    calls = []
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openrouter",
+        _config_context_length=32, _compression_safety_margin=0,
+    )
+    request = {
+        "messages": [{"role": "system", "content": "policy " * 100},
+                     {"role": "user", "content": "task " * 100}],
+        "tools": [{"type": "function", "function": {"name": "large", "parameters": {}}}],
+        "max_tokens": 8,
+    }
+    with pytest.raises(ContextProjectionUnfit):
+        _dispatch_nonstreaming_api_request(
+            agent, request, make_client=lambda *args, **kwargs: calls.append(args)
+        )
+    assert calls == []
+
+
+def test_openai_chat_streaming_final_boundary_refuses_before_completions():
+    from agent.chat_completion_helpers import interruptible_streaming_api_call
+
+    calls = []
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openrouter", platform="cli",
+        _config_context_length=32, _compression_safety_margin=0,
+        _interrupt_requested=False,
+        _interruptible_api_call=lambda request: calls.append(request),
+    )
+    request = {
+        "messages": [{"role": "system", "content": "policy " * 100},
+                     {"role": "user", "content": "task " * 100}],
+        "tools": [{"type": "function", "function": {"name": "large", "parameters": {}}}],
+        "max_tokens": 8,
+    }
+    with pytest.raises(ContextProjectionUnfit):
+        interruptible_streaming_api_call(agent, request)
+    assert calls == []
+
+
+def test_reducible_chat_dispatch_calls_once_with_sanitized_final_wire():
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    captured = []
+    response = object()
+    completions = SimpleNamespace(create=lambda **kwargs: (captured.append(kwargs), response)[1])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openrouter",
+        _config_context_length=100_000, _compression_safety_margin=0,
+    )
+    request = {
+        "messages": [{"role": "user", "content": "small", "_row_id": 9,
+                      "_compression_capsule": "private"}],
+        "tools": [], "max_tokens": 8,
+    }
+    assert _dispatch_nonstreaming_api_request(
+        agent, request, make_client=lambda *_args, **_kwargs: client
+    ) is response
+    assert len(captured) == 1
+    assert "_row_id" not in json.dumps(captured[0])
+    assert "_compression_capsule" not in json.dumps(captured[0])
+
+
+def test_transport_added_tools_make_canonical_fit_unfit_before_openai_sdk():
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    calls = []
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openrouter",
+        _config_context_length=256, _compression_safety_margin=0,
+    )
+    request = {
+        "messages": [{"role": "user", "content": "fits canonically"}],
+        "tools": [{"type": "function", "function": {"name": "x", "parameters": {"description": "z" * 5000}}}],
+        "max_tokens": 8,
+    }
+    with pytest.raises(ContextProjectionUnfit):
+        _dispatch_nonstreaming_api_request(
+            agent, request, make_client=lambda *args, **kwargs: calls.append(args)
+        )
+    assert calls == []
+
+
 def _round(number: int, *, body: str = "result"):
     call_id = f"call-{number}"
     return [
