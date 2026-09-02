@@ -50,6 +50,61 @@ def test_emergency_cut_preserves_current_group_and_latest_six_rounds():
     assert validate_projection(cut.messages).valid
 
 
+def test_emergency_cut_demotes_only_oldest_bodies_needed_to_fit():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    bodies = [f"body-{i}-" + ("x" * 1190) for i in range(6)]
+    for i, body in enumerate(bodies):
+        messages.extend(_round(i, body=body))
+
+    cut = emergency_context_cut(messages, CompressionBudget(1800, 10, 10, 10, 10), session_id="s", generation=3)
+
+    assert cut.outcome == "emergency_context_cut"
+    assert cut.provider_call_allowed is True
+    assert CompressionBudget(1800, 10, 10, 10, 10).fits(cut.messages)
+    tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
+    assert tool_bodies[0].startswith("[COMPACTION RECOVERY]")
+    assert tool_bodies[-1] == bodies[-1]
+    assert all(m.get("tool_call_id") for m in cut.messages if m.get("role") == "tool")
+    assert validate_projection(cut.messages).valid
+
+
+def test_emergency_cut_does_not_demote_already_fitting_candidate():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    body = "verbatim body"
+    messages.extend(_round(0, body=body))
+
+    cut = emergency_context_cut(messages, CompressionBudget(1000, 10, 10, 10, 10), session_id="s", generation=3)
+
+    assert cut.provider_call_allowed is True
+    assert [m["content"] for m in cut.messages if m.get("role") == "tool"] == [body]
+
+
+def test_emergency_cut_can_demote_exactly_one_oldest_body():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    bodies = [f"body-{i}-" + ("x" * 1190) for i in range(6)]
+    for i, body in enumerate(bodies):
+        messages.extend(_round(i, body=body))
+
+    cut = emergency_context_cut(messages, CompressionBudget(1950, 10, 10, 10, 10), session_id="s", generation=3)
+
+    tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
+    assert sum(body.startswith("[COMPACTION RECOVERY]") for body in tool_bodies) == 1
+    assert tool_bodies[1:] == bodies[1:]
+
+
+def test_emergency_cut_demotes_all_retained_bodies_when_required():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    for i in range(6):
+        messages.extend(_round(i, body=f"body-{i}-" + ("x" * 1190)))
+
+    cut = emergency_context_cut(messages, CompressionBudget(1000, 10, 10, 10, 10), session_id="s", generation=3)
+
+    tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
+    assert cut.provider_call_allowed is True
+    assert all(body.startswith("[COMPACTION RECOVERY]") for body in tool_bodies)
+    assert CompressionBudget(1000, 10, 10, 10, 10).fits(cut.messages)
+
+
 def test_capsule_uses_human_intent_not_synthetic_wakes_and_keeps_identifiers():
     messages = [
         {"role": "user", "content": "synthetic wake", "_internal_wake": True},

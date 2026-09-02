@@ -326,6 +326,8 @@ def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: Compres
     recovery = {"role": "system", "content": reference, "_compression_recovery": True}
     prefix = system + [capsule.message(), recovery]
     candidate = prefix + compacted
+    if validate_projection(candidate).valid and budget.fits(candidate):
+        return CutResult(candidate, "emergency_context_cut", True, identity)
     # A retained round is semantically protected, but its bulk body is not.
     # Compact oldest retained bodies progressively when the six-round envelope
     # still exceeds the safe input budget.
@@ -337,6 +339,8 @@ def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: Compres
             continue
         item["content"] = reference + " preview=" + content[:_MAX_PREVIEW]
         candidate = prefix + compacted
+        if validate_projection(candidate).valid and budget.fits(candidate):
+            break
     validation = validate_projection(candidate)
     if validation.valid and budget.fits(candidate):
         return CutResult(candidate, "emergency_context_cut", True, identity)
