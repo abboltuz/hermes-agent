@@ -11,6 +11,7 @@ from agent.compression_v3 import (
     emergency_context_cut,
     validate_projection,
     prepare_api_request,
+    prune_tool_pressure_projection,
 )
 
 
@@ -122,3 +123,44 @@ def test_pre_send_gate_refuses_irreducible_request_without_mutating_input():
     else:
         raise AssertionError("irreducible request was accepted")
     assert request["messages"] == messages
+
+
+def test_tool_pressure_projection_prunes_completed_rounds_before_next_request():
+    agent = type(
+        "Agent",
+        (),
+        {
+            "session_id": "s",
+            "_compression_generation": 4,
+            "_config_context_length": 20_000,
+            "max_tokens": 100,
+            "_compression_safety_margin": 100,
+        },
+    )()
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "do the work"}]
+    for number in range(12):
+        messages.extend(_round(number, body=f"result-{number}-" + "x" * 10_000))
+    projection, reclaimed = prune_tool_pressure_projection(agent, messages)
+    assert reclaimed >= 8192
+    assert projection != messages
+    assert validate_projection(projection).valid
+    assert all(
+        any(str(message.get("content", "")).startswith(f"result-{number}-") for message in projection)
+        for number in range(6, 12)
+    )
+
+
+def test_tool_pressure_projection_does_not_split_incomplete_group():
+    agent = type("Agent", (), {"session_id": "s", "_config_context_length": 20_000})()
+    messages = [{"role": "user", **HUMAN, "content": "task"}, {"role": "assistant", "tool_calls": [{"id": "pending"}]}]
+    projection, reclaimed = prune_tool_pressure_projection(agent, messages, current_tokens=19_000)
+    assert reclaimed == 0
+    assert projection == messages
+
+
+def test_tool_pressure_projection_keeps_cache_stable_below_soft_threshold():
+    agent = type("Agent", (), {"session_id": "s", "_config_context_length": 20_000})()
+    messages = [{"role": "user", **HUMAN, "content": "small completed turn"}]
+    projection, reclaimed = prune_tool_pressure_projection(agent, messages, current_tokens=1_000)
+    assert reclaimed == 0
+    assert projection is messages

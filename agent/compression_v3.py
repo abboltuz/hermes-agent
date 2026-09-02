@@ -19,6 +19,8 @@ from agent.message_provenance import is_human_intent
 
 _RECOVERY_PREFIX = "[COMPACTION RECOVERY] session="
 _MAX_PREVIEW = 240
+TOOL_PRESSURE_MIN_RECLAIM_TOKENS = 8192
+TOOL_PRESSURE_SOFT_RATIO = 0.85
 
 
 def _tokens(value: Any) -> int:
@@ -33,6 +35,95 @@ def _tokens(value: Any) -> int:
 
 def estimate_projection_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
     return sum(_tokens(dict(message)) for message in messages)
+
+
+def _has_incomplete_tool_group(messages: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether the projection ends with an unanswered tool call."""
+    calls = _tool_call_ids(messages)
+    answered = {
+        str(message.get("tool_call_id", ""))
+        for message in messages
+        if message.get("role") == "tool"
+    }
+    return bool(calls - answered)
+
+
+def prune_tool_pressure_projection(
+    agent: Any,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    current_tokens: int | None = None,
+    min_reclaim_tokens: int = TOOL_PRESSURE_MIN_RECLAIM_TOKENS,
+) -> tuple[list, int]:
+    """Bound completed tool history without changing durable transcript rows.
+
+    This is intentionally a projection-only operation.  The executor has already
+    persisted the completed group when this function is called; the returned
+    list is therefore the only object that may be replaced.  An unanswered
+    group makes the operation a conservative no-op rather than risking a call /
+    result split.
+    """
+    source = [dict(message) for message in messages]
+    unchanged = messages if isinstance(messages, list) else source
+    if _has_incomplete_tool_group(source):
+        return unchanged, 0
+    context_window = getattr(agent, "_config_context_length", None)
+    if not isinstance(context_window, int) or context_window <= 0:
+        compressor = getattr(agent, "context_compressor", None)
+        context_window = getattr(compressor, "context_length", None)
+    if not isinstance(context_window, int) or context_window <= 0:
+        return unchanged, 0
+    before = estimate_projection_tokens(source)
+    observed = current_tokens if isinstance(current_tokens, int) and current_tokens > 0 else before
+    soft_budget = int(context_window * TOOL_PRESSURE_SOFT_RATIO)
+    if observed <= soft_budget or before <= soft_budget:
+        return unchanged, 0
+    coordinator = ensure_compression_coordinator(
+        agent, trigger="tool_pressure", urgency=1
+    )
+    source_fingerprint = hashlib.sha256(
+        json.dumps(source, ensure_ascii=False, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    if getattr(coordinator, "_tool_pressure_fingerprint", None) == source_fingerprint:
+        return unchanged, 0
+    output_reserve = getattr(agent, "max_tokens", 0)
+    if not isinstance(output_reserve, int) or output_reserve < 0:
+        output_reserve = 0
+    safety_margin = getattr(agent, "_compression_safety_margin", 1024)
+    if not isinstance(safety_margin, int) or safety_margin < 0:
+        safety_margin = 1024
+    # emergency_context_cut is also the canonical pairing/retention policy.
+    # Adjust its context window so its safe input budget is exactly the soft
+    # projection target, while leaving system/tool schema accounting to the
+    # pre-send gate that follows.
+    budget = CompressionBudget(
+        soft_budget + output_reserve + safety_margin,
+        output_reserve,
+        safety_margin,
+    )
+    result = emergency_context_cut(
+        source,
+        budget,
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        generation=int(getattr(agent, "_compression_generation", 0) or 0),
+        watermark=int(getattr(agent, "_session_watermark", 0) or 0),
+    )
+    if not result.provider_call_allowed:
+        return unchanged, 0
+    after = estimate_projection_tokens(result.messages)
+    reclaimed = max(0, before - after)
+    if reclaimed < min_reclaim_tokens or after > soft_budget:
+        return unchanged, 0
+    coordinator.active_projection = [dict(message) for message in result.messages]
+    coordinator._tool_pressure_fingerprint = hashlib.sha256(
+        json.dumps(result.messages, ensure_ascii=False, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    setattr(
+        agent,
+        "_compression_projection_watermark",
+        int(getattr(agent, "_compression_projection_watermark", 0) or 0) + 1,
+    )
+    return result.messages, reclaimed
 
 
 @dataclass(frozen=True)
@@ -300,6 +391,7 @@ class CompressionCoordinator:
         self._attempt: CompressionAttempt | None = None
         self.outcome: str | None = None
         self.active_projection: list[dict[str, Any]] | None = None
+        self._tool_pressure_fingerprint: str | None = None
 
     def request(self, request: CompressionRequest) -> CompressionAttempt:
         if request.session_id != self.session_id:

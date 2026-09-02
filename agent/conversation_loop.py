@@ -7496,6 +7496,29 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                # Tool results are canonical only after the executor returns:
+                # apply v3 pressure pruning at this completed-round boundary,
+                # before the next provider request. This rewrites only the
+                # provider projection; SessionDB retains the exact rows above.
+                from agent.compression_v3 import prune_tool_pressure_projection
+                if (
+                    getattr(agent, "compression_enabled", False)
+                    and not getattr(agent, "_incremental_persistence_failed", False)
+                ):
+                    _pressure_tokens = estimate_request_tokens_rough(
+                        messages, tools=agent.tools or None
+                    )
+                    _pressure_projection, _pressure_reclaimed = prune_tool_pressure_projection(
+                        agent, messages, current_tokens=_pressure_tokens
+                    )
+                    if _pressure_reclaimed:
+                        messages = _pressure_projection
+                        agent._session_messages = messages
+                        logging.info(
+                            "Compression v3 tool pressure pruning reclaimed ~%d tokens",
+                            _pressure_reclaimed,
+                        )
+
                 from agent.runtime_control import get_kanban_terminal_transition
 
                 _kanban_terminal_transition = get_kanban_terminal_transition(agent)
