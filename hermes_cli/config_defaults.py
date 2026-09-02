@@ -766,6 +766,11 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        "background": {
+            "enabled": False,
+            "start_ratio": 0.55,
+            "hard_wait_seconds": 120,
+        },
         "checkpoint_required": False, # Fail closed before lossy compaction unless an
                                       # active memory provider confirms checkpoint API
                                       # compatibility and completes the checkpoint.

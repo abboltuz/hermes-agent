@@ -15,6 +15,8 @@ import re
 import secrets
 import threading
 import weakref
+import concurrent.futures
+import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agent.message_provenance import is_human_intent
@@ -25,6 +27,137 @@ _PROVISIONAL_RECOVERY_PREFIX = "[COMPACTION RECOVERY PENDING] session="
 _MAX_PREVIEW = 240
 TOOL_PRESSURE_MIN_RECLAIM_TOKENS = 8192
 TOOL_PRESSURE_SOFT_RATIO = 0.85
+BACKGROUND_HARD_WAIT_MAX_SECONDS = 120.0
+
+
+@dataclass(frozen=True)
+class BackgroundCompressionConfig:
+    """Validated, additive policy for the opt-in early compression lane."""
+
+    enabled: bool = False
+    start_ratio: float = 0.55
+    hard_wait_seconds: float = 120.0
+
+
+def resolve_background_compression_config(config: Mapping[str, Any] | None) -> BackgroundCompressionConfig:
+    raw = config if isinstance(config, Mapping) else {}
+    enabled = raw.get("enabled") is True
+    try:
+        ratio = float(raw.get("start_ratio", 0.55))
+    except (TypeError, ValueError):
+        ratio = 0.55
+    # The soft pressure threshold is the hard upper bound: pending work must
+    # never alter the cache prefix before the normal safety path is engaged.
+    ratio = min(TOOL_PRESSURE_SOFT_RATIO - 0.01, max(0.0, ratio))
+    try:
+        wait = float(raw.get("hard_wait_seconds", 120.0))
+    except (TypeError, ValueError):
+        wait = 120.0
+    wait = min(BACKGROUND_HARD_WAIT_MAX_SECONDS, max(0.0, wait))
+    return BackgroundCompressionConfig(enabled, ratio, wait)
+
+
+def background_route_eligible(
+    background_config: Mapping[str, Any] | BackgroundCompressionConfig | None,
+    compression_route: Mapping[str, Any] | None,
+    main_route: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether an explicitly configured route may run in background."""
+    policy = (background_config if isinstance(background_config, BackgroundCompressionConfig)
+              else resolve_background_compression_config(background_config))
+    if not policy.enabled or not isinstance(compression_route, Mapping) or not isinstance(main_route, Mapping):
+        return False
+    provider = str(compression_route.get("provider") or "").strip()
+    model = str(compression_route.get("model") or "").strip()
+    if not provider or not model or provider.lower() == "auto" or model.lower() == "auto":
+        return False
+    return tuple(str(compression_route.get(k) or "") for k in ("provider", "model", "base_url")) != tuple(
+        str(main_route.get(k) or "") for k in ("provider", "model", "base_url")
+    )
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple((str(k), _freeze(v)) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return tuple(sorted((_freeze(item) for item in value), key=repr))
+    return value
+
+
+@dataclass(frozen=True)
+class BackgroundCompressionSnapshot:
+    """Worker-only immutable input. It contains no live runtime objects."""
+
+    session_id: str
+    generation: int
+    watermark: int
+    messages: tuple[tuple[tuple[str, Any], ...], ...]
+    policy_capsule: Any
+    route: tuple[tuple[str, Any], ...]
+    prefix_fingerprint: str
+    deadline: float
+
+
+@dataclass(frozen=True)
+class CompressionFeasibility:
+    eligible: bool
+    reclaimable_tokens: int
+    reason: str = ""
+
+
+def assess_background_feasibility(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    target_tokens: int,
+    protected_tokens: int = 0,
+    min_reclaim_tokens: int = 1,
+) -> CompressionFeasibility:
+    """Decide feasibility before publishing any remote background work."""
+    source_tokens = estimate_projection_tokens(messages)
+    reclaimable = max(0, source_tokens - max(0, int(protected_tokens)))
+    required = max(0, int(min_reclaim_tokens))
+    if reclaimable <= 0:
+        return CompressionFeasibility(False, 0, "no_reclaimable_middle")
+    if source_tokens <= int(target_tokens):
+        return CompressionFeasibility(False, reclaimable, "already_at_target")
+    if reclaimable < required:
+        return CompressionFeasibility(False, reclaimable, "insufficient_reclaim")
+    return CompressionFeasibility(True, reclaimable)
+
+
+def build_background_snapshot(
+    session_id: str,
+    generation: int,
+    watermark: int,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    policy_capsule: Mapping[str, Any] | PolicyCapsule | Any,
+    route: Mapping[str, Any],
+    deadline: float | None = None,
+) -> BackgroundCompressionSnapshot:
+    """Copy only completed stable boundaries into an immutable worker DTO."""
+    stable: list[Mapping[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        if calls:
+            ids = {str(c.get("id")) for c in calls if isinstance(c, Mapping) and c.get("id")}
+            following = messages[len(stable) + 1:]
+            answered = {str(m.get("tool_call_id")) for m in following if isinstance(m, Mapping) and m.get("role") == "tool"}
+            if ids - answered:
+                break
+        stable.append(message)
+    frozen_messages = tuple(_freeze(dict(message)) for message in stable)
+    payload = json.dumps(frozen_messages, sort_keys=True, default=str, separators=(",", ":"))
+    return BackgroundCompressionSnapshot(
+        str(session_id), int(generation), int(watermark), frozen_messages,
+        _freeze(policy_capsule), _freeze(route),
+        hashlib.sha256(payload.encode()).hexdigest(),
+        float(deadline if deadline is not None else time.monotonic() + BACKGROUND_HARD_WAIT_MAX_SECONDS),
+    )
 
 
 def _tokens(value: Any) -> int:
@@ -576,6 +709,13 @@ class CompressionCoordinator:
         self._active_admission: tuple[int, str] | None = None
         self._terminal_generations: set[tuple[int, str]] = set()
         self._pending_request: CompressionRequest | None = None
+        self._background_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="compression-background")
+        self._background_future: concurrent.futures.Future | None = None
+        self._background_snapshot: BackgroundCompressionSnapshot | None = None
+        self._background_closed = False
+        self._background_result: Any = None
+        self._background_result_ready = False
+        self.telemetry: list[str] = []
 
     def request(self, request: CompressionRequest) -> CompressionAttempt:
         if request.session_id != self.session_id:
@@ -668,6 +808,79 @@ class CompressionCoordinator:
             return False
         self.outcome = "no_progress"
         return True
+
+    def start_background(self, snapshot: BackgroundCompressionSnapshot, worker: Callable[[BackgroundCompressionSnapshot], Any]):
+        """Start or join the sole background job for this coordinator."""
+        with self._admission_lock:
+            if self._background_closed:
+                return None
+            if self._background_future is not None and not self._background_future.done():
+                self.telemetry.append("joined")
+                return self._background_future
+            if (self._background_snapshot is not None
+                    and self._background_snapshot.generation == snapshot.generation
+                    and self._background_snapshot.prefix_fingerprint == snapshot.prefix_fingerprint):
+                self.telemetry.append("joined")
+                return self._background_future
+            self._background_snapshot = snapshot
+            self._background_result = None
+            self._background_result_ready = False
+            self.telemetry.append("background_started")
+            self._background_future = self._background_executor.submit(worker, snapshot)
+            return self._background_future
+
+    def wait_background(self, timeout: float | None = None) -> Any:
+        future = self._background_future
+        if future is None or self._background_closed:
+            return None
+        try:
+            if timeout is None and self._background_snapshot is not None:
+                timeout = max(0.0, self._background_snapshot.deadline - time.monotonic())
+            self._background_result = future.result(timeout=max(0.0, float(timeout or 0.0)))
+        except concurrent.futures.TimeoutError:
+            return None
+        except Exception:
+            self.telemetry.append("route_exhausted")
+            return None
+        self._background_result_ready = True
+        self.telemetry.append("ready")
+        return self._background_result
+
+    def adopt_background_result(self, result: Any, *, generation: int | None = None, watermark: int | None = None,
+                                prefix_hash: str | None = None, schema_hash: str | None = None) -> bool:
+        """Adopt only a ready result whose immutable fence still matches."""
+        snapshot = self._background_snapshot
+        if self._background_closed or snapshot is None or not self._background_result_ready:
+            return False
+        if time.monotonic() > snapshot.deadline:
+            self.telemetry.append("deadline")
+            return False
+        if generation is not None and generation != snapshot.generation:
+            self.telemetry.append("stale_rejected")
+            return False
+        if watermark is not None and watermark < snapshot.watermark:
+            self.telemetry.append("stale_rejected")
+            return False
+        if prefix_hash is not None and prefix_hash != snapshot.prefix_fingerprint:
+            self.telemetry.append("stale_rejected")
+            return False
+        if schema_hash is not None and schema_hash != self.schema_hash:
+            self.telemetry.append("stale_rejected")
+            return False
+        if result is not self._background_result and result != self._background_result:
+            return False
+        self.outcome = "candidate_adopted"
+        self.telemetry.append("adopted")
+        return True
+
+    def close_background(self) -> None:
+        """Fence and tear down background work; late results are discarded."""
+        with self._admission_lock:
+            self._background_closed = True
+            future = self._background_future
+            if future is not None:
+                future.cancel()
+        self._background_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1) -> CompressionCoordinator:

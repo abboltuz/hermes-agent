@@ -226,6 +226,61 @@ def test_background_route_requires_explicit_certification():
     assert not compression_route_is_eligible({"provider": "p", "model": "m", "certified_fast": True, "reasoning": True})
 
 
+def test_background_config_is_explicit_and_clamped():
+    from agent.compression_v3 import resolve_background_compression_config
+
+    cfg = resolve_background_compression_config({"enabled": True, "start_ratio": 9, "hard_wait_seconds": 999})
+    assert cfg.enabled is True
+    assert cfg.start_ratio < 0.85
+    assert cfg.hard_wait_seconds == 120
+    assert resolve_background_compression_config({}).enabled is False
+
+
+def test_background_snapshot_is_deeply_immutable_and_excludes_incomplete_tool_envelope():
+    from agent.compression_v3 import build_background_snapshot
+
+    messages = [{"role": "user", "content": {"items": ["original"]}}, {"role": "assistant", "tool_calls": [{"id": "pending"}]}]
+    snapshot = build_background_snapshot("s", 3, 8, messages, policy_capsule={"latest": "x"}, route={"provider": "p", "model": "m"})
+    messages[0]["content"]["items"].append("mutated")
+    assert snapshot.messages == ((("role", "user"), ("content", (("items", ("original",)),))),)
+    assert all(dict(item).get("role") != "assistant" for item in snapshot.messages)
+
+
+def test_background_route_requires_opt_in_explicit_distinct_route():
+    from agent.compression_v3 import background_route_eligible
+
+    assert background_route_eligible({"enabled": True}, {"provider": "fast", "model": "m"}, {"provider": "main", "model": "m"})
+    assert not background_route_eligible({"enabled": False}, {"provider": "fast", "model": "m"}, {"provider": "main", "model": "m"})
+    assert not background_route_eligible({"enabled": True}, {"provider": "auto", "model": "m"}, {"provider": "main", "model": "m"})
+    assert not background_route_eligible({"enabled": True}, {"provider": "main", "model": "m"}, {"provider": "main", "model": "m"})
+
+
+def test_background_coordinator_runs_one_job_and_fences_late_result():
+    from agent.compression_v3 import build_background_snapshot
+    import threading
+
+    coordinator = CompressionCoordinator(session_id="s")
+    coordinator.request(CompressionRequest("s", 1, "pressure", 1))
+    snapshot = build_background_snapshot("s", 1, 1, [{"role": "user", "content": "x"}], policy_capsule={}, route={"provider": "p", "model": "m"})
+    started = threading.Event()
+    release = threading.Event()
+    job = coordinator.start_background(snapshot, lambda snap: (started.set(), release.wait(1), "summary")[-1])
+    assert started.wait(1)
+    assert coordinator.start_background(snapshot, lambda _: "duplicate") is job
+    assert coordinator.wait_background(0) is None
+    coordinator.close_background()
+    release.set()
+    assert coordinator.adopt_background_result("summary") is False
+
+
+def test_background_feasibility_skips_zero_reclaim_before_remote_work():
+    from agent.compression_v3 import assess_background_feasibility
+
+    result = assess_background_feasibility([{"role": "user", "content": "x"}], target_tokens=0, protected_tokens=5)
+    assert result.eligible is False
+    assert result.reason == "no_reclaimable_middle"
+
+
 def test_agent_coordinator_is_recreated_only_when_session_identity_changes():
     agent = type("Agent", (), {"session_id": "s", "_compression_generation": 4})()
     first = ensure_compression_coordinator(agent, trigger="automatic")
