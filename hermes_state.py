@@ -20,6 +20,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import secrets
 import logging
 import os
 import queue
@@ -11279,6 +11280,68 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             ).fetchone()
         return int(row[0]) if row else 0
+
+    def register_compression_recovery(
+        self, session_id: str, message_ids: List[int], *, generation: int = 0,
+        watermark: int = 0, projection_fingerprint: str = "",
+        recovery_identity: Optional[str] = None,
+    ) -> str:
+        """Bind an opaque compression marker to canonical message row ids."""
+        ids = sorted({int(value) for value in message_ids if int(value) > 0})
+        if not session_id or not ids:
+            raise ValueError("compression recovery requires a session and rows")
+        identity = recovery_identity or secrets.token_urlsafe(24)
+
+        def _do(conn):
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id FROM messages WHERE session_id = ? AND id IN ({placeholders})",
+                (session_id, *ids),
+            ).fetchall()
+            if {int(row[0]) for row in rows} != set(ids):
+                raise ValueError("compression recovery rows are not durably owned by session")
+            conn.execute(
+                "INSERT INTO compression_recovery "
+                "(recovery_identity, session_id, generation, watermark, message_ids, projection_fingerprint, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(recovery_identity) DO UPDATE SET message_ids=excluded.message_ids, "
+                "generation=excluded.generation, watermark=excluded.watermark, "
+                "projection_fingerprint=excluded.projection_fingerprint",
+                (identity, session_id, int(generation), int(watermark), json.dumps(ids),
+                 projection_fingerprint or "", time.time()),
+            )
+            return identity
+
+        return self._execute_write(_do)
+
+    def get_compression_recovery(self, recovery_identity: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Resolve an identity to its exact durable rows, or return None."""
+        if not isinstance(recovery_identity, str) or not recovery_identity or len(recovery_identity) > 128:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM compression_recovery WHERE recovery_identity = ? AND (? IS NULL OR session_id = ?)",
+                (recovery_identity, session_id, session_id),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                ids = json.loads(row["message_ids"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(ids, list) or not ids or any(not isinstance(i, int) for i in ids):
+                return None
+            placeholders = ",".join("?" for _ in ids)
+            messages = conn.execute(
+                f"SELECT * FROM messages WHERE session_id = ? AND id IN ({placeholders}) ORDER BY id",
+                (row["session_id"], *ids),
+            ).fetchall()
+        if len(messages) != len(set(ids)):
+            return None
+        result = dict(row)
+        result["message_ids"] = ids
+        result["messages"] = [dict(message) for message in messages]
+        return result
 
     def archive_and_compact(
         self,

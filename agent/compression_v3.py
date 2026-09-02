@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
+import secrets
 import threading
 import weakref
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -124,6 +125,12 @@ def prune_tool_pressure_projection(
     reclaimed = max(0, before - after)
     if reclaimed < min_reclaim_tokens or after + non_message_floor > soft_budget:
         return unchanged, 0
+    if result.recovery_identity and not _bind_recovery_identity(
+        agent, source, result.messages, result.recovery_identity,
+        int(getattr(agent, "_compression_generation", 0) or 0),
+        int(getattr(agent, "_session_watermark", 0) or 0),
+    ):
+        return unchanged, 0
     coordinator.active_projection = [dict(message) for message in result.messages]
     coordinator._tool_pressure_fingerprint = hashlib.sha256(
         json.dumps(result.messages, ensure_ascii=False, sort_keys=True, default=str).encode()
@@ -194,6 +201,43 @@ def build_policy_capsule(messages: Iterable[Mapping[str, Any]], *, session_id: s
             constraints.append(text[:_MAX_PREVIEW])
         identifiers.update(re.findall(r"(?:#[0-9]+|[0-9a-f]{7,40}|(?:/|\\)[\w./\\-]+)", text))
     return PolicyCapsule(human, tuple(dict.fromkeys(constraints[-32:])), tuple(sorted(identifiers)), session_id, generation, watermark)
+
+
+def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], retained: Sequence[Mapping[str, Any]], identity: str, generation: int, watermark: int) -> bool:
+    """Publish a marker only after canonical rows are proven durable."""
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    register = getattr(db, "register_compression_recovery", None)
+    if not db or not session_id or not callable(register):
+        return True  # compatibility for non-persistent/unit callers
+    def key(message: Mapping[str, Any]) -> str:
+        return json.dumps({k: message.get(k) for k in ("role", "content", "tool_call_id", "tool_calls", "tool_name")}, sort_keys=True, default=str)
+    remaining = {}
+    for message in retained:
+        remaining[key(message)] = remaining.get(key(message), 0) + 1
+    demoted = {}
+    for message in source:
+        item_key = key(message)
+        if remaining.get(item_key, 0):
+            remaining[item_key] -= 1
+        else:
+            demoted[item_key] = demoted.get(item_key, 0) + 1
+    try:
+        rows = db.get_messages(session_id, include_inactive=True)
+        ids = []
+        for row in rows:
+            item_key = key(row)
+            if demoted.get(item_key, 0):
+                demoted[item_key] -= 1
+                ids.append(row.get("id"))
+        if not ids or any(count for count in demoted.values()):
+            return False
+        register(session_id, ids, generation=generation, watermark=watermark,
+                 projection_fingerprint=hashlib.sha256(key(source[0]).encode()).hexdigest(),
+                 recovery_identity=identity)
+        return True
+    except Exception:
+        return False
 
 
 def _tool_call_ids(messages: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -331,7 +375,7 @@ def emergency_context_cut(
     if human:
         selected.append((human_index if human_index is not None else len(original), human[0]))
     selected.sort(key=lambda pair: pair[0])
-    identity = hashlib.sha256(f"{session_id}:{generation}:{watermark}".encode()).hexdigest()[:16]
+    identity = secrets.token_urlsafe(24)
     reference = f"{_RECOVERY_PREFIX}{session_id} anchor={identity} watermark={watermark}"
     compacted: list[dict[str, Any]] = []
     for _, item in selected:
@@ -429,6 +473,12 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         if result.provider_call_allowed:
             result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="emergency projection remains above safe input budget")
         raise ContextProjectionUnfit(result)
+    if result.recovery_identity and not _bind_recovery_identity(
+        agent, messages, result.messages, result.recovery_identity,
+        int(getattr(agent, "_compression_generation", 0) or 0),
+        int(getattr(agent, "_session_watermark", 0) or 0),
+    ):
+        raise ContextProjectionUnfit(replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="durable recovery registration failed"))
     coordinator.active_projection = [dict(message) for message in result.messages]
     request["messages"] = result.messages
     return request

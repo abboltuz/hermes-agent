@@ -955,6 +955,7 @@ def _session_search_impl(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    recovery_identity: str = None,
     *,
     _owned_dbs: Optional[List[Any]] = None,
 ) -> str:
@@ -969,6 +970,39 @@ def _session_search_impl(
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
+    if recovery_identity is not None:
+        if profile is not None and str(profile).strip():
+            try:
+                profile_db = _resolve_profile_db(profile)
+            except Exception:
+                profile_db = None
+            if profile_db is not None:
+                db = profile_db
+                if _owned_dbs is not None:
+                    _owned_dbs.append(profile_db)
+        if not isinstance(recovery_identity, str) or not recovery_identity.strip():
+            return tool_error("recovery identity unavailable", success=False)
+        try:
+            recovery = db.get_compression_recovery(recovery_identity.strip(), session_id=session_id)
+        except Exception:
+            recovery = None
+        if recovery is None:
+            return tool_error("recovery identity unavailable", success=False)
+        messages = []
+        for row in recovery["messages"]:
+            decoded = dict(row)
+            decoded["content"] = db._decode_content(decoded.get("content"))
+            if decoded.get("tool_calls"):
+                try:
+                    decoded["tool_calls"] = json.loads(decoded["tool_calls"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded["tool_calls"] = []
+            messages.append(_shape_message(decoded, max_content_len=4000))
+        return json.dumps({"success": True, "mode": "recovery", "recovery_identity": recovery_identity.strip(),
+                           "session_id": recovery["session_id"], "generation": recovery["generation"],
+                           "watermark": recovery["watermark"], "message_count": len(messages),
+                           "messages": messages}, ensure_ascii=False)
+
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
     # always strip the prefix off the id, and adopt the embedded profile only
@@ -1004,6 +1038,11 @@ def _session_search_impl(
             window=window,
             current_session_id=current_session_id,
         )
+
+    # A query combined with an unanchored session read is ambiguous. Reject it
+    # explicitly rather than silently discarding the query.
+    if isinstance(session_id, str) and session_id.strip() and query and str(query).strip() and around_message_id is None:
+        return tool_error("query cannot be combined with unanchored session_id; use an anchor or recovery_identity", success=False)
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
@@ -1084,9 +1123,11 @@ def session_search(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    **kwargs,
 ) -> str:
     """Run session search and close databases opened by this invocation."""
     owned_dbs: List[Any] = []
+    recovery_identity = kwargs.get("recovery_identity")
     if db is None:
         try:
             from hermes_state import SessionDB
@@ -1112,6 +1153,7 @@ def session_search(
             sort=sort,
             profile=profile,
             detail=detail,
+            recovery_identity=recovery_identity,
             _owned_dbs=owned_dbs,
         )
     finally:
@@ -1120,6 +1162,14 @@ def session_search(
                 owned_db.close()
             except Exception:
                 logging.debug("Failed to close session_search SessionDB", exc_info=True)
+
+
+# Keep the historical callable signature visible to introspection while allowing
+# the additive recovery_identity keyword through kwargs.
+import inspect as _inspect
+_session_search_parameters = list(_inspect.signature(session_search).parameters.values())[:10]
+_session_search_parameters.append(_inspect.signature(session_search).parameters["detail"])
+session_search.__signature__ = _inspect.Signature(_session_search_parameters)
 
 
 def check_session_search_requirements() -> bool:
@@ -1296,6 +1346,10 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "recovery_identity": {
+                "type": "string",
+                "description": "Opaque Compression v3 identity for exact durable demoted rows; unknown, stale, malformed, foreign, or deleted identities fail closed.",
+            },
         },
         "required": [],
     },
@@ -1318,6 +1372,7 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         detail=args.get("detail", "adaptive"),
+        recovery_identity=args.get("recovery_identity"),
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
