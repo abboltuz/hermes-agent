@@ -208,6 +208,56 @@ describe('AntigravityAccounts', () => {
     expect(onConfigSaved).toHaveBeenCalledTimes(1)
   })
 
+  it('review probe invalidates model options after approval when the account refresh fails', async () => {
+    const onConfigSaved = vi.fn()
+    await renderAccounts(onConfigSaved)
+    await screen.findByText('Antigravity accounts')
+    vi.useFakeTimers()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+    })
+    rpc.listAccounts.mockRejectedValueOnce(new Error('private bridge diagnostic'))
+    rpc.pollOAuth.mockResolvedValueOnce({ status: 'approved' })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+      await Promise.resolve()
+    })
+
+    expect(onConfigSaved).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('Could not load Antigravity accounts.')).toBeTruthy()
+    expect(screen.queryByText('private bridge diagnostic')).toBeNull()
+  })
+
+  it('does not invalidate model options for an approved OAuth result after a profile transition', async () => {
+    const onConfigSaved = vi.fn()
+    const approval = deferred<{ status: string }>()
+    rpc.pollOAuth.mockReturnValueOnce(approval.promise)
+    await renderAccounts(onConfigSaved)
+    await screen.findByText('Antigravity accounts')
+    vi.useFakeTimers()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Connect account' }))
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(rpc.pollOAuth).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      $activeGatewayProfile.set('other')
+      await Promise.resolve()
+    })
+    expect(rpc.listAccounts).toHaveBeenCalledTimes(2)
+    expect($activeGatewayProfile.get()).toBe('other')
+
+    await act(async () => {
+      approval.resolve({ status: 'approved' })
+    })
+
+    expect(onConfigSaved).not.toHaveBeenCalled()
+  })
+
   it('starts OAuth only through the typed client without rendering a Project ID field and cancels its poll lifecycle', async () => {
     await renderAccounts()
     await screen.findByText('Antigravity accounts')

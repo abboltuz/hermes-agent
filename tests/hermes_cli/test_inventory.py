@@ -709,6 +709,38 @@ def test_antigravity_account_probe_failure_or_disconnected_snapshot_does_not_add
     assert "private" not in str(failed).lower()
 
 
+def test_antigravity_truthy_non_boolean_connected_snapshot_does_not_authorize_managed_row():
+    """Only a literal boolean connection result authorizes managed discovery."""
+    class TruthyConnectedClient:
+        instances = []
+
+        def __init__(self):
+            self.closed = False
+            self.list_models_called = False
+            self.instances.append(self)
+
+        def list_accounts(self):
+            return {"connected": "yes"}
+
+        def list_models(self):
+            self.list_models_called = True
+            raise AssertionError("model discovery must require literal True")
+
+        def close(self):
+            self.closed = True
+
+    ctx = _empty_ctx(provider="openrouter")
+    with (
+        _list_auth_returning([]),
+        patch("agent.antigravity_bridge_client.AntigravityBridgeClient", TruthyConnectedClient),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+
+    assert "antigravity" not in {row["slug"] for row in payload["providers"]}
+    assert TruthyConnectedClient.instances[0].list_models_called is False
+    assert TruthyConnectedClient.instances[0].closed is True
+
+
 def test_antigravity_current_provider_uses_filtered_live_catalog_without_api_key():
     """A configured Antigravity subscription is a native picker row.
 

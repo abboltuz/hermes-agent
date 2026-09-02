@@ -212,9 +212,8 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
           clearInterval(flow.timer)
           oauth.current = null
           setConnecting(false)
-          if (await refresh()) {
-            onConfigSaved?.()
-          }
+          onConfigSaved?.()
+          await refresh()
         }
       } catch (reason) {
         if (!isAbort(reason) && oauth.current === flow) {
