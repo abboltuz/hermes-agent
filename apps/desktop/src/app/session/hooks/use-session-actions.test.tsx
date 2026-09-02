@@ -736,12 +736,14 @@ describe('createBackendSessionForSend profile routing', () => {
 function ResumeHarness({
   onStateUpdate,
   onReady,
+  onViewSync,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId = null,
   sessionStateByRuntimeIdRef
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
+  onViewSync?: (sessionId: string, state: ClientSessionState) => void
   onReady: (
     resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   ) => void
@@ -769,7 +771,7 @@ function ResumeHarness({
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: stateMapRef,
-    syncSessionStateToView: vi.fn(),
+    syncSessionStateToView: onViewSync ?? vi.fn(),
     updateSessionState: (sessionId, updater, storedSessionId) => {
       // Full default shape (not a bare {} cast) so seeded/derived fields like
       // turnStartedAt behave as in production state updates.
@@ -2046,6 +2048,58 @@ describe('resumeSession warm-cache mapping integrity', () => {
     vi.restoreAllMocks()
   })
 
+  it('does not publish the warm runtime tail when persisted provenance is unavailable', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-warm', 'runtime-warm']])
+    }
+    const warmState = clientState('stored-warm')
+    warmState.messages = [
+      {
+        id: 'compressed-tail',
+        role: 'assistant',
+        parts: [{ type: 'text', text: 'unproven compressed runtime tail' }]
+      }
+    ]
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['runtime-warm', warmState]])
+    }
+    setSessions([storedSession({ id: 'stored-warm', message_count: 1 })])
+    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('REST unavailable'))
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          messages: [
+            { content: 'unproven compressed runtime tail', role: 'assistant', timestamp: 1 }
+          ],
+          messages_omitted: false,
+          resumed: 'stored-warm',
+          running: false,
+          session_id: 'runtime-warm',
+          session_key: 'stored-warm'
+        } as never
+      }
+      return {} as never
+    })
+    const viewSyncs: ClientSessionState[] = []
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onViewSync={(_sessionId, state) => viewSyncs.push(state)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-warm', true)
+
+    expect(viewSyncs.length).toBeGreaterThan(0)
+    expect(viewSyncs.every(state => state.messages.length === 0)).toBe(true)
+  })
   it('pins an untagged row to the active registry connection instead of the same-named local profile', async () => {
     setConnection({ connectionId: 'hermes01', mode: 'remote' } as never)
     setSessions([storedSession({ id: 'remote-stored', profile: 'default' })])

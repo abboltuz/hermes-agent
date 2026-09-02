@@ -1195,7 +1195,14 @@ export function useSessionActions({
                 storedSessionId
               )
 
-              syncSessionStateToView(cachedRuntimeId, activatedState)
+              // Keep the warm/runtime projection held when persisted REST
+              // provenance was not established. The cache gate also protects
+              // ordinary runtime events, but this activation finalization is a
+              // direct view sync and must apply the same hold before release.
+              syncSessionStateToView(
+                cachedRuntimeId,
+                suppressTranscriptForView(activatedState, suppressUnprovenWarmTranscript)
+              )
               releaseHeldTranscriptView?.()
               // Cache backend transcript truth only. The pending/running bit and
               // any synthetic clarify row are a live resume projection and must
