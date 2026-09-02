@@ -23,6 +23,7 @@ from agent.compression_v3 import (
 )
 from agent.compression_v3 import _provider_wire_token_bound
 from agent.compression_v3 import _bind_recovery_identity
+from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 
 
 HUMAN = {"origin_kind": "human_user", "turn_kind": "prompt", "trust_kind": "user_authorized"}
@@ -60,6 +61,33 @@ def test_prepare_api_request_strips_private_sidecars_recursively():
 
     walk(prepared)
     assert request["messages"][0]["_row_id"] == 2
+
+
+@pytest.mark.parametrize("api_mode", ["codex_responses", "anthropic_messages", "chat_completions"])
+def test_shared_dispatch_refuses_oversized_native_wire_before_client_call(api_mode):
+    agent = type("Agent", (), {
+        "api_mode": api_mode,
+        "provider": "openrouter",
+        "_config_context_length": 32,
+        "_compression_safety_margin": 0,
+    })()
+    calls = []
+
+    def make_client(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("provider client must not be created")
+
+    request = {
+        "instructions": "irreducible policy " * 40,
+        "input": [{"role": "user", "content": "irreducible input " * 40}],
+        "messages": None,
+        "tools": [{"type": "function", "name": "large", "parameters": {"type": "object"}}],
+        "max_output_tokens": 8,
+    }
+    with pytest.raises(ContextProjectionUnfit) as exc_info:
+        _dispatch_nonstreaming_api_request(agent, request, make_client=make_client)
+    assert exc_info.value.outcome == "context_projection_unfit"
+    assert calls == []
 
 
 def _round(number: int, *, body: str = "result"):
