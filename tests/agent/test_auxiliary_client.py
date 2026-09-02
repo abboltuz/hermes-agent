@@ -1692,6 +1692,71 @@ class TestCompressionFallbackContinuation:
         import asyncio
         asyncio.run(exercise())
 
+    def test_sync_no_result_fallback_candidate_advances_once(self):
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = self._payment_error()
+        first = MagicMock()
+        first.chat.completions.create.return_value = None
+        second = MagicMock()
+        second.chat.completions.create.return_value = self._response("second-none")
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "primary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "primary-model")), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   side_effect=[(first, "first-model", "route-a"),
+                                (second, "second-model", "route-b")]):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+
+        assert result.choices[0].message.content == "second-none"
+        assert first.chat.completions.create.call_count == 1
+        assert second.chat.completions.create.call_count == 1
+
+    def test_async_no_result_fallback_candidate_advances_once(self):
+        async def exercise():
+            primary = MagicMock()
+            primary.chat.completions.create = AsyncMock(side_effect=self._payment_error())
+            first = MagicMock()
+            first.chat.completions.create = AsyncMock(return_value=None)
+            second = MagicMock()
+            second.chat.completions.create = AsyncMock(return_value=self._response("second-none-async"))
+
+            with patch("agent.auxiliary_client._resolve_task_provider_model",
+                       return_value=("auto", "primary-model", None, None, None)), \
+                 patch("agent.auxiliary_client._get_cached_client",
+                       return_value=(primary, "primary-model")), \
+                 patch("agent.auxiliary_client._try_configured_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_main_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_payment_fallback",
+                       side_effect=[(first, "first-model", "route-a"),
+                                    (second, "second-model", "route-b")]), \
+                 patch("agent.auxiliary_client._to_async_client",
+                       side_effect=lambda client, model, **_: (client, model)):
+                result = await async_call_llm(
+                    task="compression", messages=[{"role": "user", "content": "x"}]
+                )
+            assert result.choices[0].message.content == "second-none-async"
+            assert first.chat.completions.create.call_count == 1
+            assert second.chat.completions.create.call_count == 1
+
+        import asyncio
+        asyncio.run(exercise())
+
+    def test_no_result_and_malformed_are_compression_route_local(self):
+        assert _is_compression_route_local_failure(
+            RuntimeError("Auxiliary compression: LLM returned None response")
+        )
+        assert _is_compression_route_local_failure(
+            RuntimeError("Auxiliary compression: LLM returned invalid response")
+        )
+
     def test_timeout_is_explicit_compression_route_local_failure(self):
         class SummaryTimeout(Exception):
             pass
