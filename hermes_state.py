@@ -11300,6 +11300,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
             if {int(row[0]) for row in rows} != set(ids):
                 raise ValueError("compression recovery rows are not durably owned by session")
+            # Verify and deduplicate atomically: the complete canonical bundle
+            # is the idempotence key for repeated pressure checks.
+            existing = conn.execute(
+                "SELECT recovery_identity FROM compression_recovery "
+                "WHERE session_id = ? AND generation = ? AND watermark = ? "
+                "AND projection_fingerprint = ? AND message_ids = ? LIMIT 1",
+                (session_id, int(generation), int(watermark),
+                 projection_fingerprint or "", json.dumps(ids)),
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
             conn.execute(
                 "INSERT INTO compression_recovery "
                 "(recovery_identity, session_id, generation, watermark, message_ids, projection_fingerprint, created_at) "

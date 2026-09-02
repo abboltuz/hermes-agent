@@ -21,6 +21,7 @@ from agent.message_provenance import is_human_intent
 
 
 _RECOVERY_PREFIX = "[COMPACTION RECOVERY] session="
+_PROVISIONAL_RECOVERY_PREFIX = "[COMPACTION RECOVERY PENDING] session="
 _MAX_PREVIEW = 240
 TOOL_PRESSURE_MIN_RECLAIM_TOKENS = 8192
 TOOL_PRESSURE_SOFT_RATIO = 0.85
@@ -203,13 +204,13 @@ def build_policy_capsule(messages: Iterable[Mapping[str, Any]], *, session_id: s
     return PolicyCapsule(human, tuple(dict.fromkeys(constraints[-32:])), tuple(sorted(identifiers)), session_id, generation, watermark)
 
 
-def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], retained: Sequence[Mapping[str, Any]], identity: str, generation: int, watermark: int) -> bool:
+def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], retained: Sequence[Mapping[str, Any]], identity: str, generation: int, watermark: int) -> str | None:
     """Publish a marker only after canonical rows are proven durable."""
     db = getattr(agent, "_session_db", None)
     session_id = str(getattr(agent, "session_id", "") or "")
     register = getattr(db, "register_compression_recovery", None)
     if not db or not session_id or not callable(register):
-        return True  # compatibility for non-persistent/unit callers
+        return None
     def key(message: Mapping[str, Any]) -> str:
         return json.dumps({k: message.get(k) for k in ("role", "content", "tool_call_id", "tool_calls", "tool_name")}, sort_keys=True, default=str)
     remaining = {}
@@ -235,13 +236,24 @@ def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], ret
                 demoted[item_key] -= 1
                 ids.append(row.get("id"))
         if not ids or any(count for count in demoted.values()):
-            return False
-        register(session_id, ids, generation=generation, watermark=watermark,
-                 projection_fingerprint=hashlib.sha256(key(source[0]).encode()).hexdigest(),
-                 recovery_identity=identity)
-        return True
+            return None
+        fingerprint = hashlib.sha256(
+            json.dumps([key(message) for message in source], ensure_ascii=False).encode()
+        ).hexdigest()
+        canonical = register(
+            session_id, ids, generation=generation, watermark=watermark,
+            projection_fingerprint=fingerprint, recovery_identity=identity,
+        )
+        if not isinstance(canonical, str) or not canonical:
+            return None
+        old = f"{_PROVISIONAL_RECOVERY_PREFIX}{session_id} anchor={identity}"
+        new = f"{_RECOVERY_PREFIX}{session_id} anchor={canonical}"
+        for message in retained:
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                message["content"] = message["content"].replace(old, new)
+        return canonical
     except Exception:
-        return False
+        return None
 
 
 def _tool_call_ids(messages: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -380,7 +392,7 @@ def emergency_context_cut(
         selected.append((human_index if human_index is not None else len(original), human[0]))
     selected.sort(key=lambda pair: pair[0])
     identity = secrets.token_urlsafe(24)
-    reference = f"{_RECOVERY_PREFIX}{session_id} anchor={identity} watermark={watermark}"
+    reference = f"{_PROVISIONAL_RECOVERY_PREFIX}{session_id} anchor={identity} watermark={watermark}"
     compacted: list[dict[str, Any]] = []
     for _, item in selected:
         if item.get("role") == "tool" and _tokens(item.get("content", "")) > max(16, budget.history_budget // 3):

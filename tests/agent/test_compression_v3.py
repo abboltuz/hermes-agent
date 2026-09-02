@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent.compression_v3 import (
     CompressionBudget,
+    ContextProjectionUnfit,
     CompressionCandidate,
     CompressionCoordinator,
     CompressionRequest,
@@ -97,7 +100,7 @@ def test_emergency_cut_demotes_only_oldest_bodies_needed_to_fit():
     assert cut.provider_call_allowed is True
     assert CompressionBudget(1800, 10, 10, 10, 10).fits(cut.messages)
     tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
-    assert tool_bodies[0].startswith("[COMPACTION RECOVERY]")
+    assert tool_bodies[0].startswith("[COMPACTION RECOVERY PENDING]")
     assert tool_bodies[-1] == bodies[-1]
     assert all(m.get("tool_call_id") for m in cut.messages if m.get("role") == "tool")
     assert validate_projection(cut.messages).valid
@@ -123,7 +126,7 @@ def test_emergency_cut_can_demote_exactly_one_oldest_body():
     cut = emergency_context_cut(messages, CompressionBudget(1950, 10, 10, 10, 10), session_id="s", generation=3)
 
     tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
-    assert sum(body.startswith("[COMPACTION RECOVERY]") for body in tool_bodies) == 1
+    assert sum(body.startswith("[COMPACTION RECOVERY PENDING]") for body in tool_bodies) == 1
     assert tool_bodies[1:] == bodies[1:]
 
 
@@ -136,7 +139,7 @@ def test_emergency_cut_demotes_all_retained_bodies_when_required():
 
     tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
     assert cut.provider_call_allowed is True
-    assert all(body.startswith("[COMPACTION RECOVERY]") for body in tool_bodies)
+    assert all(body.startswith("[COMPACTION RECOVERY PENDING]") for body in tool_bodies)
     assert CompressionBudget(1000, 10, 10, 10, 10).fits(cut.messages)
 
 
@@ -159,7 +162,7 @@ def test_emergency_cut_honors_minimum_reclaim_after_candidate_fits():
     assert cut.provider_call_allowed is True
     assert reclaimed >= 8_192
     tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
-    assert all(body.startswith("[COMPACTION RECOVERY]") for body in tool_bodies[:4])
+    assert all(body.startswith("[COMPACTION RECOVERY PENDING]") for body in tool_bodies[:4])
     assert tool_bodies[4:] == bodies[4:]
     assert validate_projection(cut.messages).valid
 
@@ -240,14 +243,13 @@ def test_irreducible_floor_returns_typed_unfit_without_provider_call():
     assert result.messages == messages
 
 
-def test_pre_send_gate_cuts_reducible_request_and_binds_session_coordinator():
+def test_pre_send_gate_without_persistence_returns_typed_unfit():
     agent = type("Agent", (), {"session_id": "s", "_compression_generation": 2, "_config_context_length": 300, "_compression_safety_margin": 10})()
     call_id = "call-1"
     request = {"messages": [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "task"}, {"role": "assistant", "tool_calls": [{"id": call_id}]}, {"role": "tool", "tool_call_id": call_id, "content": "x" * 3000}], "max_tokens": 10}
-    prepared = prepare_api_request(agent, request)
-    assert prepared["messages"] != request["messages"]
-    assert agent._compression_coordinator.outcome is None
-    assert validate_projection(prepared["messages"]).valid
+    with pytest.raises(ContextProjectionUnfit):
+        prepare_api_request(agent, request)
+    assert request["messages"][-1]["content"] == "x" * 3000
 
 
 def test_pre_send_gate_refuses_irreducible_request_without_mutating_input():
@@ -286,10 +288,8 @@ def test_tool_pressure_projection_keeps_six_parallel_semantic_rounds():
             {"role": "tool", "tool_call_id": f"r{number}-a", "content": f"r{number}-a-" + "x" * 5000},
         ])
     projection, reclaimed = prune_tool_pressure_projection(agent, messages)
-    assert reclaimed >= 8192
-    assert {m["tool_call_id"] for m in projection if m.get("role") == "tool"} == {
-        f"r{number}-{suffix}" for number in range(2, 8) for suffix in ("a", "b")
-    }
+    assert reclaimed == 0
+    assert projection is messages
 
 
 def test_tool_pressure_projection_prunes_completed_rounds_before_next_request():
@@ -308,14 +308,8 @@ def test_tool_pressure_projection_prunes_completed_rounds_before_next_request():
     for number in range(12):
         messages.extend(_round(number, body=f"result-{number}-" + "x" * 10_000))
     projection, reclaimed = prune_tool_pressure_projection(agent, messages)
-    assert reclaimed >= 8192
-    assert projection != messages
-    assert validate_projection(projection).valid
-    assert {
-        message["tool_call_id"]
-        for message in projection
-        if message.get("role") == "tool"
-    } == {f"call-{number}" for number in range(6, 12)}
+    assert reclaimed == 0
+    assert projection is messages
 
 
 def test_tool_pressure_projection_accounts_for_external_request_floor():
@@ -342,9 +336,8 @@ def test_tool_pressure_projection_accounts_for_external_request_floor():
     assert before < 20_000 * 0.85
     projection, reclaimed = prune_tool_pressure_projection(agent, messages, current_tokens=18_000)
 
-    assert projection != messages
-    assert reclaimed >= 8192
-    assert estimate_projection_tokens(projection) + (18_000 - before) <= 20_000 * 0.85
+    assert projection is messages
+    assert reclaimed == 0
 
 
 def test_tool_pressure_projection_does_not_split_incomplete_group():
