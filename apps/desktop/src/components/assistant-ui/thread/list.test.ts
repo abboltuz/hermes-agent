@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   buildGroups,
+  createThreadScrollCleanup,
   firstVisibleGroupIndex,
   HIDDEN_TRANSCRIPT_RENDER_BUDGET,
   LIVE_TAIL_MIN_GROUPS,
@@ -316,6 +317,25 @@ describe('liveTailStart', () => {
 describe('bounded transcript settling', () => {
   it('fills the normal render budget in at most two backfill frames', () => {
     expect(transcriptBackfillFrameCount()).toBeLessThanOrEqual(2)
+  })
+
+  it('does not reset foreground scroll when a retained pane becomes hidden', () => {
+    // React runs an effect cleanup after the new visibility render. The cleanup
+    // must consult that current value, not the old effect closure.
+    let paneVisible = true
+    const visibilityRef = { current: paneVisible }
+
+    const reset = vi.fn()
+    const cleanup = createThreadScrollCleanup(visibilityRef, reset)
+
+    paneVisible = false
+    visibilityRef.current = paneVisible
+    cleanup()
+    expect(reset).not.toHaveBeenCalled()
+
+    visibilityRef.current = true
+    cleanup()
+    expect(reset).toHaveBeenCalledOnce()
   })
 
   it('only snaps a near-bottom reader when a run starts', () => {

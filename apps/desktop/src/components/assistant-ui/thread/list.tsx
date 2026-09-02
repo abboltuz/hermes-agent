@@ -115,6 +115,17 @@ export const transcriptBackfillFrameCount = (
   budget = RENDER_BUDGET
 ): number => Math.ceil(Math.max(0, budget - firstPaint) / step)
 
+// Cleanup runs after a visibility render has committed. Read the current
+// visibility rather than the effect's captured value so a retained pane moving
+// visible -> hidden cannot reset the foreground pane's shared scroll atoms.
+export const shouldResetThreadScrollOnCleanup = (paneVisible: boolean): boolean => paneVisible
+
+export const createThreadScrollCleanup = (paneVisibleRef: { current: boolean }, reset: () => void) => () => {
+  if (shouldResetThreadScrollOnCleanup(paneVisibleRef.current)) {
+    reset()
+  }
+}
+
 // Browsers may quantize a requested scrollTop to a nearby device-pixel
 // boundary. use-stick-to-bottom otherwise compares the lower actual value to
 // the integer target forever, re-requesting the same instant scroll every
@@ -425,6 +436,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const mountedPanes = useStore($mountedTranscriptPanes)
   const paneLifecycle = usePaneLifecycle()
   const paneVisible = usePaneVisible()
+  const paneVisibleRef = useRef(paneVisible)
+  paneVisibleRef.current = paneVisible
   // Hidden panes retain only a live-tail budget. Visible panes share the normal
   // screen budget; a reveal backfills older rows in bounded transition steps.
   const paneBudget = transcriptPaneBudget(mountedPanes, paneLifecycle === 'hot-hidden')
@@ -581,7 +594,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
   useEffect(() => publishThreadAtBottom(isAtBottom, { paneVisible }), [isAtBottom, paneVisible])
-  useEffect(() => () => resetPublishedThreadScroll({ paneVisible }), [paneVisible])
+  useEffect(() => createThreadScrollCleanup(paneVisibleRef, () => resetPublishedThreadScroll({ paneVisible: true })), [])
 
   // Floating jump button (outside this subtree) → return to the bottom.
   useEffect(
