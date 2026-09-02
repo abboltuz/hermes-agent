@@ -2688,6 +2688,52 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    def test_summary_gate_blocks_irreducible_openai_request_before_sdk(self, agent):
+        agent._cached_system_prompt = "policy"
+        agent._config_context_length = 1
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 1
+        agent.client.chat.completions.create = MagicMock(
+            side_effect=AssertionError("provider must not be called")
+        )
+
+        with pytest.raises(ContextProjectionUnfit):
+            agent._handle_max_iterations(
+                [{"role": "user", "content": "oversized task"}],
+                1,
+            )
+
+        assert agent.client.chat.completions.create.call_count == 0
+
+    def test_summary_gate_is_reapplied_to_retry_before_sdk(self, agent):
+        agent._cached_system_prompt = "policy"
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=""),
+            AssertionError("retry provider must not be called"),
+        ]
+        original_context = agent._config_context_length
+        gate_calls = 0
+
+        from agent.compression_v3 import prepare_api_request
+
+        def gate_then_shrink(current_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 3:
+                current_agent._config_context_length = 1
+            return prepare_api_request(current_agent, request)
+
+        with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
+            with pytest.raises(ContextProjectionUnfit):
+                agent._handle_max_iterations(
+                    [{"role": "user", "content": "safe first task"}],
+                    1,
+                )
+
+        agent._config_context_length = original_context
+        assert gate_calls == 3
+        assert agent.client.chat.completions.create.call_count == 1
+
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),
