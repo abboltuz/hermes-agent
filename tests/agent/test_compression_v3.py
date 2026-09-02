@@ -10,6 +10,7 @@ from agent.compression_v3 import (
     ensure_compression_coordinator,
     emergency_context_cut,
     validate_projection,
+    prepare_api_request,
 )
 
 
@@ -98,3 +99,26 @@ def test_irreducible_floor_returns_typed_unfit_without_provider_call():
     assert result.outcome == "context_projection_unfit"
     assert result.provider_call_allowed is False
     assert result.messages == messages
+
+
+def test_pre_send_gate_cuts_reducible_request_and_binds_session_coordinator():
+    agent = type("Agent", (), {"session_id": "s", "_compression_generation": 2, "_config_context_length": 300, "_compression_safety_margin": 10})()
+    call_id = "call-1"
+    request = {"messages": [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "task"}, {"role": "assistant", "tool_calls": [{"id": call_id}]}, {"role": "tool", "tool_call_id": call_id, "content": "x" * 3000}], "max_tokens": 10}
+    prepared = prepare_api_request(agent, request)
+    assert prepared["messages"] != request["messages"]
+    assert agent._compression_coordinator.outcome is None
+    assert validate_projection(prepared["messages"]).valid
+
+
+def test_pre_send_gate_refuses_irreducible_request_without_mutating_input():
+    agent = type("Agent", (), {"session_id": "s", "_compression_generation": 1, "_config_context_length": 20, "_compression_safety_margin": 5})()
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "task"}]
+    request = {"messages": messages, "max_tokens": 5}
+    try:
+        prepare_api_request(agent, request)
+    except Exception as exc:
+        assert getattr(exc, "outcome", None) == "context_projection_unfit"
+    else:
+        raise AssertionError("irreducible request was accepted")
+    assert request["messages"] == messages

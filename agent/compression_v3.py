@@ -145,6 +145,16 @@ class CutResult:
     reason: str = ""
 
 
+class ContextProjectionUnfit(RuntimeError):
+    """Raised before transport when the irreducible request floor cannot fit."""
+
+    outcome = "context_projection_unfit"
+
+    def __init__(self, result: CutResult) -> None:
+        self.result = result
+        super().__init__(result.reason or self.outcome)
+
+
 def _round_groups(messages: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
     groups: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
@@ -189,6 +199,46 @@ def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: Compres
     if validate_projection(floor).valid and budget.fits(floor):
         return CutResult(floor, "emergency_context_cut", True, identity, validation.reason)
     return CutResult(original, "context_projection_unfit", False, identity, validation.reason)
+
+
+def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply the v3 fit gate to the actual provider-bound request."""
+    request = dict(api_kwargs)
+    messages = request.get("messages")
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        return request
+    compressor = getattr(agent, "context_compressor", None)
+    context_window = getattr(agent, "_config_context_length", None)
+    if not isinstance(context_window, int) or context_window <= 0:
+        context_window = getattr(compressor, "context_length", None)
+    if not isinstance(context_window, int) or context_window <= 0:
+        return request
+    output_reserve = request.get("max_tokens", request.get("max_completion_tokens", 0))
+    if not isinstance(output_reserve, int) or output_reserve < 0:
+        output_reserve = 0
+    safety_margin = getattr(agent, "_compression_safety_margin", 1024)
+    if not isinstance(safety_margin, int) or safety_margin < 0:
+        safety_margin = 1024
+    tools = request.get("tools") or ()
+    tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
+    budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
+    if budget.fits(messages):
+        return request
+    coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
+    result = emergency_context_cut(
+        messages,
+        budget,
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        generation=int(getattr(agent, "_compression_generation", 0) or 0),
+        watermark=int(getattr(agent, "_session_watermark", 0) or 0),
+    )
+    if not result.provider_call_allowed or not budget.fits(result.messages):
+        if result.provider_call_allowed:
+            result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="emergency projection remains above safe input budget")
+        raise ContextProjectionUnfit(result)
+    coordinator.active_projection = [dict(message) for message in result.messages]
+    request["messages"] = result.messages
+    return request
 
 
 @dataclass(frozen=True)

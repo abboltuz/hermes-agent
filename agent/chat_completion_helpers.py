@@ -939,6 +939,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent.compression_v3 import prepare_api_request
+
+    api_kwargs = prepare_api_request(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -3354,6 +3357,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     """
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
+
+    from agent.compression_v3 import prepare_api_request
+
+    api_kwargs = prepare_api_request(agent, api_kwargs)
 
     def _stream_final_text(response) -> str:
         try:
