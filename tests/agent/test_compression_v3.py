@@ -105,6 +105,49 @@ def test_emergency_cut_demotes_all_retained_bodies_when_required():
     assert CompressionBudget(1000, 10, 10, 10, 10).fits(cut.messages)
 
 
+def test_emergency_cut_honors_minimum_reclaim_after_candidate_fits():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    bodies = [f"body-{i}-" + ("x" * 10_000) for i in range(6)]
+    for i, body in enumerate(bodies):
+        messages.extend(_round(i, body=body))
+
+    original_tokens = estimate_projection_tokens(messages)
+    cut = emergency_context_cut(
+        messages,
+        CompressionBudget(100_000, 10, 10),
+        session_id="s",
+        generation=3,
+        min_reclaim_tokens=8_192,
+    )
+
+    reclaimed = original_tokens - estimate_projection_tokens(cut.messages)
+    assert cut.provider_call_allowed is True
+    assert reclaimed >= 8_192
+    tool_bodies = [m["content"] for m in cut.messages if m.get("role") == "tool"]
+    assert all(body.startswith("[COMPACTION RECOVERY]") for body in tool_bodies[:4])
+    assert tool_bodies[4:] == bodies[4:]
+    assert validate_projection(cut.messages).valid
+
+
+def test_emergency_cut_reports_fit_but_insufficient_reclaim_when_minimum_is_impossible():
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "latest task"}]
+    for i in range(6):
+        messages.extend(_round(i, body=f"small-{i}"))
+
+    cut = emergency_context_cut(
+        messages,
+        CompressionBudget(100_000, 10, 10),
+        session_id="s",
+        generation=3,
+        min_reclaim_tokens=8_192,
+    )
+
+    assert cut.provider_call_allowed is False
+    assert cut.outcome == "context_projection_min_reclaim_unmet"
+    assert estimate_projection_tokens(messages) - estimate_projection_tokens(cut.messages) < 8_192
+    assert validate_projection(cut.messages).valid
+
+
 def test_capsule_uses_human_intent_not_synthetic_wakes_and_keeps_identifiers():
     messages = [
         {"role": "user", "content": "synthetic wake", "_internal_wake": True},

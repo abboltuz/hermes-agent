@@ -114,6 +114,7 @@ def prune_tool_pressure_projection(
         session_id=str(getattr(agent, "session_id", "") or ""),
         generation=int(getattr(agent, "_compression_generation", 0) or 0),
         watermark=int(getattr(agent, "_session_watermark", 0) or 0),
+        min_reclaim_tokens=min_reclaim_tokens,
     )
     if not result.provider_call_allowed:
         return unchanged, 0
@@ -293,8 +294,20 @@ def _round_groups(messages: Sequence[Mapping[str, Any]]) -> list[tuple[int, int,
     return groups
 
 
-def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: CompressionBudget, *, session_id: str, generation: int, watermark: int = 0) -> CutResult:
+def emergency_context_cut(
+    messages: Sequence[Mapping[str, Any]],
+    budget: CompressionBudget,
+    *,
+    session_id: str,
+    generation: int,
+    watermark: int = 0,
+    min_reclaim_tokens: int = 0,
+) -> CutResult:
     original = [dict(message) for message in messages]
+    min_reclaim_tokens = max(0, int(min_reclaim_tokens))
+    original_projection_tokens = estimate_projection_tokens(original)
+    if min_reclaim_tokens == 0 and budget.fits(original):
+        return CutResult(original, "emergency_context_cut", True)
     capsule = build_policy_capsule(original, session_id=session_id, watermark=watermark, generation=generation)
     system = [dict(m) for m in original if m.get("role") == "system" and not m.get("_compression_capsule")][:1]
     human = [dict(m) for m in original if m.get("role") == "user" and is_human_intent(m)][-1:]
@@ -326,7 +339,15 @@ def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: Compres
     recovery = {"role": "system", "content": reference, "_compression_recovery": True}
     prefix = system + [capsule.message(), recovery]
     candidate = prefix + compacted
-    if validate_projection(candidate).valid and budget.fits(candidate):
+    def meets_target(candidate_messages: Sequence[Mapping[str, Any]]) -> bool:
+        reclaimed = original_projection_tokens - estimate_projection_tokens(candidate_messages)
+        return (
+            validate_projection(candidate_messages).valid
+            and budget.fits(candidate_messages)
+            and reclaimed >= min_reclaim_tokens
+        )
+
+    if meets_target(candidate):
         return CutResult(candidate, "emergency_context_cut", True, identity)
     # A retained round is semantically protected, but its bulk body is not.
     # Compact oldest retained bodies progressively when the six-round envelope
@@ -339,18 +360,34 @@ def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: Compres
             continue
         item["content"] = reference + " preview=" + content[:_MAX_PREVIEW]
         candidate = prefix + compacted
-        if validate_projection(candidate).valid and budget.fits(candidate):
+        if meets_target(candidate):
             break
     validation = validate_projection(candidate)
-    if validation.valid and budget.fits(candidate):
+    if meets_target(candidate):
         return CutResult(candidate, "emergency_context_cut", True, identity)
+    if validation.valid and budget.fits(candidate):
+        return CutResult(
+            original,
+            "context_projection_min_reclaim_unmet",
+            False,
+            identity,
+            "minimum reclaim target cannot be met by eligible bodies",
+        )
     if not budget.fits(system + [capsule.message()] + human):
         return CutResult(original, "context_projection_unfit", False, identity, "irreducible system/tool/policy/user floor exceeds safe input budget")
     # A malformed retained tail is never sent; return the safe floor and let the
     # caller rebuild the next tool group rather than inventing a pairing.
     floor = system + [capsule.message()] + human
     if validate_projection(floor).valid and budget.fits(floor):
-        return CutResult(floor, "emergency_context_cut", True, identity, validation.reason)
+        if meets_target(floor):
+            return CutResult(floor, "emergency_context_cut", True, identity, validation.reason)
+        return CutResult(
+            original,
+            "context_projection_min_reclaim_unmet",
+            False,
+            identity,
+            "minimum reclaim target cannot be met by eligible bodies",
+        )
     return CutResult(original, "context_projection_unfit", False, identity, validation.reason)
 
 
@@ -384,6 +421,7 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         session_id=str(getattr(agent, "session_id", "") or ""),
         generation=int(getattr(agent, "_compression_generation", 0) or 0),
         watermark=int(getattr(agent, "_session_watermark", 0) or 0),
+        min_reclaim_tokens=0,
     )
     if not result.provider_call_allowed or not budget.fits(result.messages):
         if result.provider_call_allowed:
