@@ -821,6 +821,7 @@ function ResumeTimerHarness({
     creatingSessionRef: useRef(false),
     ensureSessionState: cache.ensureSessionState,
     getRouteToken: () => 'timer-contract',
+    holdSessionTranscriptView: cache.holdSessionTranscriptView,
     navigate: vi.fn() as never,
     requestGateway,
     resetViewSync: cache.resetViewSync,
@@ -2099,6 +2100,100 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     expect(viewSyncs.length).toBeGreaterThan(0)
     expect(viewSyncs.every(state => state.messages.length === 0)).toBe(true)
+  })
+  it('keeps a held warm view closed to later cache projections after persisted REST failure', async () => {
+    setSessions([storedSession({ id: 'stored-warm', message_count: 1 })])
+    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('REST unavailable'))
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          messages: [{ content: 'compressed runtime tail', role: 'assistant', timestamp: 1 }],
+          messages_omitted: false,
+          resumed: 'stored-warm',
+          running: false,
+          session_id: 'runtime-warm',
+          session_key: 'stored-warm'
+        } as never
+      }
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    let projectRuntime: ((runtimeId: string, state: ClientSessionState) => void) | null = null
+    render(
+      <ResumeTimerHarness
+        onReady={(ready, project) => {
+          resume = ready
+          projectRuntime = project ?? null
+        }}
+        requestGateway={requestGateway}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    // Seed the cache through the same update path used by runtime gateway
+    // events, then clear the foreground before switching sessions.
+    await act(async () => {
+      projectRuntime!('runtime-warm', {
+        ...clientState('stored-warm'),
+        messages: [
+          { id: 'compressed-tail', role: 'assistant', parts: [{ type: 'text', text: 'compressed runtime tail' }] }
+        ]
+      })
+      await Promise.resolve()
+      setMessages([])
+    })
+
+    await act(async () => {
+      await resume!('stored-warm', true)
+    })
+    expect($messages.get()).toEqual([])
+
+    // A late runtime projection must remain held: REST never established
+    // authoritative persisted-display provenance for this session.
+    await act(async () => {
+      projectRuntime!('runtime-warm', {
+        messages: [
+          { id: 'late-tail', role: 'assistant', parts: [{ type: 'text', text: 'late compressed tail' }] }
+        ]
+      } as ClientSessionState)
+      await Promise.resolve()
+    })
+    expect($messages.get()).toEqual([])
+  })
+
+  it('releases a held warm view after authoritative persisted transcript success', async () => {
+    setSessions([storedSession({ id: 'stored-warm', message_count: 1 })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      session_id: 'stored-warm',
+      messages: [{ content: 'persisted answer', role: 'assistant', timestamp: 1 }]
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          messages: [{ content: 'runtime tail', role: 'assistant', timestamp: 1 }],
+          messages_omitted: false,
+          resumed: 'stored-warm',
+          running: false,
+          session_id: 'runtime-warm',
+          session_key: 'stored-warm'
+        } as never
+      }
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={ready => (resume = ready)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+    await act(async () => {
+      await resume!('stored-warm', true)
+    })
+
+    expect($messages.get().some(message => message.parts.some(part => part.type === 'text' && part.text === 'persisted answer'))).toBe(true)
   })
   it('pins an untagged row to the active registry connection instead of the same-named local profile', async () => {
     setConnection({ connectionId: 'hermes01', mode: 'remote' } as never)

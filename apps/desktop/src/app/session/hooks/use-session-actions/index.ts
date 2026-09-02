@@ -951,6 +951,12 @@ export function useSessionActions({
 
           try {
             let activated: SessionResumeResponse | null = null
+            // Keep a warm transcript held until the exact persisted display has
+            // been established. A successful activate is not authoritative: the
+            // REST read may fail while the runtime still exposes a compressed
+            // tail, and releasing here would let a later runtime projection
+            // publish that tail into the foreground.
+            let persistedDisplayEstablished = false
             const activateStartedAt = Date.now() / 1000
             const activateBaselineState = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId) ?? cachedViewState
             const clarifyRequestIdAtActivateStart = $clarifyRequests.get()[cachedRuntimeId]?.requestId
@@ -1124,6 +1130,7 @@ export function useSessionActions({
                   persistedMatchesActivatedSession &&
                   (persisted.messages.length || !activatedMessages.length)
                 ) {
+                  persistedDisplayEstablished = true
                   // The REST hydration is a newest-tail page; graft it onto any
                   // older pages the previous view already backfilled so
                   // re-activating a scrolled-back session keeps its history.
@@ -1203,7 +1210,9 @@ export function useSessionActions({
                 cachedRuntimeId,
                 suppressTranscriptForView(activatedState, suppressUnprovenWarmTranscript)
               )
-              releaseHeldTranscriptView?.()
+              if (persistedDisplayEstablished) {
+                releaseHeldTranscriptView?.()
+              }
               // Cache backend transcript truth only. The pending/running bit and
               // any synthetic clarify row are a live resume projection and must
               // not survive after the server-side request expires.
@@ -1220,7 +1229,14 @@ export function useSessionActions({
               return
             }
           } catch (error) {
-            releaseHeldTranscriptView?.()
+            // Do not release a held warm view for a transient activate/REST
+            // failure. The cached runtime can emit again after this catch, and
+            // its transcript is still unproven until the persisted display read
+            // succeeds. A confirmed missing runtime is different: release so
+            // the cold-resume fallback can own the view.
+            if (isSessionGoneError(error)) {
+              releaseHeldTranscriptView?.()
+            }
             // The cached runtime id was minted by a prior backend instance. A
             // pooled profile backend that gets idle-reaped (pruneSecondaryGateways)
             // and respawned across a profile swap mints fresh ids, so this mapping
