@@ -3290,8 +3290,8 @@ def create_anthropic_message(
 # install.sh needed — the bypass is part of the source code.
 #
 # The bypass adds billing-header signing, system prompt relocation,
-# Stainless SDK spoof, tool-name namespacing, rate-limit auto-wait,
-# and thinking-replay hardening.  All of these are OAuth-only and have
+# Stainless SDK spoof, tool-name namespacing, and thinking-replay
+# hardening.  All of these are OAuth-only and have
 # zero effect on API-key-authenticated requests.
 try:
     from agent.claude_auth_bypass import apply_patches as _apply_bypass
