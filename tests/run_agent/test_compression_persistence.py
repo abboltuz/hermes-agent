@@ -563,7 +563,19 @@ class TestStoredPromptCwdDrift:
                     skip_context_files=True, skip_memory=True,
                 )
             agent._session_db_created = True
-            live = [dict(row) for row in durable]
+            by_identity = {(row.get("role"), row.get("content"), row.get("reasoning")): row for row in durable}
+            # The live projection moves projection-only capsules: one leads the
+            # transcript and another is interleaved, unlike the durable sequence.
+            live_source = [
+                {"role": "system", "content": "[POLICY CAPSULE] projected leading"},
+                by_identity[("system", "policy", None)],
+                by_identity[("assistant", "duplicate", "current")],
+                by_identity[("tool", "current result", None)],
+                {"role": "system", "content": "[COMPACTION RECOVERY] projected middle"},
+                by_identity[("assistant", "duplicate", "archived")],
+                by_identity[("tool", "archived result", None)],
+            ]
+            live = [dict(row) for row in live_source]
             for row in live:
                 row.pop("_row_id", None)
             agent._flush_messages_to_session_db(live, live)
@@ -611,5 +623,38 @@ class TestStoredPromptCwdDrift:
 
             assert "_row_id" not in live[0]
             assert len(db.get_messages(session_id)) == 2
+            agent.close()
+            db.close()
+
+    def test_reordered_nested_duplicate_identity_fails_closed(self):
+        """Nested mapping order cannot hide an ambiguous durable identity."""
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            session_id = "reordered-ambiguous-alignment"
+            db.create_session(session_id=session_id, source="test")
+            first = {
+                "role": "assistant", "content": "same",
+                "provenance_metadata": {"source": "x", "event_kind": "y"},
+            }
+            second = {
+                "role": "assistant", "content": "same",
+                "provenance_metadata": {"event_kind": "y", "source": "x"},
+            }
+            db.append_messages_batch(session_id, [first, second])
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                agent = AIAgent(
+                    api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                    model="test/model", provider="openrouter", quiet_mode=True,
+                    session_db=db, session_id=session_id,
+                    skip_context_files=True, skip_memory=True,
+                )
+            durable = db.get_messages_as_conversation(session_id, include_row_ids=True)
+            live = [dict(durable[0])]
+            live[0].pop("_row_id", None)
+            agent._flush_messages_to_session_db(live, live)
+            assert "_row_id" not in live[0]
             agent.close()
             db.close()

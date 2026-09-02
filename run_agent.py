@@ -2249,11 +2249,24 @@ class AIAgent:
                     # ambiguous and fail closed rather than selecting the first
                     # row (which could be an archived duplicate).
                     from collections import Counter
+                    import json
+
+                    def _identity_key(item):
+                        # JSON's sorted-key encoding is stable for nested mappings,
+                        # unlike repr(dict), whose result depends on insertion order.
+                        return json.dumps(
+                            _identity_view(item),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+
                     durable_identity_counts = Counter(
-                        repr(_identity_view(item)) for item in durable_rows
+                        _identity_key(item) for item in durable_rows
                     )
                     live_identity_counts = Counter(
-                        repr(_identity_view(item)) for item in live_rows
+                        _identity_key(item) for item in live_rows
                     )
                     ambiguous_identities = {
                         identity for identity, count in durable_identity_counts.items()
@@ -2268,7 +2281,7 @@ class AIAgent:
                             break
                         stored = durable_rows[durable_index]
                         durable_index += 1
-                        identity = repr(_identity_view(live))
+                        identity = _identity_key(live)
                         if identity in ambiguous_identities:
                             # Stop at ambiguity so later rows cannot be
                             # positionally shifted onto a different identity.
