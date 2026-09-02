@@ -53,6 +53,19 @@ def test_compression_requests_share_logical_owner_and_admit_once():
     )).outcome == "joined"
 
 
+def test_compression_requests_rearm_only_for_changed_source_or_force():
+    owner = CompressionCoordinator(session_id="logical-2")
+    first = CompressionRequest("logical-2", 4, "preflight", source_fingerprint="a")
+    assert owner.admit_execution(first).outcome == "admitted"
+    owner.finish_execution(first, "no_progress")
+    assert owner.admit_execution(first).outcome == "no_progress_suppressed"
+    changed = CompressionRequest("logical-2", 4, "overflow", urgency=3, source_fingerprint="b")
+    assert owner.admit_execution(changed).outcome == "admitted"
+    owner.finish_execution(changed, "timed_out")
+    forced = CompressionRequest("logical-2", 4, "manual", urgency=3, source_fingerprint="b", force=True)
+    assert owner.admit_execution(forced).outcome == "admitted"
+
+
 def test_budget_includes_wire_floor_and_blocks_unfit_projection():
     budget = CompressionBudget(context_window=100, output_reserve=20, safety_margin=10, system_tokens=25, tool_schema_tokens=15)
     assert budget.safe_input_budget == 70
