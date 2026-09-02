@@ -2671,6 +2671,100 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    def test_reducible_summary_preserves_durable_recovery_rows(self, agent, tmp_path):
+        """A reducible iteration summary binds demoted rows before one SDK call."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "recovery.db")
+        session_id = "iteration-recovery-e2e"
+        db.create_session(session_id=session_id, source="test")
+        durable = []
+        for index in range(8):
+            durable.extend([
+                {
+                    "role": "user",
+                    "content": f"semantic round {index}",
+                    "origin_kind": "human_user",
+                    "turn_kind": "prompt",
+                    "trust_kind": "user_authorized",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"call-{index}",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }],
+                    "reasoning": f"reasoning-{index}",
+                    "provenance_metadata": {"event_kind": "tool_call"},
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call-{index}",
+                    "content": f"tool body {index} " + ("x" * 1200),
+                },
+            ])
+        durable.append({
+            "role": "user",
+            "content": "latest human task: preserve this exact task",
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+        })
+        db.append_messages_batch(session_id, durable)
+        source = db.get_messages_as_conversation(session_id, include_row_ids=True)
+        source_before = [dict(message) for message in source]
+        durable_snapshot = db.get_messages_as_conversation(session_id, include_row_ids=True)
+        latest_task = source[-1]["content"]
+        for message in source:
+            message["_db_persisted"] = True
+
+        original_register = db.register_compression_recovery
+        registered = {}
+
+        def register(*args, **kwargs):
+            result = original_register(*args, **kwargs)
+            registered["identity"] = result
+            registered["ids"] = list(args[1])
+            return result
+
+        db.register_compression_recovery = register
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = session_id
+        agent._config_context_length = 8_000
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 64
+        agent._cached_system_prompt = ""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+
+        result = agent._handle_max_iterations(source, 1)
+
+        assert result == "Summary"
+        assert agent.client.chat.completions.create.call_count == 1
+        request = agent.client.chat.completions.create.call_args.kwargs
+        assert all(
+            not (isinstance(key, str) and (key.startswith("_") or key == "provenance_metadata"))
+            for message in request["messages"]
+            for key in message
+        )
+        assert latest_task == "latest human task: preserve this exact task"
+        assert sum(message.get("role") == "assistant" and message.get("tool_calls") is not None for message in request["messages"]) == 6
+
+        from agent.compression_v3 import _provider_wire_token_bound
+        assert _provider_wire_token_bound(request) + agent.max_tokens + agent._compression_safety_margin <= agent._config_context_length
+        assert db.get_messages_as_conversation(session_id, include_row_ids=True) == durable_snapshot
+        durable_ids = {message["_row_id"] for message in source_before}
+        assert registered["ids"]
+        assert set(registered["ids"]).issubset(durable_ids)
+        assert set(registered["ids"]) >= {source_before[0]["_row_id"], source_before[1]["_row_id"]}
+        recovery = db.get_compression_recovery(registered["identity"], session_id)
+        assert recovery is not None
+        assert recovery["message_ids"] == registered["ids"]
+        assert len(db.get_messages(session_id)) == len(durable)
+        db.close()
+
     def test_summary_notice_uses_safe_print(self, agent):
         agent._print_fn = lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("closed"))
         agent.client.chat.completions.create.return_value = _mock_response(content="Summary")

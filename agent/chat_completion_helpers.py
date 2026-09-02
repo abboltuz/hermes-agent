@@ -3024,14 +3024,24 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # recognize stubs after reasoning fields are stripped.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
-        # Strip all remaining underscore-prefixed scaffolding keys before the
-        # wire. The summary path calls chat.completions.create() directly,
-        # bypassing the transport's universal underscore-key sweeper.
+        # Remove legacy schema-foreign scaffolding, but retain the v3 sidecars
+        # that the canonical fit gate needs for durable recovery binding.
         for api_msg in api_messages:
-            if isinstance(api_msg, dict):
-                for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
-                    api_msg.pop(internal_key, None)
+            if not isinstance(api_msg, dict):
+                continue
+            for internal_key in [
+                key for key in api_msg
+                if isinstance(key, str)
+                and key.startswith("_")
+                and key not in {"_row_id", "_db_persisted"}
+                and not key.startswith(("_compression", "_micro_compact"))
+            ]:
+                api_msg.pop(internal_key, None)
 
+        # Keep recovery sidecars in this in-process canonical projection until
+        # prepare_api_request performs the deterministic cut and binds durable
+        # row identity. That function returns a provider-safe copy, so source
+        # transcript rows remain lossless while no private fields reach a SDK.
         def _prepare_canonical_summary_messages() -> list:
             """Fit the canonical Chat history before route transformation."""
             from agent.compression_v3 import prepare_api_request

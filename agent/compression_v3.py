@@ -273,7 +273,17 @@ def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], ret
         return value if isinstance(value, int) and value > 0 else None
 
     try:
-        # Compression snapshots loaded from SessionDB carry the exact private
+        from agent.context_compressor import ContextCompressor
+    except Exception:
+        ContextCompressor = None
+
+    def is_synthetic(message: Mapping[str, Any]) -> bool:
+        return bool(
+            ContextCompressor is not None
+            and ContextCompressor._is_synthetic_compression_user_turn(message)
+        )
+
+    try:
         # row marker.  The marker is never sent to a provider and is absent on
         # synthetic projection-only rows; refusing missing demotions is safer
         # than aliasing an older duplicate found by content.
@@ -283,6 +293,8 @@ def _bind_recovery_identity(agent: Any, source: Sequence[Mapping[str, Any]], ret
             if message.get("role") == "system":
                 continue
             row_id = durable_id(message)
+            if row_id is None and is_synthetic(message):
+                continue
             if row_id is None:
                 return None
             if row_id not in retained_ids:
