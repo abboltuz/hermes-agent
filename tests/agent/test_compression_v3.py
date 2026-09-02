@@ -125,6 +125,35 @@ def test_pre_send_gate_refuses_irreducible_request_without_mutating_input():
     assert request["messages"] == messages
 
 
+def test_tool_pressure_projection_keeps_six_parallel_semantic_rounds():
+    agent = type(
+        "Agent",
+        (),
+        {
+            "session_id": "s",
+            "_compression_generation": 4,
+            "_config_context_length": 20_000,
+            "max_tokens": 100,
+            "_compression_safety_margin": 100,
+        },
+    )()
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "do the work"}]
+    for number in range(8):
+        messages.append({"role": "assistant", "tool_calls": [
+            {"id": f"r{number}-a", "type": "function", "function": {"name": "tool", "arguments": "{}"}},
+            {"id": f"r{number}-b", "type": "function", "function": {"name": "tool", "arguments": "{}"}},
+        ]})
+        messages.extend([
+            {"role": "tool", "tool_call_id": f"r{number}-b", "content": f"r{number}-b-" + "x" * 10000},
+            {"role": "tool", "tool_call_id": f"r{number}-a", "content": f"r{number}-a-" + "x" * 5000},
+        ])
+    projection, reclaimed = prune_tool_pressure_projection(agent, messages)
+    assert reclaimed >= 8192
+    assert {m["tool_call_id"] for m in projection if m.get("role") == "tool"} == {
+        f"r{number}-{suffix}" for number in range(2, 8) for suffix in ("a", "b")
+    }
+
+
 def test_tool_pressure_projection_prunes_completed_rounds_before_next_request():
     agent = type(
         "Agent",

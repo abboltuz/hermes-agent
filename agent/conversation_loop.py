@@ -7513,7 +7513,6 @@ def run_conversation(
                     )
                     if _pressure_reclaimed:
                         messages = _pressure_projection
-                        agent._session_messages = messages
                         logging.info(
                             "Compression v3 tool pressure pruning reclaimed ~%d tokens",
                             _pressure_reclaimed,

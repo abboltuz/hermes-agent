@@ -65,7 +65,7 @@ def prune_tool_pressure_projection(
     """
     source = [dict(message) for message in messages]
     unchanged = messages if isinstance(messages, list) else source
-    if _has_incomplete_tool_group(source):
+    if _has_incomplete_tool_group(source) or not validate_projection(source).valid:
         return unchanged, 0
     context_window = getattr(agent, "_config_context_length", None)
     if not isinstance(context_window, int) or context_window <= 0:
@@ -212,6 +212,8 @@ def validate_projection(messages: Sequence[Mapping[str, Any]]) -> ProjectionVali
             call_id = str(message.get("tool_call_id", ""))
             if call_id not in calls:
                 return ProjectionValidation(False, "orphan_tool_result")
+            if call_id in results:
+                return ProjectionValidation(False, "duplicate_tool_result")
             results.add(call_id)
             continue
         if role == "assistant" and message.get("tool_calls"):
@@ -247,19 +249,32 @@ class ContextProjectionUnfit(RuntimeError):
 
 
 def _round_groups(messages: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group complete assistant tool envelopes and all matching results atomically."""
     groups: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for message in messages:
-        item = dict(message)
-        if item.get("role") == "assistant" and item.get("tool_calls") and current:
-            groups.append(current)
-            current = []
-        current.append(item)
-        if item.get("role") == "tool":
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
+    index = 0
+    while index < len(messages):
+        item = dict(messages[index])
+        calls = item.get("tool_calls") if item.get("role") == "assistant" else None
+        if calls:
+            expected = {
+                str(call.get("id"))
+                for call in calls
+                if isinstance(call, Mapping) and call.get("id")
+            }
+            group = [item]
+            seen: set[str] = set()
+            index += 1
+            while index < len(messages) and seen != expected:
+                result = dict(messages[index])
+                if result.get("role") != "tool":
+                    break
+                group.append(result)
+                seen.add(str(result.get("tool_call_id", "")))
+                index += 1
+            groups.append(group)
+            continue
+        groups.append([item])
+        index += 1
     return groups
 
 
@@ -278,7 +293,21 @@ def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: Compres
             if item.get("role") == "tool" and _tokens(item.get("content", "")) > max(16, budget.history_budget // 3):
                 item["content"] = reference + " preview=" + str(item.get("content", ""))[:_MAX_PREVIEW]
             compacted.append(item)
-    candidate = system + [capsule.message()] + human + compacted
+    prefix = system + [capsule.message()] + human
+    candidate = prefix + compacted
+    # A retained round is semantically protected, but its bulk body is not.
+    # Compact oldest retained bodies progressively when the six-round envelope
+    # still exceeds the safe input budget.
+    for item in compacted:
+        if budget.fits(candidate):
+            break
+        if item.get("role") != "tool":
+            continue
+        content = str(item.get("content", ""))
+        if content.startswith(_RECOVERY_PREFIX):
+            continue
+        item["content"] = reference + " preview=" + content[:_MAX_PREVIEW]
+        candidate = prefix + compacted
     validation = validate_projection(candidate)
     if validation.valid and budget.fits(candidate):
         return CutResult(candidate, "emergency_context_cut", True, identity)
