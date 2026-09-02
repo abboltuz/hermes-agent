@@ -794,7 +794,10 @@ function ResumeTimerHarness({
   onReady,
   requestGateway
 }: {
-  onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
+  onReady: (
+    resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>,
+    projectRuntime?: (runtimeId: string, state: ClientSessionState) => void
+  ) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
   const activeSessionId = useStore($activeSessionId)
@@ -828,9 +831,17 @@ function ResumeTimerHarness({
     updateSessionState: cache.updateSessionState
   })
 
+  const { activeSessionIdRef, updateSessionState } = cache
+
   useEffect(() => {
-    onReady(actions.resumeSession)
-  }, [actions.resumeSession, onReady])
+    onReady(actions.resumeSession, (runtimeId, state) => {
+      // This is the same cache/update path used by runtime gateway events. Make
+      // the projected runtime the foreground owner before delivering it so the
+      // production session-scoped view gate is exercised, not a direct atom set.
+      setActiveSessionId(runtimeId)
+      queueMicrotask(() => updateSessionState(runtimeId, previous => ({ ...previous, ...state }), state.storedSessionId))
+    })
+  }, [actions.resumeSession, activeSessionIdRef, onReady, updateSessionState])
 
   return null
 }
@@ -2357,10 +2368,13 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     let resumedState: ClientSessionState | undefined
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    let projectRuntime: ((runtimeId: string, state: ClientSessionState) => void) | null = null
     render(
-      <ResumeHarness
-        onReady={value => (resume = value)}
-        onStateUpdate={(_sessionId, state) => (resumedState = state)}
+      <ResumeTimerHarness
+        onReady={(value, project) => {
+          resume = value
+          projectRuntime = project ?? null
+        }}
         requestGateway={requestGateway}
       />
     )
@@ -2370,12 +2384,28 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect($messages.get()).toHaveLength(persisted.length)
     expect(JSON.stringify($messages.get())).toContain('persisted-0')
 
-    // A runtime projection arriving after the rejected resume layers onto the
-    // already-painted snapshot instead of blanking it first.
-    setMessages([
-      ...$messages.get(),
-      { id: 'runtime-projection', role: 'assistant', parts: [{ type: 'text', text: 'runtime graft' }] }
-    ])
+    // Deliver a runtime projection through the real session-state cache wiring
+    // after the resume rejection. It must graft onto the already-painted REST
+    // snapshot rather than replacing it or requiring a direct atom mutation.
+    const runtimeProjection: ClientSessionState = {
+      ...createClientSessionState('stored-A'),
+      // A runtime event projects the retained REST snapshot plus its live tail;
+      // feed that complete projection through the cache callback below.
+      messages: [
+        ...$messages.get(),
+        {
+          id: 'runtime-projection',
+          role: 'assistant',
+          parts: [{ type: 'text', text: 'runtime graft' }]
+        }
+      ]
+    }
+    expect(projectRuntime).not.toBeNull()
+    await act(async () => {
+      projectRuntime!('rt-A', runtimeProjection)
+      await Promise.resolve()
+    })
+
     expect(JSON.stringify($messages.get())).toContain('persisted-0')
     expect(JSON.stringify($messages.get())).toContain('runtime graft')
     expect(resumedState).toBeUndefined()

@@ -100,8 +100,15 @@ describe('ThreadMessageList integration contracts', () => {
     expect(document.querySelectorAll('[data-testid="message"]').length).toBe(2)
     expect(harness.frames.length).toBeLessThanOrEqual(2)
 
-    // The mounted list owns the first-paint cap; the exported frame budget
-    // contract proves the deferred work cannot require more than two commits.
+    // Drive the real list effect: the queued settle/backfill callbacks commit
+    // the deferred budget, and the mounted output must reach the full transcript
+    // without requiring a third backfill frame.
+    act(() => harness.frames.shift()!(0))
+    act(() => harness.frames.shift()!(0))
+    expect(document.querySelectorAll('[data-testid="message"]').length).toBe(30)
+
+    // The mounted list owns the first-paint cap; this formula remains a small
+    // invariant check for the configured budget boundary.
     expect(transcriptBackfillFrameCount()).toBeLessThanOrEqual(2)
   })
 
