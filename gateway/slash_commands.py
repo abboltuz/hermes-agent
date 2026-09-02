@@ -4477,6 +4477,7 @@ class GatewaySlashCommandsMixin:
                         approx_tokens=approx_tokens,
                         focus_topic=focus_topic,
                         force=True,
+                        trigger="gateway_manual",
                         defer_context_engine_notification=True,
                     )
                 )

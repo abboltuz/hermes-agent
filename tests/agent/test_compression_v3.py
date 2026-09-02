@@ -31,6 +31,28 @@ def _round(number: int, *, body: str = "result"):
     ]
 
 
+def test_compression_requests_share_logical_owner_and_admit_once():
+    db = object()
+    first = SimpleNamespace(session_id="physical-a", _session_db=db, _conversation_root_id=lambda: "logical-1")
+    second = SimpleNamespace(session_id="physical-b", _session_db=db, _conversation_root_id=lambda: "logical-1")
+
+    owner_a = ensure_compression_coordinator(first, trigger="preflight", urgency=1)
+    owner_b = ensure_compression_coordinator(second, trigger="gateway_hygiene", urgency=3)
+
+    assert owner_a is owner_b
+    assert owner_b.attempt is not None
+    assert owner_b.attempt.trigger == "gateway_hygiene"
+    assert owner_b.attempt.urgency == 3
+    assert owner_b.admit_execution(CompressionRequest(
+        session_id="logical-1", generation=0, trigger="gateway_hygiene",
+        urgency=3, source_fingerprint="same", force=False,
+    )).outcome == "admitted"
+    assert owner_b.admit_execution(CompressionRequest(
+        session_id="logical-1", generation=0, trigger="preflight",
+        urgency=1, source_fingerprint="same", force=False,
+    )).outcome == "joined"
+
+
 def test_budget_includes_wire_floor_and_blocks_unfit_projection():
     budget = CompressionBudget(context_window=100, output_reserve=20, safety_margin=10, system_tokens=25, tool_schema_tokens=15)
     assert budget.safe_input_budget == 70

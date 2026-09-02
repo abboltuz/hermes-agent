@@ -8058,6 +8058,7 @@ class AIAgent:
         task_id: str = "default",
         focus_topic: str = None,
         force: bool = False,
+        trigger: Optional[str] = None,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -8123,6 +8124,7 @@ class AIAgent:
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
                     force=force,
+                    trigger=trigger,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),

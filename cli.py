@@ -13647,6 +13647,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     approx_tokens=approx_tokens,
                     focus_topic=focus_topic or None,
                     force=True,
+                    trigger="cli_manual",
                     defer_context_engine_notification=True,
                 )
 

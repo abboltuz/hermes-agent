@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
+import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agent.message_provenance import is_human_intent
@@ -438,6 +439,18 @@ class CompressionRequest:
     generation: int
     trigger: str
     urgency: int = 1
+    source_fingerprint: str = ""
+    row_watermark: int = 0
+    estimated_pressure: int = 0
+    estimated_reclaim: int = 0
+    deadline: float | None = None
+    force: bool = False
+
+
+@dataclass(frozen=True)
+class CompressionAdmission:
+    outcome: str
+    attempt: "CompressionAttempt | None" = None
 
 
 @dataclass(frozen=True)
@@ -492,6 +505,10 @@ class CompressionCoordinator:
         self.outcome: str | None = None
         self.active_projection: list[dict[str, Any]] | None = None
         self._tool_pressure_fingerprint: str | None = None
+        self._admission_lock = threading.RLock()
+        self._active_admission: tuple[int, str] | None = None
+        self._terminal_generations: set[tuple[int, str]] = set()
+        self._pending_request: CompressionRequest | None = None
 
     def request(self, request: CompressionRequest) -> CompressionAttempt:
         if request.session_id != self.session_id:
@@ -503,6 +520,32 @@ class CompressionCoordinator:
         self._attempt = CompressionAttempt(self._next_attempt, request.generation, request.urgency, request.trigger)
         self.outcome = None
         return self._attempt
+
+    def admit_execution(self, request: CompressionRequest) -> CompressionAdmission:
+        """Admit one executor for a logical generation and source snapshot."""
+        if request.session_id != self.session_id:
+            raise ValueError("compression request belongs to another session")
+        key = (request.generation, request.source_fingerprint)
+        with self._admission_lock:
+            attempt = self.request(request)
+            if key in self._terminal_generations and not request.force:
+                return CompressionAdmission("no_progress_suppressed", attempt)
+            if self._active_admission == key:
+                return CompressionAdmission("joined", attempt)
+            if self._active_admission is not None:
+                return CompressionAdmission("deferred_lock", attempt)
+            self._active_admission = key
+            return CompressionAdmission("admitted", attempt)
+
+    def finish_execution(self, request: CompressionRequest, outcome: str) -> None:
+        """Release admission and retain no-progress terminals for this snapshot."""
+        key = (request.generation, request.source_fingerprint)
+        with self._admission_lock:
+            if self._active_admission == key:
+                self._active_admission = None
+            self.outcome = outcome
+            if outcome in {"no_progress", "timed_out", "aborted"}:
+                self._terminal_generations.add(key)
 
     @property
     def attempt(self) -> CompressionAttempt | None:
@@ -562,11 +605,22 @@ class CompressionCoordinator:
 
 def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1) -> CompressionCoordinator:
     """Return the coordinator bound to an agent's current session identity."""
-    session_id = str(getattr(agent, "session_id", "") or "")
-    coordinator = getattr(agent, "_compression_coordinator", None)
-    if not isinstance(coordinator, CompressionCoordinator) or coordinator.session_id != session_id:
-        coordinator = CompressionCoordinator(session_id=session_id)
-        setattr(agent, "_compression_coordinator", coordinator)
+    physical_id = str(getattr(agent, "session_id", "") or "")
+    root_getter = getattr(agent, "_conversation_root_id", None)
+    try:
+        logical_id = str(root_getter() or physical_id) if callable(root_getter) else physical_id
+    except Exception:
+        logical_id = physical_id
+    session_db = getattr(agent, "_session_db", None)
+    registry_key = (logical_id, id(session_db) if session_db is not None else id(agent))
+    registry = globals().setdefault("_COMPRESSION_COORDINATORS", {})
+    registry_lock = globals().setdefault("_COMPRESSION_COORDINATORS_LOCK", threading.RLock())
+    with registry_lock:
+        coordinator = registry.get(registry_key)
+        if not isinstance(coordinator, CompressionCoordinator):
+            coordinator = CompressionCoordinator(session_id=logical_id)
+            registry[registry_key] = coordinator
+    setattr(agent, "_compression_coordinator", coordinator)
     generation = int(getattr(agent, "_compression_generation", 0) or 0)
-    coordinator.request(CompressionRequest(session_id, generation, trigger, urgency))
+    coordinator.request(CompressionRequest(logical_id, generation, trigger, urgency))
     return coordinator

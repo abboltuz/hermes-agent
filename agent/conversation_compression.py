@@ -2311,6 +2311,7 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    trigger: Optional[str] = None,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
@@ -2345,7 +2346,7 @@ def compress_context(
     """
     ensure_compression_coordinator(
         agent,
-        trigger="manual" if force else "automatic",
+        trigger=trigger or ("manual" if force else "automatic"),
         urgency=3 if force else 1,
     )
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
