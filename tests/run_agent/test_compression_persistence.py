@@ -584,3 +584,32 @@ class TestStoredPromptCwdDrift:
             assert registered["ids"] == [current["_row_id"], demoted[1]["_row_id"]]
             agent.close()
             db.close()
+
+    def test_ambiguous_duplicate_durable_identity_fails_closed(self):
+        """Identical durable rows never receive an arbitrary recovery ID."""
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            session_id = "ambiguous-alignment"
+            db.create_session(session_id=session_id, source="test")
+            duplicate = {"role": "assistant", "content": "same", "reasoning": "opaque"}
+            db.append_messages_batch(session_id, [duplicate, dict(duplicate)])
+
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                agent = AIAgent(
+                    api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                    model="test/model", provider="openrouter", quiet_mode=True,
+                    session_db=db, session_id=session_id,
+                    skip_context_files=True, skip_memory=True,
+                )
+            durable = db.get_messages_as_conversation(session_id, include_row_ids=True)
+            live = [dict(durable[0])]
+            live[0].pop("_row_id", None)
+            agent._flush_messages_to_session_db(live, live)
+
+            assert "_row_id" not in live[0]
+            assert len(db.get_messages(session_id)) == 2
+            agent.close()
+            db.close()

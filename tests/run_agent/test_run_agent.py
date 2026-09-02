@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
+from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
 import run_agent
 from run_agent import AIAgent
@@ -76,7 +77,40 @@ def agent():
         )
         a.client = MagicMock()
         return a
+from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
+
+def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkeypatch):
+    """An unchanged typed fit refusal is not retried by the production loop."""
+    gate_attempts = []
+    result = CutResult(
+        messages=[{"role": "system", "content": "policy"}],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="irreducible request floor",
+    )
+
+    def refuse_once(*_args, **_kwargs):
+        gate_attempts.append(True)
+        raise ContextProjectionUnfit(result)
+
+    agent._interruptible_api_call = refuse_once
+    agent.client.chat.completions.create = MagicMock(
+        side_effect=AssertionError("provider must not be called")
+    )
+    monkeypatch.setattr(run_agent.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("retry sleep")))
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        outcome = agent.run_conversation("irreducible task")
+
+    assert len(gate_attempts) == 1
+    assert agent.client.chat.completions.create.call_count == 0
+    assert outcome["completed"] is False
+    assert outcome["error_type"] == "ContextProjectionUnfit"
+    assert outcome["api_calls"] == 0
 
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]

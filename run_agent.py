@@ -2222,7 +2222,7 @@ class AIAgent:
                     def _identity_view(item):
                         return {
                             key: value for key, value in item.items()
-                            if key not in {"_row_id", "_db_persisted"}
+                            if key not in {"_row_id", "_db_persisted", "timestamp"}
                             and not str(key).startswith("_")
                         }
                     def _projection_only_system(item):
@@ -2243,19 +2243,43 @@ class AIAgent:
                         item for item in messages
                         if isinstance(item, dict) and not _projection_only_system(item)
                     ]
+                    # An identity appearing more than once is not sufficient
+                    # evidence for positional recovery: the same live row could
+                    # bind to either durable row.  Mark those identities
+                    # ambiguous and fail closed rather than selecting the first
+                    # row (which could be an archived duplicate).
+                    from collections import Counter
+                    durable_identity_counts = Counter(
+                        repr(_identity_view(item)) for item in durable_rows
+                    )
+                    live_identity_counts = Counter(
+                        repr(_identity_view(item)) for item in live_rows
+                    )
+                    ambiguous_identities = {
+                        identity for identity, count in durable_identity_counts.items()
+                        if count != 1
+                    } | {
+                        identity for identity, count in live_identity_counts.items()
+                        if count != 1
+                    }
                     durable_index = 0
                     for live in live_rows:
                         if durable_index >= len(durable_rows):
                             break
                         stored = durable_rows[durable_index]
                         durable_index += 1
+                        identity = repr(_identity_view(live))
+                        if identity in ambiguous_identities:
+                            # Stop at ambiguity so later rows cannot be
+                            # positionally shifted onto a different identity.
+                            break
                         if (
-                            live.get("_row_id") is None
+                            live.get('_row_id') is None
                             and _identity_view(live) == _identity_view(stored)
-                            and isinstance(stored.get("_row_id"), int)
+                            and isinstance(stored.get('_row_id'), int)
                         ):
-                            live["_row_id"] = stored["_row_id"]
-                        elif live.get("_row_id") is None:
+                            live['_row_id'] = stored['_row_id']
+                        elif live.get('_row_id') is None:
                             # Stop backfilling at the first mismatch.  Assigning
                             # later rows would make an ambiguous projection look
                             # durable and could bind recovery to the wrong row.

@@ -4506,7 +4506,10 @@ def run_conversation(
                     from agent.compression_v3 import ContextProjectionUnfit
                 except Exception:  # pragma: no cover - import is stable in production
                     ContextProjectionUnfit = ()
-                if ContextProjectionUnfit and isinstance(api_error, ContextProjectionUnfit):
+                if (
+                    (ContextProjectionUnfit and isinstance(api_error, ContextProjectionUnfit))
+                    or getattr(api_error, "outcome", None) == "context_projection_unfit"
+                ):
                     _unfit_summary = agent._summarize_api_error(api_error)
                     agent._buffer_vprint(
                         f"❌ Request refused before provider call: {_unfit_summary}"
@@ -4515,9 +4518,11 @@ def run_conversation(
                     return {
                         "final_response": _unfit_summary,
                         "messages": messages,
-                        "api_calls": api_call_count,
                         "completed": False,
                         "error_type": type(api_error).__name__,
+                        # The fit gate increments the attempt counter before
+                        # invoking transport; no provider call occurred.
+                        "api_calls": max(0, api_call_count - 1),
                     }
 
                 # -----------------------------------------------------------
