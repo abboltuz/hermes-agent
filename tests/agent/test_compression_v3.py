@@ -16,6 +16,7 @@ from agent.compression_v3 import (
     validate_projection,
     prepare_api_request,
     prune_tool_pressure_projection,
+    estimate_projection_tokens,
 )
 
 
@@ -177,10 +178,11 @@ def test_tool_pressure_projection_prunes_completed_rounds_before_next_request():
     assert reclaimed >= 8192
     assert projection != messages
     assert validate_projection(projection).valid
-    assert all(
-        any(str(message.get("content", "")).startswith(f"result-{number}-") for message in projection)
-        for number in range(6, 12)
-    )
+    assert {
+        message["tool_call_id"]
+        for message in projection
+        if message.get("role") == "tool"
+    } == {f"call-{number}" for number in range(6, 12)}
 
 
 def test_tool_pressure_projection_accounts_for_external_request_floor():
@@ -258,9 +260,9 @@ def test_production_turn_executes_tools_prunes_projection_and_preserves_sessiond
     agent = None
     calls = []
     try:
-        prior = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "task"}]
-        for number in range(10):
-            prior.extend(_round(number, body=f"durable-{number}-" + "y" * 20_000))
+        prior = [{"role": "system", "content": "policy"}]
+        for number in range(7):
+            prior.extend(_round(number, body=f"durable-{number}-" + "y" * 6_000))
 
         db.create_session(session_id=session_id, source="cli")
         db.append_messages_batch(session_id, prior)
@@ -295,17 +297,34 @@ def test_production_turn_executes_tools_prunes_projection_and_preserves_sessiond
         agent._config_context_length = 100_000
         agent.context_compressor.context_length = 100_000
         agent.context_compressor.should_compress = lambda tokens: False
+        agent._compress_context = lambda messages, system_message, **kwargs: (
+            messages,
+            system_message,
+        )
         agent._compression_safety_margin = 100
         agent._disable_streaming = True
+        agent._cached_system_prompt = "policy"
         production_prune_calls = []
         production_prune_results = []
+        production_pressure = {}
         original_prune = compression_v3.prune_tool_pressure_projection
 
         def production_prune(*args, **kwargs):
-            production_prune_calls.append(kwargs.get("current_tokens"))
             args[0]._config_context_length = 60_000
             args[0].context_compressor.context_length = 60_000
-            kwargs["current_tokens"] = 1_000_000
+            message_before = estimate_projection_tokens(args[1])
+            soft_budget = int(args[0]._config_context_length * 0.85)
+            non_message_floor = min(
+                soft_budget - 1,
+                max(1, soft_budget - message_before + 4_096),
+            )
+            kwargs["current_tokens"] = message_before + non_message_floor
+            production_pressure.update(
+                message_before=message_before,
+                non_message_floor=non_message_floor,
+                soft_budget=soft_budget,
+            )
+            production_prune_calls.append(kwargs["current_tokens"])
             result = original_prune(*args, **kwargs)
             production_prune_results.append(result)
             return result
@@ -351,17 +370,47 @@ def test_production_turn_executes_tools_prunes_projection_and_preserves_sessiond
 
         agent._interruptible_api_call = scripted_call
         result = agent.run_conversation(
-            "task", conversation_history=prior, task_id="compression-e2e"
+            "task", system_message="policy", conversation_history=prior, task_id="compression-e2e"
         )
 
         assert result["final_response"] == "final answer"
         assert production_prune_calls
         assert production_prune_results
         assert len(calls) == 2
+        message_before = production_pressure["message_before"]
+        non_message_floor = production_pressure["non_message_floor"]
+        soft_budget = production_pressure["soft_budget"]
+        projected, reclaimed = production_prune_results[-1]
+        message_after = estimate_projection_tokens(projected)
+        assert reclaimed >= 8_192
+        assert projected != prior
+        assert 0 < non_message_floor < soft_budget
+        assert message_before + non_message_floor > soft_budget
+        assert message_after + non_message_floor <= soft_budget
         second_tools = [m for m in calls[1] if m.get("role") == "tool"]
         first_tools = [m for m in calls[0] if m.get("role") == "tool"]
         assert len(first_tools) >= 7
+        assert estimate_projection_tokens(calls[1]) < message_before
         assert any(message.get("tool_call_id") == "live-call" for message in second_tools)
+        assert any(
+            message.get("role") == "system"
+            and "[COMPACTION RECOVERY]" in message.get("content", "")
+            for message in calls[1]
+        )
+        assert {
+            message["tool_call_id"]
+            for message in calls[1]
+            if message.get("role") == "tool"
+        } == {f"call-{number}" for number in range(2, 7)} | {"live-call"}
+        assert any(
+            message.get("content") == "durable-0-" + "y" * 6_000
+            for message in calls[0]
+        )
+        assert not any(
+            message.get("content") == "durable-0-" + "y" * 6_000
+            for message in calls[1]
+        )
+        assert validate_projection(calls[1]).valid
 
 
         loaded = db.get_messages(session_id, include_inactive=True)
@@ -373,8 +422,8 @@ def test_production_turn_executes_tools_prunes_projection_and_preserves_sessiond
         canonical_body = json.dumps({"ok": True, "body": "canonical-" + "x" * 3_000})
         assert durable_bodies.count(canonical_body) == 1
         assert all(
-            durable_bodies.count(f"durable-{number}-" + "y" * 20_000) == 1
-            for number in range(10)
+            durable_bodies.count(f"durable-{number}-" + "y" * 6_000) == 1
+            for number in range(7)
         )
     finally:
         if original is None:

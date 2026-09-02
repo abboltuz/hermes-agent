@@ -255,33 +255,41 @@ class ContextProjectionUnfit(RuntimeError):
         super().__init__(result.reason or self.outcome)
 
 
-def _round_groups(messages: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Group complete assistant tool envelopes and all matching results atomically."""
-    groups: list[list[dict[str, Any]]] = []
+def _round_groups(messages: Sequence[Mapping[str, Any]]) -> list[tuple[int, int, list[dict[str, Any]]]]:
+    """Return complete tool envelopes with their source span.
+
+    Narrative rows are deliberately not groups: they must not consume the
+    semantic-round retention quota.  Results may arrive in any order, but an
+    envelope is complete only when its contiguous tool-result tail contains
+    exactly each declared call id.
+    """
+    groups: list[tuple[int, int, list[dict[str, Any]]]] = []
     index = 0
     while index < len(messages):
         item = dict(messages[index])
         calls = item.get("tool_calls") if item.get("role") == "assistant" else None
-        if calls:
-            expected = {
-                str(call.get("id"))
-                for call in calls
-                if isinstance(call, Mapping) and call.get("id")
-            }
-            group = [item]
-            seen: set[str] = set()
+        expected = {
+            str(call.get("id"))
+            for call in calls or ()
+            if isinstance(call, Mapping) and call.get("id")
+        }
+        if not expected:
             index += 1
-            while index < len(messages) and seen != expected:
-                result = dict(messages[index])
-                if result.get("role") != "tool":
-                    break
-                group.append(result)
-                seen.add(str(result.get("tool_call_id", "")))
-                index += 1
-            groups.append(group)
             continue
-        groups.append([item])
+        start = index
+        group = [item]
+        seen: set[str] = set()
         index += 1
+        while index < len(messages) and seen != expected:
+            result = dict(messages[index])
+            if result.get("role") != "tool":
+                break
+            call_id = str(result.get("tool_call_id", ""))
+            group.append(result)
+            seen.add(call_id)
+            index += 1
+        if seen == expected and len(group) == len(expected) + 1:
+            groups.append((start, index, group))
     return groups
 
 
@@ -290,24 +298,38 @@ def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: Compres
     capsule = build_policy_capsule(original, session_id=session_id, watermark=watermark, generation=generation)
     system = [dict(m) for m in original if m.get("role") == "system" and not m.get("_compression_capsule")][:1]
     human = [dict(m) for m in original if m.get("role") == "user" and is_human_intent(m)][-1:]
-    groups = _round_groups([m for m in original if m.get("role") != "system"])
+    non_system = [(index, dict(message)) for index, message in enumerate(original) if message.get("role") != "system"]
+    groups = _round_groups([message for _, message in non_system])
     retained = groups[-6:]
+    selected: list[tuple[int, dict[str, Any]]] = []
+    for start, end, group in retained:
+        for offset, item in enumerate(group):
+            selected.append((non_system[start + offset][0], item))
+    # Keep the latest human at its original position relative to retained
+    # envelopes.  It is inserted once, rather than once in both prefix and
+    # compacted history, so validation cannot reject an otherwise safe cut.
+    human_index = next(
+        (index for index in range(len(original) - 1, -1, -1)
+         if original[index].get("role") == "user" and is_human_intent(original[index])),
+        None,
+    )
+    if human:
+        selected.append((human_index if human_index is not None else len(original), human[0]))
+    selected.sort(key=lambda pair: pair[0])
     identity = hashlib.sha256(f"{session_id}:{generation}:{watermark}".encode()).hexdigest()[:16]
     reference = f"{_RECOVERY_PREFIX}{session_id} anchor={identity} watermark={watermark}"
     compacted: list[dict[str, Any]] = []
-    for group in retained:
-        for item in group:
-            if item.get("role") == "tool" and _tokens(item.get("content", "")) > max(16, budget.history_budget // 3):
-                item["content"] = reference + " preview=" + str(item.get("content", ""))[:_MAX_PREVIEW]
-            compacted.append(item)
-    prefix = system + [capsule.message()] + human
+    for _, item in selected:
+        if item.get("role") == "tool" and _tokens(item.get("content", "")) > max(16, budget.history_budget // 3):
+            item["content"] = reference + " preview=" + str(item.get("content", ""))[:_MAX_PREVIEW]
+        compacted.append(item)
+    recovery = {"role": "system", "content": reference, "_compression_recovery": True}
+    prefix = system + [capsule.message(), recovery]
     candidate = prefix + compacted
     # A retained round is semantically protected, but its bulk body is not.
     # Compact oldest retained bodies progressively when the six-round envelope
     # still exceeds the safe input budget.
     for item in compacted:
-        if budget.fits(candidate):
-            break
         if item.get("role") != "tool":
             continue
         content = str(item.get("content", ""))
