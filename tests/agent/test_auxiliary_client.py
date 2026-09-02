@@ -1775,6 +1775,294 @@ class TestCompressionFallbackContinuation:
         assert result == (None, None, "")
         assert not candidate.called
 
+    @pytest.mark.parametrize("status, message", [
+        (402, "payment required"),
+        (429, "rate limit exceeded"),
+        (500, "server overloaded"),
+        (503, "service unavailable"),
+    ])
+    def test_sync_route_local_matrix_advances_to_next_candidate(self, status, message):
+        """Each route-local HTTP failure is exercised through the real loop."""
+        primary = MagicMock()
+        primary_error = Exception(message)
+        primary_error.status_code = status
+        primary.chat.completions.create.side_effect = primary_error
+        failed = MagicMock()
+        failed_error = Exception(message)
+        failed_error.status_code = status
+        failed.chat.completions.create.side_effect = failed_error
+        healthy = MagicMock()
+        healthy.chat.completions.create.return_value = self._response("matrix-sync")
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "primary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "primary-model")), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   side_effect=[(failed, "failed-model", "route-a"),
+                                (healthy, "healthy-model", "route-b")]), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+
+        assert result.choices[0].message.content == "matrix-sync"
+        assert primary.chat.completions.create.call_count == 1
+        assert failed.chat.completions.create.call_count == 1
+        assert healthy.chat.completions.create.call_count == 1
+
+    def test_sync_timeout_and_connection_matrix_advances_without_same_route_retry(self):
+        for error in (
+            TimeoutError("request timed out"),
+            ConnectionError("connection refused"),
+        ):
+            primary = MagicMock()
+            primary.chat.completions.create.side_effect = error
+            failed = MagicMock()
+            failed.chat.completions.create.side_effect = error
+            healthy = MagicMock()
+            healthy.chat.completions.create.return_value = self._response("transport-sync")
+            with patch("agent.auxiliary_client._resolve_task_provider_model",
+                       return_value=("auto", "primary-model", None, None, None)), \
+                 patch("agent.auxiliary_client._get_cached_client",
+                       return_value=(primary, "primary-model")), \
+                 patch("agent.auxiliary_client._try_configured_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_main_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_payment_fallback",
+                       side_effect=[(failed, "failed-model", "route-a"),
+                                    (healthy, "healthy-model", "route-b")]), \
+                 patch("agent.auxiliary_client._transient_retry_count", return_value=0):
+                result = call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+            assert result.choices[0].message.content == "transport-sync"
+            assert primary.chat.completions.create.call_count == 1
+            assert failed.chat.completions.create.call_count == 1
+
+    def test_sync_malformed_fallback_response_is_route_local(self):
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = self._payment_error()
+        malformed = MagicMock()
+        malformed.chat.completions.create.return_value = object()
+        healthy = MagicMock()
+        healthy.chat.completions.create.return_value = self._response("malformed-sync")
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "primary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "primary-model")), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   side_effect=[(malformed, "bad-model", "route-a"),
+                                (healthy, "healthy-model", "route-b")]):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+        assert result.choices[0].message.content == "malformed-sync"
+        assert malformed.chat.completions.create.call_count == 1
+
+    def test_sync_content_validation_and_cancellation_are_terminal(self):
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = self._payment_error()
+        terminal = MagicMock()
+        terminal.chat.completions.create.side_effect = ValueError("content validation failed")
+        healthy = MagicMock()
+        healthy.chat.completions.create.return_value = self._response("must-not-run")
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "primary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "primary-model")), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=(terminal, "terminal-model", "route-a")):
+            with pytest.raises(ValueError, match="content validation"):
+                call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+        assert healthy.chat.completions.create.call_count == 0
+
+    def test_sync_cancellation_does_not_start_fallback(self):
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = KeyboardInterrupt()
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "primary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "primary-model")), \
+             patch("agent.auxiliary_client._try_payment_fallback") as discover:
+            with pytest.raises(KeyboardInterrupt):
+                call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+        discover.assert_not_called()
+
+    def test_all_compression_candidates_fail_with_bounded_original_error(self):
+        primary = MagicMock()
+        original = self._payment_error()
+        primary.chat.completions.create.side_effect = original
+        candidates = []
+        for _ in range(2):
+            candidate = MagicMock()
+            candidate.chat.completions.create.side_effect = self._payment_error()
+            candidates.append(candidate)
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "primary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "primary-model")), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   side_effect=[*(
+                       (candidate, f"model-{idx}", f"route-{idx}")
+                       for idx, candidate in enumerate(candidates)
+                   ), (None, None, "")]):
+            with pytest.raises(Exception, match="Payment Required"):
+                call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+        assert primary.chat.completions.create.call_count == 1
+        assert [c.chat.completions.create.call_count for c in candidates] == [1, 1]
+
+    def test_compression_summary_passes_explicit_bounded_max_tokens(self):
+        from agent.context_compressor import ContextCompressor
+
+        compressor = object.__new__(ContextCompressor)
+        compressor._lean_pristine_tools = None
+        response = self._response("bounded")
+        with patch("agent.auxiliary_client.call_llm", return_value=response) as summary_call:
+            result = compressor._build_chunk_digests(
+                [{"role": "user", "content": "x"}]
+            )
+
+        assert "Segment 1/1" in result
+        assert summary_call.call_args.kwargs["task"] == "compression"
+        max_tokens = summary_call.call_args.kwargs["max_tokens"]
+        assert isinstance(max_tokens, int)
+        assert max_tokens > 0
+
+    def test_async_route_local_matrix_and_malformed_response_advance(self):
+        import asyncio
+
+        async def exercise():
+            primary = MagicMock()
+            primary.chat.completions.create = AsyncMock(side_effect=self._payment_error())
+            malformed = MagicMock()
+            malformed.chat.completions.create = AsyncMock(return_value=object())
+            healthy = MagicMock()
+            healthy.chat.completions.create = AsyncMock(return_value=self._response("matrix-async"))
+            with patch("agent.auxiliary_client._resolve_task_provider_model",
+                       return_value=("auto", "primary-model", None, None, None)), \
+                 patch("agent.auxiliary_client._get_cached_client",
+                       return_value=(primary, "primary-model")), \
+                 patch("agent.auxiliary_client._try_configured_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_main_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_payment_fallback",
+                       side_effect=[(malformed, "bad-model", "route-a"),
+                                    (healthy, "healthy-model", "route-b")]), \
+                 patch("agent.auxiliary_client._to_async_client",
+                       side_effect=lambda client, model, **_: (client, model)):
+                result = await async_call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+            assert result.choices[0].message.content == "matrix-async"
+            assert primary.chat.completions.create.call_count == 1
+            assert malformed.chat.completions.create.call_count == 1
+            assert healthy.chat.completions.create.call_count == 1
+
+        asyncio.run(exercise())
+
+    def test_async_terminal_cancellation_does_not_start_fallback(self):
+        import asyncio
+
+        async def exercise():
+            primary = MagicMock()
+            primary.chat.completions.create = AsyncMock(side_effect=asyncio.CancelledError())
+            with patch("agent.auxiliary_client._resolve_task_provider_model",
+                       return_value=("auto", "primary-model", None, None, None)), \
+                 patch("agent.auxiliary_client._get_cached_client",
+                       return_value=(primary, "primary-model")), \
+                 patch("agent.auxiliary_client._try_payment_fallback") as discover:
+                with pytest.raises(asyncio.CancelledError):
+                    await async_call_llm(task="compression", messages=[{"role": "user", "content": "x"}])
+            discover.assert_not_called()
+
+        asyncio.run(exercise())
+
+    def test_async_route_local_matrix_advances_for_transport_and_overload(self):
+        import asyncio
+
+        async def exercise():
+            cases = [
+                TimeoutError("request timed out"),
+                ConnectionError("connection refused"),
+            ]
+            for status, message in ((500, "server overloaded"), (503, "service unavailable")):
+                error = Exception(message)
+                error.status_code = status
+                cases.append(error)
+            for error in cases:
+                primary = MagicMock()
+                primary.chat.completions.create = AsyncMock(side_effect=error)
+                failed = MagicMock()
+                failed.chat.completions.create = AsyncMock(side_effect=error)
+                healthy = MagicMock()
+                healthy.chat.completions.create = AsyncMock(
+                    return_value=self._response("transport-async")
+                )
+                with patch("agent.auxiliary_client._resolve_task_provider_model",
+                           return_value=("auto", "primary-model", None, None, None)), \
+                     patch("agent.auxiliary_client._get_cached_client",
+                           return_value=(primary, "primary-model")), \
+                     patch("agent.auxiliary_client._try_configured_fallback_chain",
+                           return_value=(None, None, "")), \
+                     patch("agent.auxiliary_client._try_main_fallback_chain",
+                           return_value=(None, None, "")), \
+                     patch("agent.auxiliary_client._try_payment_fallback",
+                           side_effect=[(failed, "failed-model", "route-a"),
+                                        (healthy, "healthy-model", "route-b")]), \
+                     patch("agent.auxiliary_client._to_async_client",
+                           side_effect=lambda client, model, **_: (client, model)):
+                    result = await async_call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "x"}],
+                    )
+                assert result.choices[0].message.content == "transport-async"
+                assert failed.chat.completions.create.call_count == 1
+                assert healthy.chat.completions.create.call_count == 1
+
+        asyncio.run(exercise())
+
+    def test_async_content_validation_is_terminal(self):
+        import asyncio
+
+        async def exercise():
+            primary = MagicMock()
+            primary.chat.completions.create = AsyncMock(side_effect=self._payment_error())
+            terminal = MagicMock()
+            terminal.chat.completions.create = AsyncMock(
+                side_effect=ValueError("content validation failed")
+            )
+            with patch("agent.auxiliary_client._resolve_task_provider_model",
+                       return_value=("auto", "primary-model", None, None, None)), \
+                 patch("agent.auxiliary_client._get_cached_client",
+                       return_value=(primary, "primary-model")), \
+                 patch("agent.auxiliary_client._try_configured_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_main_fallback_chain",
+                       return_value=(None, None, "")), \
+                 patch("agent.auxiliary_client._try_payment_fallback",
+                       return_value=(terminal, "terminal-model", "route-a")), \
+                 patch("agent.auxiliary_client._to_async_client",
+                       side_effect=lambda client, model, **_: (client, model)):
+                with pytest.raises(ValueError, match="content validation"):
+                    await async_call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "x"}],
+                    )
+            assert terminal.chat.completions.create.call_count == 1
+
+        asyncio.run(exercise())
+
 
 class TestStaleFallbackCandidateSkip:
     """A fallback candidate with a stale credential must not abort the task.
