@@ -2687,6 +2687,7 @@ class TestHandleMaxIterations:
         assert isinstance(result, str)
         assert len(result) > 0
         assert "summary" in result.lower()
+        assert agent.client.chat.completions.create.call_count == 1
 
     def test_summary_gate_blocks_irreducible_codex_request_before_responses_sdk(self, agent):
         agent.api_mode = "codex_responses"
@@ -2865,6 +2866,7 @@ class TestHandleMaxIterations:
             )
 
         assert result == "Summary"
+        assert agent.client.chat.completions.create.call_count == 2
         assert [call["metadata"]["retry_count"] for call in relay_calls] == [0, 1]
         assert relay_calls[0]["metadata"]["api_request_id"] == (
             relay_calls[1]["metadata"]["api_request_id"]
