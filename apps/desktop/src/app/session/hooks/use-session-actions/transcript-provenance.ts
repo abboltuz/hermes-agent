@@ -39,3 +39,7 @@ export function invalidatePersistedDisplayTranscriptAuthority(state: ClientSessi
 export function suppressTranscriptForView(state: ClientSessionState, suppress: boolean): ClientSessionState {
   return !suppress || state.messages.length === 0 ? state : { ...state, messages: [] }
 }
+
+export function shouldPaintPersistedTranscript(prefetchResolved: boolean, resumeIsCurrent: boolean): boolean {
+  return prefetchResolved && resumeIsCurrent
+}

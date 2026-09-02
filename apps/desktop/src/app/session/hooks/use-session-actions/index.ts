@@ -115,6 +115,7 @@ import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './
 import {
   createPersistedDisplayTranscriptProvenance,
   hasPersistedDisplayTranscriptProvenance,
+  shouldPaintPersistedTranscript,
   suppressTranscriptForView,
 } from './transcript-provenance'
 import {
@@ -1368,7 +1369,7 @@ export function useSessionActions({
         // Paint persisted history as soon as REST returns. Resume and prefetch
         // remain concurrent; the runtime acknowledgement below only grafts a
         // live projection onto this snapshot.
-        if (prefetchedResult && isCurrentResume()) {
+        if (prefetchedResult && shouldPaintPersistedTranscript(true, isCurrentResume())) {
           const previousMessages = resumedSameSelectedSession
             ? preserveLocalPendingTurnMessages(viewMessagesForReconcile(), resumeStartMessages)
             : viewMessagesForReconcile()

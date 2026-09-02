@@ -9,7 +9,10 @@ import {
   liveTailStart,
   type MessageGroup,
   resolveThreadScrollTarget,
+  shouldRePinOnTranscriptReload,
+  shouldSnapOnRunStart,
   subscribeToThreadForeground,
+  transcriptBackfillFrameCount,
   transcriptPaneBudget
 } from './list'
 
@@ -307,5 +310,22 @@ describe('liveTailStart', () => {
 
       expect(rendered(liveTailStart(groups))).toBeLessThanOrEqual(rendered(oldStart))
     }
+  })
+})
+
+describe('bounded transcript settling', () => {
+  it('fills the normal render budget in at most two backfill frames', () => {
+    expect(transcriptBackfillFrameCount()).toBeLessThanOrEqual(2)
+  })
+
+  it('only snaps a near-bottom reader when a run starts', () => {
+    expect(shouldSnapOnRunStart(63)).toBe(true)
+    expect(shouldSnapOnRunStart(64)).toBe(false)
+  })
+
+  it('re-pins on a session switch but preserves a settled reader on refresh', () => {
+    expect(shouldRePinOnTranscriptReload({ sessionSwitched: true, settledNonEmpty: true })).toBe(true)
+    expect(shouldRePinOnTranscriptReload({ sessionSwitched: false, settledNonEmpty: true })).toBe(false)
+    expect(shouldRePinOnTranscriptReload({ sessionSwitched: false, settledNonEmpty: false })).toBe(true)
   })
 })
