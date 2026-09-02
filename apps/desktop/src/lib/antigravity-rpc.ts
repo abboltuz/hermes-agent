@@ -8,7 +8,6 @@ export const ANTIGRAVITY_RPC_METHODS = {
   start: 'antigravity.oauth.start'
 } as const
 
-const MAX_PROJECT_ID_LENGTH = 4096
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const ACCOUNT_ID_PATTERN = new RegExp(`^acct_${UUID_PATTERN.source.slice(1, -1)}$`)
 const MALFORMED_PERCENT_ESCAPE = /%(?![0-9a-f]{2})/i
@@ -63,7 +62,7 @@ export interface AntigravityRpc {
     priority: number,
     options?: AntigravityRequestOptions
   ): Promise<AntigravityAccountsSnapshot>
-  startOAuth(projectId: string, options?: AntigravityRequestOptions): Promise<AntigravityOAuthStart>
+  startOAuth(options?: AntigravityRequestOptions): Promise<AntigravityOAuthStart>
 }
 
 interface AccountsEnvelope {
@@ -325,14 +324,6 @@ export function createAntigravityRpc(
         await request(ANTIGRAVITY_RPC_METHODS.priority, { account_id: accountId, priority }, options)
       )
     },
-    startOAuth: async (projectId, options) => {
-      if (projectId !== '' && !isSafeText(projectId, MAX_PROJECT_ID_LENGTH)) {
-        throw invalidRequest()
-      }
-
-      const params = projectId === '' ? undefined : { project_id: projectId }
-
-      return parseOAuthStart(await request(ANTIGRAVITY_RPC_METHODS.start, params, options))
-    }
+    startOAuth: async options => parseOAuthStart(await request(ANTIGRAVITY_RPC_METHODS.start, undefined, options))
   }
 }

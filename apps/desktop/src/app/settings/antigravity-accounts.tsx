@@ -43,20 +43,24 @@ function isAbort(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
-export function AntigravityAccounts() {
-  const profile = useStore($activeGatewayProfile)
-
-  return <AntigravityAccountsForProfile key={profile} />
+interface AntigravityAccountsProps {
+  onConfigSaved?: () => void
 }
 
-function AntigravityAccountsForProfile() {
+export function AntigravityAccounts({ onConfigSaved }: AntigravityAccountsProps) {
+  const profile = useStore($activeGatewayProfile)
+
+  return <AntigravityAccountsForProfile key={profile} onConfigSaved={onConfigSaved} />
+}
+
+function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsProps) {
   const { t } = useI18n()
   const copy = t.settings.providers.antigravity
   const { requestGateway } = useGatewayRequest()
   const rpc = useMemo(() => createAntigravityRpc(requestGateway, () => $activeGatewayProfile.get()), [requestGateway])
   const [accounts, setAccounts] = useState<AntigravityAccount[] | null>(null)
   const [error, setError] = useState(false)
-  const [projectId, setProjectId] = useState('')
+
   const [priorityDrafts, setPriorityDrafts] = useState<Record<string, string>>({})
   const [priorityErrors, setPriorityErrors] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState<null | string>(null)
@@ -85,11 +89,12 @@ function AntigravityAccountsForProfile() {
 
     try {
       const snapshot = await rpc.listAccounts({ signal: controller.signal })
-      applySnapshot(snapshot, expectedProfile, expectedGeneration)
+      return applySnapshot(snapshot, expectedProfile, expectedGeneration)
     } catch (reason) {
       if (!isAbort(reason) && expectedProfile === $activeGatewayProfile.get() && expectedGeneration === generation.current) {
         setError(true)
       }
+      return false
     }
   }, [applySnapshot, rpc])
 
@@ -151,11 +156,12 @@ function AntigravityAccountsForProfile() {
 
       try {
         const snapshot = await operation(rpc, controller.signal)
-        applySnapshot(snapshot, expectedProfile, expectedGeneration)
+        return applySnapshot(snapshot, expectedProfile, expectedGeneration)
       } catch (reason) {
         if (!isAbort(reason)) {
           notifyError(reason, copy.mutationFailed)
         }
+        return false
       } finally {
         setBusy(current => (current === key ? null : current))
       }
@@ -188,7 +194,9 @@ function AntigravityAccountsForProfile() {
       return
     }
 
-    await runMutation(`remove:${account.id}`, (client, signal) => client.removeAccount(account.id, { signal }))
+    if (await runMutation(`remove:${account.id}`, (client, signal) => client.removeAccount(account.id, { signal }))) {
+      onConfigSaved?.()
+    }
   }
 
   const poll = useCallback(
@@ -204,6 +212,7 @@ function AntigravityAccountsForProfile() {
           clearInterval(flow.timer)
           oauth.current = null
           setConnecting(false)
+          onConfigSaved?.()
           await refresh()
         }
       } catch (reason) {
@@ -213,7 +222,7 @@ function AntigravityAccountsForProfile() {
         }
       }
     },
-    [cancelOAuth, copy.connectFailed, refresh, rpc]
+    [cancelOAuth, copy.connectFailed, onConfigSaved, refresh, rpc]
   )
 
   const connect = async () => {
@@ -229,7 +238,7 @@ function AntigravityAccountsForProfile() {
     setConnecting(true)
 
     try {
-      const start = await rpc.startOAuth(projectId.trim(), { signal: pending.controller.signal })
+      const start = await rpc.startOAuth({ signal: pending.controller.signal })
 
       if (pendingOAuthStart.current !== pending || pending.profile !== $activeGatewayProfile.get()) {
         const scopedRpc = createAntigravityRpc(requestGateway, () => pending.profile)
@@ -274,10 +283,6 @@ function AntigravityAccountsForProfile() {
           {copy.description}
         </p>
         <div className="flex flex-wrap items-end gap-2 rounded-md border border-border/50 p-3">
-          <label className="grid min-w-52 flex-1 gap-1.5 text-xs text-muted-foreground">
-            {copy.projectId}
-            <Input onChange={event => setProjectId(event.target.value)} value={projectId} />
-          </label>
           {connecting ? (
             <Button onClick={() => cancelOAuth()} type="button" variant="outline">
               {t.common.cancel}

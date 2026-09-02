@@ -511,7 +511,7 @@ export function ProvidersSettings({
 
   return (
     <SettingsContent>
-      <AntigravityAccounts />
+      <AntigravityAccounts onConfigSaved={onConfigSaved} />
       <OAuthPicker
         disconnecting={disconnecting}
         onDisconnect={provider => void handleDisconnect(provider)}

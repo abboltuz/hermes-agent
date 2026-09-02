@@ -641,6 +641,106 @@ def test_list_authenticated_providers_refresh_busts_cache():
 # ─── Antigravity managed-provider inventory ─────────────────────────────
 
 
+def test_antigravity_connected_managed_account_appears_without_config_or_current_provider():
+    """A connected managed account is explicit picker authentication by itself."""
+    class ManagedClient:
+        instances = []
+
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+            self.instances.append(self)
+
+        def list_accounts(self):
+            self.calls.append("accounts")
+            return {"connected": True}
+
+        def list_models(self):
+            self.calls.append("models")
+            return [
+                {"id": "antigravity-gemini-3-pro"},
+                {"id": "bridge-secret-token"},
+            ]
+
+        def close(self):
+            self.closed = True
+
+    ctx = _empty_ctx(provider="openrouter")
+    with (
+        _list_auth_returning([]),
+        patch("agent.antigravity_bridge_client.AntigravityBridgeClient", ManagedClient),
+        patch("hermes_cli.models.cached_provider_model_ids", side_effect=AssertionError("duplicate catalog probe")),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+
+    row = next(row for row in payload["providers"] if row["slug"] == "antigravity")
+    assert row["authenticated"] is True
+    assert row["models"] == ["antigravity-gemini-3-pro"]
+    assert ManagedClient.instances[0].calls == ["accounts", "models"]
+    assert ManagedClient.instances[0].closed is True
+    assert "bridge" not in str(row).lower()
+    assert "secret" not in str(row).lower()
+
+
+def test_antigravity_account_probe_failure_or_disconnected_snapshot_does_not_add_authenticated_row():
+    """Unverified account state never turns the managed skeleton into an auth row."""
+    class DisconnectedClient:
+        def list_accounts(self):
+            return {"connected": False}
+
+        def close(self):
+            pass
+
+    ctx = _empty_ctx(provider="openrouter")
+    with (
+        _list_auth_returning([]),
+        patch("agent.antigravity_bridge_client.AntigravityBridgeClient", DisconnectedClient),
+    ):
+        disconnected = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+
+    with (
+        _list_auth_returning([]),
+        patch("agent.antigravity_bridge_client.AntigravityBridgeClient", side_effect=RuntimeError("private account diagnostic")),
+    ):
+        failed = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+
+    assert "antigravity" not in {row["slug"] for row in disconnected["providers"]}
+    assert "antigravity" not in {row["slug"] for row in failed["providers"]}
+    assert "private" not in str(failed).lower()
+
+
+def test_antigravity_truthy_non_boolean_connected_snapshot_does_not_authorize_managed_row():
+    """Only a literal boolean connection result authorizes managed discovery."""
+    class TruthyConnectedClient:
+        instances = []
+
+        def __init__(self):
+            self.closed = False
+            self.list_models_called = False
+            self.instances.append(self)
+
+        def list_accounts(self):
+            return {"connected": "yes"}
+
+        def list_models(self):
+            self.list_models_called = True
+            raise AssertionError("model discovery must require literal True")
+
+        def close(self):
+            self.closed = True
+
+    ctx = _empty_ctx(provider="openrouter")
+    with (
+        _list_auth_returning([]),
+        patch("agent.antigravity_bridge_client.AntigravityBridgeClient", TruthyConnectedClient),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+
+    assert "antigravity" not in {row["slug"] for row in payload["providers"]}
+    assert TruthyConnectedClient.instances[0].list_models_called is False
+    assert TruthyConnectedClient.instances[0].closed is True
+
+
 def test_antigravity_current_provider_uses_filtered_live_catalog_without_api_key():
     """A configured Antigravity subscription is a native picker row.
 

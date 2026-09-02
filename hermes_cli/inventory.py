@@ -618,6 +618,13 @@ def _antigravity_is_explicitly_configured(ctx: ConfigContext) -> bool:
     )
 
 
+def _antigravity_has_config_entry(ctx: ConfigContext) -> bool:
+    return any(
+        str(name).strip().lower() == "antigravity"
+        for name in (ctx.user_providers or {})
+    )
+
+
 _MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH = 96
 _ANTIGRAVITY_PICKER_MODEL_ID = re.compile(
     r"^(?:antigravity-)?(?:"
@@ -648,8 +655,8 @@ def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | No
     """Build Antigravity's configured managed-transport row.
 
     Antigravity intentionally has no API-key environment variable: accounts
-    live in its profile-scoped bridge service. A current selection or explicit
-    ``providers.antigravity`` entry is therefore sufficient to render its
+    live in its profile-scoped bridge service. A current selection, explicit
+    configuration, or a verified connected account is sufficient to render its
     native picker row. An unconfigured install remains a canonical setup
     skeleton via :func:`_append_unconfigured_rows`.
     """
@@ -662,22 +669,38 @@ def _antigravity_provider_row(rows: list[dict], ctx: ConfigContext) -> dict | No
 
     current = str(ctx.current_provider or "").strip().lower() == slug
     explicitly_configured = _antigravity_is_explicitly_configured(ctx)
-    if not current and not explicitly_configured:
+    if not current and _antigravity_has_config_entry(ctx) and not explicitly_configured:
         return None
-
     try:
-        from agent.antigravity_bridge_client import filter_antigravity_models
+        from agent.antigravity_bridge_client import (
+            AntigravityBridgeClient,
+            CURATED_FALLBACK_MODELS,
+            filter_antigravity_models,
+        )
         from hermes_cli.models import cached_provider_model_ids
         from providers import get_provider_profile
 
         profile = get_provider_profile(slug)
         if profile is None:
             return None
-        discovered = cached_provider_model_ids(slug)
+        if not current and not explicitly_configured:
+            client = AntigravityBridgeClient()
+            try:
+                snapshot = client.list_accounts()
+                if snapshot.get("connected") is not True:
+                    return None
+                try:
+                    discovered = filter_antigravity_models(client.list_models())
+                except Exception:
+                    discovered = list(CURATED_FALLBACK_MODELS)
+            finally:
+                client.close()
+        else:
+            discovered = filter_antigravity_models(
+                [{"id": model_id} for model_id in cached_provider_model_ids(slug) if isinstance(model_id, str)]
+            )
         models = _safe_antigravity_model_ids(
-            filter_antigravity_models(
-                [{"id": model_id} for model_id in discovered if isinstance(model_id, str)]
-            ) or []
+            discovered or []
         )
         return {
             "slug": slug,
@@ -834,9 +857,10 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
         if current_slug and slug == current_slug:
             kept.append(row)
             continue
-        if slug == "antigravity" and _antigravity_is_explicitly_configured(ctx):
+        if slug == "antigravity" and row.get("source") == "managed":
             # Antigravity is configured through its managed profile/account
-            # service, not an API-key environment variable.
+            # service, not an API-key environment variable. This includes a
+            # verified connected managed-account snapshot.
             kept.append(row)
             continue
         if slug == "moa":
