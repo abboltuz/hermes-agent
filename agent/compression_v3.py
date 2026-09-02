@@ -76,7 +76,14 @@ def prune_tool_pressure_projection(
     before = estimate_projection_tokens(source)
     observed = current_tokens if isinstance(current_tokens, int) and current_tokens > 0 else before
     soft_budget = int(context_window * TOOL_PRESSURE_SOFT_RATIO)
-    if observed <= soft_budget or before <= soft_budget:
+    if observed <= soft_budget:
+        return unchanged, 0
+    # ``observed`` is the full request estimate (messages plus system/tool
+    # payload and wire overhead), while ``before`` is only the message
+    # projection.  Keep the external portion as a bounded floor rather than
+    # requiring the message projection to exceed the whole-request threshold.
+    non_message_floor = max(0, observed - before)
+    if non_message_floor >= soft_budget:
         return unchanged, 0
     coordinator = ensure_compression_coordinator(
         agent, trigger="tool_pressure", urgency=1
@@ -93,11 +100,11 @@ def prune_tool_pressure_projection(
     if not isinstance(safety_margin, int) or safety_margin < 0:
         safety_margin = 1024
     # emergency_context_cut is also the canonical pairing/retention policy.
-    # Adjust its context window so its safe input budget is exactly the soft
-    # projection target, while leaving system/tool schema accounting to the
-    # pre-send gate that follows.
+    # Adjust its context window so its safe input budget is exactly the
+    # remaining message target after reserving the non-message floor.
+    message_target = soft_budget - non_message_floor
     budget = CompressionBudget(
-        soft_budget + output_reserve + safety_margin,
+        message_target + output_reserve + safety_margin,
         output_reserve,
         safety_margin,
     )
@@ -112,7 +119,7 @@ def prune_tool_pressure_projection(
         return unchanged, 0
     after = estimate_projection_tokens(result.messages)
     reclaimed = max(0, before - after)
-    if reclaimed < min_reclaim_tokens or after > soft_budget:
+    if reclaimed < min_reclaim_tokens or after + non_message_floor > soft_budget:
         return unchanged, 0
     coordinator.active_projection = [dict(message) for message in result.messages]
     coordinator._tool_pressure_fingerprint = hashlib.sha256(

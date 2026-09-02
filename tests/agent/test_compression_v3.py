@@ -183,6 +183,35 @@ def test_tool_pressure_projection_prunes_completed_rounds_before_next_request():
     )
 
 
+def test_tool_pressure_projection_accounts_for_external_request_floor():
+    from agent.compression_v3 import estimate_projection_tokens
+
+    agent = type(
+        "Agent",
+        (),
+        {
+            "session_id": "s",
+            "_compression_generation": 4,
+            "_config_context_length": 20_000,
+            "max_tokens": 100,
+            "_compression_safety_margin": 100,
+        },
+    )()
+    messages = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "do the work"}]
+    for number in range(12):
+        messages.extend(_round(number, body=f"result-{number}-" + "x" * 5_500))
+
+    # Message projection is below the whole-request soft threshold, but tool
+    # schemas/wire overhead put the observed request above it.
+    before = estimate_projection_tokens(messages)
+    assert before < 20_000 * 0.85
+    projection, reclaimed = prune_tool_pressure_projection(agent, messages, current_tokens=18_000)
+
+    assert projection != messages
+    assert reclaimed >= 8192
+    assert estimate_projection_tokens(projection) + (18_000 - before) <= 20_000 * 0.85
+
+
 def test_tool_pressure_projection_does_not_split_incomplete_group():
     agent = type("Agent", (), {"session_id": "s", "_config_context_length": 20_000})()
     messages = [{"role": "user", **HUMAN, "content": "task"}, {"role": "assistant", "tool_calls": [{"id": "pending"}]}]
@@ -333,6 +362,7 @@ def test_production_turn_executes_tools_prunes_projection_and_preserves_sessiond
         first_tools = [m for m in calls[0] if m.get("role") == "tool"]
         assert len(first_tools) >= 7
         assert any(message.get("tool_call_id") == "live-call" for message in second_tools)
+
 
         loaded = db.get_messages(session_id, include_inactive=True)
         durable_bodies = [
