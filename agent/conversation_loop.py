@@ -4519,7 +4519,9 @@ def run_conversation(
                         "final_response": _unfit_summary,
                         "messages": messages,
                         "completed": False,
+                        "failed": True,
                         "error_type": type(api_error).__name__,
+                        "error": str(api_error),
                         # The fit gate increments the attempt counter before
                         # invoking transport; no provider call occurred.
                         "api_calls": max(0, api_call_count - 1),

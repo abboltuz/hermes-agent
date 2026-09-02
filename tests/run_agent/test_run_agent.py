@@ -109,7 +109,9 @@ def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkey
     assert len(gate_attempts) == 1
     assert agent.client.chat.completions.create.call_count == 0
     assert outcome["completed"] is False
+    assert outcome["failed"] is True
     assert outcome["error_type"] == "ContextProjectionUnfit"
+    assert outcome["error"] == "irreducible request floor"
     assert outcome["api_calls"] == 0
 
 def test_persist_user_message_override_rewrites_text_turns(agent):

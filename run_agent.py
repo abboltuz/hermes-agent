@@ -2207,6 +2207,10 @@ class AIAgent:
                 if not isinstance(seed_ids, set):
                     seed_ids = set()
             self._flushed_db_message_session_id = current_session_id
+            # Only IDs established by the complete alignment proof below may
+            # suppress a write. Caller-provided sidecars are not durability
+            # evidence and must not control the append loop.
+            _validated_durable_row_ids = set()
             # Preserve exact row identity when a caller supplies a durable
             # history snapshot without the optional private sidecar.  This is
             # an ordered, full-message proof against the active DB snapshot,
@@ -2292,6 +2296,7 @@ class AIAgent:
                             and isinstance(stored.get('_row_id'), int)
                         ):
                             live['_row_id'] = stored['_row_id']
+                            _validated_durable_row_ids.add(stored['_row_id'])
                         elif live.get('_row_id') is None:
                             # Stop backfilling at the first mismatch.  Assigning
                             # later rows would make an ambiguous projection look
@@ -2349,6 +2354,9 @@ class AIAgent:
                 # history copy, or seeded by a caller. Stamp them so future
                 # flushes skip them without consulting any id() set again.
                 if id(msg) in history_ids or id(msg) in seed_ids:
+                    msg[_DB_PERSISTED_MARKER] = True
+                    continue
+                if msg.get("_row_id") in _validated_durable_row_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
                 role = msg.get("role", "unknown")

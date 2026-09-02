@@ -580,6 +580,8 @@ class TestStoredPromptCwdDrift:
                 row.pop("_row_id", None)
             agent._flush_messages_to_session_db(live, live)
 
+            assert len(db.get_messages(session_id)) == len(durable)
+
             current = next(row for row in live if row.get("reasoning") == "current")
             archived = next(row for row in live if row.get("reasoning") == "archived")
             assert current["_row_id"] == by_content[("assistant", "duplicate", "current")]

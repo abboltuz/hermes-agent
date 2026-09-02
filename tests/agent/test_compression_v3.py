@@ -170,6 +170,36 @@ def test_bedrock_converse_final_boundary_refuses_control_wire_before_boto3(monke
     assert converse_calls == []
 
 
+def test_bedrock_nested_output_reserve_is_checked_before_boto3(monkeypatch):
+    """Converse maxTokens consumes context even when serialized input fits."""
+    from agent import bedrock_adapter
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    calls = []
+    request = {
+        "__bedrock_region__": "us-east-1", "__bedrock_converse__": True,
+        "system": [{"text": "policy"}],
+        "messages": [{"role": "user", "content": [{"text": "task"}]}],
+        "inferenceConfig": {"maxTokens": 100},
+    }
+    # Leave room for the request wire but not for its nested output reserve.
+    from agent.compression_v3 import _provider_wire_token_bound, _strip_provider_private
+    wire = _provider_wire_token_bound(_strip_provider_private(request))
+    agent = SimpleNamespace(
+        api_mode="bedrock_converse", provider="bedrock",
+        _config_context_length=wire + 99, _compression_safety_margin=0,
+    )
+    monkeypatch.setattr(
+        bedrock_adapter, "_get_bedrock_runtime_client",
+        lambda _region: SimpleNamespace(converse=lambda **kwargs: calls.append(kwargs)),
+    )
+    with pytest.raises(ContextProjectionUnfit):
+        _dispatch_nonstreaming_api_request(
+            agent, request, make_client=lambda *args, **kwargs: calls.append(args)
+        )
+    assert calls == []
+
+
 def test_openai_chat_nonstreaming_final_boundary_refuses_before_completions(monkeypatch):
     from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 
@@ -236,6 +266,42 @@ def test_reducible_chat_dispatch_calls_once_with_sanitized_final_wire():
     assert "_compression_capsule" not in json.dumps(captured[0])
 
 
+def test_oversized_reducible_history_is_cut_before_one_chat_dispatch():
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+    captured = []
+    response = object()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: (captured.append(kwargs), response)[1]
+            )
+        )
+    )
+    messages = [{"role": "user", "content": "latest request", "_row_id": 1}]
+    for number in range(8):
+        call_id = f"old-{number}"
+        messages.extend([
+            {"role": "assistant", "_row_id": 2 + number * 2, "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+            {"role": "tool", "_row_id": 3 + number * 2, "tool_call_id": call_id, "content": "old result " * 500},
+        ])
+    # The original wire is oversized, but the retained/capsule projection is
+    # reducible and must reach the SDK exactly once.
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openrouter",
+        _config_context_length=2200, _compression_safety_margin=0,
+        session_id="reducible-dispatch",
+        _session_db=SimpleNamespace(register_compression_recovery=lambda *_args, **_kwargs: "recovery-1"),
+    )
+    assert _dispatch_nonstreaming_api_request(
+        agent, {"messages": messages, "tools": [], "max_tokens": 8},
+        make_client=lambda *_args, **_kwargs: client,
+    ) is response
+    assert len(captured) == 1
+    assert len(json.dumps(captured[0], ensure_ascii=True).encode()) <= 2200 - 8
+    assert "_compression" not in json.dumps(captured[0])
+
+
 def test_transport_added_tools_make_canonical_fit_unfit_before_openai_sdk():
     from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 
@@ -246,9 +312,16 @@ def test_transport_added_tools_make_canonical_fit_unfit_before_openai_sdk():
     )
     request = {
         "messages": [{"role": "user", "content": "fits canonically"}],
-        "tools": [{"type": "function", "function": {"name": "x", "parameters": {"description": "z" * 5000}}}],
+        "tools": [{"type": "function", "function": {"name": "x", "parameters": {"description": "z" * 500}}}],
         "max_tokens": 8,
     }
+    tool_tokens = estimate_projection_tokens(request["tools"])
+    canonical_context = estimate_projection_tokens(request["messages"]) + tool_tokens + 8
+    agent._config_context_length = canonical_context
+    assert CompressionBudget(
+        canonical_context, 8, 0, tool_schema_tokens=tool_tokens
+    ).fits(request["messages"])
+    assert _provider_wire_token_bound(request) + 8 > canonical_context
     with pytest.raises(ContextProjectionUnfit):
         _dispatch_nonstreaming_api_request(
             agent, request, make_client=lambda *args, **kwargs: calls.append(args)

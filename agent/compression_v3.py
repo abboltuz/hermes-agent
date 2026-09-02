@@ -524,6 +524,12 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     output_reserve = request.get("max_tokens", request.get("max_completion_tokens", 0))
     if "max_output_tokens" in request:
         output_reserve = request["max_output_tokens"]
+    inference_config = request.get("inferenceConfig")
+    if isinstance(inference_config, Mapping) and isinstance(
+        inference_config.get("maxTokens"), int
+    ):
+        # Bedrock Converse carries output capacity in its nested control wire.
+        output_reserve = inference_config["maxTokens"]
     if not isinstance(output_reserve, int) or output_reserve < 0:
         output_reserve = 0
     safety_margin = getattr(agent, "_compression_safety_margin", 1024)
