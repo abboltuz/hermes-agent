@@ -1,0 +1,330 @@
+"""Continuable-session compression primitives.
+
+This module is deliberately independent from the provider adapters.  It owns the
+invariants that must hold regardless of which ContextEngine supplies narrative
+summaries: durable rows are never deleted, the active projection is bounded, and
+an unsafe projection is refused before a provider call.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+import hashlib
+import json
+import re
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from agent.message_provenance import is_human_intent
+
+
+_RECOVERY_PREFIX = "[COMPACTION RECOVERY] session="
+_MAX_PREVIEW = 240
+
+
+def _tokens(value: Any) -> int:
+    if isinstance(value, str):
+        return max(1, (len(value) + 3) // 4)
+    if isinstance(value, Mapping):
+        return sum(_tokens(k) + _tokens(v) for k, v in value.items())
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return sum(_tokens(item) for item in value)
+    return 1
+
+
+def estimate_projection_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
+    return sum(_tokens(dict(message)) for message in messages)
+
+
+@dataclass(frozen=True)
+class CompressionBudget:
+    context_window: int
+    output_reserve: int
+    safety_margin: int
+    system_tokens: int = 0
+    tool_schema_tokens: int = 0
+    wire_overhead_tokens: int = 0
+
+    @property
+    def safe_input_budget(self) -> int:
+        return max(0, self.context_window - self.output_reserve - self.safety_margin)
+
+    @property
+    def history_budget(self) -> int:
+        return max(0, self.safe_input_budget - self.system_tokens - self.tool_schema_tokens - self.wire_overhead_tokens)
+
+    def fits(self, messages: Sequence[Mapping[str, Any]]) -> bool:
+        return self.system_tokens + self.tool_schema_tokens + self.wire_overhead_tokens + estimate_projection_tokens(messages) <= self.safe_input_budget
+
+
+@dataclass(frozen=True)
+class PolicyCapsule:
+    latest_human_intent: str
+    constraints: tuple[str, ...] = ()
+    identifiers: tuple[str, ...] = ()
+    session_id: str = ""
+    generation: int = 0
+    watermark: int = 0
+    provenance: str = "Cekasha"
+
+    def message(self) -> dict[str, Any]:
+        body = {
+            "latest_human_intent": self.latest_human_intent,
+            "constraints": list(self.constraints),
+            "identifiers": list(self.identifiers),
+            "session_id": self.session_id,
+            "generation": self.generation,
+            "watermark": self.watermark,
+            "provenance": self.provenance,
+        }
+        return {"role": "system", "content": "[POLICY CAPSULE]\n" + json.dumps(body, ensure_ascii=False, sort_keys=True), "_compression_capsule": True}
+
+
+def build_policy_capsule(messages: Iterable[Mapping[str, Any]], *, session_id: str, watermark: int, generation: int) -> PolicyCapsule:
+    human = ""
+    constraints: list[str] = []
+    identifiers: set[str] = set()
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        if message.get("role") == "user" and is_human_intent(message):
+            human = str(message.get("content", ""))
+        text = str(message.get("content", ""))
+        if re.search(r"\b(?:MUST|NEVER|REQUIRED|approval|approv(?:e|al))\b", text, re.I):
+            constraints.append(text[:_MAX_PREVIEW])
+        identifiers.update(re.findall(r"(?:#[0-9]+|[0-9a-f]{7,40}|(?:/|\\)[\w./\\-]+)", text))
+    return PolicyCapsule(human, tuple(dict.fromkeys(constraints[-32:])), tuple(sorted(identifiers)), session_id, generation, watermark)
+
+
+def _tool_call_ids(messages: Sequence[Mapping[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for message in messages:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or ():
+                if isinstance(call, Mapping) and call.get("id"):
+                    ids.add(str(call["id"]))
+    return ids
+
+
+@dataclass(frozen=True)
+class ProjectionValidation:
+    valid: bool
+    reason: str = ""
+
+
+def validate_projection(messages: Sequence[Mapping[str, Any]]) -> ProjectionValidation:
+    calls = _tool_call_ids(messages)
+    results: set[str] = set()
+    previous_visible: str | None = None
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            call_id = str(message.get("tool_call_id", ""))
+            if call_id not in calls:
+                return ProjectionValidation(False, "orphan_tool_result")
+            results.add(call_id)
+            continue
+        if role == "assistant" and message.get("tool_calls"):
+            continue
+        if role not in {"system", "user", "assistant"}:
+            return ProjectionValidation(False, "unknown_role")
+        if previous_visible == role and role != "system":
+            return ProjectionValidation(False, "role_alternation")
+        previous_visible = role
+    missing = calls - results
+    if missing:
+        return ProjectionValidation(False, "missing_tool_result")
+    return ProjectionValidation(True)
+
+
+@dataclass(frozen=True)
+class CutResult:
+    messages: list[dict[str, Any]]
+    outcome: str
+    provider_call_allowed: bool
+    recovery_identity: str = ""
+    reason: str = ""
+
+
+def _round_groups(messages: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for message in messages:
+        item = dict(message)
+        if item.get("role") == "assistant" and item.get("tool_calls") and current:
+            groups.append(current)
+            current = []
+        current.append(item)
+        if item.get("role") == "tool":
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
+def emergency_context_cut(messages: Sequence[Mapping[str, Any]], budget: CompressionBudget, *, session_id: str, generation: int, watermark: int = 0) -> CutResult:
+    original = [dict(message) for message in messages]
+    capsule = build_policy_capsule(original, session_id=session_id, watermark=watermark, generation=generation)
+    system = [dict(m) for m in original if m.get("role") == "system" and not m.get("_compression_capsule")][:1]
+    human = [dict(m) for m in original if m.get("role") == "user" and is_human_intent(m)][-1:]
+    groups = _round_groups([m for m in original if m.get("role") != "system"])
+    retained = groups[-6:]
+    identity = hashlib.sha256(f"{session_id}:{generation}:{watermark}".encode()).hexdigest()[:16]
+    reference = f"{_RECOVERY_PREFIX}{session_id} anchor={identity} watermark={watermark}"
+    compacted: list[dict[str, Any]] = []
+    for group in retained:
+        for item in group:
+            if item.get("role") == "tool" and _tokens(item.get("content", "")) > max(16, budget.history_budget // 3):
+                item["content"] = reference + " preview=" + str(item.get("content", ""))[:_MAX_PREVIEW]
+            compacted.append(item)
+    candidate = system + [capsule.message()] + human + compacted
+    validation = validate_projection(candidate)
+    if validation.valid and budget.fits(candidate):
+        return CutResult(candidate, "emergency_context_cut", True, identity)
+    if not budget.fits(system + [capsule.message()] + human):
+        return CutResult(original, "context_projection_unfit", False, identity, "irreducible system/tool/policy/user floor exceeds safe input budget")
+    # A malformed retained tail is never sent; return the safe floor and let the
+    # caller rebuild the next tool group rather than inventing a pairing.
+    floor = system + [capsule.message()] + human
+    if validate_projection(floor).valid and budget.fits(floor):
+        return CutResult(floor, "emergency_context_cut", True, identity, validation.reason)
+    return CutResult(original, "context_projection_unfit", False, identity, validation.reason)
+
+
+@dataclass(frozen=True)
+class CompressionRequest:
+    session_id: str
+    generation: int
+    trigger: str
+    urgency: int = 1
+
+
+@dataclass(frozen=True)
+class CompressionCandidate:
+    session_id: str
+    generation: int
+    watermark: int
+    prefix_hash: str
+    schema_hash: str
+    messages: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class CompressionSnapshot:
+    """Immutable fence describing the stable prefix a worker may read."""
+
+    session_id: str
+    generation: int
+    watermark: int
+    prefix_hash: str
+    schema_hash: str
+
+
+def compression_route_is_eligible(route: Mapping[str, Any] | None) -> bool:
+    """Require an explicit separately certified fast non-reasoning route."""
+    return bool(
+        isinstance(route, Mapping)
+        and route.get("provider")
+        and route.get("model")
+        and route.get("certified_fast") is True
+        and route.get("reasoning") is False
+    )
+
+
+@dataclass(frozen=True)
+class CompressionAttempt:
+    attempt_id: int
+    generation: int
+    urgency: int
+    trigger: str
+
+
+class CompressionCoordinator:
+    """Small per-session owner that coalesces pressure requests and fences adopts."""
+
+    def __init__(self, *, session_id: str, prefix_hash: str = "", schema_hash: str = "") -> None:
+        self.session_id = session_id
+        self.prefix_hash = prefix_hash
+        self.schema_hash = schema_hash
+        self._next_attempt = 0
+        self._attempt: CompressionAttempt | None = None
+        self.outcome: str | None = None
+        self.active_projection: list[dict[str, Any]] | None = None
+
+    def request(self, request: CompressionRequest) -> CompressionAttempt:
+        if request.session_id != self.session_id:
+            raise ValueError("compression request belongs to another session")
+        if self._attempt is not None and self._attempt.generation == request.generation:
+            self._attempt = replace(self._attempt, urgency=max(self._attempt.urgency, request.urgency), trigger=request.trigger if request.urgency >= self._attempt.urgency else self._attempt.trigger)
+            return self._attempt
+        self._next_attempt += 1
+        self._attempt = CompressionAttempt(self._next_attempt, request.generation, request.urgency, request.trigger)
+        self.outcome = None
+        return self._attempt
+
+    @property
+    def attempt(self) -> CompressionAttempt | None:
+        return self._attempt
+
+    def adopt(self, candidate: CompressionCandidate, *, current_watermark: int | None = None) -> bool:
+        attempt = self._attempt
+        if attempt is None or candidate.session_id != self.session_id or candidate.generation != attempt.generation:
+            return False
+        if candidate.prefix_hash != self.prefix_hash or candidate.schema_hash != self.schema_hash:
+            return False
+        if current_watermark is not None and candidate.watermark > current_watermark:
+            return False
+        if not validate_projection(candidate.messages).valid:
+            return False
+        self.active_projection = [dict(message) for message in candidate.messages]
+        self.outcome = "candidate_adopted"
+        return True
+
+    def snapshot(self, *, watermark: int, generation: int | None = None) -> CompressionSnapshot:
+        """Capture worker input without copying mutable live agent state."""
+        active_generation = self.attempt.generation if self.attempt else 0
+        return CompressionSnapshot(
+            self.session_id,
+            active_generation if generation is None else generation,
+            watermark,
+            self.prefix_hash,
+            self.schema_hash,
+        )
+
+    def adopt_with_tail(
+        self,
+        candidate: CompressionCandidate,
+        concurrent_tail: Iterable[Mapping[str, Any]],
+        *,
+        current_watermark: int,
+    ) -> bool:
+        """Validate and publish a candidate plus rows appended after its fence."""
+        if candidate.watermark > current_watermark:
+            return False
+        tail = [dict(message) for message in concurrent_tail]
+        combined = [dict(message) for message in candidate.messages] + tail
+        if not validate_projection(combined).valid:
+            return False
+        if not self.adopt(candidate, current_watermark=current_watermark):
+            return False
+        self.active_projection = combined
+        self.outcome = "candidate_adopted_with_tail"
+        return True
+
+    def mark_no_progress(self) -> bool:
+        if self._attempt is None or self.outcome == "no_progress":
+            return False
+        self.outcome = "no_progress"
+        return True
+
+
+def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1) -> CompressionCoordinator:
+    """Return the coordinator bound to an agent's current session identity."""
+    session_id = str(getattr(agent, "session_id", "") or "")
+    coordinator = getattr(agent, "_compression_coordinator", None)
+    if not isinstance(coordinator, CompressionCoordinator) or coordinator.session_id != session_id:
+        coordinator = CompressionCoordinator(session_id=session_id)
+        setattr(agent, "_compression_coordinator", coordinator)
+    generation = int(getattr(agent, "_compression_generation", 0) or 0)
+    coordinator.request(CompressionRequest(session_id, generation, trigger, urgency))
+    return coordinator

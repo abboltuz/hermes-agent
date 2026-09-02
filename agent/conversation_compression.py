@@ -71,6 +71,7 @@ from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
 )
+from agent.compression_v3 import ensure_compression_coordinator
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -2342,6 +2343,11 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    ensure_compression_coordinator(
+        agent,
+        trigger="manual" if force else "automatic",
+        urgency=3 if force else 1,
+    )
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
