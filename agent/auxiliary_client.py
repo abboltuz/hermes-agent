@@ -5238,6 +5238,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    deadline: Optional[float] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -5259,7 +5260,10 @@ def _call_fallback_candidate_sync(
     fallback tuned differently from the primary is allowed its own budget
     (#62452).
     """
+    remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
     fb_timeout = _fallback_entry_timeout(task, fb_label)
+    if remaining is not None:
+        fb_timeout = remaining if fb_timeout is None else min(fb_timeout, remaining)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
             "Auxiliary %s: %s using its configured timeout %.0fs "
@@ -5363,9 +5367,13 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    deadline: Optional[float] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
+    remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
     fb_timeout = _fallback_entry_timeout(task, fb_label)
+    if remaining is not None:
+        fb_timeout = remaining if fb_timeout is None else min(fb_timeout, remaining)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
             "Auxiliary %s: %s using its configured timeout %.0fs "
@@ -9604,6 +9612,7 @@ def _call_llm_impl(
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    deadline = time.monotonic() + max(0.0, float(effective_timeout))
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
         request_provider,
@@ -10174,7 +10183,8 @@ def _call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    deadline=deadline)
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
@@ -10192,7 +10202,8 @@ def _call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        deadline=deadline)
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible
@@ -10423,6 +10434,7 @@ async def _async_call_llm_impl(
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    deadline = time.monotonic() + max(0.0, float(effective_timeout))
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
         request_provider,
@@ -10878,7 +10890,8 @@ async def _async_call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    deadline=deadline)
                 if fb_resp is not None:
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
@@ -10900,7 +10913,8 @@ async def _async_call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        deadline=deadline)
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)

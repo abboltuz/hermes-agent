@@ -792,7 +792,13 @@ class CompressionCoordinator:
         self._background_closed = False
         self._background_result: Any = None
         self._background_result_ready = False
+        self._owner_thread_id = threading.get_ident()
+        self._background_adopted = False
         self.telemetry: list[str] = []
+
+    @property
+    def closed(self) -> bool:
+        return self._background_closed
 
     def request(self, request: CompressionRequest) -> CompressionAttempt:
         if request.session_id != self.session_id:
@@ -836,6 +842,8 @@ class CompressionCoordinator:
         return self._attempt
 
     def adopt(self, candidate: CompressionCandidate, *, current_watermark: int | None = None) -> bool:
+        if threading.get_ident() != self._owner_thread_id or self._background_adopted:
+            return False
         attempt = self._attempt
         if attempt is None or candidate.session_id != self.session_id or candidate.generation != attempt.generation:
             return False
@@ -847,6 +855,7 @@ class CompressionCoordinator:
             return False
         self.active_projection = [dict(message) for message in candidate.messages]
         self.outcome = "candidate_adopted"
+        self._background_adopted = True
         return True
 
     def snapshot(self, *, watermark: int, generation: int | None = None) -> CompressionSnapshot:
@@ -870,6 +879,8 @@ class CompressionCoordinator:
         """Validate and publish a candidate plus rows appended after its fence."""
         if candidate.watermark > current_watermark:
             return False
+        if threading.get_ident() != self._owner_thread_id or self._background_adopted:
+            return False
         tail = [dict(message) for message in concurrent_tail]
         combined = [dict(message) for message in candidate.messages] + tail
         if not validate_projection(combined).valid:
@@ -878,6 +889,7 @@ class CompressionCoordinator:
             return False
         self.active_projection = combined
         self.outcome = "candidate_adopted_with_tail"
+        self._background_adopted = True
         return True
 
     def mark_no_progress(self) -> bool:
@@ -950,14 +962,28 @@ class CompressionCoordinator:
             return False
         if result is not self._background_result and result != self._background_result:
             return False
+        if not isinstance(result, CompressionCandidate):
+            return False
+        if result.session_id != snapshot.session_id or result.generation != snapshot.generation:
+            return False
+        if result.prefix_hash != snapshot.prefix_fingerprint:
+            return False
+        if self._background_adopted:
+            return False
+        if threading.get_ident() != self._owner_thread_id:
+            return False
+        self.active_projection = [dict(message) for message in result.messages]
         self.outcome = "candidate_adopted"
         self.telemetry.append("adopted")
+        self._background_adopted = True
         return True
 
     def close_background(self) -> None:
         """Fence and tear down background work; late results are discarded."""
         with self._admission_lock:
             self._background_closed = True
+            self._background_result = None
+            self._background_result_ready = False
             future = self._background_future
             if future is not None:
                 future.cancel()
@@ -984,7 +1010,7 @@ def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1
             try:
                 db_registry = weak_registry.setdefault(session_db, {})
                 coordinator = db_registry.get(logical_id)
-                if not isinstance(coordinator, CompressionCoordinator):
+                if not isinstance(coordinator, CompressionCoordinator) or coordinator.closed:
                     coordinator = CompressionCoordinator(session_id=logical_id)
                     db_registry[logical_id] = coordinator
             except TypeError:
