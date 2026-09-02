@@ -2037,12 +2037,50 @@ def _is_real_user_message(message: Any) -> bool:
     """
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
-    from agent.message_provenance import is_human_intent
+    from agent.message_provenance import (
+        OriginKind,
+        TrustKind,
+        TurnKind,
+        SEMANTIC_FIELDS,
+        classify_legacy_message,
+        decode_message_provenance,
+        is_human_intent,
+    )
 
-    if not is_human_intent(message):
+    # Explicit provenance is authoritative and remains fail-closed: only a
+    # prompt/task/UI human (or external actor) can be trusted as human intent.
+    # A legacy row with no semantic provenance is different: retention needs to
+    # preserve it as a compatibility anchor, but it must stay legacy_unknown
+    # and never acquire authorization through this helper.
+    provenance = decode_message_provenance(message)
+    if provenance is not None:
+        if provenance.origin_kind == OriginKind.LEGACY_UNKNOWN:
+            # A fully normalized legacy row remains retention-compatible, but
+            # mixed claims (for example legacy origin + user authorization) are
+            # not accepted as an anchor.
+            if not (
+                provenance.turn_kind == TurnKind.LEGACY_UNKNOWN
+                and provenance.trust_kind == TrustKind.LEGACY_UNKNOWN
+            ):
+                return False
+        else:
+            return is_human_intent(message)
+    else:
+        # Invalid or partial semantic claims are not silently downgraded to a
+        # legacy row. Only a genuinely missing-provenance message gets the
+        # compatibility classification below.
+        if any(field in message for field in SEMANTIC_FIELDS):
+            return False
+        provenance = classify_legacy_message(message)
+        if provenance.origin_kind != OriginKind.LEGACY_UNKNOWN:
+            return is_human_intent(message)
+
+    if any(message.get(flag) is True for flag in _SYNTHETIC_USER_FLAGS):
         return False
     from agent.context_compressor import ContextCompressor
 
+    if ContextCompressor._is_context_summary_content(_message_text(message)):
+        return False
     return not ContextCompressor._is_blank_user_turn(message)
 
 
