@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import threading
+import weakref
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agent.message_provenance import is_human_intent
@@ -612,14 +613,33 @@ def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1
     except Exception:
         logical_id = physical_id
     session_db = getattr(agent, "_session_db", None)
-    registry_key = (logical_id, id(session_db) if session_db is not None else id(agent))
     registry = globals().setdefault("_COMPRESSION_COORDINATORS", {})
     registry_lock = globals().setdefault("_COMPRESSION_COORDINATORS_LOCK", threading.RLock())
     with registry_lock:
-        coordinator = registry.get(registry_key)
-        if not isinstance(coordinator, CompressionCoordinator):
-            coordinator = CompressionCoordinator(session_id=logical_id)
-            registry[registry_key] = coordinator
+        if session_db is not None:
+            weak_registry = globals().setdefault(
+                "_COMPRESSION_COORDINATORS_BY_DB", weakref.WeakKeyDictionary()
+            )
+            try:
+                db_registry = weak_registry.setdefault(session_db, {})
+                coordinator = db_registry.get(logical_id)
+                if not isinstance(coordinator, CompressionCoordinator):
+                    coordinator = CompressionCoordinator(session_id=logical_id)
+                    db_registry[logical_id] = coordinator
+            except TypeError:
+                # A third-party SessionDB shim may not support weak references;
+                # retain compatibility without using recyclable object ids.
+                registry_key = (logical_id, id(session_db))
+                coordinator = registry.get(registry_key)
+                if not isinstance(coordinator, CompressionCoordinator):
+                    coordinator = CompressionCoordinator(session_id=logical_id)
+                    registry[registry_key] = coordinator
+        else:
+            registry_key = (logical_id, id(agent))
+            coordinator = registry.get(registry_key)
+            if not isinstance(coordinator, CompressionCoordinator):
+                coordinator = CompressionCoordinator(session_id=logical_id)
+                registry[registry_key] = coordinator
     setattr(agent, "_compression_coordinator", coordinator)
     generation = int(getattr(agent, "_compression_generation", 0) or 0)
     coordinator.request(CompressionRequest(logical_id, generation, trigger, urgency))

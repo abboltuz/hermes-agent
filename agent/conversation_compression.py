@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -71,7 +72,10 @@ from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
 )
-from agent.compression_v3 import ensure_compression_coordinator
+from agent.compression_v3 import (
+    CompressionRequest,
+    ensure_compression_coordinator,
+)
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -2302,7 +2306,119 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def _compression_source_fingerprint(messages: list, system_message: str) -> str:
+    """Hash provider-relevant input while ignoring transient persistence tags."""
+    def stable(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: stable(item)
+                for key, item in sorted(value.items())
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, (list, tuple)):
+            return [stable(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    payload = json.dumps(
+        {"messages": stable(messages), "system_message": stable(system_message)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def compress_context(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    focus_topic: Optional[str] = None,
+    force: bool = False,
+    trigger: Optional[str] = None,
+    defer_context_engine_notification: bool = False,
+    commit_fence: Optional[CompressionCommitFence] = None,
+) -> Tuple[list, str]:
+    """Admit one logical-session execution before entering compression."""
+    requested_trigger = trigger
+    trigger = trigger or ("manual" if force else "automatic")
+    # Preserve the legacy direct/manual wrapper contract. Automatic in-agent
+    # ingress is explicit and always passes a trigger below; out-of-band
+    # callers without provenance must retain their existing behavior.
+    if requested_trigger is None:
+        ensure_compression_coordinator(agent, trigger=trigger, urgency=3 if force else 1)
+        return _compress_context_impl(
+            agent, messages, system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            trigger=None,
+            defer_context_engine_notification=defer_context_engine_notification,
+            commit_fence=commit_fence,
+        )
+    logical_id = str(getattr(agent, "_conversation_root_id", lambda: None)() or getattr(agent, "session_id", ""))
+    generation = int(getattr(agent, "_compression_generation", 0) or 0)
+    fingerprint = _compression_source_fingerprint(messages, system_message)
+    request = CompressionRequest(
+        logical_id,
+        generation,
+        trigger,
+        urgency=3 if force else 1,
+        source_fingerprint=fingerprint,
+        row_watermark=len(messages),
+        estimated_pressure=int(approx_tokens or 0),
+        force=force,
+    )
+    coordinator = ensure_compression_coordinator(agent, trigger=trigger, urgency=request.urgency)
+    admission = coordinator.admit_execution(request)
+    if admission.outcome != "admitted":
+        existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
+        return messages, existing_prompt
+    try:
+        result = _compress_context_impl(
+            agent,
+            messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            trigger=requested_trigger,
+            defer_context_engine_notification=defer_context_engine_notification,
+            commit_fence=commit_fence,
+        )
+        if result[0] is messages:
+            compressor = getattr(agent, "context_compressor", None)
+            blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
+            if callable(blocked) and not force and blocked(compressor):
+                outcome = "cooldown"
+            elif getattr(agent, "_compression_skipped_due_to_lock", None):
+                outcome = "deferred_lock"
+            elif getattr(agent, "api_mode", None) == "codex_app_server":
+                outcome = "native_delegated"
+            else:
+                outcome = "no_progress"
+        else:
+            outcome = "committed"
+        coordinator.finish_execution(request, outcome)
+        return result
+    except (KeyboardInterrupt, SystemExit):
+        coordinator.finish_execution(request, "aborted")
+        raise
+    except Exception:
+        coordinator.finish_execution(request, "aborted")
+        raise
+    finally:
+        if coordinator.outcome not in {"aborted", "no_progress", "timed_out", "deferred_lock", "cooldown", "native_delegated", "committed"}:
+            coordinator.finish_execution(request, "aborted")
+
+
+def _compress_context_impl(
     agent: Any,
     messages: list,
     system_message: str,
@@ -2344,11 +2460,7 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
-    ensure_compression_coordinator(
-        agent,
-        trigger=trigger or ("manual" if force else "automatic"),
-        urgency=3 if force else 1,
-    )
+
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
