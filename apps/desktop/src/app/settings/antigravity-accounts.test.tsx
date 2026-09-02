@@ -232,6 +232,12 @@ describe('AntigravityAccounts', () => {
         expect.anything()
       )
     )
+    const oauthStartCall = requestGateway.mock.calls.find(([method]) => method === 'antigravity.oauth.start')
+    expect(oauthStartCall).toBeDefined()
+
+    const [, params] = oauthStartCall!
+    expect(params).toStrictEqual({ profile: 'default' })
+    expect(Object.hasOwn(params, 'project_id')).toBe(false)
     expect(openExternalLink).toHaveBeenCalledWith(oauthStart.authUrl)
   })
 

@@ -129,6 +129,16 @@ describe('createAntigravityRpc', () => {
     await expect(api.startOAuth('')).resolves.toMatchObject({ sessionId: SESSION_ID, status: 'pending' })
 
     expect(request).toHaveBeenCalledWith(ANTIGRAVITY_RPC_METHODS.start, { profile: 'alpha' }, undefined, undefined)
+    const oauthStartCall = vi.mocked(request).mock.calls.find(([method]) => method === ANTIGRAVITY_RPC_METHODS.start)
+    expect(oauthStartCall).toBeDefined()
+
+    const [, params] = oauthStartCall!
+    expect(params).toBeDefined()
+    if (!params) {
+      throw new Error('OAuth start params were not recorded')
+    }
+    expect(params).toStrictEqual({ profile: 'alpha' })
+    expect(Object.hasOwn(params, 'project_id')).toBe(false)
   })
 
   it.each([
