@@ -1,5 +1,9 @@
 """Behavioral contracts for the continuable-session compression coordinator."""
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 from agent.compression_v3 import (
     CompressionBudget,
     CompressionCandidate,
@@ -193,3 +197,158 @@ def test_tool_pressure_projection_keeps_cache_stable_below_soft_threshold():
     projection, reclaimed = prune_tool_pressure_projection(agent, messages, current_tokens=1_000)
     assert reclaimed == 0
     assert projection is messages
+
+
+def test_production_turn_executes_tools_prunes_projection_and_preserves_sessiondb(
+    monkeypatch, tmp_path
+):
+    """The mid-turn boundary must be exercised through AIAgent, not its helper."""
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    from tools.registry import registry
+    import agent.compression_v3 as compression_v3
+
+    tool_name = "compression_v3_e2e_tool"
+    original = registry.get_entry(tool_name)
+    registry.register(
+        name=tool_name,
+        toolset="test",
+        schema={
+            "name": tool_name,
+            "description": "deterministic compression test tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda args, **kwargs: json.dumps(
+            {"ok": True, "body": "canonical-" + "x" * 3_000}
+        ),
+        check_fn=lambda: True,
+        max_result_size_chars=100_000,
+    )
+    db = SessionDB(db_path=Path(tmp_path) / "session.db")
+    session_id = "compression-v3-production-e2e"
+    agent = None
+    calls = []
+    try:
+        prior = [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "task"}]
+        for number in range(10):
+            prior.extend(_round(number, body=f"durable-{number}-" + "y" * 20_000))
+
+        db.create_session(session_id=session_id, source="cli")
+        db.append_messages_batch(session_id, prior)
+
+        monkeypatch.setattr(
+            "run_agent.get_tool_definitions",
+            lambda **kwargs: [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": "deterministic compression test tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="http://compression-v3.test",
+            provider="openrouter",
+            model="test-model",
+            session_id=session_id,
+            session_db=db,
+            max_iterations=3,
+            max_tokens=100,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.compression_enabled = True
+        agent._config_context_length = 100_000
+        agent.context_compressor.context_length = 100_000
+        agent.context_compressor.should_compress = lambda tokens: False
+        agent._compression_safety_margin = 100
+        agent._disable_streaming = True
+        production_prune_calls = []
+        production_prune_results = []
+        original_prune = compression_v3.prune_tool_pressure_projection
+
+        def production_prune(*args, **kwargs):
+            production_prune_calls.append(kwargs.get("current_tokens"))
+            args[0]._config_context_length = 60_000
+            args[0].context_compressor.context_length = 60_000
+            kwargs["current_tokens"] = 1_000_000
+            result = original_prune(*args, **kwargs)
+            production_prune_results.append(result)
+            return result
+
+        monkeypatch.setattr(compression_v3, "prune_tool_pressure_projection", production_prune)
+
+        tool_call = SimpleNamespace(
+            id="live-call",
+            type="function",
+            function=SimpleNamespace(name=tool_name, arguments="{}"),
+        )
+        scripted = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            role="assistant", content=None, tool_calls=[tool_call]
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            role="assistant", content="final answer", tool_calls=None
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            ),
+        ]
+
+        def scripted_call(kwargs):
+            calls.append(json.loads(json.dumps(kwargs["messages"])))
+            if len(calls) == 1:
+                agent._config_context_length = 60_000
+                agent.context_compressor.context_length = 60_000
+            return scripted.pop(0)
+
+        agent._interruptible_api_call = scripted_call
+        result = agent.run_conversation(
+            "task", conversation_history=prior, task_id="compression-e2e"
+        )
+
+        assert result["final_response"] == "final answer"
+        assert production_prune_calls
+        assert production_prune_results
+        assert len(calls) == 2
+        second_tools = [m for m in calls[1] if m.get("role") == "tool"]
+        first_tools = [m for m in calls[0] if m.get("role") == "tool"]
+        assert len(first_tools) >= 7
+        assert any(message.get("tool_call_id") == "live-call" for message in second_tools)
+
+        loaded = db.get_messages(session_id, include_inactive=True)
+        durable_bodies = [
+            message["content"]
+            for message in loaded
+            if message.get("role") == "tool"
+        ]
+        canonical_body = json.dumps({"ok": True, "body": "canonical-" + "x" * 3_000})
+        assert durable_bodies.count(canonical_body) == 1
+        assert all(
+            durable_bodies.count(f"durable-{number}-" + "y" * 20_000) == 1
+            for number in range(10)
+        )
+    finally:
+        if original is None:
+            registry.deregister(tool_name)
+        if agent is not None:
+            agent.close()
+        db.close()
