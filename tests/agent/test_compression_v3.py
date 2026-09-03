@@ -29,7 +29,7 @@ from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 HUMAN = {"origin_kind": "human_user", "turn_kind": "prompt", "trust_kind": "user_authorized"}
 
 
-def test_provider_wire_bound_uses_escaped_bytes_without_underestimate():
+def test_provider_wire_estimate_stays_in_token_domain_with_explicit_overhead():
     request = {
         "instructions": 'ASCII compact id 😀 中文 "quotes" \\n',
         "input": [{"role": "user", "content": [{"type": "text", "text": "\\ud800"}]}],
@@ -37,7 +37,72 @@ def test_provider_wire_bound_uses_escaped_bytes_without_underestimate():
         "max_output_tokens": 17,
     }
     serialized = json.dumps(request, ensure_ascii=True, sort_keys=True, default=str)
-    assert _provider_wire_token_bound(request) >= len(serialized.encode("utf-8"))
+    serialized_bytes = len(serialized.encode("utf-8"))
+    estimate = _provider_wire_token_bound(request)
+
+    assert estimate >= (serialized_bytes + 2) // 3
+    assert estimate < serialized_bytes
+
+
+def test_codex_responses_incident_sized_wire_reaches_transport_once():
+    """Serialized JSON bytes are not provider tokens for the final fit gate."""
+    clients = []
+    codex_calls = []
+    response = object()
+    client = object()
+
+    def make_client(reason, **_kwargs):
+        clients.append(reason)
+        return client
+
+    def run_codex(request, **kwargs):
+        codex_calls.append((request, kwargs))
+        return response
+
+    agent = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        _config_context_length=272_000,
+        _compression_safety_margin=1_024,
+        _run_codex_stream=run_codex,
+    )
+    request = {
+        "model": "gpt-5.6-luna",
+        "instructions": "policy " * 5_000,
+        "input": [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "result " * 20_000}],
+        }],
+        "tools": [{
+            "type": "function",
+            "name": "write_file",
+            "description": "schema " * 15_000,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        }],
+        "max_output_tokens": 16_000,
+    }
+    serialized_bytes = len(
+        json.dumps(request, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    )
+    assert serialized_bytes > agent._config_context_length
+
+    assert _dispatch_nonstreaming_api_request(
+        agent, request, make_client=make_client
+    ) is response
+    assert clients == ["codex_stream_request"]
+    assert len(codex_calls) == 1
+    prepared, kwargs = codex_calls[0]
+    assert prepared["instructions"] == request["instructions"]
+    assert prepared["input"] == request["input"]
+    assert prepared["tools"] == request["tools"]
+    assert kwargs["client"] is client
 
 
 def test_prepare_api_request_strips_private_sidecars_recursively():
@@ -298,7 +363,11 @@ def test_oversized_reducible_history_is_cut_before_one_chat_dispatch():
         make_client=lambda *_args, **_kwargs: client,
     ) is response
     assert len(captured) == 1
-    assert len(json.dumps(captured[0], ensure_ascii=True).encode()) <= 2200 - 8
+    assert len(captured[0]["messages"]) < len(messages)
+    assert (
+        _provider_wire_token_bound(captured[0]) + captured[0]["max_tokens"]
+        <= agent._config_context_length
+    )
     assert "_compression" not in json.dumps(captured[0])
 
 

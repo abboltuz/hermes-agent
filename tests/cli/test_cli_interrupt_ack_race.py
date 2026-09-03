@@ -121,6 +121,39 @@ class _StubAgent:
         self._interrupt_message = None
 
 
+def test_chat_retains_structured_failure_for_oneshot_exit_mapping():
+    cli = _make_cli()
+
+    class _FailedAgent(_StubAgent):
+        def run_conversation(self, **_kwargs):
+            self.result = {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": "final provider wire payload exceeds safe context budget",
+                "response_previewed": True,
+            }
+            return self.result
+
+    agent = _FailedAgent(cli.session_id, turn_seconds=0)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        response = cli.chat("original")
+
+    assert response == "Error: final provider wire payload exceeds safe context budget"
+    assert cli._last_structured_result is agent.result
+
+
 def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     cli = _make_cli()
     agent = _StubAgent(cli.session_id)

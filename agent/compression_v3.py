@@ -25,6 +25,7 @@ _PROVISIONAL_RECOVERY_PREFIX = "[COMPACTION RECOVERY PENDING] session="
 _MAX_PREVIEW = 240
 TOOL_PRESSURE_MIN_RECLAIM_TOKENS = 8192
 TOOL_PRESSURE_SOFT_RATIO = 0.85
+_PROVIDER_WIRE_BYTES_PER_TOKEN = 3
 
 
 def _tokens(value: Any) -> int:
@@ -42,24 +43,27 @@ def estimate_projection_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
 
 
 def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
-    """Return a no-underestimate bound for the complete provider wire.
+    """Estimate complete provider-wire usage in the token domain.
 
-    Provider-specific tokenizers are not available at this layer.  Escaped JSON
-    UTF-8 bytes are therefore used as the fallback bound: a provider token
-    cannot encode fewer than one serialized byte.  This intentionally refuses
-    some requests that would fit under a real tokenizer, but never permits an
-    oversized wire through a divisor heuristic.
+    Provider-specific tokenizers are not available at this layer.  Keep the
+    existing structural token estimate, then conservatively account for JSON
+    framing, escaping, route fields, and nested schemas at three serialized
+    UTF-8 bytes per token.  Raw bytes are not tokens: treating them as equal
+    falsely rejects large multilingual and schema-heavy requests that fit the
+    provider context window.
     """
     public = {
         key: value for key, value in request.items()
         if not str(key).startswith("_") and not str(key).startswith("__")
     }
     serialized = json.dumps(public, ensure_ascii=True, sort_keys=True, default=str)
-    # Escaped JSON covers structural framing, route fields, instructions/input,
-    # messages, tools and nested schemas.  Keep the one-byte-per-token upper
-    # bound exact rather than dividing by an assumed tokenizer ratio.
-    serialized_bound = max(1, len(serialized.encode("utf-8")))
-    return max(_tokens(public), serialized_bound)
+    serialized_bytes = len(serialized.encode("utf-8"))
+    serialized_tokens = max(
+        1,
+        (serialized_bytes + _PROVIDER_WIRE_BYTES_PER_TOKEN - 1)
+        // _PROVIDER_WIRE_BYTES_PER_TOKEN,
+    )
+    return max(_tokens(public), serialized_tokens)
 
 
 def _strip_provider_private(value: Any) -> Any:
