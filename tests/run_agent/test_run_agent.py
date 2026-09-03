@@ -5109,8 +5109,10 @@ class TestRunConversation:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
-        # Huge API-only system prompt; persisted messages are tiny.
-        agent._cached_system_prompt = "S" * 796_000
+        # Large API-only system prompt; persisted messages are tiny. Keep the
+        # request below the local final-wire gate so the simulated provider
+        # output-cap response remains reachable.
+        agent._cached_system_prompt = "S" * 100_000
 
         error_msg = (
             "max_tokens: 65536 > context_window: 200000 "
