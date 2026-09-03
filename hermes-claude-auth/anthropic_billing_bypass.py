@@ -1099,7 +1099,6 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
             kept.append({
                 "type": "text",
                 "text": _SYSTEM_IDENTITY,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             })
             if rest:
                 moved_texts.append(rest)
@@ -1111,10 +1110,19 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         kept.insert(0, {
             "type": "text",
             "text": _SYSTEM_IDENTITY,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         })
 
     api_kwargs["system"] = [billing_entry] + kept
+
+    # Strip all cache_control from system blocks.  The Anthropic API
+    # enforces TTL ordering (longer before shorter), and blocks from
+    # Hermes's prompt caching may conflict with the bypass's identity
+    # block.  Removing cache_control from the system blocks is safe
+    # because the billing header and identity are the only blocks that
+    # matter for the bypass.
+    for _block in api_kwargs["system"]:
+        if isinstance(_block, dict):
+            _block.pop("cache_control", None)
 
     if moved_texts:
         _prepend_to_first_user_message(messages, moved_texts)
