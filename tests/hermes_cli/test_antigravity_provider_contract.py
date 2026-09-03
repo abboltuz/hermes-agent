@@ -163,3 +163,22 @@ def test_cursor_and_api_key_provider_controls_keep_existing_paths(monkeypatch):
         )
     # Static fallback remains available without credentials/network access.
     assert models.provider_model_ids("openrouter")
+
+
+def test_safe_antigravity_picker_ids_allow_preview_customtools_only_for_gemini():
+    from hermes_cli.inventory import _safe_antigravity_model_ids
+
+    valid_gemini = "antigravity-gemini-3.1-pro-preview"
+    valid_customtools = "antigravity-gemini-3.1-pro-preview-customtools"
+    valid_claude = "antigravity-claude-sonnet-4-6"
+    rejected = [
+        "antigravity-gemini-3.1-pro-preview-customtool",
+        "antigravity-gemini-3.1-pro-preview-customtools-extra",
+        "antigravity-gemini-3.1-pro-preview-customtools://host",
+        "antigravity-claude-sonnet-4-6-customtools",
+        valid_customtools + "x" * 97,
+    ]
+
+    assert _safe_antigravity_model_ids(
+        [valid_gemini, valid_customtools, valid_claude, *rejected]
+    ) == [valid_gemini, valid_customtools, valid_claude]
