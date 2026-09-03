@@ -165,6 +165,102 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
         reset_hermes_home_override(token)
 
 
+def test_nested_live_prompt_refresh_preserves_outer_kanban_subscription(
+    monkeypatch, tmp_path
+):
+    from agent.runtime_cwd import resolve_agent_cwd
+    from gateway.session_context import get_session_env
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    outer_key = "outer-session"
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {"kanban": {"auto_subscribe_on_create": True}},
+    )
+
+    conn = kb.connect(db_path=tmp_path / "kanban.db")
+    task_id = kb.create_task(conn, title="nested refresh subscription target")
+
+    class _DB:
+        def update_system_prompt(self, *_args):
+            return None
+
+    class _Agent:
+        session_id = "agent-session"
+        _session_db = _DB()
+
+        def _build_system_prompt(self, _unused):
+            assert get_session_env("HERMES_SESSION_KEY") == outer_key
+            assert resolve_agent_cwd() == tmp_path
+            return "prompt"
+
+    session = {
+        "agent": _Agent(),
+        "session_key": outer_key,
+        "cwd": str(tmp_path),
+    }
+    outer_tokens = server._set_session_context(outer_key, cwd=str(tmp_path))
+    try:
+        server._persist_live_session_system_prompt(session)
+        assert kt._maybe_auto_subscribe(conn, task_id) is True
+        subscriptions = kb.list_notify_subs(conn, task_id)
+        assert len(subscriptions) == 1
+        assert subscriptions[0]["platform"] == "tui"
+        assert subscriptions[0]["chat_id"] == outer_key
+        assert resolve_agent_cwd() == tmp_path
+    finally:
+        server._clear_session_context(outer_tokens)
+        conn.close()
+
+    monkeypatch.setenv("HERMES_SESSION_KEY", "stale-process-session")
+    assert get_session_env("HERMES_SESSION_KEY") == ""
+
+
+def test_bot_capability_refresh_preserves_outer_session_context(
+    monkeypatch, tmp_path
+):
+    from agent.runtime_cwd import resolve_agent_cwd
+    from gateway.session_context import get_session_env
+    from tools import bot_mode_probe
+
+    class _CurrentAgent:
+        _session_title_hint = "Bot Chat"
+
+    class _ReplacementAgent:
+        pass
+
+    session = {
+        "agent": _CurrentAgent(),
+        "session_key": "durable-session",
+        "cwd": str(tmp_path),
+        "bot_caps_seen": "before",
+    }
+    observed = {}
+
+    monkeypatch.setattr(bot_mode_probe, "capability_fingerprint", lambda _home: "after")
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("model", "provider"))
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    def _make_agent(*_args, **_kwargs):
+        observed["session_key"] = get_session_env("HERMES_SESSION_KEY")
+        observed["cwd"] = resolve_agent_cwd()
+        return _ReplacementAgent()
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+
+    outer_tokens = server._set_session_context("outer-session", cwd=str(tmp_path))
+    try:
+        server._sync_bot_capabilities("ui-session", session)
+        assert observed == {"session_key": "ui-session", "cwd": tmp_path}
+        assert get_session_env("HERMES_SESSION_KEY") == "outer-session"
+        assert resolve_agent_cwd() == tmp_path
+    finally:
+        server._clear_session_context(outer_tokens)
+
+
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     """Desktop/TUI sessions must pin the agent cwd per session.
 

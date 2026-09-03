@@ -4945,39 +4945,48 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     if db is None or not hasattr(db, "update_system_prompt"):
         return
 
-    # Re-bind HERMES_HOME to the session's profile so load_soul_md() and
-    # build_skills_system_prompt() resolve to the correct profile.  Without
-    # this, _start_agent_build's finally block has already reset the
-    # override and the rebuilt prompt silently uses the root profile's
-    # SOUL.md and skills.  See issue #50233.
-    profile_home = session.get("profile_home")
-    home_token = (
-        set_hermes_home_override(profile_home) if profile_home else None
-    )
-    # Bind the session context too. This function runs on the RPC dispatcher
-    # thread (model.switch, config.set model). On that thread the _SESSION_CWD
-    # contextvar is not set, so resolve_agent_cwd() falls back to the process
-    # TERMINAL_CWD, which the desktop pins to the home directory. The rebuilt
-    # prompt then records the wrong working directory and persists it. Later
-    # turns restore the stored bytes without change, because the turn
-    # prologue rebuilds only when _cached_system_prompt is None.
-    session_tokens = _set_session_context(
-        session_key, cwd=_session_cwd(session)
-    )
-    try:
-        prompt = agent._build_system_prompt(None)
-        agent._cached_system_prompt = prompt
-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
-    except Exception:
-        logger.warning(
-            "failed to persist live session system prompt for session %s",
-            session_key,
-            exc_info=True,
+    def _refresh_prompt() -> None:
+        # Re-bind HERMES_HOME to the session's profile so load_soul_md() and
+        # build_skills_system_prompt() resolve to the correct profile.  Without
+        # this, _start_agent_build's finally block has already reset the
+        # override and the rebuilt prompt silently uses the root profile's
+        # SOUL.md and skills.  See issue #50233.
+        profile_home = session.get("profile_home")
+        home_token = (
+            set_hermes_home_override(profile_home) if profile_home else None
         )
-    finally:
-        _clear_session_context(session_tokens)
-        if home_token is not None:
-            reset_hermes_home_override(home_token)
+        # Bind the session context too. This function runs on the RPC dispatcher
+        # thread (model.switch, config.set model). On that thread the _SESSION_CWD
+        # contextvar is not set, so resolve_agent_cwd() falls back to the process
+        # TERMINAL_CWD, which the desktop pins to the home directory. The rebuilt
+        # prompt then records the wrong working directory and persists it. Later
+        # turns restore the stored bytes without change, because the turn
+        # prologue rebuilds only when _cached_system_prompt is None.
+        session_tokens = _set_session_context(
+            session_key, cwd=_session_cwd(session)
+        )
+        try:
+            prompt = agent._build_system_prompt(None)
+            agent._cached_system_prompt = prompt
+            db.update_system_prompt(
+                getattr(agent, "session_id", None) or session_key, prompt
+            )
+        except Exception:
+            logger.warning(
+                "failed to persist live session system prompt for session %s",
+                session_key,
+                exc_info=True,
+            )
+        finally:
+            _clear_session_context(session_tokens)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
+
+    # A config/model refresh can run synchronously inside an already-bound turn.
+    # Keep the nested clear local so it cannot erase the outer turn's session
+    # identity or cwd; top-level handler cleanup retains its explicit-empty
+    # semantics for suppressing stale process-environment fallback.
+    contextvars.copy_context().run(_refresh_prompt)
 
 
 # Stable leading text of the model-switch marker, shared by the builder and the
@@ -5812,16 +5821,19 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     # session_id/key, so the DB-backed history and (epoch-refreshed) system
     # prompt carry over; only tool definitions and prompt bytes change.
     try:
-        tokens = _set_session_context(sid, cwd=_session_cwd(session))
-        try:
-            new_agent = _make_agent(
-                sid,
-                session["session_key"],
-                session_id=session["session_key"],
-                platform_override=_session_source(session),
-            )
-        finally:
-            _clear_session_context(tokens)
+        def _rebuild_agent():
+            tokens = _set_session_context(sid, cwd=_session_cwd(session))
+            try:
+                return _make_agent(
+                    sid,
+                    session["session_key"],
+                    session_id=session["session_key"],
+                    platform_override=_session_source(session),
+                )
+            finally:
+                _clear_session_context(tokens)
+
+        new_agent = contextvars.copy_context().run(_rebuild_agent)
         new_agent._session_title_hint = "Bot Chat"
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
