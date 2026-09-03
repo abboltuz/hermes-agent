@@ -11271,7 +11271,6 @@ def _notification_poller_loop(
     """
     from tools.process_registry import process_registry, format_process_notification
 
-    _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
@@ -11379,6 +11378,16 @@ def _notification_poller_loop(
                                 + list(session.get("_kanban_pending") or [])
                             )
                             session["running"] = False
+        # A busy-session process event already lives in this session's
+        # structured buffer, not the global queue. Revisit it on every poll so
+        # the transition to idle is sufficient to trigger delivery even when
+        # no newer process event arrives.
+        if session.get("_process_notification_pending"):
+            _dispatch_pending_process_notifications(
+                sid,
+                session,
+                consumer="tui-poller",
+            )
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -11424,72 +11433,22 @@ def _notification_poller_loop(
         if not text:
             continue
 
-        # Only emit the same notification identity to TUI once — re-queued
-        # completions get re-emitted every 0.5s otherwise when session is busy,
-        # while distinct watch_match events from the same process must remain
-        # visible independently.
-        _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
-
-        _requeued = False
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
-        if _requeued:
-            # Back off before re-polling: the re-queued event keeps the queue
-            # non-empty, so without a sleep this loop spins at full speed
-            # (100% CPU, GIL churn) for as long as the session stays busy.
-            time.sleep(0.25)
-            continue
-
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        # Once this poller positively owns an event, move it out of the
+        # process-global queue. Busy sessions retain structured FIFO state in
+        # their own buffer instead of rotating the event through every poller.
+        _buffer_process_notifications(sid, session, [(evt, text)])
+        _dispatch_pending_process_notifications(
+            sid,
+            session,
+            consumer="tui-poller",
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="internal_notification",
-                    display_metadata=_process_notification_display_metadata(evt),
-                )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
-    deferred: list = []
+    deferred: list[dict] = []
+    owned_notifications: list[tuple[dict, str]] = []
     while not process_registry.completion_queue.empty():
         try:
             evt = process_registry.completion_queue.get_nowait()
@@ -11520,59 +11479,44 @@ def _notification_poller_loop(
         text = format_process_notification(evt)
         if not text:
             continue
-
-        _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
-
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
-
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="internal_notification",
-                    display_metadata=_process_notification_display_metadata(evt),
-                )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        owned_notifications.append((evt, text))
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
         process_registry.completion_queue.put(evt)
+
+    _buffer_process_notifications(sid, session, owned_notifications)
+    with session["history_lock"]:
+        cannot_dispatch = bool(
+            session.get("running")
+            or session.get("_closing")
+            or session.get("_finalized")
+        )
+        handoff = (
+            list(session.get("_process_notification_pending") or [])
+            if cannot_dispatch
+            else []
+        )
+        if handoff:
+            session["_process_notification_pending"] = []
+    if handoff:
+        # The poller is stopping, so a busy/closing session cannot retain an
+        # in-memory backlog. Hand each structured event back once for another
+        # live owner or a later resume; this is shutdown recovery, not churn.
+        for item in handoff:
+            process_registry.completion_queue.put(item.event)
+    elif session.get("_process_notification_pending"):
+        accepted = _dispatch_pending_process_notifications(
+            sid,
+            session,
+            consumer="tui-poller",
+        )
+        if not accepted:
+            with session["history_lock"]:
+                handoff = list(session.get("_process_notification_pending") or [])
+                session["_process_notification_pending"] = []
+            for item in handoff:
+                process_registry.completion_queue.put(item.event)
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -11620,6 +11564,197 @@ def _process_notification_display_metadata(evt: dict) -> dict:
     if event_id:
         metadata["event_id"] = event_id
     return metadata
+
+
+_PROCESS_NOTIFICATION_BATCH_MAX_EVENTS = 8
+_PROCESS_NOTIFICATION_BATCH_MAX_CHARS = 12_000
+_PROCESS_NOTIFICATION_SEPARATOR = "\n\n"
+
+
+class _PendingProcessNotification(NamedTuple):
+    """One typed process event retained until an internal turn accepts it."""
+
+    event: dict
+    text: str
+
+
+def _buffer_process_notifications(
+    sid: str,
+    session: dict,
+    notifications: list[tuple[dict, str]],
+) -> None:
+    """Append owned process events in FIFO order and emit each status once."""
+
+    status_texts: list[str] = []
+    with session["history_lock"]:
+        pending = list(session.get("_process_notification_pending") or [])
+        emitted = session.setdefault("_process_notification_emitted", set())
+        for event, text in notifications:
+            pending.append(_PendingProcessNotification(event=event, text=text))
+            identity = _notification_event_dedup_key(event)
+            if identity not in emitted:
+                emitted.add(identity)
+                status_texts.append(text)
+        session["_process_notification_pending"] = pending
+    for text in status_texts:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+
+
+def _partition_process_notification_batch(
+    pending: list[_PendingProcessNotification],
+) -> tuple[list[_PendingProcessNotification], list[_PendingProcessNotification]]:
+    """Take one class-preserving FIFO batch, leaving all later items ordered."""
+
+    if not pending:
+        return [], []
+    if pending[0].event.get("type") == "async_delegation":
+        return pending[:1], pending[1:]
+
+    batch: list[_PendingProcessNotification] = []
+    formatted_chars = 0
+    for item in pending:
+        if item.event.get("type") == "async_delegation":
+            break
+        separator_chars = len(_PROCESS_NOTIFICATION_SEPARATOR) if batch else 0
+        candidate_chars = formatted_chars + separator_chars + len(item.text)
+        if batch and (
+            len(batch) >= _PROCESS_NOTIFICATION_BATCH_MAX_EVENTS
+            or candidate_chars > _PROCESS_NOTIFICATION_BATCH_MAX_CHARS
+        ):
+            break
+        batch.append(item)
+        formatted_chars = candidate_chars
+    return batch, pending[len(batch):]
+
+
+def _process_notification_event_metadata(
+    item: _PendingProcessNotification,
+) -> dict:
+    """Retain each event's bounded identity and exact display projection."""
+
+    metadata = _process_notification_display_metadata(item.event)
+    metadata["display_text"] = item.text
+    return metadata
+
+
+def _process_notification_batch_message_id(
+    batch: list[_PendingProcessNotification],
+) -> str:
+    """Return a stable identity for one ordered process-notification batch."""
+
+    identities = [_notification_event_dedup_key(item.event) for item in batch]
+    encoded = json.dumps(
+        identities,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return f"process-notification:{hashlib.sha256(encoded).hexdigest()[:32]}"
+
+
+def _process_notification_batch_display_metadata(
+    batch: list[_PendingProcessNotification],
+) -> dict:
+    """Build internal provenance for one ordinary process-event batch."""
+
+    return {
+        "source": "process",
+        "internal": True,
+        "kind": "process_notification_batch",
+        "message_id": _process_notification_batch_message_id(batch),
+        "display_text": _PROCESS_NOTIFICATION_SEPARATOR.join(
+            item.text for item in batch
+        ),
+        "events": [_process_notification_event_metadata(item) for item in batch],
+    }
+
+
+def _restore_process_notification_batch(
+    session: dict,
+    batch: list[_PendingProcessNotification],
+) -> None:
+    """Restore a failed prefix once, ahead of events buffered meanwhile."""
+
+    with session["history_lock"]:
+        session["_process_notification_pending"] = batch + list(
+            session.get("_process_notification_pending") or []
+        )
+        session["running"] = False
+
+
+def _dispatch_pending_process_notifications(
+    sid: str,
+    session: dict,
+    *,
+    consumer: str,
+    rid: str | None = None,
+) -> bool:
+    """Start one pending delegation or bounded ordinary-process batch."""
+
+    with session["history_lock"]:
+        if session.get("running"):
+            return False
+        pending = list(session.get("_process_notification_pending") or [])
+        batch, remainder = _partition_process_notification_batch(pending)
+        if not batch:
+            return False
+        session["_process_notification_pending"] = remainder
+        session["running"] = True
+
+    from tools.async_delegation import (
+        claim_event_delivery,
+        complete_event_delivery,
+        release_event_delivery,
+    )
+
+    claims: list[tuple[_PendingProcessNotification, str]] = []
+    try:
+        for item in batch:
+            claim = claim_event_delivery(item.event, consumer)
+            if claim is None:
+                for claimed_item, claimed_token in claims:
+                    release_event_delivery(claimed_item.event, claimed_token)
+                _restore_process_notification_batch(session, batch)
+                return False
+            claims.append((item, claim))
+
+        _emit("message.start", sid)
+        dispatch_rid = rid or f"__notif__{int(time.time() * 1000)}"
+        if batch[0].event.get("type") == "async_delegation":
+            item = batch[0]
+            accepted = _run_prompt_submit(
+                dispatch_rid,
+                sid,
+                session,
+                item.text,
+                display_kind="async_delegation_complete",
+                display_metadata=_async_delegation_display_metadata(item.event),
+            )
+        else:
+            accepted = _run_prompt_submit(
+                dispatch_rid,
+                sid,
+                session,
+                _PROCESS_NOTIFICATION_SEPARATOR.join(item.text for item in batch),
+                display_kind="internal_notification",
+                display_metadata=_process_notification_batch_display_metadata(batch),
+            )
+        if accepted is False:
+            raise RuntimeError("process notification turn was not accepted")
+        for item, claim in claims:
+            complete_event_delivery(item.event, claim)
+        return True
+    except Exception as exc:
+        for item, claim in claims:
+            release_event_delivery(item.event, claim)
+        _restore_process_notification_batch(session, batch)
+        print(
+            f"[tui_gateway] notification dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False
 
 
 def _wire_agent_terminal_output() -> None:
@@ -11710,7 +11845,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     # Registry of (stop, thread) pairs so test teardowns can reap pollers
     # leaked by session.init/create tests — an unjoined poller steals
     # events off the process-global completion_queue mid-assertion in a
-    # LATER test (flaky test_run_prompt_submit_requeues_all_unstarted_...).
+    # LATER test (flaky test_run_prompt_submit_starts_one_fifo_batch_...).
     # Bounded: entries for dead threads are pruned on each spawn.
     _notification_pollers[:] = [
         (s, th) for (s, th) in _notification_pollers if th.is_alive()
@@ -12951,49 +13086,13 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
-            for index, (_evt, synth) in enumerate(drained):
-                with session["history_lock"]:
-                    if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
-                            process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
-                if _claim is None:
-                    continue
-                try:
-                    _emit("message.start", sid)
-                    if _evt.get("type") == "async_delegation":
-                        _run_prompt_submit(
-                            rid,
-                            sid,
-                            session,
-                            synth,
-                            display_kind="async_delegation_complete",
-                            display_metadata=_async_delegation_display_metadata(_evt),
-                        )
-                    else:
-                        _run_prompt_submit(
-                            rid,
-                            sid,
-                            session,
-                            synth,
-                            display_kind="internal_notification",
-                            display_metadata=_process_notification_display_metadata(_evt),
-                        )
-                    complete_event_delivery(_evt, _claim)
-                except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
-                    print(
-                        f"[tui_gateway] completion notification dispatch failed: "
-                        f"{type(_n_exc).__name__}: {_n_exc}",
-                        file=sys.stderr,
-                    )
-                    with session["history_lock"]:
-                        session["running"] = False
+            _buffer_process_notifications(sid, session, drained)
+            _dispatch_pending_process_notifications(
+                sid,
+                session,
+                consumer="tui-post-turn",
+                rid=rid,
+            )
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

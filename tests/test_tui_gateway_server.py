@@ -86,7 +86,7 @@ def _reap_leaked_notification_pollers():
     poller left running by one test steals-and-requeues events off the
     PROCESS-GLOBAL process_registry.completion_queue while a later test is
     asserting on it — the root cause of the flaky
-    test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading
+    test_run_prompt_submit_starts_one_fifo_batch_with_real_threading
     (two CI hits on unrelated PRs, Aug 2026). Set every registered poller's
     stop event (the loop wakes at least every 0.5s), then join with ONE
     small shared budget — never per-thread — so teardown stays O(seconds)
@@ -6915,15 +6915,21 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         assert len(delivered["a"]) == 1
         text, kwargs = delivered["a"][0]
         assert "proc-live-handoff completed normally" in text
-        assert kwargs == {
-            "display_kind": "internal_notification",
-            "display_metadata": {
-                "source": "process",
-                "internal": True,
-                "kind": "completion",
-                "session_id": "proc-live-handoff",
-                "event_id": "proc-live-handoff",
-            },
+        assert kwargs["display_kind"] == "internal_notification"
+        metadata = kwargs["display_metadata"]
+        assert metadata["source"] == "process"
+        assert metadata["internal"] is True
+        assert metadata["kind"] == "process_notification_batch"
+        assert metadata["message_id"].startswith("process-notification:")
+        assert metadata["display_text"] == text
+        assert len(metadata["events"]) == 1
+        assert metadata["events"][0] == {
+            "source": "process",
+            "internal": True,
+            "kind": "completion",
+            "session_id": "proc-live-handoff",
+            "event_id": "proc-live-handoff",
+            "display_text": text,
         }
         assert delivered["b"] == []
         assert isolated_queue.empty()
@@ -6933,6 +6939,97 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         process_registry._completion_consumed.discard(event["session_id"])
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
+
+
+def test_notification_poller_buffers_owned_event_while_busy_without_requeue(
+    monkeypatch,
+):
+    """Owned busy events leave the global queue after one status emission."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    delivered = []
+    emitted = []
+    session = _session(session_key="session-busy-buffer", running=True)
+    event = {
+        "type": "watch_match",
+        "session_id": "proc-busy-buffer",
+        "session_key": "session-busy-buffer",
+        "message_id": "watch-busy-buffer",
+        "command": "probe",
+        "pattern": "READY=false",
+        "output": "not ready",
+    }
+    owner_thread = threading.current_thread()
+
+    class _ThreadBoundQueue(_queue_mod.Queue):
+        def get(self, *args, **kwargs):
+            if threading.current_thread() is not owner_thread:
+                raise _queue_mod.Empty
+            return super().get(*args, **kwargs)
+
+    class _EndLivePoll(Exception):
+        pass
+
+    class _RaiseBeforeShutdown:
+        def __init__(self):
+            self._checks = 0
+
+        def is_set(self):
+            self._checks += 1
+            if self._checks > 1:
+                raise _EndLivePoll
+            return False
+
+    isolated_queue: _queue_mod.Queue = _ThreadBoundQueue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: delivered.append((_args, _kwargs)),
+    )
+    server._sessions["sid-busy-buffer"] = session
+
+    try:
+        with pytest.raises(_EndLivePoll):
+            server._notification_poller_loop(
+                _RaiseBeforeShutdown(),  # type: ignore[arg-type]
+                "sid-busy-buffer",
+                session,
+            )
+
+        assert delivered == []
+        assert isolated_queue.empty()
+        pending = session["_process_notification_pending"]
+        assert len(pending) == 1
+        assert pending[0].event is event
+        status_calls = [args for args in emitted if args[0] == "status.update"]
+        assert len(status_calls) == 1
+        assert "proc-busy-buffer" in status_calls[0][2]["text"]
+
+        with session["history_lock"]:
+            session["running"] = False
+        with pytest.raises(_EndLivePoll):
+            server._notification_poller_loop(
+                _RaiseBeforeShutdown(),  # type: ignore[arg-type]
+                "sid-busy-buffer",
+                session,
+            )
+
+        assert len(delivered) == 1
+        assert "proc-busy-buffer" in delivered[0][0][3]
+        assert session["_process_notification_pending"] == []
+        assert len([args for args in emitted if args[0] == "status.update"]) == 1
+    finally:
+        server._sessions.pop("sid-busy-buffer", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+        process_registry._completion_consumed.discard(event["session_id"])
+        process_registry._poll_observed.discard(event["session_id"])
 
 
 def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
@@ -7145,6 +7242,65 @@ def test_notification_poller_delivers_owned_events(
         server._sessions.pop("sid_a", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_shutdown_batches_owned_events_fifo(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    delivered = []
+    emitted = []
+    session = _session(session_key="session-shutdown-batch", running=False)
+    events = [
+        {
+            "type": "completion",
+            "session_id": f"proc-shutdown-{index}",
+            "session_key": "session-shutdown-batch",
+            "command": f"command-{index}",
+            "exit_code": 0,
+            "output": f"output-{index}",
+        }
+        for index in range(3)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
+
+    def _deliver(_rid, _sid, checked_session, text, **kwargs):
+        delivered.append((text, kwargs))
+        checked_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
+    server._sessions["sid-shutdown-batch"] = session
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(
+            stop,
+            "sid-shutdown-batch",
+            session,
+        )
+
+        assert len(delivered) == 1
+        prompt, kwargs = delivered[0]
+        positions = [prompt.index(event["session_id"]) for event in events]
+        assert positions == sorted(positions)
+        assert kwargs["display_metadata"]["kind"] == "process_notification_batch"
+        assert len(kwargs["display_metadata"]["events"]) == 3
+        assert len([args for args in emitted if args[0] == "status.update"]) == 3
+        assert isolated_queue.empty()
+        assert session["_process_notification_pending"] == []
+    finally:
+        server._sessions.pop("sid-shutdown-batch", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+        for event in events:
+            process_registry._completion_consumed.discard(event["session_id"])
 
 
 def _configure_immediate_prompt_run(
@@ -7431,20 +7587,419 @@ def test_post_turn_completion_keeps_process_provenance(monkeypatch, tmp_path):
         nested_prompt, nested_kwargs = turns[1]
         assert event["session_id"] in nested_prompt
         assert nested_kwargs["persist_user_display_kind"] == "internal_notification"
-        assert nested_kwargs["persist_user_display_metadata"] == {
-            "source": "process",
-            "internal": True,
-            "kind": "completion",
-            "session_id": event["session_id"],
-            "event_id": event["session_id"],
-        }
+        metadata = nested_kwargs["persist_user_display_metadata"]
+        assert metadata["source"] == "process"
+        assert metadata["internal"] is True
+        assert metadata["kind"] == "process_notification_batch"
+        assert metadata["message_id"].startswith("process-notification:")
+        assert metadata["display_text"] == nested_prompt
+        assert metadata["events"] == [
+            {
+                "source": "process",
+                "internal": True,
+                "kind": "completion",
+                "session_id": event["session_id"],
+                "event_id": event["session_id"],
+                "display_text": nested_prompt,
+            }
+        ]
     finally:
         server._sessions.pop("sid_a", None)
         process_registry._completion_consumed.discard(event["session_id"])
         process_registry._poll_observed.discard(event["session_id"])
 
 
-def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
+def test_run_prompt_submit_batches_busy_process_notifications_fifo(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+
+    class _BatchRecordingAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+            **_kwargs,
+        ):
+            turns.append(
+                (
+                    prompt,
+                    persist_user_display_kind,
+                    persist_user_display_metadata,
+                )
+            )
+            return {"final_response": "", "messages": []}
+
+    session = _session(
+        session_key="session-batch",
+        agent=_BatchRecordingAgent([]),
+        running=True,
+    )
+    events = [
+        {
+            "type": "watch_match",
+            "session_id": f"proc_busy_{index}",
+            "session_key": "session-batch",
+            "message_id": f"watch-{index}",
+            "command": f"probe-{index}",
+            "pattern": "MANUAL_TEST_READY=false",
+            "output": f"result-{index}",
+        }
+        for index in range(5)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    server._sessions["sid-batch"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-batch", "sid-batch", session, "long-running human turn"
+        )
+
+        assert len(turns) == 2
+        assert turns[0][0] == "long-running human turn"
+        prompt, display_kind, metadata = turns[1]
+        assert display_kind == "internal_notification"
+        assert metadata["source"] == "process"
+        assert metadata["internal"] is True
+        assert metadata["kind"] == "process_notification_batch"
+        assert metadata["message_id"].startswith("process-notification:")
+        assert [event["session_id"] for event in metadata["events"]] == [
+            event["session_id"] for event in events
+        ]
+        assert all(event["display_text"] for event in metadata["events"])
+        positions = [prompt.index(event["session_id"]) for event in events]
+        assert positions == sorted(positions)
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-batch", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+        for event in events:
+            process_registry._completion_consumed.discard(event["session_id"])
+            process_registry._poll_observed.discard(event["session_id"])
+
+
+def test_process_notification_claim_failure_restores_fifo(monkeypatch):
+    from tools import async_delegation
+
+    delegation = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-claimed-elsewhere",
+        "session_key": "session-claim-retry",
+    }
+    ordinary = {
+        "type": "completion",
+        "session_id": "proc-after-delegation",
+        "session_key": "session-claim-retry",
+    }
+    pending = [
+        server._PendingProcessNotification(delegation, "delegation result"),
+        server._PendingProcessNotification(ordinary, "ordinary result"),
+    ]
+    session = _session(
+        session_key="session-claim-retry",
+        running=False,
+        _process_notification_pending=list(pending),
+    )
+    submitted = []
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: submitted.append((_args, _kwargs)),
+    )
+
+    accepted = server._dispatch_pending_process_notifications(
+        "sid-claim-retry",
+        session,
+        consumer="test-consumer",
+    )
+
+    assert accepted is False
+    assert session["running"] is False
+    assert session["_process_notification_pending"] == pending
+    assert submitted == []
+
+
+def test_process_notification_submit_failure_restores_before_newer_and_retries(
+    monkeypatch,
+):
+    from tools import async_delegation
+
+    def _item(index):
+        return server._PendingProcessNotification(
+            {
+                "type": "completion",
+                "session_id": f"proc-retry-{index}",
+                "session_key": "session-submit-retry",
+            },
+            f"notification-{index}",
+        )
+
+    older = [_item(1), _item(2)]
+    newer = _item(3)
+    session = _session(
+        session_key="session-submit-retry",
+        running=False,
+        _process_notification_pending=list(older),
+    )
+    released = []
+    completed = []
+    successful_prompts = []
+
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda event, _consumer: f"claim-{event['session_id']}",
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda event, _claim: released.append(event["session_id"]),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda event, _claim: completed.append(event["session_id"]),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    def _fail_with_concurrent_enqueue(*_args, **_kwargs):
+        with session["history_lock"]:
+            session["_process_notification_pending"].append(newer)
+        raise OSError("submit failed")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _fail_with_concurrent_enqueue)
+
+    assert not server._dispatch_pending_process_notifications(
+        "sid-submit-retry",
+        session,
+        consumer="test-consumer",
+    )
+    assert session["_process_notification_pending"] == older + [newer]
+    assert session["running"] is False
+    assert released == ["proc-retry-1", "proc-retry-2"]
+    assert completed == []
+
+    def _succeed(_rid, _sid, checked_session, prompt, **_kwargs):
+        successful_prompts.append(prompt)
+        checked_session["running"] = False
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _succeed)
+
+    assert server._dispatch_pending_process_notifications(
+        "sid-submit-retry",
+        session,
+        consumer="test-consumer",
+    )
+    assert session["_process_notification_pending"] == []
+    assert len(successful_prompts) == 1
+    positions = [
+        successful_prompts[0].index(item.text) for item in older + [newer]
+    ]
+    assert positions == sorted(positions)
+    assert completed == ["proc-retry-1", "proc-retry-2", "proc-retry-3"]
+
+
+def test_process_notification_batch_count_cap_preserves_fifo_remainder():
+    pending = [
+        server._PendingProcessNotification(
+            {
+                "type": "completion",
+                "session_id": f"proc-cap-{index}",
+            },
+            f"event-{index}",
+        )
+        for index in range(10)
+    ]
+
+    batch, remainder = server._partition_process_notification_batch(pending)
+
+    assert [item.event["session_id"] for item in batch] == [
+        f"proc-cap-{index}" for index in range(8)
+    ]
+    assert [item.event["session_id"] for item in remainder] == [
+        "proc-cap-8",
+        "proc-cap-9",
+    ]
+
+
+def test_process_notification_batch_char_cap_includes_separator_and_admits_head(
+    monkeypatch,
+):
+    monkeypatch.setattr(server, "_PROCESS_NOTIFICATION_BATCH_MAX_CHARS", 10)
+    pending = [
+        server._PendingProcessNotification(
+            {"type": "completion", "session_id": "proc-first"},
+            "x" * 6,
+        ),
+        server._PendingProcessNotification(
+            {"type": "completion", "session_id": "proc-next"},
+            "y" * 3,
+        ),
+    ]
+
+    batch, remainder = server._partition_process_notification_batch(pending)
+
+    assert batch == pending[:1]
+    assert remainder == pending[1:]
+
+    oversized = [
+        server._PendingProcessNotification(
+            {"type": "completion", "session_id": "proc-oversized"},
+            "z" * 11,
+        )
+    ]
+    batch, remainder = server._partition_process_notification_batch(oversized)
+    assert batch == oversized
+    assert remainder == []
+
+
+def test_process_notification_batch_identity_uses_ordered_event_identity_not_text():
+    first = server._PendingProcessNotification(
+        {"type": "completion", "session_id": "proc-identity-first"},
+        "original first rendering",
+    )
+    second = server._PendingProcessNotification(
+        {"type": "completion", "session_id": "proc-identity-second"},
+        "original second rendering",
+    )
+    batch = [first, second]
+    rerendered = [
+        server._PendingProcessNotification(first.event, "changed first rendering"),
+        server._PendingProcessNotification(second.event, "changed second rendering"),
+    ]
+
+    batch_id = server._process_notification_batch_message_id(batch)
+
+    assert server._process_notification_batch_message_id(rerendered) == batch_id
+    assert server._process_notification_batch_message_id(list(reversed(batch))) != batch_id
+
+
+def test_post_turn_process_batches_keep_delegation_separate_and_fifo(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+
+    class _TypedRecordingAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+            **_kwargs,
+        ):
+            turns.append(
+                (
+                    prompt,
+                    persist_user_display_kind,
+                    persist_user_display_metadata,
+                )
+            )
+            return {"final_response": "", "messages": []}
+
+    session = _session(
+        session_key="session-mixed-events",
+        agent=_TypedRecordingAgent([]),
+        running=True,
+    )
+    events = [
+        {
+            "type": "completion",
+            "session_id": "proc-before-delegation",
+            "session_key": "session-mixed-events",
+            "command": "first-command",
+            "exit_code": 0,
+            "output": "first",
+        },
+        {
+            "type": "async_delegation",
+            "delegation_id": "delegation-middle",
+            "session_key": "session-mixed-events",
+            "goal": "middle goal",
+            "status": "completed",
+            "summary": "middle result",
+            "model": "test-model",
+        },
+        {
+            "type": "completion",
+            "session_id": "proc-after-delegation",
+            "session_key": "session-mixed-events",
+            "command": "last-command",
+            "exit_code": 0,
+            "output": "last",
+        },
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda event, _consumer: (
+            "delegation-claim" if event.get("type") == "async_delegation" else ""
+        ),
+    )
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", lambda *_args: None)
+    server._sessions["sid-mixed-events"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-mixed",
+            "sid-mixed-events",
+            session,
+            "human turn",
+        )
+
+        assert len(turns) == 4
+        assert [turn[1] for turn in turns] == [
+            None,
+            "internal_notification",
+            "async_delegation_complete",
+            "internal_notification",
+        ]
+        assert "proc-before-delegation" in turns[1][0]
+        assert turns[1][2]["events"][0]["session_id"] == (
+            "proc-before-delegation"
+        )
+        assert "delegation-middle" in turns[2][0]
+        assert turns[2][2]["delegation_id"] == "delegation-middle"
+        assert "proc-after-delegation" in turns[3][0]
+        assert turns[3][2]["events"][0]["session_id"] == "proc-after-delegation"
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-mixed-events", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+        for event in events:
+            process_registry._completion_consumed.discard(event.get("session_id", ""))
+            process_registry._poll_observed.discard(event.get("session_id", ""))
+
+
+def test_run_prompt_submit_starts_one_fifo_batch_with_real_threading(
     monkeypatch, tmp_path
 ):
     import queue as _queue_mod
@@ -7503,26 +8058,11 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
-        queued: dict = {}
-        deadline = time.time() + 5.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
-            try:
-                evt = isolated_queue.get(timeout=0.1)
-            except _queue_mod.Empty:
-                continue
-            queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        assert isolated_queue.empty()
+        assert session["_process_notification_pending"] == []
+        assert len(turns) == 2
+        positions = [turns[1].index(event["session_id"]) for event in events]
+        assert positions == sorted(positions)
     finally:
         release_nested.set()
         for thread in threads:
@@ -17391,7 +17931,8 @@ def test_notification_poller_delivers_completion(monkeypatch):
     # worker) is allowed to dequeue and dispatch it to its own session — whose
     # agent may be a fixture double without run_conversation. A fresh Queue
     # here fully isolates this test; monkeypatch restores the original on
-    # teardown. (Same pattern as test_notification_poller_requeues_when_busy.)
+    # teardown. (Same pattern as
+    # test_notification_poller_shutdown_requeues_busy_event_once.)
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     process_registry._completion_consumed.discard("proc_poller_test")
@@ -17455,7 +17996,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
     # Isolate the completion queue so a concurrent/leaked poller in the same
     # xdist worker can't dequeue this session_key-less event before our poller
     # does. monkeypatch restores the shared singleton on teardown. (Same
-    # pattern as test_notification_poller_requeues_when_busy.)
+    # pattern as test_notification_poller_shutdown_requeues_busy_event_once.)
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
 
@@ -17481,8 +18022,8 @@ def test_notification_poller_skips_consumed(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
-def test_notification_poller_requeues_when_busy(monkeypatch):
-    """When the agent is busy, the poller requeues the event."""
+def test_notification_poller_shutdown_requeues_busy_event_once(monkeypatch):
+    """A stopping poller hands a busy session's buffered event back once."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -17497,7 +18038,7 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     # reads process_registry.completion_queue by attribute at runtime, so a
     # fresh Queue here means no concurrently-running test in the same xdist
     # worker can put/get on the shared singleton mid-run and drain the event
-    # we expect to be requeued. monkeypatch restores the original on teardown.
+    # we expect shutdown to hand back. monkeypatch restores it on teardown.
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     process_registry._completion_consumed.discard("proc_busy_test")
@@ -17521,7 +18062,7 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
 
-        # Event was requeued (agent was busy, no turn triggered)
+        # Shutdown handed the event back once (the busy turn was not interrupted).
         assert not isolated_queue.empty()
         requeued = isolated_queue.get_nowait()
         assert requeued["session_id"] == "proc_busy_test"
@@ -17632,8 +18173,10 @@ def test_notification_event_dedup_key_preserves_distinct_watch_matches():
     assert server._notification_event_dedup_key(distinct_pattern) != base_key
 
 
-def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
-    """Distinct watch matches from one process emit; exact replay is deduped."""
+def test_notification_poller_emits_distinct_watch_statuses_and_batches_delivery(
+    monkeypatch,
+):
+    """Distinct watch statuses emit once while all delivery events are batched."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -17676,7 +18219,9 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         status_text = "\n".join(call[2]["text"] for call in status_calls)
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
-        assert len(turns) == 3
+        assert len(turns) == 1
+        assert turns[0].count("READY on port 8000") == 2
+        assert turns[0].count("READY on port 9000") == 1
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():
