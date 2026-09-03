@@ -3,6 +3,9 @@
 import copy
 from types import SimpleNamespace
 
+import anthropic_billing_bypass as bypass
+import pytest
+
 from anthropic_billing_bypass import (
     _AGENT_SDK_SYSTEM_IDENTITY,
     _BILLING_ENTRYPOINT,
@@ -21,6 +24,52 @@ from anthropic_billing_bypass import (
     _wrap_tool_name,
     apply_claude_code_bypass,
 )
+
+
+def test_apply_patches_leaves_core_429_entrypoints_untouched(monkeypatch):
+    """The installable bypass must not add sleep/retry around core 429 handling."""
+    calls = []
+
+    class RateLimitError(Exception):
+        status_code = 429
+        response = SimpleNamespace(status_code=429, headers={"retry-after": "21600"})
+
+    class FakeAgent:
+        def _interruptible_api_call(self, *_args, **_kwargs):
+            calls.append("non-streaming")
+            raise RateLimitError("quota exhausted")
+
+        def _interruptible_streaming_api_call(self, *_args, **_kwargs):
+            calls.append("streaming")
+            raise RateLimitError("quota exhausted")
+
+    def build_anthropic_kwargs(*, is_oauth=False):
+        return {"is_oauth": is_oauth}
+
+    adapter = SimpleNamespace(
+        _OAUTH_ONLY_BETAS=[],
+        build_anthropic_kwargs=build_anthropic_kwargs,
+        __version__="test",
+    )
+    monkeypatch.setattr(bypass, "_install_thinking_replay_classifier_patch", lambda: None)
+    monkeypatch.setattr(bypass, "_install_response_pascalcase_unhook", lambda _aa: None)
+    monkeypatch.setattr(bypass, "_install_pool_select_hook", lambda: None)
+    monkeypatch.setattr(bypass, "_get_version_safely", lambda _aa: "test")
+
+    import run_agent
+
+    original_api = run_agent.AIAgent._interruptible_api_call
+    original_stream = run_agent.AIAgent._interruptible_streaming_api_call
+    assert bypass.apply_patches(adapter) is True
+    assert run_agent.AIAgent._interruptible_api_call is original_api
+    assert run_agent.AIAgent._interruptible_streaming_api_call is original_stream
+
+    agent = FakeAgent()
+    with pytest.raises(RateLimitError):
+        agent._interruptible_api_call({})
+    with pytest.raises(RateLimitError):
+        agent._interruptible_streaming_api_call({})
+    assert calls == ["non-streaming", "streaming"]
 
 
 def test_apply_claude_code_bypass_injects_billing_header_and_preserves_identity(
@@ -782,7 +831,7 @@ def test_bypass_normalizes_agent_sdk_identity_to_claude_code(new_identity_api_kw
 
     identity_entry = new_identity_api_kwargs["system"][1]
     assert identity_entry["text"] == _SYSTEM_IDENTITY
-    assert identity_entry.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in identity_entry
 
 
 def test_bypass_emits_exactly_one_identity_entry(new_identity_api_kwargs):
@@ -803,12 +852,24 @@ def test_bypass_emits_exactly_one_identity_entry(new_identity_api_kwargs):
     assert identities[0]["text"] == _SYSTEM_IDENTITY
 
 
-def test_bypass_injects_cache_control_on_identity(basic_api_kwargs):
-    """Identity system entry should have ephemeral cache_control."""
+def test_bypass_strips_cache_control_from_every_system_block(basic_api_kwargs):
+    """The installable bypass must not restore unsafe system cache markers."""
+    basic_api_kwargs["system"][0]["cache_control"] = {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
+    basic_api_kwargs["system"][1]["cache_control"] = {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+
     apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
 
-    identity_entry = basic_api_kwargs["system"][1]
-    assert identity_entry["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert all(
+        "cache_control" not in block
+        for block in basic_api_kwargs["system"]
+        if isinstance(block, dict)
+    )
 
 
 def test_bypass_injects_context_management_via_extra_body(basic_api_kwargs):
