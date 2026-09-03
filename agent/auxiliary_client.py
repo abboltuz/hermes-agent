@@ -4292,6 +4292,27 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
+def _is_compression_route_local_failure(exc: Exception) -> bool:
+    """Return whether compression may safely continue on another route."""
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        if "llm returned none response" in message:
+            return True
+        if "llm returned invalid response" in message:
+            return True
+    if (
+        _is_payment_error(exc)
+        or _is_rate_limit_error(exc)
+        or _is_timeout_error(exc)
+        or _is_connection_error(exc)
+    ):
+        return True
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    return isinstance(status, int) and 500 <= status < 600
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Detect a request timeout — the full-budget stall, distinct from a fast
     connection drop.
@@ -5457,6 +5478,7 @@ def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "payment error",
+    attempted_labels: Optional[set] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try alternative providers after a payment/credit or connection error.
 
@@ -5482,7 +5504,9 @@ def _try_payment_fallback(
 
     tried = []
     for label, try_fn in _get_provider_chain():
-        if label in skip_chain_labels:
+        if label in skip_chain_labels or (
+            attempted_labels is not None and label in attempted_labels
+        ):
             continue
         if _is_provider_unhealthy(label):
             _log_skip_unhealthy(label, task)
@@ -5677,6 +5701,7 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    attempted_labels: Optional[set] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5755,6 +5780,9 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
+
+        if attempted_labels is not None and label in attempted_labels:
+            continue
 
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
@@ -10083,6 +10111,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or (task == "compression" and _is_compression_route_local_failure(first_err))
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -10106,6 +10135,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or (task == "compression" and _is_compression_route_local_failure(first_err))
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10165,36 +10195,48 @@ def _call_llm_impl(
                         failed_model=_chain_failed_model)
 
             if fb_client is not None:
-                _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
-                )
-                fb_resp = _call_fallback_candidate_sync(
-                    fb_client, fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
-                if fb_resp is not None:
-                    return fb_resp
-                # The candidate had a stale/unrefreshable credential and was
-                # quarantined — walk the discovery chain once more; unhealthy
-                # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
+                attempted_fallback_labels = set()
+                fallback_attempt_count = 0
+                while fb_client is not None and (
+                    task == "compression" or fallback_attempt_count < 2
+                ):
+                    fallback_attempt_count += 1
+                    attempted_fallback_labels.add(fb_label)
                     _record_route_info(
                         route_info, _fallback_provider_from_label(fb_label), fb_model
                     )
-                    fb_resp = _call_fallback_candidate_sync(
-                        fb_client, fb_model, fb_label,
-                        task=task, messages=messages,
-                        temperature=temperature, max_tokens=max_tokens,
-                        tools=tools, effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                    try:
+                        fb_resp = _call_fallback_candidate_sync(
+                            fb_client, fb_model, fb_label,
+                            task=task, messages=messages,
+                            temperature=temperature, max_tokens=max_tokens,
+                            tools=tools, effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config)
+                    except Exception as fallback_err:
+                        if task != "compression" or not _is_compression_route_local_failure(fallback_err):
+                            raise
+                        failed_provider = _fallback_provider_from_label(fb_label)
+                        failed_model = None if (
+                            _is_payment_error(fallback_err)
+                            or _is_rate_limit_error(fallback_err)
+                        ) else fb_model
+                        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                            task, failed_provider or "auto", reason="fallback route failure",
+                            failed_model=failed_model,
+                            attempted_labels=attempted_fallback_labels)
+                        if fb_client is None:
+                            fb_client, fb_model, fb_label = _try_payment_fallback(
+                                failed_provider or resolved_provider, task,
+                                reason="fallback route failure",
+                                attempted_labels=attempted_fallback_labels)
+                        continue
                     if fb_resp is not None:
                         return fb_resp
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential",
+                        **({"attempted_labels": attempted_fallback_labels}
+                           if task == "compression" else {}))
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -10793,6 +10835,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or (task == "compression" and _is_compression_route_local_failure(first_err))
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -10808,6 +10851,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or (task == "compression" and _is_compression_route_local_failure(first_err))
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10863,29 +10907,13 @@ async def _async_call_llm_impl(
                         failed_model=_chain_failed_model)
 
             if fb_client is not None:
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
-                )
-                _record_route_info(
-                    route_info,
-                    _fallback_provider_from_label(fb_label),
-                    async_fb_model or fb_model,
-                )
-                fb_resp = await _call_fallback_candidate_async(
-                    async_fb, async_fb_model or fb_model, fb_label,
-                    task=task, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
-                if fb_resp is not None:
-                    return fb_resp
-                # Stale/unrefreshable candidate credential — quarantined; walk
-                # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
+                attempted_fallback_labels = set()
+                fallback_attempt_count = 0
+                while fb_client is not None and (
+                    task == "compression" or fallback_attempt_count < 2
+                ):
+                    fallback_attempt_count += 1
+                    attempted_fallback_labels.add(fb_label)
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
@@ -10894,15 +10922,38 @@ async def _async_call_llm_impl(
                         _fallback_provider_from_label(fb_label),
                         async_fb_model or fb_model,
                     )
-                    fb_resp = await _call_fallback_candidate_async(
-                        async_fb, async_fb_model or fb_model, fb_label,
-                        task=task, messages=messages,
-                        temperature=temperature, max_tokens=max_tokens,
-                        tools=tools, effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                    try:
+                        fb_resp = await _call_fallback_candidate_async(
+                            async_fb, async_fb_model or fb_model, fb_label,
+                            task=task, messages=messages,
+                            temperature=temperature, max_tokens=max_tokens,
+                            tools=tools, effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config)
+                    except Exception as fallback_err:
+                        if task != "compression" or not _is_compression_route_local_failure(fallback_err):
+                            raise
+                        failed_provider = _fallback_provider_from_label(fb_label)
+                        failed_model = None if (
+                            _is_payment_error(fallback_err)
+                            or _is_rate_limit_error(fallback_err)
+                        ) else fb_model
+                        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                            task, failed_provider or "auto", reason="fallback route failure",
+                            failed_model=failed_model,
+                            attempted_labels=attempted_fallback_labels)
+                        if fb_client is None:
+                            fb_client, fb_model, fb_label = _try_payment_fallback(
+                                failed_provider or resolved_provider, task,
+                                reason="fallback route failure",
+                                attempted_labels=attempted_fallback_labels)
+                        continue
                     if fb_resp is not None:
                         return fb_resp
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential",
+                        **({"attempted_labels": attempted_fallback_labels}
+                           if task == "compression" else {}))
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "

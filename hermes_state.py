@@ -20,6 +20,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import secrets
 import logging
 import os
 import queue
@@ -10704,7 +10705,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
-    ) -> int:
+        return_message_ids: bool = False,
+    ) -> int | List[int]:
         """Append multiple messages atomically in ONE write transaction.
 
         ``messages`` is a list of dicts in the same shape
@@ -10737,15 +10739,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         if chunk_rows is not None and len(messages) > chunk_rows:
             inserted_total = 0
+            inserted_ids: list[int] = []
             for start in range(0, len(messages), chunk_rows):
-                inserted_total += self.append_messages_batch(
+                result = self.append_messages_batch(
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
                     turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    return_message_ids=return_message_ids,
                 )
-            return inserted_total
+                if return_message_ids:
+                    inserted_ids.extend(result if isinstance(result, list) else [])
+                    inserted_total += len(result) if isinstance(result, list) else result
+                else:
+                    inserted_total += result if isinstance(result, int) else 0
+            return inserted_ids if return_message_ids else inserted_total
 
         def _do(conn):
             self._check_transcript_write_guards(
@@ -10770,6 +10779,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
+            if return_message_ids:
+                rows = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    (session_id, inserted),
+                ).fetchall()
+                return [int(row[0]) for row in reversed(rows)]
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
@@ -11279,6 +11294,79 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             ).fetchone()
         return int(row[0]) if row else 0
+
+    def register_compression_recovery(
+        self, session_id: str, message_ids: List[int], *, generation: int = 0,
+        watermark: int = 0, projection_fingerprint: str = "",
+        recovery_identity: Optional[str] = None,
+    ) -> str:
+        """Bind an opaque compression marker to canonical message row ids."""
+        ids = sorted({int(value) for value in message_ids if int(value) > 0})
+        if not session_id or not ids:
+            raise ValueError("compression recovery requires a session and rows")
+        identity = recovery_identity or secrets.token_urlsafe(24)
+
+        def _do(conn):
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id FROM messages WHERE session_id = ? AND id IN ({placeholders})",
+                (session_id, *ids),
+            ).fetchall()
+            if {int(row[0]) for row in rows} != set(ids):
+                raise ValueError("compression recovery rows are not durably owned by session")
+            # Verify and deduplicate atomically: the complete canonical bundle
+            # is the idempotence key for repeated pressure checks.
+            existing = conn.execute(
+                "SELECT recovery_identity FROM compression_recovery "
+                "WHERE session_id = ? AND generation = ? AND watermark = ? "
+                "AND projection_fingerprint = ? AND message_ids = ? LIMIT 1",
+                (session_id, int(generation), int(watermark),
+                 projection_fingerprint or "", json.dumps(ids)),
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
+            conn.execute(
+                "INSERT INTO compression_recovery "
+                "(recovery_identity, session_id, generation, watermark, message_ids, projection_fingerprint, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(recovery_identity) DO UPDATE SET message_ids=excluded.message_ids, "
+                "generation=excluded.generation, watermark=excluded.watermark, "
+                "projection_fingerprint=excluded.projection_fingerprint",
+                (identity, session_id, int(generation), int(watermark), json.dumps(ids),
+                 projection_fingerprint or "", time.time()),
+            )
+            return identity
+
+        return self._execute_write(_do)
+
+    def get_compression_recovery(self, recovery_identity: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Resolve an identity to its exact durable rows, or return None."""
+        if not isinstance(recovery_identity, str) or not recovery_identity or len(recovery_identity) > 128:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM compression_recovery WHERE recovery_identity = ? AND (? IS NULL OR session_id = ?)",
+                (recovery_identity, session_id, session_id),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                ids = json.loads(row["message_ids"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(ids, list) or not ids or any(not isinstance(i, int) for i in ids):
+                return None
+            placeholders = ",".join("?" for _ in ids)
+            messages = conn.execute(
+                f"SELECT * FROM messages WHERE session_id = ? AND id IN ({placeholders}) ORDER BY id",
+                (row["session_id"], *ids),
+            ).fetchall()
+        if len(messages) != len(set(ids)):
+            return None
+        result = dict(row)
+        result["message_ids"] = ids
+        result["messages"] = [dict(message) for message in messages]
+        return result
 
     def archive_and_compact(
         self,

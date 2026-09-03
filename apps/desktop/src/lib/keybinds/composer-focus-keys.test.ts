@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $workspaceIsPage } from '@/app/routes'
+import { $activeTreeGroup, $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { $switcherOpen, closeSwitcher } from '@/store/session-switcher'
 
 import {
   composerFocusBlockedBySurface,
   composerFocusKeysAllowed,
   isActivateOnEnterTarget,
-  typeToFocusChar
+  typeToFocusChar,
+  visibleClarifyCard
 } from './composer-focus-keys'
 
 function keydown(init: KeyboardEventInit & { target?: EventTarget }): KeyboardEvent {
@@ -199,5 +201,26 @@ describe('composerFocusKeysAllowed', () => {
 
     expect(composerFocusKeysAllowed(keydown({ key: 'a', target: document.body }), 'type')).toBe(true)
     expect(composerFocusKeysAllowed(keydown({ key: 'Enter', target: document.body }), 'enter')).toBe(true)
+  })
+
+  it('prefers the hovered clarify zone, then the focused zone', () => {
+    const firstZone = document.createElement('div')
+    firstZone.dataset.treeGroup = 'first'
+    const secondZone = document.createElement('div')
+    secondZone.dataset.treeGroup = 'second'
+    const first = document.createElement('div')
+    first.setAttribute('data-clarify-choices', '1')
+    const second = document.createElement('div')
+    second.setAttribute('data-clarify-choices', '1')
+    firstZone.append(first)
+    secondZone.append(second)
+    document.body.append(firstZone, secondZone)
+
+    $activeTreeGroup.set('first')
+    $hoveredTreeGroup.set('second')
+    expect(visibleClarifyCard()).toBe(second)
+
+    $hoveredTreeGroup.set(null)
+    expect(visibleClarifyCard()).toBe(first)
   })
 })

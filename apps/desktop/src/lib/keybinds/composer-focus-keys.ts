@@ -7,7 +7,8 @@
  */
 
 import { $workspaceIsPage } from '@/app/routes'
-import { queryVisible } from '@/components/pane-shell/pane-visibility'
+import { queryAllVisible } from '@/components/pane-shell/pane-visibility'
+import { $activeTreeGroup, $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { switcherActive } from '@/store/session-switcher'
 
 import { isEditableTarget, isFocusWithin } from './combo'
@@ -47,6 +48,25 @@ const BLOCKING_OVERLAY =
 // one has to be visible-scoped: a clarify card waiting in a background thread
 // must not take the foreground composer's letter keys.
 const BLOCKING_IN_SURFACE = '[data-clarify-choices]'
+const TREE_GROUP = '[data-tree-group]'
+
+export const visibleClarifyCard = (): HTMLElement | null => {
+  const cards = queryAllVisible<HTMLElement>(BLOCKING_IN_SURFACE)
+  if (cards.length < 2) {
+    return cards[0] ?? null
+  }
+
+  for (const zone of [$hoveredTreeGroup.get(), $activeTreeGroup.get()]) {
+    const card = zone
+      ? cards.find(el => el.closest<HTMLElement>(TREE_GROUP)?.dataset.treeGroup === zone)
+      : undefined
+    if (card) {
+      return card
+    }
+  }
+
+  return cards[0]
+}
 
 /** True when the focused control would normally handle Enter itself. */
 export function isActivateOnEnterTarget(target: EventTarget | null): boolean {
@@ -70,7 +90,7 @@ export function isActivateOnEnterTarget(target: EventTarget | null): boolean {
  * with no store coupling.
  */
 export function clarifyCardOwnsKey(event: KeyboardEvent): boolean {
-  const card = queryVisible(BLOCKING_IN_SURFACE)
+  const card = visibleClarifyCard()
 
   if (!card) {
     return false

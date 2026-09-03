@@ -2554,6 +2554,7 @@ class HermesACPAgent(acp.Agent):
                     approx_tokens=approx_tokens,
                     task_id=state.session_id,
                     force=True,
+                    trigger="acp_manual",
                 )
             finally:
                 agent._session_db = original_session_db
