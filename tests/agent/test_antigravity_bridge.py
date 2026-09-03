@@ -500,6 +500,54 @@ def test_antigravity_runtime_factory_selects_client_without_starting_bridge(monk
     client.close()
 
 
+def test_antigravity_primary_runtime_constructs_agent_with_resolved_bridge(monkeypatch):
+    from agent import antigravity_bridge_transport
+    from agent.antigravity_bridge_client import AntigravityBridgeClient
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from run_agent import AIAgent
+
+    bridge_command = "/tmp/fake-antigravity-bridge"
+    monkeypatch.setattr(
+        antigravity_bridge_transport,
+        "resolve_antigravity_bridge_command",
+        lambda: bridge_command,
+    )
+    monkeypatch.setattr(
+        AntigravityBridgeClient,
+        "list_accounts",
+        lambda self: {"connected": True, "total": 1},
+    )
+
+    runtime = resolve_runtime_provider(
+        requested="antigravity",
+        target_model="antigravity-gemini-3-pro",
+    )
+    agent = AIAgent(
+        model="antigravity-gemini-3-pro",
+        provider=runtime["provider"],
+        base_url=runtime["base_url"],
+        api_key=runtime["api_key"],
+        api_mode=runtime["api_mode"],
+        acp_command=runtime["command"],
+        acp_args=runtime["args"],
+        enabled_toolsets=[],
+        disabled_toolsets=[],
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+
+    client = agent.client
+    try:
+        assert isinstance(client, AntigravityBridgeClient)
+        assert client._bridge_command == bridge_command
+        assert client._process is None
+    finally:
+        if client is not None:
+            client.close()
+
+
 def test_antigravity_auxiliary_router_returns_sync_and_async_clients(monkeypatch):
     from agent import antigravity_bridge_transport
     from agent.antigravity_bridge_client import AntigravityBridgeClient, AsyncAntigravityBridgeClient

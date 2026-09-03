@@ -246,6 +246,10 @@ class ProviderConfig:
     base_url_env_var: str = ""
 
 
+ANTIGRAVITY_MANAGED_API_KEY_PLACEHOLDER = "antigravity-managed"
+ANTIGRAVITY_MANAGED_BASE_URL = "sdkbridge://antigravity"
+
+
 PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "nous": ProviderConfig(
         id="nous",
@@ -268,6 +272,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url="sdkbridge://cursor",
         api_key_env_vars=("CURSOR_API_KEY",),
+    ),
+    "antigravity": ProviderConfig(
+        id="antigravity",
+        name="Google Antigravity",
+        auth_type="external_process",
+        inference_base_url=ANTIGRAVITY_MANAGED_BASE_URL,
     ),
     "openai-api": ProviderConfig(
         id="openai-api",
@@ -7304,6 +7314,61 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _get_antigravity_auth_status(
+    *, bridge_command: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a privacy-safe projection of managed Antigravity readiness."""
+    client = None
+    command = bridge_command
+    try:
+        from agent.antigravity_bridge_client import AntigravityBridgeClient
+        from agent.antigravity_bridge_transport import resolve_antigravity_bridge_command
+
+        if command is None:
+            command = resolve_antigravity_bridge_command()
+        if not command:
+            return {
+                "provider": "antigravity",
+                "logged_in": False,
+                "configured": False,
+                "bridge_available": False,
+                "base_url": ANTIGRAVITY_MANAGED_BASE_URL,
+                "source": "managed-bridge",
+            }
+
+        client = AntigravityBridgeClient(bridge_command=command)
+        snapshot = client.list_accounts()
+        connected = isinstance(snapshot, dict) and snapshot.get("connected") is True
+        status: Dict[str, Any] = {
+            "provider": "antigravity",
+            "logged_in": connected,
+            "configured": connected,
+            "bridge_available": True,
+            "base_url": ANTIGRAVITY_MANAGED_BASE_URL,
+            "source": "managed-bridge",
+        }
+        total = snapshot.get("total") if isinstance(snapshot, dict) else None
+        if type(total) is int and total >= 0:
+            status["account_count"] = total
+        return status
+    except Exception as exc:
+        return {
+            "provider": "antigravity",
+            "logged_in": False,
+            "configured": False,
+            "bridge_available": bool(command),
+            "base_url": ANTIGRAVITY_MANAGED_BASE_URL,
+            "source": "managed-bridge",
+            "error": type(exc).__name__,
+        }
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = (provider_id or get_active_provider() or "").strip().lower()
@@ -7323,6 +7388,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
+    if target == "antigravity":
+        return _get_antigravity_auth_status()
     if target == "cursor":
         try:
             from agent.cursor_sdk_auth import (
@@ -7563,6 +7630,37 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             "command": command,
             "args": [],
             "source": source,
+        }
+
+    if provider_id == "antigravity":
+        from agent.antigravity_bridge_transport import resolve_antigravity_bridge_command
+
+        command = resolve_antigravity_bridge_command()
+        if not command:
+            raise AuthError(
+                "Google Antigravity managed bridge is not installed.",
+                provider=provider_id,
+                code="missing_antigravity_bridge",
+            )
+        status = _get_antigravity_auth_status(bridge_command=command)
+        if status.get("logged_in") is not True:
+            code = (
+                "antigravity_account_status_unavailable"
+                if status.get("error")
+                else "missing_antigravity_account"
+            )
+            raise AuthError(
+                "No connected Google Antigravity account is available.",
+                provider=provider_id,
+                code=code,
+            )
+        return {
+            "provider": provider_id,
+            "api_key": ANTIGRAVITY_MANAGED_API_KEY_PLACEHOLDER,
+            "base_url": ANTIGRAVITY_MANAGED_BASE_URL,
+            "command": command,
+            "args": [],
+            "source": "managed-bridge",
         }
 
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""

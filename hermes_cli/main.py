@@ -1087,6 +1087,14 @@ def _has_any_provider_configured() -> bool:
         if cfg_provider or cfg_base_url or cfg_api_key:
             return True
 
+    # Antigravity owns credentials in its profile-scoped managed account store,
+    # so it has no API-key env var for the generic sweep below to discover.
+    try:
+        if get_auth_status("antigravity").get("logged_in") is True:
+            return True
+    except Exception:
+        pass
+
     # Check provider-specific auth fallbacks (for example, Copilot via gh auth).
     try:
         for provider_id, pconfig in PROVIDER_REGISTRY.items():
