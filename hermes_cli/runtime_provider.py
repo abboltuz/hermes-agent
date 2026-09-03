@@ -2155,6 +2155,19 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
 
+    if provider == "antigravity":
+        creds = resolve_external_process_provider_credentials(provider)
+        return {
+            "provider": "antigravity",
+            "api_mode": "chat_completions",
+            "base_url": creds["base_url"],
+            "api_key": creds["api_key"],
+            "command": creds["command"],
+            "args": list(creds.get("args") or []),
+            "source": creds.get("source", "managed-bridge"),
+            "requested_provider": requested_provider,
+        }
+
     if provider == "cursor":
         creds = resolve_external_process_provider_credentials(provider)
         return {
