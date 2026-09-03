@@ -24,6 +24,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
+import { visibleClarifyCard } from '@/lib/keybinds/composer-focus-keys'
 import { cn } from '@/lib/utils'
 import {
   bareChoice,
@@ -443,6 +444,7 @@ function ClarifyToolSinglePending({
   const [activeIndex, setActiveIndex] = useState(0)
   const [otherFocused, setOtherFocused] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const formRef = useRef<HTMLFormElement | null>(null)
 
   // Race: tool.start fires a tick before clarify.request, so request_id
   // arrives slightly after the tool block mounts. If the question text is
@@ -609,6 +611,10 @@ function ClarifyToolSinglePending({
         return
       }
 
+      if (visibleClarifyCard() !== formRef.current) {
+        return
+      }
+
       const active = document.activeElement as HTMLElement | null
 
       if (
@@ -704,6 +710,7 @@ function ClarifyToolSinglePending({
       className="my-1.5 grid gap-4"
       data-clarify-choices={hasChoices ? choices.length : undefined}
       onSubmit={handleSubmit}
+      ref={formRef}
     >
       <ClarifyShell className="grid gap-2">
         <div className="flex items-start gap-2">

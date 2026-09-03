@@ -68,6 +68,26 @@ def _seed_modpack_sessions(db):
 # =========================================================================
 
 class TestSchema:
+    def test_recovery_bundle_index_survives_reopen(self, db):
+        indexes = {
+            row["name"] for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        assert "idx_compression_recovery_bundle" in indexes
+        path = db.db_path
+        db.close()
+        reopened = SessionDB(path)
+        try:
+            indexes = {
+                row["name"] for row in reopened._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+            assert "idx_compression_recovery_bundle" in indexes
+        finally:
+            reopened.close()
+
     def test_schema_params_cover_every_shape(self):
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
         # Discovery shape
@@ -99,7 +119,7 @@ class TestSchema:
             "sort",
             "profile",
         ]
-        assert parameters == [*historical_prefix, "detail"]
+        assert parameters == [*historical_prefix, "detail", "recovery_identity", "recovery_message_id", "content_start", "content_count"]
 
 
 class TestFormatTimestamp:
@@ -1143,4 +1163,44 @@ class TestNewResetLineageBrowse:
         result = json.loads(session_search(db=db, current_session_id="s_other"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_legacy_child" in sids
+
+
+class TestCompressionRecoveryPaging:
+    def test_manifest_and_bounded_pages_are_exact_and_profile_local(self, db):
+        db.create_session("recovery-session", source="cli")
+        body = "абв" * 9000
+        row_id = db.append_message("recovery-session", role="tool", content=body)
+        identity = db.register_compression_recovery(
+            "recovery-session", [row_id], generation=2, watermark=4,
+            projection_fingerprint="complete-bundle", recovery_identity="opaque-recovery",
+        )
+        db_path = db.db_path
+        db.close()
+        db = SessionDB(db_path)
+        manifest = json.loads(session_search(db=db, recovery_identity=identity))
+        assert manifest["mode"] == "recovery"
+        entry = manifest["messages"][0]
+        assert entry["content_chars"] == len(body)
+        assert entry["content_truncated"] is True
+        page = json.loads(session_search(
+            db=db, recovery_identity=identity,
+            recovery_message_id=row_id, content_start=8000, content_count=8000,
+        ))
+        assert page["content"] == body[8000:16000]
+        assert page["start"] == 8000 and page["end"] == 16000
+        assert page["has_more"] is True
+        denied = json.loads(session_search(
+            db=db, recovery_identity=identity, profile="other-profile"
+        ))
+        assert denied == {"success": False, "error": "recovery identity unavailable"}
+
+    def test_registration_is_idempotent_for_same_bundle(self, db):
+        db.create_session("recovery-session", source="cli")
+        row_id = db.append_message("recovery-session", role="tool", content="payload")
+        kwargs = dict(generation=1, watermark=1, projection_fingerprint="bundle")
+        first = db.register_compression_recovery("recovery-session", [row_id], **kwargs)
+        second = db.register_compression_recovery("recovery-session", [row_id], **kwargs)
+        assert first == second
+        count = db._conn.execute("SELECT COUNT(*) FROM compression_recovery").fetchone()[0]
+        assert count == 1
 

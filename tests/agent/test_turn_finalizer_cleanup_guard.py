@@ -10,6 +10,7 @@ traceback and lost the whole turn.
 
 import pytest
 
+from agent.compression_v3 import ContextProjectionUnfit, CutResult
 from agent.turn_finalizer import finalize_turn
 
 
@@ -26,8 +27,9 @@ class _StubCompressor:
 class _StubAgent:
     """Minimal agent surface that ``finalize_turn`` reads from."""
 
-    def __init__(self, *, raise_in):
+    def __init__(self, *, raise_in, summary_error=None):
         self._raise_in = set(raise_in)
+        self._summary_error = summary_error
         self.max_iterations = 3
         self.iteration_budget = _StubBudget()
         self.context_compressor = _StubCompressor()
@@ -82,7 +84,12 @@ class _StubAgent:
         pass
 
     def _handle_max_iterations(self, messages, n):
+        if self._summary_error is not None:
+            raise self._summary_error
         return "PARTIAL SUMMARY FROM MODEL"
+
+    def _summarize_api_error(self, error):
+        return f"summary refused: {error}"
 
     def _file_mutation_verifier_enabled(self):
         return False
@@ -154,6 +161,22 @@ def test_single_cleanup_step_raises_does_not_skip_others(step):
         )
     ]
     assert len(result["cleanup_errors"]) == 1
+
+
+def test_iteration_summary_projection_refusal_returns_typed_failed_result():
+    error = ContextProjectionUnfit(CutResult(
+        messages=[],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="irreducible summary wire",
+    ))
+    result = _run(_StubAgent(raise_in={"summary"}, summary_error=error))
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["error_type"] == "ContextProjectionUnfit"
+    assert result["error"] == "irreducible summary wire"
+    assert result["final_response"] == "summary refused: irreducible summary wire"
 
 
 def test_clean_turn_has_no_cleanup_errors_key():

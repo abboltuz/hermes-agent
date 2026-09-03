@@ -939,6 +939,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent.compression_v3 import prepare_api_request
+
+    api_kwargs = prepare_api_request(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -2910,10 +2913,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     summary_call_outcome = "failed"
 
     def _managed_summary_call(request, callback, *, retry_count: int):
+        """Gate the final provider-shaped summary wire before dispatch."""
         from agent import relay_llm
+        from agent.compression_v3 import prepare_api_request
 
+        # This is deliberately inside the managed callback boundary: provider
+        # adapters may have added route-specific fields (Responses input,
+        # Anthropic system blocks, or nested Bedrock controls) since the
+        # canonical projection was prepared.
+        prepared_request = prepare_api_request(agent, request)
         return relay_llm.execute_current(
-            request,
+            prepared_request,
             callback,
             name=str(getattr(agent, "provider", "") or "provider"),
             model_name=str(getattr(agent, "model", "") or ""),
@@ -3014,13 +3024,33 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # recognize stubs after reasoning fields are stripped.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
-        # Strip all remaining underscore-prefixed scaffolding keys before the
-        # wire. The summary path calls chat.completions.create() directly,
-        # bypassing the transport's universal underscore-key sweeper.
+        # Remove legacy schema-foreign scaffolding, but retain the v3 sidecars
+        # that the canonical fit gate needs for durable recovery binding.
         for api_msg in api_messages:
-            if isinstance(api_msg, dict):
-                for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
-                    api_msg.pop(internal_key, None)
+            if not isinstance(api_msg, dict):
+                continue
+            for internal_key in [
+                key for key in api_msg
+                if isinstance(key, str)
+                and key.startswith("_")
+                and key not in {"_row_id", "_db_persisted"}
+                and not key.startswith(("_compression", "_micro_compact"))
+            ]:
+                api_msg.pop(internal_key, None)
+
+        # Keep recovery sidecars in this in-process canonical projection until
+        # prepare_api_request performs the deterministic cut and binds durable
+        # row identity. That function returns a provider-safe copy, so source
+        # transcript rows remain lossless while no private fields reach a SDK.
+        def _prepare_canonical_summary_messages() -> list:
+            """Fit the canonical Chat history before route transformation."""
+            from agent.compression_v3 import prepare_api_request
+
+            canonical_request = {"messages": api_messages}
+            if agent.max_tokens is not None:
+                canonical_request.update(agent._max_tokens_param(agent.max_tokens))
+            prepared = prepare_api_request(agent, canonical_request)
+            return prepared["messages"]
 
         summary_extra_body = {}
         try:
@@ -3061,9 +3091,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
+            summary_messages = _prepare_canonical_summary_messages()
+            codex_kwargs = agent._build_api_kwargs(summary_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            summary_response = _managed_summary_call(
+                codex_kwargs,
+                lambda request: agent._run_codex_stream(request),
+                retry_count=0,
+            )
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -3131,10 +3166,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_kwargs["extra_body"] = summary_extra_body
 
             if agent.api_mode == "anthropic_messages":
+                summary_messages = _prepare_canonical_summary_messages()
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(
                     model=agent.model,
-                    messages=api_messages,
+                    messages=summary_messages,
                     tools=None,
                     max_tokens=agent.max_tokens,
                     reasoning_config=agent.reasoning_config,
@@ -3151,6 +3187,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
+                summary_messages = _prepare_canonical_summary_messages()
+                summary_kwargs["messages"] = summary_messages
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
@@ -3176,17 +3214,23 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
+                summary_messages = _prepare_canonical_summary_messages()
+                codex_kwargs = agent._build_api_kwargs(summary_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                retry_response = _managed_summary_call(
+                    codex_kwargs,
+                    lambda request: agent._run_codex_stream(request),
+                    retry_count=1,
+                )
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()
             elif agent.api_mode == "anthropic_messages":
+                summary_messages = _prepare_canonical_summary_messages()
                 _tretry = agent._get_transport()
                 _ant_kw2 = _tretry.build_kwargs(
                     model=agent.model,
-                    messages=api_messages,
+                    messages=summary_messages,
                     tools=None,
                     is_oauth=agent._is_anthropic_oauth,
                     max_tokens=agent.max_tokens,
@@ -3203,9 +3247,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
             else:
+                summary_messages = _prepare_canonical_summary_messages()
                 summary_kwargs = {
                     "model": agent.model,
-                    "messages": api_messages,
+                    "messages": summary_messages,
                 }
                 if _summary_temperature is not None:
                     summary_kwargs["temperature"] = _summary_temperature
@@ -3242,6 +3287,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
+        from agent.compression_v3 import ContextProjectionUnfit
+
+        if isinstance(e, ContextProjectionUnfit):
+            # An unfit summary is a terminal provider-gate refusal, not a
+            # successful fallback string. Let the conversation/turn-finalizer
+            # record the typed failure and prevent relay success accounting.
+            raise
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
@@ -3354,6 +3406,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     """
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
+
+    from agent.compression_v3 import prepare_api_request
+
+    api_kwargs = prepare_api_request(agent, api_kwargs)
 
     def _stream_final_text(response) -> str:
         try:

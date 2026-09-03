@@ -2207,6 +2207,104 @@ class AIAgent:
                 if not isinstance(seed_ids, set):
                     seed_ids = set()
             self._flushed_db_message_session_id = current_session_id
+            # Only IDs established by the complete alignment proof below may
+            # suppress a write. Caller-provided sidecars are not durability
+            # evidence and must not control the append loop.
+            _validated_durable_row_ids = set()
+            # Preserve exact row identity when a caller supplies a durable
+            # history snapshot without the optional private sidecar.  This is
+            # an ordered, full-message proof against the active DB snapshot,
+            # never a content-key scan across inactive history.
+            if current_session_id and any(
+                isinstance(item, dict) and "_row_id" not in item
+                for item in messages
+            ):
+                try:
+                    durable = self._session_db.get_messages_as_conversation(
+                        current_session_id, include_row_ids=True
+                    )
+                    def _identity_view(item):
+                        return {
+                            key: value for key, value in item.items()
+                            if key not in {"_row_id", "_db_persisted", "timestamp"}
+                            and not str(key).startswith("_")
+                        }
+                    def _projection_only_system(item):
+                        if not isinstance(item, dict) or item.get("role") != "system":
+                            return False
+                        content = str(item.get("content", ""))
+                        return bool(
+                            item.get("_compression_capsule")
+                            or item.get("_compression_recovery")
+                            or content.startswith("[POLICY CAPSULE]")
+                            or content.startswith("[COMPACTION RECOVERY")
+                        )
+                    durable_rows = [
+                        item for item in durable
+                        if isinstance(item, dict) and not _projection_only_system(item)
+                    ]
+                    live_rows = [
+                        item for item in messages
+                        if isinstance(item, dict) and not _projection_only_system(item)
+                    ]
+                    # An identity appearing more than once is not sufficient
+                    # evidence for positional recovery: the same live row could
+                    # bind to either durable row.  Mark those identities
+                    # ambiguous and fail closed rather than selecting the first
+                    # row (which could be an archived duplicate).
+                    from collections import Counter
+                    import json
+
+                    def _identity_key(item):
+                        # JSON's sorted-key encoding is stable for nested mappings,
+                        # unlike repr(dict), whose result depends on insertion order.
+                        return json.dumps(
+                            _identity_view(item),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+
+                    durable_identity_counts = Counter(
+                        _identity_key(item) for item in durable_rows
+                    )
+                    live_identity_counts = Counter(
+                        _identity_key(item) for item in live_rows
+                    )
+                    ambiguous_identities = {
+                        identity for identity, count in durable_identity_counts.items()
+                        if count != 1
+                    } | {
+                        identity for identity, count in live_identity_counts.items()
+                        if count != 1
+                    }
+                    durable_index = 0
+                    for live in live_rows:
+                        if durable_index >= len(durable_rows):
+                            break
+                        stored = durable_rows[durable_index]
+                        durable_index += 1
+                        identity = _identity_key(live)
+                        if identity in ambiguous_identities:
+                            # Stop at ambiguity so later rows cannot be
+                            # positionally shifted onto a different identity.
+                            break
+                        if (
+                            live.get('_row_id') is None
+                            and _identity_view(live) == _identity_view(stored)
+                            and isinstance(stored.get('_row_id'), int)
+                        ):
+                            live['_row_id'] = stored['_row_id']
+                            _validated_durable_row_ids.add(stored['_row_id'])
+                        elif live.get('_row_id') is None:
+                            # Stop backfilling at the first mismatch.  Assigning
+                            # later rows would make an ambiguous projection look
+                            # durable and could bind recovery to the wrong row.
+                            break
+                except Exception:
+                    # Missing identity remains fail-closed at recovery bind.
+                    pass
             history_ids = {
                 id(item) for item in (conversation_history or [])
                 if isinstance(item, dict)
@@ -2256,6 +2354,9 @@ class AIAgent:
                 # history copy, or seeded by a caller. Stamp them so future
                 # flushes skip them without consulting any id() set again.
                 if id(msg) in history_ids or id(msg) in seed_ids:
+                    msg[_DB_PERSISTED_MARKER] = True
+                    continue
+                if msg.get("_row_id") in _validated_durable_row_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
                 role = msg.get("role", "unknown")
@@ -2408,7 +2509,7 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
+                _inserted_ids = self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
                     compression_lock_holder=getattr(
@@ -2421,7 +2522,11 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    return_message_ids=True,
                 )
+                if isinstance(_inserted_ids, list):
+                    for _written, _row_id in zip(_batch_msgs, _inserted_ids):
+                        _written["_row_id"] = _row_id
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -8058,6 +8163,7 @@ class AIAgent:
         task_id: str = "default",
         focus_topic: str = None,
         force: bool = False,
+        trigger: Optional[str] = None,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -8123,6 +8229,7 @@ class AIAgent:
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
                     force=force,
+                    trigger=trigger,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
@@ -8135,6 +8242,27 @@ class AIAgent:
                 return _run(active_fence)
 
             idle_timeout, total_ceiling = resolve_context_compression_timeouts()
+            # Hard-pressure entry points have one absolute remote/pre-commit
+            # budget. Progress and route fallback may consume that budget but
+            # never extend it. Manual /compress and maintenance callers keep
+            # their configured timeout semantics.
+            from agent.conversation_compression import (
+                HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                is_hard_pressure_compression_trigger,
+            )
+            if is_hard_pressure_compression_trigger(trigger):
+                # A disabled general timeout must not disable the safety
+                # wrapper on provider-bound automatic pressure paths.
+                idle_timeout = min(
+                    idle_timeout if idle_timeout > 0
+                    else HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                    HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                )
+                total_ceiling = min(
+                    total_ceiling if total_ceiling > 0
+                    else HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                    HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
+                )
             if idle_timeout <= 0:
                 return _run(active_fence)
 

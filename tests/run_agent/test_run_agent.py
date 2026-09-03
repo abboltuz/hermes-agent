@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
+from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
 import run_agent
 from run_agent import AIAgent
@@ -76,7 +77,42 @@ def agent():
         )
         a.client = MagicMock()
         return a
+from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
+
+def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkeypatch):
+    """An unchanged typed fit refusal is not retried by the production loop."""
+    gate_attempts = []
+    result = CutResult(
+        messages=[{"role": "system", "content": "policy"}],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="irreducible request floor",
+    )
+
+    def refuse_once(*_args, **_kwargs):
+        gate_attempts.append(True)
+        raise ContextProjectionUnfit(result)
+
+    agent._interruptible_api_call = refuse_once
+    agent.client.chat.completions.create = MagicMock(
+        side_effect=AssertionError("provider must not be called")
+    )
+    monkeypatch.setattr(run_agent.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("retry sleep")))
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        outcome = agent.run_conversation("irreducible task")
+
+    assert len(gate_attempts) == 1
+    assert agent.client.chat.completions.create.call_count == 0
+    assert outcome["completed"] is False
+    assert outcome["failed"] is True
+    assert outcome["error_type"] == "ContextProjectionUnfit"
+    assert outcome["error"] == "irreducible request floor"
+    assert outcome["api_calls"] == 0
 
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
@@ -2635,6 +2671,100 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    def test_reducible_summary_preserves_durable_recovery_rows(self, agent, tmp_path):
+        """A reducible iteration summary binds demoted rows before one SDK call."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "recovery.db")
+        session_id = "iteration-recovery-e2e"
+        db.create_session(session_id=session_id, source="test")
+        durable = []
+        for index in range(8):
+            durable.extend([
+                {
+                    "role": "user",
+                    "content": f"semantic round {index}",
+                    "origin_kind": "human_user",
+                    "turn_kind": "prompt",
+                    "trust_kind": "user_authorized",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"call-{index}",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }],
+                    "reasoning": f"reasoning-{index}",
+                    "provenance_metadata": {"event_kind": "tool_call"},
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call-{index}",
+                    "content": f"tool body {index} " + ("x" * 1200),
+                },
+            ])
+        durable.append({
+            "role": "user",
+            "content": "latest human task: preserve this exact task",
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+        })
+        db.append_messages_batch(session_id, durable)
+        source = db.get_messages_as_conversation(session_id, include_row_ids=True)
+        source_before = [dict(message) for message in source]
+        durable_snapshot = db.get_messages_as_conversation(session_id, include_row_ids=True)
+        latest_task = source[-1]["content"]
+        for message in source:
+            message["_db_persisted"] = True
+
+        original_register = db.register_compression_recovery
+        registered = {}
+
+        def register(*args, **kwargs):
+            result = original_register(*args, **kwargs)
+            registered["identity"] = result
+            registered["ids"] = list(args[1])
+            return result
+
+        db.register_compression_recovery = register
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = session_id
+        agent._config_context_length = 8_000
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 64
+        agent._cached_system_prompt = ""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+
+        result = agent._handle_max_iterations(source, 1)
+
+        assert result == "Summary"
+        assert agent.client.chat.completions.create.call_count == 1
+        request = agent.client.chat.completions.create.call_args.kwargs
+        assert all(
+            not (isinstance(key, str) and (key.startswith("_") or key == "provenance_metadata"))
+            for message in request["messages"]
+            for key in message
+        )
+        assert latest_task == "latest human task: preserve this exact task"
+        assert sum(message.get("role") == "assistant" and message.get("tool_calls") is not None for message in request["messages"]) == 6
+
+        from agent.compression_v3 import _provider_wire_token_bound
+        assert _provider_wire_token_bound(request) + agent.max_tokens + agent._compression_safety_margin <= agent._config_context_length
+        assert db.get_messages_as_conversation(session_id, include_row_ids=True) == durable_snapshot
+        durable_ids = {message["_row_id"] for message in source_before}
+        assert registered["ids"]
+        assert set(registered["ids"]).issubset(durable_ids)
+        assert set(registered["ids"]) >= {source_before[0]["_row_id"], source_before[1]["_row_id"]}
+        recovery = db.get_compression_recovery(registered["identity"], session_id)
+        assert recovery is not None
+        assert recovery["message_ids"] == registered["ids"]
+        assert len(db.get_messages(session_id)) == len(durable)
+        db.close()
+
     def test_summary_notice_uses_safe_print(self, agent):
         agent._print_fn = lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("closed"))
         agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
@@ -2651,6 +2781,162 @@ class TestHandleMaxIterations:
         assert isinstance(result, str)
         assert len(result) > 0
         assert "summary" in result.lower()
+        assert agent.client.chat.completions.create.call_count == 1
+
+    def test_summary_gate_blocks_irreducible_codex_request_before_responses_sdk(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._cached_system_prompt = "policy"
+        agent._config_context_length = 1
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 1
+        calls = []
+        agent._run_codex_stream = lambda request: calls.append(request)
+
+        with pytest.raises(ContextProjectionUnfit):
+            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+
+        assert calls == []
+
+    def test_summary_gate_is_reapplied_to_codex_retry_before_responses_sdk(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._cached_system_prompt = "policy"
+        provider_calls = []
+        agent._run_codex_stream = lambda request: (provider_calls.append(request), SimpleNamespace(
+            status="completed",
+            output=[SimpleNamespace(type="message", status="completed", content=[SimpleNamespace(type="output_text", text="")])],
+        ))[1]
+        original_context = agent._config_context_length
+        gate_calls = 0
+        from agent.compression_v3 import prepare_api_request
+
+        def gate_then_shrink(current_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 3:
+                current_agent._config_context_length = 1
+            return prepare_api_request(current_agent, request)
+
+        try:
+            with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
+                with patch("agent.relay_llm.complete_logical_call") as complete_logical:
+                    with pytest.raises(ContextProjectionUnfit):
+                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    complete_logical.assert_called_once_with(
+                        complete_logical.call_args.args[0], outcome="failed"
+                    )
+        finally:
+            agent._config_context_length = original_context
+
+        assert len(provider_calls) == 1
+        assert gate_calls == 3
+
+    def test_summary_gate_blocks_irreducible_anthropic_request_before_messages_sdk(self, agent):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.base_url = "https://api.anthropic.com"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "claude-3-5-sonnet"
+        agent._cached_system_prompt = "policy"
+        agent._config_context_length = 1
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 1
+        calls = []
+        agent._anthropic_messages_create = lambda request, **kwargs: calls.append(request)
+
+        with pytest.raises(ContextProjectionUnfit):
+            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+
+        assert calls == []
+
+    def test_summary_gate_is_reapplied_to_anthropic_retry_before_messages_sdk(self, agent):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.base_url = "https://api.anthropic.com"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "claude-3-5-sonnet"
+        agent._cached_system_prompt = "policy"
+        provider_calls = []
+        agent._anthropic_messages_create = lambda request, **kwargs: (provider_calls.append(request), SimpleNamespace(content=[], stop_reason="end_turn", usage=None))[1]
+        original_context = agent._config_context_length
+        gate_calls = 0
+        from agent.compression_v3 import prepare_api_request
+
+        def gate_then_shrink(current_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 3:
+                current_agent._config_context_length = 1
+            return prepare_api_request(current_agent, request)
+
+        try:
+            with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
+                with patch("agent.relay_llm.complete_logical_call") as complete_logical:
+                    with pytest.raises(ContextProjectionUnfit):
+                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    complete_logical.assert_called_once_with(
+                        complete_logical.call_args.args[0], outcome="failed"
+                    )
+        finally:
+            agent._config_context_length = original_context
+
+        assert len(provider_calls) == 1
+        assert gate_calls == 3
+
+    def test_summary_gate_blocks_irreducible_openai_request_before_sdk(self, agent):
+        agent._cached_system_prompt = "policy"
+        agent._config_context_length = 1
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 1
+        agent.client.chat.completions.create = MagicMock(
+            side_effect=AssertionError("provider must not be called")
+        )
+
+        with pytest.raises(ContextProjectionUnfit):
+            agent._handle_max_iterations(
+                [{"role": "user", "content": "oversized task"}],
+                1,
+            )
+
+        assert agent.client.chat.completions.create.call_count == 0
+
+    def test_summary_gate_is_reapplied_to_retry_before_sdk(self, agent):
+        agent._cached_system_prompt = "policy"
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=""),
+            AssertionError("retry provider must not be called"),
+        ]
+        original_context = agent._config_context_length
+        gate_calls = 0
+
+        from agent.compression_v3 import prepare_api_request
+
+        def gate_then_shrink(current_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 3:
+                current_agent._config_context_length = 1
+            return prepare_api_request(current_agent, request)
+
+        with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
+            with pytest.raises(ContextProjectionUnfit):
+                agent._handle_max_iterations(
+                    [{"role": "user", "content": "safe first task"}],
+                    1,
+                )
+
+        agent._config_context_length = original_context
+        assert gate_calls == 3
+        assert agent.client.chat.completions.create.call_count == 1
 
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
@@ -2674,6 +2960,7 @@ class TestHandleMaxIterations:
             )
 
         assert result == "Summary"
+        assert agent.client.chat.completions.create.call_count == 2
         assert [call["metadata"]["retry_count"] for call in relay_calls] == [0, 1]
         assert relay_calls[0]["metadata"]["api_request_id"] == (
             relay_calls[1]["metadata"]["api_request_id"]
@@ -4822,8 +5109,10 @@ class TestRunConversation:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
-        # Huge API-only system prompt; persisted messages are tiny.
-        agent._cached_system_prompt = "S" * 796_000
+        # Large API-only system prompt; persisted messages are tiny. Keep the
+        # request below the local final-wire gate so the simulated provider
+        # output-cap response remains reachable.
+        agent._cached_system_prompt = "S" * 100_000
 
         error_msg = (
             "max_tokens: 65536 > context_window: 200000 "

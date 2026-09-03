@@ -20204,6 +20204,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            trigger="gateway_hygiene",
                                             commit_fence=_hyg_commit_fence,
                                         ),
                                     )

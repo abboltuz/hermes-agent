@@ -386,6 +386,10 @@ Not merged:
 
 - **HTTP 400: "Third-party apps now draw from your extra usage, not your plan limits"**: Anthropic's server-side validation has classified your requests as third-party and routed them to pay-per-token credits instead of your Max/Pro plan. Make sure you're on the latest version of this patch (it tracks the upstream [opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth) fingerprint changes). Reinstall with `./install.sh` and restart `hermes-gateway`. If the error persists after update, the bypass is currently broken upstream too — track [issue #6](https://github.com/kristianvast/hermes-claude-auth/issues/6) for status.
 - **HTTP 400 persists after update**: The billing salt or signature format may have been rotated by Anthropic again. Check for newer commits to this repo.
+- **System cache-control safety**: The installer strips `cache_control` from all
+  bypass system blocks. Hermes may add short-lived prompt-cache markers, while
+  older bypass builds injected a `1h` identity marker; mixing those markers can
+  violate Anthropic's global TTL ordering and return HTTP 400.
 
 ### Rate-limit / 429 behaviour
 

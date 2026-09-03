@@ -619,7 +619,36 @@ def test_durable_message_committed_before_lease_is_adopted(
     assert child_id == agent.session_id
 
 
+def test_durable_message_adoption_no_growth_returns_lossless_transcript(
+    tmp_path: Path,
+) -> None:
+    """No-growth fallback must return the adopted durable source, not stale input."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "PRE_LEASE_DURABLE_NO_GROWTH"
+    db.create_session(parent_sid, source="webui")
+    db.append_message(parent_sid, "user", "old durable")
+    db.append_message(parent_sid, "assistant", "late committed before lease")
 
+    agent = _build_agent_with_db(db, parent_sid)
+    # Return the adopted source unchanged so the production no-growth guard
+    # refuses rotation while preserving the late durable row.
+    agent.context_compressor.compress.side_effect = lambda messages, **_kw: list(messages)
+    stale_snapshot = [{"role": "user", "content": "old durable"}]
+
+    returned, _system_prompt = agent._compress_context(
+        stale_snapshot, "sys", approx_tokens=120_000
+    )
+
+    assert [message["content"] for message in returned] == [
+        "old durable",
+        "late committed before lease",
+    ]
+    assert [message["content"] for message in db.get_messages(parent_sid)] == [
+        "old durable",
+        "late committed before lease",
+    ]
+    assert _count_children(db, parent_sid) == 0
+    assert agent.session_id == parent_sid
 
 
 def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) -> None:

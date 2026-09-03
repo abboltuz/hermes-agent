@@ -2774,6 +2774,7 @@ def run_conversation(
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+                trigger="pre_api_auto",
             )
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
@@ -4497,6 +4498,35 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
+                # A projection refusal is deterministic for this exact request.
+                # Retrying it unchanged cannot alter the fit predicate, and may
+                # rotate credentials/routes needlessly without a larger context.
+                # Return one typed terminal result before generic retry handling.
+                try:
+                    from agent.compression_v3 import ContextProjectionUnfit
+                except Exception:  # pragma: no cover - import is stable in production
+                    ContextProjectionUnfit = ()
+                if (
+                    (ContextProjectionUnfit and isinstance(api_error, ContextProjectionUnfit))
+                    or getattr(api_error, "outcome", None) == "context_projection_unfit"
+                ):
+                    _unfit_summary = agent._summarize_api_error(api_error)
+                    agent._buffer_vprint(
+                        f"❌ Request refused before provider call: {_unfit_summary}"
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _unfit_summary,
+                        "messages": messages,
+                        "completed": False,
+                        "failed": True,
+                        "error_type": type(api_error).__name__,
+                        "error": str(api_error),
+                        # The fit gate increments the attempt counter before
+                        # invoking transport; no provider call occurred.
+                        "api_calls": max(0, api_call_count - 1),
+                    }
+
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
                 #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste
@@ -5442,6 +5472,7 @@ def run_conversation(
                             messages, system_message,
                             approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                             task_id=effective_task_id,
+                            trigger="payload_413_recovery",
                         )
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
@@ -5720,12 +5751,13 @@ def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
-                    # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
-                    # true request (msgs + tools + system), not the tool-blind message count.
+                    # Option A (LCM issue 441): overhead-aware request size so recovery arms on
+                    # the true request (msgs + tools + system), not the tool-blind message count.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        trigger="payload_413_recovery",
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -5878,6 +5910,7 @@ def run_conversation(
                                 messages, system_message,
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
+                                trigger="payload_413_recovery",
                             )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
@@ -6032,6 +6065,7 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        trigger="context_overflow_recovery",
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -7496,6 +7530,28 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                # Tool results are canonical only after the executor returns:
+                # apply v3 pressure pruning at this completed-round boundary,
+                # before the next provider request. This rewrites only the
+                # provider projection; SessionDB retains the exact rows above.
+                from agent.compression_v3 import prune_tool_pressure_projection
+                if (
+                    getattr(agent, "compression_enabled", False)
+                    and not getattr(agent, "_incremental_persistence_failed", False)
+                ):
+                    _pressure_tokens = estimate_request_tokens_rough(
+                        messages, tools=agent.tools or None
+                    )
+                    _pressure_projection, _pressure_reclaimed = prune_tool_pressure_projection(
+                        agent, messages, current_tokens=_pressure_tokens
+                    )
+                    if _pressure_reclaimed:
+                        messages = _pressure_projection
+                        logging.info(
+                            "Compression v3 tool pressure pruning reclaimed ~%d tokens",
+                            _pressure_reclaimed,
+                        )
+
                 from agent.runtime_control import get_kanban_terminal_transition
 
                 _kanban_terminal_transition = get_kanban_terminal_transition(agent)
@@ -7634,6 +7690,7 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=_real_tokens,
                         task_id=effective_task_id,
+                        trigger="mid_loop_pressure",
                     )
                     if (
                         messages is _post_tool_input
