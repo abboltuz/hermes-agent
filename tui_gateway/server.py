@@ -6011,6 +6011,7 @@ def _compress_session_history(
             # boundary-aware forms).
             focus_topic=focus_topic or None,
             force=True,
+            trigger="tui_manual",
             defer_context_engine_notification=True,
         )
     except Exception:

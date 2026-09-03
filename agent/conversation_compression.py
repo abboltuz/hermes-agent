@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -70,6 +71,10 @@ from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
+)
+from agent.compression_v3 import (
+    CompressionRequest,
+    ensure_compression_coordinator,
 )
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import (
@@ -721,6 +726,19 @@ class CompressionCommitFence:
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
 
+# Automatic hard-pressure compression is a safety path: remote retries must
+# never postpone the deterministic final cut beyond this absolute ceiling.
+HARD_PRESSURE_COMPRESSION_MAX_SECONDS = 120.0
+_HARD_PRESSURE_COMPRESSION_TRIGGERS = frozenset({
+    "preflight_auto", "pre_api_auto", "mid_loop_pressure",
+    "payload_413_recovery", "context_overflow_recovery",
+})
+
+
+def is_hard_pressure_compression_trigger(trigger: Optional[str]) -> bool:
+    """Return whether *trigger* is an automatic provider-bound hard path."""
+    return trigger in _HARD_PRESSURE_COMPRESSION_TRIGGERS
+
 # Shared daemon pool for sync compress_context timeout wraps — analogous to
 # asyncio's default executor used by gateway session hygiene's
 # ``loop.run_in_executor(None, ...)``, but daemon so a fence-cancelled hung
@@ -1271,7 +1289,7 @@ def _adopt_live_compression_child(
     child = row_getter(session_db, child_session_id)
     if not isinstance(child, dict) or child.get("ended_at") is not None:
         return None
-    recovered = loader(session_db, child_session_id)
+    recovered = loader(session_db, child_session_id, include_row_ids=True)
     if not isinstance(recovered, list) or not recovered:
         return None
     # Revalidate after loading: the tip may have rotated or a competing
@@ -2019,12 +2037,50 @@ def _is_real_user_message(message: Any) -> bool:
     """
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
-    from agent.message_provenance import is_human_intent
+    from agent.message_provenance import (
+        OriginKind,
+        TrustKind,
+        TurnKind,
+        SEMANTIC_FIELDS,
+        classify_legacy_message,
+        decode_message_provenance,
+        is_human_intent,
+    )
 
-    if not is_human_intent(message):
+    # Explicit provenance is authoritative and remains fail-closed: only a
+    # prompt/task/UI human (or external actor) can be trusted as human intent.
+    # A legacy row with no semantic provenance is different: retention needs to
+    # preserve it as a compatibility anchor, but it must stay legacy_unknown
+    # and never acquire authorization through this helper.
+    provenance = decode_message_provenance(message)
+    if provenance is not None:
+        if provenance.origin_kind == OriginKind.LEGACY_UNKNOWN:
+            # A fully normalized legacy row remains retention-compatible, but
+            # mixed claims (for example legacy origin + user authorization) are
+            # not accepted as an anchor.
+            if not (
+                provenance.turn_kind == TurnKind.LEGACY_UNKNOWN
+                and provenance.trust_kind == TrustKind.LEGACY_UNKNOWN
+            ):
+                return False
+        else:
+            return is_human_intent(message)
+    else:
+        # Invalid or partial semantic claims are not silently downgraded to a
+        # legacy row. Only a genuinely missing-provenance message gets the
+        # compatibility classification below.
+        if any(field in message for field in SEMANTIC_FIELDS):
+            return False
+        provenance = classify_legacy_message(message)
+        if provenance.origin_kind != OriginKind.LEGACY_UNKNOWN:
+            return is_human_intent(message)
+
+    if any(message.get(flag) is True for flag in _SYNTHETIC_USER_FLAGS):
         return False
     from agent.context_compressor import ContextCompressor
 
+    if ContextCompressor._is_context_summary_content(_message_text(message)):
+        return False
     return not ContextCompressor._is_blank_user_turn(message)
 
 
@@ -2301,6 +2357,30 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def _compression_source_fingerprint(messages: list, system_message: str) -> str:
+    """Hash provider-relevant input while ignoring transient persistence tags."""
+    def stable(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: stable(item)
+                for key, item in sorted(value.items())
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, (list, tuple)):
+            return [stable(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    payload = json.dumps(
+        {"messages": stable(messages), "system_message": stable(system_message)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -2310,6 +2390,95 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    trigger: Optional[str] = None,
+    defer_context_engine_notification: bool = False,
+    commit_fence: Optional[CompressionCommitFence] = None,
+) -> Tuple[list, str]:
+    """Admit one logical-session execution before entering compression."""
+    requested_trigger = trigger
+    trigger = trigger or ("manual" if force else "automatic")
+    # Preserve the legacy direct/manual wrapper contract. Automatic in-agent
+    # ingress is explicit and always passes a trigger below; out-of-band
+    # callers without provenance must retain their existing behavior.
+    if requested_trigger is None:
+        ensure_compression_coordinator(agent, trigger=trigger, urgency=3 if force else 1)
+        return _compress_context_impl(
+            agent, messages, system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            trigger=None,
+            defer_context_engine_notification=defer_context_engine_notification,
+            commit_fence=commit_fence,
+        )
+    logical_id = str(getattr(agent, "_conversation_root_id", lambda: None)() or getattr(agent, "session_id", ""))
+    generation = int(getattr(agent, "_compression_generation", 0) or 0)
+    fingerprint = _compression_source_fingerprint(messages, system_message)
+    request = CompressionRequest(
+        logical_id,
+        generation,
+        trigger,
+        urgency=3 if force else 1,
+        source_fingerprint=fingerprint,
+        row_watermark=len(messages),
+        estimated_pressure=int(approx_tokens or 0),
+        force=force,
+    )
+    coordinator = ensure_compression_coordinator(agent, trigger=trigger, urgency=request.urgency)
+    admission = coordinator.admit_execution(request)
+    if admission.outcome != "admitted":
+        existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
+        return messages, existing_prompt
+    try:
+        result = _compress_context_impl(
+            agent,
+            messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            trigger=requested_trigger,
+            defer_context_engine_notification=defer_context_engine_notification,
+            commit_fence=commit_fence,
+        )
+        if result[0] is messages:
+            compressor = getattr(agent, "context_compressor", None)
+            blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
+            if callable(blocked) and not force and blocked(compressor):
+                outcome = "cooldown"
+            elif getattr(agent, "_compression_skipped_due_to_lock", None):
+                outcome = "deferred_lock"
+            elif getattr(agent, "api_mode", None) == "codex_app_server":
+                outcome = "native_delegated"
+            else:
+                outcome = "no_progress"
+        else:
+            outcome = "committed"
+        coordinator.finish_execution(request, outcome)
+        return result
+    except (KeyboardInterrupt, SystemExit):
+        coordinator.finish_execution(request, "aborted")
+        raise
+    except Exception:
+        coordinator.finish_execution(request, "aborted")
+        raise
+    finally:
+        if coordinator.outcome not in {"aborted", "no_progress", "timed_out", "deferred_lock", "cooldown", "native_delegated", "committed"}:
+            coordinator.finish_execution(request, "aborted")
+
+
+def _compress_context_impl(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    focus_topic: Optional[str] = None,
+    force: bool = False,
+    trigger: Optional[str] = None,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
@@ -2342,6 +2511,7 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -2936,7 +3106,7 @@ def compress_context(
                 type(_lock_db), "get_messages_as_conversation", None
             )
             if callable(durable_loader):
-                durable_parent = durable_loader(_lock_db, _lock_sid)
+                durable_parent = durable_loader(_lock_db, _lock_sid, include_row_ids=True)
                 if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
                     # The in-memory transcript carries the CURRENT turn's
                     # un-persisted user tail (anchored by
@@ -2984,7 +3154,7 @@ def compress_context(
                     else:
                         # Re-read after the flush so the adopted snapshot
                         # carries the just-persisted tail.
-                        durable_parent = durable_loader(_lock_db, _lock_sid)
+                        durable_parent = durable_loader(_lock_db, _lock_sid, include_row_ids=True)
                     if (
                         _preflush_ok
                         and isinstance(durable_parent, list)

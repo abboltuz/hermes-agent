@@ -630,8 +630,9 @@ class TestPreflightCompression:
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True
         # Set a small context so the history is "oversized", but large enough
-        # that the compressed result (2 short messages) fits in a single pass.
-        agent.context_compressor.context_length = 2000
+        # that the compressed result (2 short messages) fits including the
+        # serialized provider-wire framing and output reserve.
+        agent.context_compressor.context_length = 5000
         agent.context_compressor.threshold_tokens = 200
 
         # Build a history that will be large enough to trigger preflight

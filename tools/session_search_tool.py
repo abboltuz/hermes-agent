@@ -60,6 +60,8 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+_RECOVERY_PREVIEW_CHARS = 240
+_RECOVERY_MAX_PAGE_CHARS = 8000
 
 # Raw FTS rows are only a discovery-plan input. The final response hydrates
 # its own anchored message window and bookends after lineage deduplication.
@@ -955,6 +957,10 @@ def _session_search_impl(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    recovery_identity: str = None,
+    recovery_message_id: int = None,
+    content_start: int = 0,
+    content_count: int = 8000,
     *,
     _owned_dbs: Optional[List[Any]] = None,
 ) -> str:
@@ -969,6 +975,66 @@ def _session_search_impl(
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
+    if recovery_identity is not None or recovery_message_id is not None:
+        # Recovery is deliberately bound to the caller's already-open DB.  A
+        # profile selector here would turn an opaque leaked token into a
+        # cross-profile read capability.
+        if profile is not None and str(profile).strip():
+            return tool_error("recovery identity unavailable", success=False)
+        if not isinstance(recovery_identity, str) or not recovery_identity.strip():
+            return tool_error("recovery identity unavailable", success=False)
+        try:
+            recovery = db.get_compression_recovery(
+                recovery_identity.strip(), session_id=session_id
+            )
+        except Exception:
+            recovery = None
+        if recovery is None:
+            return tool_error("recovery identity unavailable", success=False)
+        decoded_rows = []
+        for row in recovery["messages"]:
+            decoded = dict(row)
+            decoded["content"] = db._decode_content(decoded.get("content"))
+            if decoded.get("tool_calls"):
+                try:
+                    decoded["tool_calls"] = json.loads(decoded["tool_calls"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded["tool_calls"] = []
+            decoded_rows.append(decoded)
+        if recovery_message_id is not None:
+            try:
+                requested_id = int(recovery_message_id)
+                start = max(0, int(content_start))
+                count = max(1, min(int(content_count), _RECOVERY_MAX_PAGE_CHARS))
+            except (TypeError, ValueError):
+                return tool_error("recovery identity unavailable", success=False)
+            row = next((item for item in decoded_rows if item.get("id") == requested_id), None)
+            if row is None:
+                return tool_error("recovery identity unavailable", success=False)
+            shaped = _shape_message(row)
+            content = shaped.get("content")
+            if not isinstance(content, str):
+                content = "" if content is None else str(content)
+            total = len(content)
+            end = min(total, start + count)
+            return json.dumps({
+                "success": True, "mode": "recovery_page",
+                "recovery_identity": recovery_identity.strip(),
+                "recovery_message_id": requested_id, "start": start,
+                "end": end, "total_chars": total, "has_more": end < total,
+                "content": content[start:end],
+            }, ensure_ascii=False)
+        manifest = []
+        for row in decoded_rows:
+            shaped = _shape_message(row, max_content_len=_RECOVERY_PREVIEW_CHARS)
+            shaped["recovery_message_id"] = row.get("id")
+            shaped["content_chars"] = len(row.get("content") or "")
+            manifest.append(shaped)
+        return json.dumps({"success": True, "mode": "recovery", "recovery_identity": recovery_identity.strip(),
+                           "session_id": recovery["session_id"], "generation": recovery["generation"],
+                           "watermark": recovery["watermark"], "message_count": len(manifest),
+                           "messages": manifest}, ensure_ascii=False)
+
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
     # always strip the prefix off the id, and adopt the embedded profile only
@@ -1004,6 +1070,11 @@ def _session_search_impl(
             window=window,
             current_session_id=current_session_id,
         )
+
+    # A query combined with an unanchored session read is ambiguous. Reject it
+    # explicitly rather than silently discarding the query.
+    if isinstance(session_id, str) and session_id.strip() and query and str(query).strip() and around_message_id is None:
+        return tool_error("query cannot be combined with unanchored session_id; use an anchor or recovery_identity", success=False)
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
@@ -1084,6 +1155,10 @@ def session_search(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    recovery_identity: str = None,
+    recovery_message_id: int = None,
+    content_start: int = 0,
+    content_count: int = 8000,
 ) -> str:
     """Run session search and close databases opened by this invocation."""
     owned_dbs: List[Any] = []
@@ -1112,6 +1187,10 @@ def session_search(
             sort=sort,
             profile=profile,
             detail=detail,
+            recovery_identity=recovery_identity,
+            recovery_message_id=recovery_message_id,
+            content_start=content_start,
+            content_count=content_count,
             _owned_dbs=owned_dbs,
         )
     finally:
@@ -1296,6 +1375,24 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "recovery_identity": {
+                "type": "string",
+                "description": "Opaque Compression v3 identity for exact durable demoted rows; unknown, stale, malformed, foreign, or deleted identities fail closed.",
+            },
+            "recovery_message_id": {
+                "type": "integer",
+                "description": "Recovery continuation shape: one message id from the recovery manifest to page.",
+            },
+            "content_start": {
+                "type": "integer",
+                "description": "Recovery page character offset (zero-based).",
+                "default": 0,
+            },
+            "content_count": {
+                "type": "integer",
+                "description": "Recovery page size in characters; clamped to a safe maximum of 8000.",
+                "default": 8000,
+            },
         },
         "required": [],
     },
@@ -1318,6 +1415,10 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         detail=args.get("detail", "adaptive"),
+        recovery_identity=args.get("recovery_identity"),
+        recovery_message_id=args.get("recovery_message_id"),
+        content_start=args.get("content_start", 0),
+        content_count=args.get("content_count", 8000),
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
