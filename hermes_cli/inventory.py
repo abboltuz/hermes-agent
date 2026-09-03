@@ -628,7 +628,7 @@ def _antigravity_has_config_entry(ctx: ConfigContext) -> bool:
 _MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH = 96
 _ANTIGRAVITY_PICKER_MODEL_ID = re.compile(
     r"^(?:antigravity-)?(?:"
-    r"gemini-[1-9](?:\.\d)?-(?:pro|flash|ultra|nano|lite)(?:-(?:preview|thinking|experimental|exp|latest))?"
+    r"gemini-[1-9](?:\.\d)?-(?:pro|flash|ultra|nano|lite)(?:-(?:preview(?:-customtools)?|thinking|experimental|exp|latest))?"
     r"|claude-(?:(?:opus|sonnet|haiku)-[1-9](?:-[1-9])?(?:-(?:latest|thinking|beta|preview))?"
     r"|[1-9](?:-[1-9])?-(?:opus|sonnet|haiku)(?:-\d{8})?(?:-(?:latest|thinking|beta|preview))?)"
     r")$"
