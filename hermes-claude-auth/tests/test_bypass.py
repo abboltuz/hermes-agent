@@ -862,9 +862,29 @@ def test_bypass_strips_cache_control_from_every_system_block(basic_api_kwargs):
         "type": "ephemeral",
         "ttl": "5m",
     }
+    retained_sentinel = {
+        "type": "custom_system_block",
+        "payload": {"name": "retained-sentinel", "enabled": True},
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
+    basic_api_kwargs["system"].append(retained_sentinel)
 
     apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
 
+    retained_blocks = [
+        block
+        for block in basic_api_kwargs["system"]
+        if isinstance(block, dict)
+        and block.get("type") == "custom_system_block"
+        and block.get("payload", {}).get("name") == "retained-sentinel"
+    ]
+    assert retained_blocks == [
+        {
+            "type": "custom_system_block",
+            "payload": {"name": "retained-sentinel", "enabled": True},
+        }
+    ]
+    assert "cache_control" not in retained_blocks[0]
     assert all(
         "cache_control" not in block
         for block in basic_api_kwargs["system"]
