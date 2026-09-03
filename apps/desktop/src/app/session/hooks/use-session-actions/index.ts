@@ -1765,6 +1765,7 @@ export function useSessionActions({
       activeSessionIdRef,
       busyRef,
       copy,
+      holdSessionTranscriptView,
       requestGateway,
       resetViewSync,
       runtimeIdByStoredSessionIdRef,
