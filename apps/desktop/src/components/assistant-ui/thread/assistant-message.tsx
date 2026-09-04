@@ -72,11 +72,13 @@ interface MessageActionProps {
    *  was a large slice of per-token script time on long transcripts. */
   getMessageText: () => string
   onBranchInNewChat?: (messageId: string) => void
+  readOnly?: boolean
 }
 
 interface AssistantMessageProps {
   onBranchInNewChat?: (messageId: string) => void
   onDismissError?: (messageId: string) => void
+  readOnly?: boolean
 }
 
 export const AssistantMessage: FC<AssistantMessageProps> = props => {
@@ -173,7 +175,8 @@ const InterAgentAssistantMessage: FC<AssistantMessageProps & { sender: string }>
 const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null | ReactNode }> = ({
   collapsedNotice = null,
   onBranchInNewChat,
-  onDismissError
+  onDismissError,
+  readOnly
 }) => {
   const messageId = useAuiState(s => s.message.id)
   const messageRuntime = useMessageRuntime()
@@ -268,6 +271,7 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
               getMessageText={getMessageText}
               messageId={messageId}
               onBranchInNewChat={onBranchInNewChat}
+              readOnly={readOnly}
             />
           )}
           {/* Last thing in the turn — under the action bar, the way Cursor ends a
@@ -582,7 +586,8 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
   durationS,
   messageId,
   getMessageText,
-  onBranchInNewChat
+  onBranchInNewChat,
+  readOnly = false
 }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
@@ -635,11 +640,13 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
         )}
         <CopyButton appearance="icon" buttonSize="icon" label={copy.copy} text={getMessageText} />
         <ReadAloudButton getText={getMessageText} messageId={messageId} />
-        <ActionBarPrimitive.Reload asChild>
-          <TooltipIconButton onClick={() => triggerHaptic('submit')} tooltip={copy.refresh}>
-            <RefreshCwIcon className="size-3.5" />
-          </TooltipIconButton>
-        </ActionBarPrimitive.Reload>
+        {!readOnly && (
+          <ActionBarPrimitive.Reload asChild>
+            <TooltipIconButton onClick={() => triggerHaptic('submit')} tooltip={copy.refresh}>
+              <RefreshCwIcon className="size-3.5" />
+            </TooltipIconButton>
+          </ActionBarPrimitive.Reload>
+        )}
       </ActionBarPrimitive.Root>
       {/* ONE slot, Slack-style: the picker trigger and the landed reaction are
           the same element, so reacting never shifts layout. Empty → ☺, hidden
@@ -649,7 +656,7 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
           clicking it reopens the picker to switch or retract. Outside
           ActionBarPrimitive.Root so a landed reaction doesn't ride the bar's
           hover opacity. */}
-      {(reactionsEnabled || shownReactions.length > 0) && (
+      {!readOnly && (reactionsEnabled || shownReactions.length > 0) && (
         <ReactionPicker
           onOpenChange={setPickerOpen}
           onSelect={pickEmoji}

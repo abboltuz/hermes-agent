@@ -16,8 +16,8 @@
 
 import { useStore } from '@nanostores/react'
 import { useQueryClient } from '@tanstack/react-query'
-import { atom, computed } from 'nanostores'
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+import { atom, computed, type ReadableAtom } from 'nanostores'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useModelControls } from '@/app/session/hooks/use-model-controls'
@@ -30,6 +30,8 @@ import { findGroupOfPane } from '@/components/pane-shell/tree/model'
 import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupTabStrip } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ErrorBanner, ErrorState } from '@/components/ui/error-state'
+import { Loader } from '@/components/ui/loader'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -58,6 +60,7 @@ import {
   sessionTileDelegate,
   sessionTileOwnerRoute
 } from '@/store/session-states'
+import type { TranscriptProfileScope } from '@/store/transcript-tail'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { SessionDragPayload } from './composer/inline-refs'
@@ -71,8 +74,9 @@ import { useSessionTileActions } from './session-tile-actions'
 import { type SessionView, SessionViewProvider } from './session-view'
 import { SessionContextMenu } from './sidebar/session-actions-menu'
 import { lastVisibleMessageIsUser } from './thread-loading'
+import { mergeOlderTranscriptPage } from './transcript-backfill'
 
-import { ChatView } from '.'
+import { ChatView, StoredSessionTranscript } from '.'
 
 const NO_MESSAGES: ChatMessage[] = []
 
@@ -98,7 +102,7 @@ export function sessionTileResumeFailure(
 
 /** The tile's SessionView: the same atom shape the primary chat renders
  *  from, computed from this session's slice of `$sessionStates`. */
-function buildTileView(storedSessionId: string): SessionView {
+function buildTileView(storedSessionId: string, $preview: ReadableAtom<ChatMessage[] | null>): SessionView {
   const $runtimeId = computed(
     $sessionTiles,
     tiles => tiles.find(t => t.storedSessionId === storedSessionId)?.runtimeId ?? null
@@ -108,7 +112,7 @@ function buildTileView(storedSessionId: string): SessionView {
     runtimeId ? states[runtimeId] : undefined
   )
 
-  const $messages = computed($state, state => state?.messages ?? NO_MESSAGES)
+  const $messages = computed([$state, $preview], (state, preview) => state?.messages ?? preview ?? NO_MESSAGES)
 
   return {
     kind: 'tile',
@@ -275,6 +279,7 @@ function TileChat({
 }
 
 export function SessionTilePane({ storedSessionId }: { storedSessionId: string }) {
+  const { t } = useI18n()
   const tiles = useStore($sessionTiles)
   const tile = tiles.find(t => t.storedSessionId === storedSessionId)
   const ownerRoute = tile?.ownerRoute
@@ -282,7 +287,41 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const gatewayOpen = useStore($gatewayState) === 'open'
   const delegateRevision = useStore($sessionTileDelegateRevision)
   const resumingRef = useRef(false)
-  const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
+  const [resumeGeneration, setResumeGeneration] = useState(0)
+  // Transient presentation state, never persisted with the tile or fabricated
+  // as a runtime id. A route change discards the old owner's preview.
+  const previewKey = JSON.stringify([storedSessionId, ownerRoute ?? null])
+
+  const previewState = useMemo(
+    () => ({
+      key: previewKey,
+      messages: atom<ChatMessage[] | null>(null),
+      profile: atom<TranscriptProfileScope | undefined>(undefined)
+    }),
+    [previewKey]
+  )
+
+  const preview = previewState.messages
+  const previewScope = previewState.profile
+  const historyProfile = useStore(previewScope)
+  const hasPreview = useStore(preview) !== null
+  const view = useMemo(() => buildTileView(storedSessionId, preview), [storedSessionId, preview])
+
+  const prependPreview = useCallback(
+    (older: ChatMessage[]) => {
+      const current = preview.get()
+
+      if (current) {
+        preview.set(mergeOlderTranscriptPage(current, older))
+      }
+    },
+    [preview]
+  )
+
+  const retryResume = useCallback(() => {
+    patchSessionTile(storedSessionId, { error: undefined })
+    setResumeGeneration(generation => generation + 1)
+  }, [storedSessionId])
 
   const storedSessionStillExists = useCallback(
     () => $sessions.get().some(s => sessionMatchesStoredId(s, storedSessionId)),
@@ -342,7 +381,9 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   // latched every restored tile into the error card.
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (!gatewayOpen || runtimeId || tile?.error || resumingRef.current) {
+    const currentError = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)?.error
+
+    if (!gatewayOpen || runtimeId || currentError || resumingRef.current) {
       return
     }
 
@@ -353,11 +394,29 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     }
 
     resumingRef.current = true
+    let cancelled = false
 
     delegate
-      .resumeTile(storedSessionId)
-      .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
+      .resumeTile(storedSessionId, {
+        publish: (messages, profile) => {
+          if (!cancelled) {
+            previewScope.set(profile)
+            preview.set(messages)
+          }
+        },
+        current: () => (cancelled ? null : preview.get()),
+        isCurrent: () => !cancelled
+      })
+      .then(id => {
+        if (!cancelled) {
+          patchSessionTile(storedSessionId, { error: undefined, runtimeId: id })
+        }
+      })
       .catch(async (err: unknown) => {
+        if (cancelled) {
+          return
+        }
+
         const message = err instanceof Error ? err.message : String(err)
 
         if (!/session not found|\b404\b/i.test(message)) {
@@ -372,6 +431,11 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
         // retried by the user, but must never be deleted on an inconclusive
         // reconnect-time lookup.
         const durableSession = await resolveStoredSession(storedSessionId, ownerRoute).catch(() => undefined)
+
+        if (cancelled) {
+          return
+        }
+
         const current = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
         const error = sessionTileResumeFailure(message, Boolean(durableSession), Boolean(current && !current.runtimeId))
 
@@ -380,9 +444,16 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
         }
       })
       .finally(() => {
-        resumingRef.current = false
+        if (!cancelled) {
+          resumingRef.current = false
+        }
       })
-  }, [delegateRevision, gatewayOpen, ownerRoute, runtimeId, storedSessionId, tile?.error])
+
+    return () => {
+      cancelled = true
+      resumingRef.current = false
+    }
+  }, [delegateRevision, gatewayOpen, ownerRoute, preview, previewScope, resumeGeneration, runtimeId, storedSessionId])
 
   // The gateway (re)opening invalidates any latched error — it likely came
   // from a not-yet-open gateway or the previous connection. Clearing it
@@ -390,21 +461,45 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   // mirroring the primary path's became-open resync.
   useEffect(() => {
     if (gatewayOpen && tile?.error) {
-      patchSessionTile(storedSessionId, { error: undefined })
+      retryResume()
     }
+    // Error changes alone must not auto-retry; this effect is deliberately an
+    // edge handler for the gateway becoming open.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gatewayOpen, storedSessionId])
+
+  if (!runtimeId && hasPreview) {
+    return (
+      <SessionViewProvider value={view}>
+        <div className="flex h-full min-h-0 flex-col">
+          <StoredSessionTranscript historyProfile={historyProfile} onOlderPage={prependPreview} />
+          <div className="space-y-2 p-4" role="status">
+            {tile?.error ? (
+              <>
+                <ErrorBanner>
+                  {t.desktop.historyReadOnly} {tile.error}
+                </ErrorBanner>
+                <Button onClick={retryResume} size="sm" variant="outline">
+                  {t.desktop.resumeRetry}
+                </Button>
+              </>
+            ) : (
+              <Loader label={t.desktop.historyConnecting} />
+            )}
+          </div>
+        </div>
+      </SessionViewProvider>
+    )
+  }
 
   if (tile?.error) {
     return (
       <div className="grid h-full place-items-center p-4">
-        <div className="max-w-[24rem] space-y-2 text-center font-mono text-[11px]">
-          <div className="text-(--ui-danger,#f87171)">Couldn't open this session</div>
-          <div className="break-words text-(--ui-text-quaternary)">{tile.error}</div>
-          <Button onClick={() => patchSessionTile(storedSessionId, { error: undefined })} size="sm" variant="outline">
-            Retry
+        <ErrorState description={tile.error} title={t.desktop.resumeStrandedTitle}>
+          <Button onClick={retryResume} size="sm" variant="outline">
+            {t.desktop.resumeRetry}
           </Button>
-        </div>
+        </ErrorState>
       </div>
     )
   }

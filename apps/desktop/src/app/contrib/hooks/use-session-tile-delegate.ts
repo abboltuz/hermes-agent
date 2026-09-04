@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 
+import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { getLatestSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
 import { $sessions, knownSessionOwner } from '@/store/session'
@@ -162,7 +163,7 @@ export function useSessionTileDelegate({
           }
         )
       },
-      resumeTile: async storedSessionId => {
+      resumeTile: async (storedSessionId, transcript) => {
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
 
@@ -190,9 +191,25 @@ export function useSessionTileDelegate({
             ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
             : owner
 
-        const [prefetch, resumed] = await Promise.all([
-          getLatestSessionMessages(storedSessionId, restScope).catch(() => null),
-          singleFlightSessionResume(storedSessionId, () =>
+        let prefetched: Awaited<ReturnType<typeof getLatestSessionMessages>> | null | undefined
+
+        const prefetchPromise = getLatestSessionMessages(storedSessionId, restScope)
+          .then(page => {
+            prefetched = page
+            transcript?.publish(toChatMessages(page.messages), restScope)
+
+            return page
+          })
+          .catch(() => {
+            prefetched = null
+
+            return null
+          })
+
+        let resumed: SessionResumeResponse
+
+        try {
+          resumed = await singleFlightSessionResume(storedSessionId, () =>
             requestForSessionProfile<SessionResumeResponse>(owner, requestGateway, 'session.resume', {
               session_id: storedSessionId,
               cols: 96,
@@ -204,7 +221,18 @@ export function useSessionTileDelegate({
               ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
             })
           )
-        ])
+        } catch (error) {
+          // The history request remains independent: it may still paint a
+          // readable transcript after the runtime error has been surfaced.
+          void prefetchPromise
+          throw error
+        }
+
+        // Runtime readiness must not wait for archive I/O either. When the
+        // REST tail has already arrived, use it; otherwise bind immediately
+        // from the resume payload and let the independent preview request
+        // finish (or fail) on its own.
+        void prefetchPromise
 
         const runtimeId = resumed?.session_id
 
@@ -212,7 +240,12 @@ export function useSessionTileDelegate({
           throw new Error('resume returned no session id')
         }
 
+        if (transcript && !transcript.isCurrent()) {
+          return runtimeId
+        }
+
         const info = resumed?.info
+        const initialMessages = transcript?.current() ?? toChatMessages(prefetched?.messages ?? resumed?.messages ?? [])
 
         updateSessionState(
           runtimeId,
@@ -226,7 +259,9 @@ export function useSessionTileDelegate({
             ...(typeof info?.reasoning_effort === 'string' ? { reasoningEffort: info.reasoning_effort } : {}),
             ...(typeof info?.fast === 'boolean' ? { fast: info.fast } : {}),
             messages:
-              state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
+              state.messages.length > 0
+                ? graftRefreshedTailOntoBackfill(state.messages, initialMessages)
+                : initialMessages
           }),
           storedSessionId
         )

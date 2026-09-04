@@ -122,6 +122,13 @@ describe('mergeOlderTranscriptPage', () => {
     expect(mergeOlderTranscriptPage(existing, older).map(m => m.rowId)).toEqual([1, 2, 3])
   })
 
+  it('does not collapse distinct durable rows that reuse a transient rendered id', () => {
+    const existing = [chat('collided-id', 2)]
+    const older = [chat('collided-id', 1)]
+
+    expect(mergeOlderTranscriptPage(existing, older).map(m => m.rowId)).toEqual([1, 2])
+  })
+
   it('keeps reference identity when every older row is already present', () => {
     const existing = [chat('a', 1), chat('b', 2)]
     const older = [chat('a', 1)]
@@ -147,6 +154,13 @@ describe('graftRefreshedTailOntoBackfill', () => {
   it('returns the refreshed tail unchanged when no anchor is found', () => {
     const previous = [chat('x', 90), chat('y', 91), chat('z', 92)]
     const refreshed = [chat('p', 200), chat('q', 201)]
+
+    expect(graftRefreshedTailOntoBackfill(refreshed, previous)).toBe(refreshed)
+  })
+
+  it('does not anchor distinct durable rows that reuse a transient rendered id', () => {
+    const previous = [chat('collided-id', 1), chat('tail', 2)]
+    const refreshed = [chat('collided-id', 3)]
 
     expect(graftRefreshedTailOntoBackfill(refreshed, previous)).toBe(refreshed)
   })

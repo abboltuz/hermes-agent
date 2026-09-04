@@ -338,7 +338,15 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     const rowId = message.row_id ?? (typeof message.id === 'number' ? message.id : undefined)
 
     result.push({
-      id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
+      // The REST transcript and gateway resume expose the same durable row
+      // under different field names. Use that row as the rendered identity so
+      // independently hydrated pages can be grafted without relying on wall
+      // clock timing (two timestamp-less rows may otherwise receive the same
+      // Date.now/index/role id when converted in separate calls).
+      id:
+        rowId !== undefined
+          ? `stored-row-${rowId}-${displayRole}`
+          : `${message.timestamp || Date.now()}-${index}-${displayRole}`,
       role: displayRole,
       parts,
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),

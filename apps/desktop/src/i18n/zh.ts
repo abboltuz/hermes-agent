@@ -1309,7 +1309,25 @@ export const zh: Translations = {
       },
       loading: '正在加载提供方...',
       antigravity: {
-        title: 'Antigravity 账号', description: '管理 Antigravity 账号，不会显示账号凭据。', projectId: '项目 ID', connect: '连接账号', connectFailed: '无法开始 Antigravity 登录', loadFailed: '无法加载 Antigravity 账号。', mutationFailed: '无法更新 Antigravity 账号。', emptyTitle: '没有 Antigravity 账号', empty: '连接账号即可开始。', enabled: '已启用', disabled: '已停用', priority: '优先级', priorityFor: account => `Antigravity 账号 ${account} 的优先级`, priorityInvalid: '优先级必须介于 1 和 999999 之间。', savePriority: '保存优先级', enableAccount: account => `启用 Antigravity 账号 ${account}`, accountLabel: account => `Antigravity 账号 ${account}`, removeAccount: account => `移除 Antigravity 账号 ${account}`, removeConfirm: '移除此 Antigravity 账号？'
+        title: 'Antigravity 账号',
+        description: '管理 Antigravity 账号，不会显示账号凭据。',
+        projectId: '项目 ID',
+        connect: '连接账号',
+        connectFailed: '无法开始 Antigravity 登录',
+        loadFailed: '无法加载 Antigravity 账号。',
+        mutationFailed: '无法更新 Antigravity 账号。',
+        emptyTitle: '没有 Antigravity 账号',
+        empty: '连接账号即可开始。',
+        enabled: '已启用',
+        disabled: '已停用',
+        priority: '优先级',
+        priorityFor: account => `Antigravity 账号 ${account} 的优先级`,
+        priorityInvalid: '优先级必须介于 1 和 999999 之间。',
+        savePriority: '保存优先级',
+        enableAccount: account => `启用 Antigravity 账号 ${account}`,
+        accountLabel: account => `Antigravity 账号 ${account}`,
+        removeAccount: account => `移除 Antigravity 账号 ${account}`,
+        removeConfirm: '移除此 Antigravity 账号？'
       }
     },
     sessions: {
@@ -3529,6 +3547,8 @@ export const zh: Translations = {
     resumeStrandedTitle: '无法加载此会话',
     resumeStrandedBody: '与此会话的连接失败，自动重试已停止。请确认网关正在运行，然后重试。',
     resumeRetry: '重试',
+    historyConnecting: '历史记录已可查看。正在连接智能体…',
+    historyReadOnly: '历史记录可供只读查看。请重新连接以继续此对话。',
     nothingToBranch: '没有可分支的内容',
     branchNeedsChat: '分支前请先开始或恢复一个对话。',
     sessionBusy: '会话忙碌中',

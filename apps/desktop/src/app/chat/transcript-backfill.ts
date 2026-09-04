@@ -41,26 +41,21 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
     return existing
   }
 
-  const existingRowIds = new Set<number>()
-  const existingIds = new Set<string>()
-
-  for (const message of existing) {
-    if (message.rowId !== undefined) {
-      existingRowIds.add(message.rowId)
-    }
-
-    existingIds.add(message.id)
-  }
-
-  const fresh = olderPage.filter(
-    message => !(message.rowId !== undefined && existingRowIds.has(message.rowId)) && !existingIds.has(message.id)
-  )
+  const fresh = olderPage.filter(message => !existing.some(current => sameTranscriptIdentity(current, message)))
 
   if (fresh.length === 0) {
     return existing
   }
 
   return [...fresh, ...existing]
+}
+
+function sameTranscriptIdentity(left: ChatMessage, right: ChatMessage): boolean {
+  if (left.rowId !== undefined && right.rowId !== undefined) {
+    return left.rowId === right.rowId
+  }
+
+  return left.id === right.id
 }
 
 /**
@@ -79,11 +74,7 @@ export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], pre
 
   const first = refreshedTail[0]
 
-  const anchor = previous.findIndex(
-    message =>
-      (first.rowId !== undefined && message.rowId !== undefined && message.rowId === first.rowId) ||
-      message.id === first.id
-  )
+  const anchor = previous.findIndex(message => sameTranscriptIdentity(message, first))
 
   if (anchor <= 0) {
     return refreshedTail

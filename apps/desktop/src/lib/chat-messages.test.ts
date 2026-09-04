@@ -80,6 +80,21 @@ describe('withUniqueToolCallIdsWithinMessage', () => {
 })
 
 describe('toChatMessages', () => {
+  it('uses durable row identity across independent transcript hydrations', () => {
+    const first = toChatMessages([{ id: 41, role: 'user', content: 'same stored row' }])
+    const second = toChatMessages([{ row_id: 41, role: 'user', content: 'same stored row' }])
+
+    expect(first[0].id).toBe('stored-row-41-user')
+    expect(second[0].id).toBe(first[0].id)
+  })
+
+  it('keeps different timestamp-less durable rows distinct across hydrations', () => {
+    const first = toChatMessages([{ id: 41, role: 'user', content: 'older' }])
+    const second = toChatMessages([{ id: 42, role: 'user', content: 'newer' }])
+
+    expect(first[0].id).not.toBe(second[0].id)
+  })
+
   it('projects typed automation and legacy-unknown user-role rows neutrally', () => {
     const messages = hydrateChatMessages([
       {

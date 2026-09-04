@@ -146,11 +146,39 @@ and an owner that disabled the guard, plus foreign-context restoration.
 
 Tests hold the guard behind a real synchronization barrier and prove that the
 acknowledgement returns first, including when the eventual result is oversized.
-They do not establish complete independent browsing: failed history preparation
-still discards the runtime handle, and the UI still needs a distinct recoverable
-preparation state. Profile store construction, legacy title/adoption fallback,
-lineage resolution and workspace metadata also remain on the acknowledgement
-path; bounded resource isolation and large-archive latency are not yet proven.
+Profile store construction, legacy title/adoption fallback, lineage resolution
+and workspace metadata also remain on the acknowledgement path; bounded resource
+isolation and large-archive latency are not yet proven.
+
+## Independent tile browsing increment
+
+A Desktop session tile now treats persisted history and the agent runtime as two
+independent products. It starts the owner-scoped REST tail read and deferred
+`session.resume` together, but neither result hides or cancels the other. A
+runtime failure is surfaced immediately rather than waiting for a slow history
+read; a later history result can still replace the empty error screen with the
+normal transcript in read-only mode. If history arrives first, it remains visible
+while the runtime connects, after a failure, and during an explicit retry.
+
+The preview is transient presentation state keyed by stored session and owner
+route. It is never persisted as a second conversation and never fabricated as a
+runtime id. Older-page reads reuse the existing bounded transcript window and
+the exact profile scope captured by the tail read. Stale reads are discarded on
+unmount/session replacement. If a runtime eventually binds, pages backfilled
+while it was connecting are grafted onto the newer live tail instead of being
+silently replaced by the latest REST page. Persisted messages use their durable
+database row as renderer identity, so independently loaded pages cannot collide
+through a timestamp-derived UI key. The shared message renderer is used without
+a composer or mutation controls; copy/read navigation remains available.
+
+This increment establishes browse availability for the tile path, not complete
+backend preparation recovery. The gateway still reports worker hydration failure
+as a generic session error and discards the runtime handle. A distinct persisted
+`preparing`/`preparation_failed` protocol state, a retained browse handle and a
+bounded retry command are still required. The primary route already paints REST
+history independently, but it must converge on that same explicit state machine.
+No multi-gigabyte archive latency, cold-storage isolation or migration behavior
+is established by the Desktop tests in this increment.
 
 ## Required verification beyond the current increment
 

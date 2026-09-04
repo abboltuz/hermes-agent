@@ -997,7 +997,25 @@ export const zhHant = defineLocale({
       },
       loading: '正在載入提供方...',
       antigravity: {
-        title: 'Antigravity 帳號', description: '管理 Antigravity 帳號，不會顯示帳號憑證。', projectId: '專案 ID', connect: '連結帳號', connectFailed: '無法開始 Antigravity 登入', loadFailed: '無法載入 Antigravity 帳號。', mutationFailed: '無法更新 Antigravity 帳號。', emptyTitle: '沒有 Antigravity 帳號', empty: '連結帳號即可開始。', enabled: '已啟用', disabled: '已停用', priority: '優先順序', priorityFor: account => `Antigravity 帳號 ${account} 的優先順序`, priorityInvalid: '優先順序必須介於 1 和 999999 之間。', savePriority: '儲存優先順序', enableAccount: account => `啟用 Antigravity 帳號 ${account}`, accountLabel: account => `Antigravity 帳號 ${account}`, removeAccount: account => `移除 Antigravity 帳號 ${account}`, removeConfirm: '移除此 Antigravity 帳號？'
+        title: 'Antigravity 帳號',
+        description: '管理 Antigravity 帳號，不會顯示帳號憑證。',
+        projectId: '專案 ID',
+        connect: '連結帳號',
+        connectFailed: '無法開始 Antigravity 登入',
+        loadFailed: '無法載入 Antigravity 帳號。',
+        mutationFailed: '無法更新 Antigravity 帳號。',
+        emptyTitle: '沒有 Antigravity 帳號',
+        empty: '連結帳號即可開始。',
+        enabled: '已啟用',
+        disabled: '已停用',
+        priority: '優先順序',
+        priorityFor: account => `Antigravity 帳號 ${account} 的優先順序`,
+        priorityInvalid: '優先順序必須介於 1 和 999999 之間。',
+        savePriority: '儲存優先順序',
+        enableAccount: account => `啟用 Antigravity 帳號 ${account}`,
+        accountLabel: account => `Antigravity 帳號 ${account}`,
+        removeAccount: account => `移除 Antigravity 帳號 ${account}`,
+        removeConfirm: '移除此 Antigravity 帳號？'
       }
     },
     sessions: {
@@ -2907,6 +2925,8 @@ export const zhHant = defineLocale({
     resumeStrandedTitle: '無法載入此工作階段',
     resumeStrandedBody: '與此工作階段的連線失敗，自動重試已停止。請確認閘道正在執行，然後重試。',
     resumeRetry: '重試',
+    historyConnecting: '歷史記錄已可檢視。正在連線至代理程式…',
+    historyReadOnly: '歷史記錄可供唯讀檢視。請重新連線以繼續此對話。',
     nothingToBranch: '沒有可分支的內容',
     branchNeedsChat: '分支前請先開始或繼續一個聊天。',
     sessionBusy: '工作階段忙碌中',

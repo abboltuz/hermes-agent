@@ -48,7 +48,7 @@ import {
   shouldMigrateComposerScope
 } from '@/store/session'
 import { $focusedStoredSessionId, sessionTileDelegate } from '@/store/session-states'
-import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
+import { $transcriptTailBySessionId, type TranscriptProfileScope, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
@@ -192,6 +192,7 @@ interface ChatRuntimeBoundaryProps {
 }
 
 const NO_MESSAGES: ChatMessage[] = []
+const ignoreNewMessage = async () => undefined
 
 /**
  * The view's $messages, live only while this surface is the VISIBLE tab.
@@ -277,9 +278,13 @@ function ChatRuntimeBoundary({
     ? getSessionOwnerHint(storedId, connectionId ? { connectionId, profile: activeProfile } : undefined)
     : undefined
 
-  const tailProfile = ownerRoute
-    ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
-    : undefined
+  const tailProfile = useMemo(
+    () =>
+      ownerRoute
+        ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
+        : undefined,
+    [ownerRoute]
+  )
 
   const tailState = storedId && transcriptTailStates ? transcriptTailState(storedId, tailProfile) : undefined
   const restBackfillAvailable = Boolean(tailState?.possiblyTruncated)
@@ -325,10 +330,7 @@ function ChatRuntimeBoundary({
     messageRepository: runtimeMessageRepository,
     isRunning: busy,
     setMessages: onThreadMessagesChange,
-    onNew: async () => {
-      // Submission is handled explicitly by ChatBar.
-      // Keeping this no-op avoids duplicate prompt.submit calls.
-    },
+    onNew: ignoreNewMessage,
     onEdit,
     onCancel: async () => onCancel(),
     onReload
@@ -341,15 +343,79 @@ function ChatRuntimeBoundary({
   )
 }
 
+function StoredTranscriptRuntime({
+  children,
+  historyProfile,
+  onOlderPage
+}: {
+  children: React.ReactNode
+  historyProfile?: TranscriptProfileScope
+  onOlderPage: (messages: ChatMessage[]) => void
+}) {
+  const view = useSessionView()
+  const messages = useMessagesWhileVisible(view.$messages)
+  const repository = useRuntimeMessageRepository(messages)
+
+  const runtimeStore = useMemo(
+    () => ({ messageRepository: repository, isRunning: false, onNew: ignoreNewMessage }),
+    [repository]
+  )
+
+  const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeStore)
+  const storedId = useStore(view.$storedId)
+  const tailStates = useStore($transcriptTailBySessionId)
+  const olderAvailable = Boolean(storedId && tailStates && transcriptBackfillAvailable(storedId, historyProfile))
+
+  const expandWindow = useCallback(() => {
+    if (!storedId) {
+      return
+    }
+
+    void backfillOlderTranscriptPage({
+      storedSessionId: storedId,
+      profile: historyProfile,
+      isCurrent: () => view.$storedId.get() === storedId && view.$runtimeId.get() === null,
+      applyOlderPage: onOlderPage
+    })
+  }, [historyProfile, onOlderPage, storedId, view])
+
+  const transcriptWindow = useMemo(() => ({ olderAvailable, expandWindow }), [expandWindow, olderAvailable])
+
+  return (
+    <TranscriptWindowProvider value={transcriptWindow}>
+      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+    </TranscriptWindowProvider>
+  )
+}
+
+/** The existing transcript renderer without agent capabilities or a composer.
+ *  Durable history remains navigable while no runtime has been bound. */
+export function StoredSessionTranscript({
+  onOlderPage,
+  historyProfile
+}: {
+  onOlderPage: (messages: ChatMessage[]) => void
+  historyProfile?: TranscriptProfileScope
+}) {
+  const view = useSessionView()
+  const storedId = useStore(view.$storedId)
+
+  return (
+    <StoredTranscriptRuntime historyProfile={historyProfile} onOlderPage={onOlderPage}>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <Thread readOnly sessionKey={storedId} />
+      </div>
+    </StoredTranscriptRuntime>
+  )
+}
+
 // Memoized: the tile caller (session-tile.tsx) and the contrib surface re-render
 // on idle ticks unrelated to the chat; with stable callback props (hoisted to
 // useCallback at the call sites) memo() lets the whole chat shell skip those.
 const CURSOR_MODEL_CATALOG_REFRESH_MS = 5 * 60 * 1000
 
 function modelOptionsIncludeConfiguredCursor(data: ModelOptionsResponse | undefined): boolean {
-  return Boolean(
-    data?.providers?.some(provider => provider.slug === 'cursor' && provider.authenticated !== false)
-  )
+  return Boolean(data?.providers?.some(provider => provider.slug === 'cursor' && provider.authenticated !== false))
 }
 
 export const ChatView = memo(function ChatView(props: ChatViewProps) {
