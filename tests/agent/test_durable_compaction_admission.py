@@ -205,6 +205,8 @@ def test_preexisting_cooldown_deferral_remains_retryable(tmp_path, monkeypatch):
     def no_progress(instance, messages, system, **_kwargs):
         if not instance.context_compressor._automatic_compression_blocked():
             calls.append(1)
+        else:
+            _kwargs["_execution_outcome"]["outcome"] = "cooldown"
         return messages, system
 
     monkeypatch.setattr(compression, "_compress_context_impl", no_progress)
@@ -254,3 +256,54 @@ def test_endpoint_credentials_are_excluded_from_strategy_identity(tmp_path):
         fingerprint = compression._compression_strategy_fingerprint
         assert fingerprint(first, None) == fingerprint(second, None)
         assert fingerprint(first, None) != fingerprint(third, None)
+
+
+def test_sibling_cooldown_discovered_by_real_impl_is_retryable(tmp_path, monkeypatch):
+    import time
+
+    path = tmp_path / "state.db"
+    messages = [{"role": "user", "content": "same source"}]
+    with SessionDB(path) as db, SessionDB(path) as sibling:
+        db.create_session("chat", "test")
+        instance = real_agent(db)
+        instance._cached_system_prompt = "policy"
+        instance.context_compressor.bind_session_state(db, "chat")
+        assert not instance.context_compressor._automatic_compression_blocked()
+        sibling.record_compression_failure_cooldown("chat", time.time() + 60, "sibling failure")
+        # Public wrapper and actual implementation: stale local state must not
+        # turn the impl's fresh durable cooldown deferral into terminal failure.
+        result = compression.compress_context(instance, messages, "policy", trigger="preflight")
+        assert result[0] is messages
+        sibling.clear_compression_failure_cooldown("chat")
+    calls = []
+
+    def attempted(_instance, messages, system, **_kwargs):
+        calls.append(1)
+        return messages, system
+
+    monkeypatch.setattr(compression, "_compress_context_impl", attempted)
+    with SessionDB(path) as db:
+        compression.compress_context(real_agent(db), messages, "policy", trigger="preflight")
+    assert calls == [1]
+
+
+def test_cooldown_cleared_before_execution_does_not_make_new_failure_retryable(tmp_path, monkeypatch):
+    calls = []
+
+    def attempted(instance, messages, system, **_kwargs):
+        calls.append(1)
+        instance.context_compressor._clear_compression_failure_cooldown()
+        instance.context_compressor.record_timeout_failure("new attempted timeout")
+        return messages, system
+
+    monkeypatch.setattr(compression, "_compress_context_impl", attempted)
+    path = tmp_path / "state.db"
+    messages = [{"role": "user", "content": "same source"}]
+    with SessionDB(path) as db:
+        db.create_session("chat", "test")
+        instance = real_agent(db)
+        instance.context_compressor.record_timeout_failure("previous timeout")
+        compression.compress_context(instance, messages, "policy", trigger="preflight")
+    with SessionDB(path) as db:
+        compression.compress_context(real_agent(db), messages, "policy", trigger="preflight")
+    assert calls == [1]

@@ -2679,11 +2679,6 @@ def compress_context(
     fingerprint = _compression_source_fingerprint(messages, system_message)
     try:
         strategy = _compression_strategy_fingerprint(agent, focus_topic)
-        compressor = getattr(agent, "context_compressor", None)
-        blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
-        # A failure can ARM cooldown while executing. Only a block that already
-        # existed before the attempt qualifies as retryable nonexecution.
-        cooldown_preexisting = bool(callable(blocked) and not force and blocked(compressor))
     except Exception:
         logger.warning("Context compaction policy unavailable; keeping previous context", exc_info=True)
         return messages, getattr(agent, "_cached_system_prompt", None) or system_message or ""
@@ -2724,6 +2719,7 @@ def compress_context(
             existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
             return messages, existing_prompt
     outcome = "aborted"
+    execution_outcome: dict[str, str] = {}
     try:
         result = _compress_context_impl(
             agent,
@@ -2736,16 +2732,12 @@ def compress_context(
             trigger=requested_trigger,
             defer_context_engine_notification=defer_context_engine_notification,
             commit_fence=commit_fence,
+            _execution_outcome=execution_outcome,
         )
         if result[0] is messages:
-            if cooldown_preexisting:
-                outcome = "cooldown"
-            elif getattr(agent, "_compression_skipped_due_to_lock", None):
-                outcome = "deferred_lock"
-            elif getattr(agent, "api_mode", None) == "codex_app_server":
-                outcome = "native_delegated"
-            else:
-                outcome = "no_progress"
+            # The implementation reports at the gate that actually deferred
+            # work. Guard snapshots before/after it race sibling state changes.
+            outcome = execution_outcome.get("outcome", "no_progress")
         else:
             outcome = "committed"
         coordinator.finish_execution(request, outcome)
@@ -2780,6 +2772,7 @@ def _compress_context_impl(
     trigger: Optional[str] = None,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    _execution_outcome: Optional[Dict[str, str]] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2811,6 +2804,10 @@ def _compress_context_impl(
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
 
+    # Private receipt shared only with the admission wrapper, never the engine
+    # or provider. Each actual nonexecution gate owns its disposition.
+    if _execution_outcome is None:
+        _execution_outcome = {}
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -2884,6 +2881,7 @@ def _compress_context_impl(
                     existing_prompt = agent._build_system_prompt(system_message)
                 return messages, existing_prompt
         try:
+            _execution_outcome["outcome"] = "native_delegated"
             return _compress_context_via_codex_app_server(
                 agent,
                 messages,
@@ -2907,6 +2905,7 @@ def _compress_context_impl(
             None,
         )
         if callable(blocked) and blocked(agent.context_compressor):
+            _execution_outcome["outcome"] = "cooldown"
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -3195,6 +3194,7 @@ def _compress_context_impl(
                 failure_class="lock_contended",
             )
             _complete_compaction_lifecycle()
+            _execution_outcome["outcome"] = "deferred_lock"
             return messages, _existing_sp
     _lock_released = False
     _lock_release_guard = threading.Lock()
@@ -3354,6 +3354,7 @@ def _compress_context_impl(
             None,
         )
         if callable(blocked) and blocked(compressor):
+            _execution_outcome["outcome"] = "cooldown"
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
