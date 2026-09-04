@@ -2689,6 +2689,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
         if ready.is_set() or session.get("agent_build_started"):
             return
         session["agent_build_started"] = True
+        build_generation = int(session.get("agent_build_generation") or 0)
+        # A preparation retry replaces this Event. Capture the generation's
+        # exact fence now: an older build thread must never start waiting on a
+        # newer attempt just because it reached _build after the replacement.
+        history_ready = session.get("resume_history_ready")
         # An upgrading lazy session is now genuinely mid-construction — restore
         # its "still starting" eviction exemption.
         session.pop("lazy", None)
@@ -2708,10 +2713,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
         owns_db = False
         profile_home = current.get("profile_home")
         try:
-            history_ready = current.get("resume_history_ready")
             if history_ready is not None:
                 if not history_ready.wait(timeout=300.0):
                     raise TimeoutError("session history hydration timed out")
+                if int(current.get("agent_build_generation") or 0) != build_generation:
+                    return
                 if history_error := current.get("resume_history_error"):
                     raise RuntimeError(str(history_error))
                 with _sessions_lock:
@@ -2789,6 +2795,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
+            # Retry can invalidate this generation while provider discovery is
+            # still constructing the agent. Do not publish a superseded build.
+            if int(current.get("agent_build_generation") or 0) != build_generation:
+                return
             current["agent"] = agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
@@ -2858,8 +2868,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            # A failed deferred-history attempt can be explicitly retried on
+            # the same runtime. Its old build waiter may unwind after the retry
+            # has installed a fresh ready event; fence that stale waiter from
+            # poisoning the new generation.
+            if int(current.get("agent_build_generation") or 0) == build_generation:
+                current["agent_error"] = str(e)
+                _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -9662,8 +9677,28 @@ def _assert_session_resume_safe(
         reset_hermes_home_override(home_token)
 
 
+def _resume_preparation_payload(session: dict | None) -> dict | None:
+    """Return the public, JSON-safe state of deferred model-history setup."""
+    preparation = (session or {}).get("resume_preparation")
+    return dict(preparation) if isinstance(preparation, dict) else None
+
+
+def _resume_hydration_db(session: dict):
+    """Open the exact profile store for an explicit preparation retry."""
+    profile_home = str(session.get("profile_home") or "").strip()
+    if not profile_home:
+        return _get_db(), False
+    try:
+        from hermes_state import SessionDB
+
+        return SessionDB(db_path=Path(profile_home) / "state.db"), True
+    except Exception as exc:
+        logger.warning("resume retry store unavailable for %s: %s", profile_home, exc)
+        return None, False
+
+
 def _schedule_resume_hydration(
-    sid: str, stored_id: str, db, *, close_db: bool = False
+    sid: str, stored_id: str, db, *, close_db: bool = False, attempt: int = 1
 ) -> None:
     """Load a cold resume's transcript off the JSON-RPC response path."""
 
@@ -9672,10 +9707,20 @@ def _schedule_resume_hydration(
         try:
             if session is None:
                 return
+            preparation = session.get("resume_preparation") or {}
+            if (
+                preparation.get("status") != "preparing"
+                or int(preparation.get("attempt") or 0) != attempt
+            ):
+                return
             _emit(
                 "session.resume_progress",
                 sid,
-                {"phase": "history", "status": "loading"},
+                {
+                    "phase": "history",
+                    "status": "loading",
+                    "preparation": _resume_preparation_payload(session),
+                },
             )
             _assert_session_resume_safe(
                 db, stored_id, session.get("resume_message_count"),
@@ -9686,13 +9731,23 @@ def _schedule_resume_hydration(
             prefix = db.get_ancestor_display_prefix(stored_id)
             history = sanitize_replay_history(raw_history)
 
-            if _sessions.get(sid) is not session:
+            if (
+                _sessions.get(sid) is not session
+                or int((session.get("resume_preparation") or {}).get("attempt") or 0)
+                != attempt
+            ):
                 return
             with session["history_lock"]:
                 session["history"] = history
                 session["display_history_prefix"] = prefix
                 session["resume_hydrating"] = False
                 session["resume_message_count"] = len(display_history)
+                session["resume_preparation"] = {
+                    "attempt": attempt,
+                    "message_count": len(display_history),
+                    "phase": "history",
+                    "status": "ready",
+                }
             session["resume_history_ready"].set()
             _emit(
                 "session.resume_progress",
@@ -9701,30 +9756,46 @@ def _schedule_resume_hydration(
                     "message_count": len(display_history),
                     "phase": "history",
                     "status": "complete",
+                    "preparation": _resume_preparation_payload(session),
                 },
             )
             _maybe_schedule_auto_continue(sid, session, stored_id)
             _start_agent_build(sid, session)
         except Exception as exc:
-            if _sessions.get(sid) is not session:
+            if (
+                _sessions.get(sid) is not session
+                or int((session.get("resume_preparation") or {}).get("attempt") or 0)
+                != attempt
+            ):
                 return
             message = f"resume failed: {exc}"
-            session["resume_hydrating"] = False
-            session["resume_history_error"] = message
-            session["agent_error"] = message
-            session["resume_history_ready"].set()
-            session["agent_ready"].set()
+            with session["history_lock"]:
+                session["resume_hydrating"] = False
+                session["resume_history_error"] = message
+                session["agent_error"] = message
+                session["resume_preparation"] = {
+                    "attempt": attempt,
+                    "message": message,
+                    "phase": "history",
+                    "status": "preparation_failed",
+                }
+                session["resume_history_ready"].set()
+                session["agent_ready"].set()
             _emit(
                 "session.resume_progress",
                 sid,
-                {"message": message, "phase": "history", "status": "failed"},
+                {
+                    "message": message,
+                    "phase": "history",
+                    "status": "failed",
+                    "preparation": _resume_preparation_payload(session),
+                },
             )
-            _emit("error", sid, {"message": message})
-            with _sessions_lock:
-                discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
-            lease = (discarded or {}).get("active_session_lease")
-            if lease is not None:
-                lease.release()
+            _emit(
+                "error",
+                sid,
+                {"kind": "session_preparation", "message": message},
+            )
         finally:
             if close_db and hasattr(db, "close"):
                 try:
@@ -9745,6 +9816,9 @@ def _session_pending_kind(sid: str) -> str:
 
 
 def _session_live_status(sid: str, session: dict) -> str:
+    preparation_status = (session.get("resume_preparation") or {}).get("status")
+    if preparation_status in {"preparing", "preparation_failed"}:
+        return preparation_status
     if _session_pending_kind(sid):
         return "waiting"
     ready = session.get("agent_ready")
@@ -9989,6 +10063,8 @@ def _live_session_payload(
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
     }
+    if preparation := _resume_preparation_payload(session):
+        payload["preparation"] = preparation
     if inflight:
         payload["inflight"] = inflight
     if queued:

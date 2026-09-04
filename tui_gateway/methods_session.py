@@ -607,6 +607,8 @@ def _(rid, params: dict) -> dict:
                     session.get("resume_message_count") or payload["message_count"]
                 )
                 payload["hydrating"] = bool(session.get("resume_hydrating"))
+                if preparation := _resume_preparation_payload(session):
+                    payload["preparation"] = preparation
             # A lazy watch session never owns a run loop, so its payload's running
             # flag is always False — overlay the child-run registry so a reconnecting
             # watch window keeps its busy indicator while the child is still mid-run.
@@ -748,6 +750,11 @@ def _(rid, params: dict) -> dict:
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
             record["resume_message_count"] = int(found.get("message_count") or 0)
+            record["resume_preparation"] = {
+                "attempt": 1,
+                "phase": "history",
+                "status": "preparing",
+            }
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
 
@@ -765,6 +772,7 @@ def _(rid, params: dict) -> dict:
                     "message_count": record["resume_message_count"],
                     "messages": [],
                     "hydrating": True,
+                    "preparation": _resume_preparation_payload(record),
                     "info": _lazy_resume_info(
                         cwd,
                         model=model_override.get("model") or "",
@@ -1072,6 +1080,96 @@ def _(rid, params: dict) -> dict:
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
     return _ok(rid, payload)
+
+
+@method("session.resume.retry")
+def _(rid, params: dict) -> dict:
+    """Retry one failed deferred-history preparation on its retained runtime.
+
+    This starts at most one worker and never loops internally. Calls while a
+    worker is active are idempotent; each explicit call after a failure creates
+    one new fenced attempt on the same browse handle.
+    """
+    sid = str(params.get("session_id") or "").strip()
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+
+    with session["history_lock"]:
+        preparation = session.get("resume_preparation")
+        if not isinstance(preparation, dict):
+            return _err(rid, 4018, "session has no deferred preparation")
+
+        status = preparation.get("status")
+        if status in {"preparing", "ready"}:
+            return _ok(
+                rid,
+                {"session_id": sid, "preparation": _resume_preparation_payload(session)},
+            )
+        if status != "preparation_failed":
+            return _err(rid, 4019, f"preparation is not retryable: {status or 'unknown'}")
+
+        attempt = int(preparation.get("attempt") or 0) + 1
+        session["agent_build_generation"] = int(
+            session.get("agent_build_generation") or 0
+        ) + 1
+        session["agent_build_started"] = False
+        session.pop("_agent_build_thread", None)
+        session["resume_history_ready"] = threading.Event()
+        session["agent_ready"] = threading.Event()
+        session["resume_hydrating"] = True
+        session.pop("resume_history_error", None)
+        session["agent_error"] = None
+        session["resume_preparation"] = {
+            "attempt": attempt,
+            "phase": "history",
+            "status": "preparing",
+        }
+
+    db, owns_db = _resume_hydration_db(session)
+    if db is None:
+        message = "resume failed: state.db unavailable"
+        with session["history_lock"]:
+            session["resume_hydrating"] = False
+            session["resume_history_error"] = message
+            session["agent_error"] = message
+            session["resume_preparation"] = {
+                "attempt": attempt,
+                "message": message,
+                "phase": "history",
+                "status": "preparation_failed",
+            }
+            session["resume_history_ready"].set()
+            session["agent_ready"].set()
+        preparation_payload = _resume_preparation_payload(session)
+        _emit(
+            "session.resume_progress",
+            sid,
+            {
+                "message": message,
+                "phase": "history",
+                "status": "failed",
+                "preparation": preparation_payload,
+            },
+        )
+        _emit(
+            "error",
+            sid,
+            {"kind": "session_preparation", "message": message},
+        )
+        return _err(rid, 5000, message)
+
+    _schedule_resume_hydration(
+        sid,
+        str(session.get("resume_session_id") or session.get("session_key") or ""),
+        db,
+        close_db=owns_db,
+        attempt=attempt,
+    )
+    return _ok(
+        rid,
+        {"session_id": sid, "preparation": _resume_preparation_payload(session)},
+    )
 
 
 @method("session.cwd.set")

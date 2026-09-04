@@ -3574,6 +3574,11 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         )
 
         assert first["result"]["hydrating"] is True
+        assert first["result"]["preparation"] == {
+            "attempt": 1,
+            "phase": "history",
+            "status": "preparing",
+        }
         assert first["result"]["messages"] == []
         assert first["result"]["message_count"] == 1200
         assert history_started.wait(timeout=1.0)
@@ -3597,6 +3602,12 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         assert server._sessions[sid]["history"] == [loaded]
         assert server._sessions[sid]["display_history_prefix"] == [ancestor]
         assert server._sessions[sid]["resume_message_count"] == 2
+        assert server._sessions[sid]["resume_preparation"] == {
+            "attempt": 1,
+            "message_count": 2,
+            "phase": "history",
+            "status": "ready",
+        }
         assert auto_continue_calls == [(sid, server._sessions[sid], "large-session")]
     finally:
         release_history.set()
@@ -3684,7 +3695,10 @@ def test_deferred_resume_acknowledges_before_materialization_guard(monkeypatch, 
 
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     first_released = threading.Event()
+    retry_started = threading.Event()
+    release_retry = threading.Event()
     build_started = threading.Event()
+    emitted = []
     attempts = 0
 
     class FakeDB:
@@ -3703,6 +3717,8 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
             if attempts == 1:
                 first_released.set()
                 raise RuntimeError("sqlite read failed")
+            retry_started.set()
+            assert release_retry.wait(timeout=2.0)
             loaded = [{"role": "user", "content": "retry loaded"}]
             return loaded, loaded
 
@@ -3718,6 +3734,11 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
         ),
     )
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append((event, sid, payload)),
+    )
     monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
     monkeypatch.setattr(
         server,
@@ -3732,23 +3753,101 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
         )
         first_sid = first["result"]["session_id"]
         assert first_released.wait(timeout=1.0)
-        assert first_sid not in server._sessions
+        first_session = server._sessions[first_sid]
+        assert first_session["resume_history_ready"].wait(timeout=1.0)
+        assert first_session["resume_preparation"] == {
+            "attempt": 1,
+            "message": "resume failed: sqlite read failed",
+            "phase": "history",
+            "status": "preparation_failed",
+        }
+        assert (
+            "error",
+            first_sid,
+            {
+                "kind": "session_preparation",
+                "message": "resume failed: sqlite read failed",
+            },
+        ) in emitted
 
         second = server._methods["session.resume"](
             "r2",
             {"session_id": "retry-session", "defer_history": True},
         )
-        second_sid = second["result"]["session_id"]
-        assert second_sid != first_sid
-        assert server._sessions[second_sid]["resume_history_ready"].wait(timeout=1.0)
+        assert second["result"]["session_id"] == first_sid
+        assert second["result"]["preparation"]["status"] == "preparation_failed"
+        assert second["result"]["status"] == "preparation_failed"
+        assert second["result"]["hydrating"] is False
+
+        retry = server._methods["session.resume.retry"](
+            "r3", {"session_id": first_sid}
+        )
+        assert retry["result"] == {
+            "session_id": first_sid,
+            "preparation": {
+                "attempt": 2,
+                "phase": "history",
+                "status": "preparing",
+            },
+        }
+        assert retry_started.wait(timeout=1.0)
+
+        duplicate_retry = server._methods["session.resume.retry"](
+            "r4", {"session_id": first_sid}
+        )
+        assert duplicate_retry["result"]["preparation"]["attempt"] == 2
+        assert attempts == 2
+
+        release_retry.set()
+        assert first_session["resume_history_ready"].wait(timeout=1.0)
         assert build_started.wait(timeout=1.0)
+        assert first_session["resume_preparation"] == {
+            "attempt": 2,
+            "message_count": 1,
+            "phase": "history",
+            "status": "ready",
+        }
     finally:
+        release_retry.set()
         for sid, session in list(server._sessions.items()):
             if session.get("session_key") == "retry-session":
                 lease = session.get("active_session_lease")
                 if lease is not None:
                     lease.release()
                 server._sessions.pop(sid, None)
+
+
+def test_stale_agent_build_waiter_cannot_poison_retry_generation():
+    old_history_ready = threading.Event()
+    old_agent_ready = threading.Event()
+    sid = "retry-build-generation"
+    session = {
+        "agent_build_generation": 0,
+        "agent_ready": old_agent_ready,
+        "history_lock": threading.Lock(),
+        "resume_history_ready": old_history_ready,
+        "session_key": "retry-build-generation-stored",
+    }
+    server._sessions[sid] = session
+
+    try:
+        server._start_agent_build(sid, session)
+        assert session["agent_build_started"] is True
+
+        # Mirror session.resume.retry installing a new generation before the
+        # old preparation waiter unwinds with its failure.
+        session["agent_build_generation"] = 1
+        session["agent_build_started"] = False
+        session["agent_ready"] = threading.Event()
+        session["resume_history_error"] = "old preparation failed"
+        old_history_ready.set()
+
+        assert old_agent_ready.wait(timeout=1.0)
+        assert session.get("agent_error") is None
+        assert session["agent_ready"].is_set() is False
+    finally:
+        old_history_ready.set()
+        server._sessions.pop(sid, None)
 
 
 def test_session_resume_deferred_history_close_cancels_build(monkeypatch):
