@@ -53,10 +53,19 @@ describe('transcript tail bookkeeping', () => {
     expect(transcriptBackfillAvailable('stored-1')).toBe(true)
   })
 
-  it('marks a short page as complete', () => {
+  it('keeps one archive probe for an older backend with no continuation bit', () => {
     recordTranscriptTail('stored-1', {
       messages: [row(1, 'only')],
       pagination: { limit: 120, offset: 0, order: 'latest', returned: 1 }
+    })
+
+    expect(transcriptBackfillAvailable('stored-1')).toBe(true)
+  })
+
+  it('marks a short page complete when the backend explicitly denies continuation', () => {
+    recordTranscriptTail('stored-1', {
+      messages: [row(1, 'only')],
+      pagination: { has_more: false, limit: 120, offset: 0, order: 'latest', returned: 1 }
     })
 
     expect(transcriptBackfillAvailable('stored-1')).toBe(false)
@@ -448,7 +457,7 @@ describe('backfillOlderTranscriptPage', () => {
   it('resolves false without fetching when the tail is not truncated', async () => {
     recordTranscriptTail('stored-1', {
       messages: [row(1, 'only')],
-      pagination: { limit: 120, offset: 0, order: 'latest', returned: 1 }
+      pagination: { has_more: false, limit: 120, offset: 0, order: 'latest', returned: 1 }
     })
 
     const applied = await backfillOlderTranscriptPage({

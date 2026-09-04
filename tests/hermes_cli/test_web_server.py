@@ -2100,7 +2100,10 @@ class TestWebServerEndpoints:
         contents = [m["content"] for m in resp.json()["messages"]]
         assert contents == ["old q", "old a", "summary", "live q", "live a"]
 
-    def test_active_tail_continues_into_compacted_archive_without_overlap(self):
+    @pytest.mark.parametrize("active_count", [0, 1, 120, 121])
+    def test_active_tail_continues_into_compacted_archive_without_overlap(
+        self, active_count
+    ):
         """Desktop can open from the active projection, then use that row
         count as the newest-relative offset into the lossless display history.
         """
@@ -2120,12 +2123,11 @@ class TestWebServerEndpoints:
                 "compacted-fast-open",
                 [
                     {
-                        "role": "assistant",
-                        "content": "summary",
-                        "_compressed_summary": True,
-                    },
-                    {"role": "user", "content": "live q"},
-                    {"role": "assistant", "content": "live a"},
+                        "role": "assistant" if index % 2 else "user",
+                        "content": f"active {index}",
+                        **({"_compressed_summary": True} if index == 0 else {}),
+                    }
+                    for index in range(active_count)
                 ],
             )
         finally:
@@ -2137,24 +2139,57 @@ class TestWebServerEndpoints:
         )
         assert tail.status_code == 200
         tail_payload = tail.json()
+        expected_tail_start = max(0, active_count - 120)
         assert [m["content"] for m in tail_payload["messages"]] == [
-            "summary",
-            "live q",
-            "live a",
+            f"active {index}" for index in range(expected_tail_start, active_count)
         ]
         assert tail_payload["pagination"]["has_more"] is True
 
+        tail_count = min(active_count, 120)
         archive = self.client.get(
             "/api/sessions/compacted-fast-open/messages"
-            "?include_compacted=true&limit=120&offset=3&order=latest"
+            f"?include_compacted=true&limit=120&offset={tail_count}&order=latest"
         )
         assert archive.status_code == 200
         archive_payload = archive.json()
         assert [m["content"] for m in archive_payload["messages"]] == [
             "old q",
             "old a",
+            *[f"active {index}" for index in range(expected_tail_start)],
         ]
         assert archive_payload["pagination"]["has_more"] is False
+
+    def test_zero_limit_never_reads_or_scans_messages(self, monkeypatch):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="zero-limit", source="desktop")
+            db.append_message("zero-limit", "user", "must not be read")
+        finally:
+            db.close()
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("limit=0 must short-circuit before get_messages")
+
+        monkeypatch.setattr(SessionDB, "get_messages", fail_if_called)
+        response = self.client.get(
+            "/api/sessions/zero-limit/messages"
+            "?include_compacted=true&limit=0&order=latest"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "session_id": "zero-limit",
+            "messages": [],
+            "pagination": {
+                "has_more": False,
+                "limit": 0,
+                "offset": 0,
+                "order": "latest",
+                "returned": 0,
+            },
+        }
 
     def test_get_session_messages_projects_and_dedupes_composite_carrier(self):
         from agent.context_compressor import (

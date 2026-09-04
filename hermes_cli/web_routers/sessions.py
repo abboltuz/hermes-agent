@@ -631,6 +631,13 @@ async def get_session_messages(
             # Fetch one extra row so pagination has a continuation bit
             # without a COUNT. For the working projection this remains a
             # bounded indexed query regardless of total archive size.
+            if _limit == 0:
+                # Especially important for include_compacted: that legacy
+                # reader deduplicates before slicing, so passing limit=0 would
+                # still materialize the entire archive merely to return []. A
+                # zero-sized page deliberately reports no continuation; callers
+                # that want to probe must request at least one row.
+                return sid, _limit, [], False
             read_limit = _limit + 1 if _limit > 0 else 0
             messages = db.get_messages(
                 sid,
