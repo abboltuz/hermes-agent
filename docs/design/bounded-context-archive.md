@@ -73,6 +73,24 @@ This first increment retains the existing legacy untagged compression-call
 contract; these callers and direct engine compaction entry points still need to
 converge on the snapshot publication service in step 2.
 
+## Budget certainty prerequisite
+
+The final-wire gate separates `fits` from `allows_dispatch`. A missing context
+window produces `fits=None` / `unknown_window` while compatibility policy still
+admits the request. A known window produces `estimated_fit` or
+`estimated_overflow`, retaining the configured output reserve and safety margin.
+Debug diagnostics and fit errors carry this distinction without request bodies
+or credentials. This does not add retries or change the existing bounded
+pressure-recovery policy.
+
+All current final-wire counts remain explicitly `estimated`. Model metadata,
+a configured context window and a successful previous request do not establish
+an authoritative count of a new full request. No current route is labeled
+`verified`; adding that label requires an adapter-level complete counting and
+context-window contract, including tool schemas and multimodal accounting.
+This prerequisite is not the bounded snapshot validator or a universal fit
+guarantee, and does not replace the remaining work in steps 2–5.
+
 ## Required verification beyond the current increment
 
 - Restart and multiple real connections/processes: one admitted source/strategy;
