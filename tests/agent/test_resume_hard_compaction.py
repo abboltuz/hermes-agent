@@ -11,7 +11,7 @@ from agent.resume_hard_compaction import (
     _LeaseRefresher,
     compact_oversized_resume,
 )
-from hermes_state import SessionDB
+from hermes_state import SessionCompactionSourceChangedError, SessionDB
 
 
 HUMAN_PROVENANCE = {
@@ -354,6 +354,62 @@ def test_large_tool_call_stays_paired_through_archive_reference(tmp_path):
     assert str(call_row_id) in assistant["tool_calls"][0]["function"]["arguments"]
 
 
+def test_tool_group_wider_than_tail_is_reduced_without_orphan_loss(
+    tmp_path, monkeypatch
+):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 12)
+    call_ids = [f"wide-call-{index}" for index in range(4)]
+    db.append_message("chat", "user", "wide tool turn", **HUMAN_PROVENANCE)
+    db.append_message(
+        "chat",
+        "assistant",
+        "issuing wide tool group",
+        tool_calls=[
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+            for call_id in call_ids
+        ],
+    )
+    for index, call_id in enumerate(call_ids):
+        db.append_message(
+            "chat",
+            "tool",
+            f"wide-result-{index}",
+            tool_call_id=call_id,
+        )
+    db.append_message("chat", "assistant", "wide tool turn complete")
+    db.append_message("chat", "user", "latest request", **HUMAN_PROVENANCE)
+    db.append_message("chat", "assistant", "latest answer")
+
+    reduced_rows = []
+    real_add = hard_compaction._RollingReducer.add
+
+    def observed_add(self, messages):
+        reduced_rows.extend(dict(message) for message in messages)
+        return real_add(self, messages)
+
+    monkeypatch.setattr(hard_compaction._RollingReducer, "add", observed_add)
+    compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(target_rows=6),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    reduced_contents = {row.get("content") for row in reduced_rows}
+    assert {f"wide-result-{index}" for index in range(4)} <= reduced_contents
+    assert any(row.get("tool_calls") for row in reduced_rows)
+    active = db.get_model_resume_conversation("chat")
+    assert [row["content"] for row in active[-2:]] == [
+        "latest request",
+        "latest answer",
+    ]
+
+
 def test_lease_refresher_tolerates_one_blip_but_bounds_persistent_failure():
     class RefreshDB:
         def __init__(self, results):
@@ -410,6 +466,8 @@ def test_giant_prefix_and_tail_fields_are_bounded_before_python_reduction(
         reasoning=huge,
         reasoning_details=[{"text": huge}],
     )
+    structured = [{"type": "input_text", "text": huge}]
+    structured_id = db.append_message("chat", "assistant", structured)
     for index in range(40):
         db.append_message(
             "chat",
@@ -428,6 +486,7 @@ def test_giant_prefix_and_tail_fields_are_bounded_before_python_reduction(
         "chat",
         "assistant",
         huge,
+        tool_name=huge,
         reasoning_content=huge,
         codex_message_items=[{"payload": huge}],
     )
@@ -468,13 +527,75 @@ def test_giant_prefix_and_tail_fields_are_bounded_before_python_reduction(
     raw = {
         row["id"]: row
         for row in db.get_messages("chat", include_inactive=True)
-        if row["id"] in {prefix_id, tail_user_id, tail_assistant_id}
+        if row["id"]
+        in {prefix_id, structured_id, tail_user_id, tail_assistant_id}
     }
     assert raw[prefix_id]["content"] == huge
     assert raw[prefix_id]["api_content"] == huge
+    assert raw[structured_id]["content"] == structured
     assert raw[tail_user_id]["api_content"] == huge
     assert raw[tail_assistant_id]["content"] == huge
+    assert raw[tail_assistant_id]["tool_name"] == huge
     assert raw[tail_assistant_id]["reasoning_content"] == huge
+
+
+def test_source_mutation_during_paging_rejects_stale_publication(
+    tmp_path, monkeypatch
+):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 40)
+    before_count = len(db.get_messages("chat"))
+    real_page = db.get_compaction_source_page
+    changed = False
+
+    def mutate_after_first_page(*args, **kwargs):
+        nonlocal changed
+        page = real_page(*args, **kwargs)
+        if page and not changed:
+            changed = True
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE messages SET api_content = ? "
+                    "WHERE session_id = ? AND id = ("
+                    "SELECT MIN(id) FROM messages WHERE session_id = ?)",
+                    ("changed-after-read", "chat", "chat"),
+                )
+            )
+        return page
+
+    monkeypatch.setattr(
+        db,
+        "get_compaction_source_page",
+        mutate_after_first_page,
+    )
+    with pytest.raises(SessionCompactionSourceChangedError):
+        compact_oversized_resume(
+            db,
+            "chat",
+            policy=ResumeHardCompactionPolicy(target_rows=8, page_rows=5),
+            summarize=lambda *_args: "stale summary",
+        )
+
+    active = db.get_messages("chat")
+    assert len(active) == before_count
+    assert all(row["compacted"] == 0 for row in active)
+    assert active[0]["api_content"] == "changed-after-read"
+
+    retried = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(target_rows=8, page_rows=5),
+        summarize=lambda *_args: "fresh summary",
+    )
+    assert retried.outcome == "committed"
+
+
+def test_page_budget_must_cover_one_complete_bounded_row():
+    with pytest.raises(ValueError, match="one worst-case bounded row"):
+        ResumeHardCompactionPolicy(
+            max_tail_message_chars=2_000,
+            max_page_materialized_chars=20_000,
+        ).validate()
 
 
 def test_changed_source_projection_rearms_terminal_receipt(tmp_path, monkeypatch):

@@ -535,6 +535,36 @@ CREATE TABLE IF NOT EXISTS context_compaction_jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_context_compaction_running
     ON context_compaction_jobs(session_id) WHERE outcome = 'running';
 
+-- Append-only growth is already fenced by a message-id watermark. Updates or
+-- deletes of existing rows need a separate CAS revision so a cold compactor
+-- cannot publish a projection derived from bytes that changed while it paged.
+CREATE TABLE IF NOT EXISTS message_mutation_revisions (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO message_mutation_revisions (session_id, revision)
+SELECT id, 0 FROM sessions;
+CREATE TRIGGER IF NOT EXISTS message_mutation_session_insert
+AFTER INSERT ON sessions
+BEGIN
+    INSERT OR IGNORE INTO message_mutation_revisions (session_id, revision)
+    VALUES (NEW.id, 0);
+END;
+CREATE TRIGGER IF NOT EXISTS message_mutation_update
+AFTER UPDATE ON messages
+BEGIN
+    UPDATE message_mutation_revisions SET revision = revision + 1
+    WHERE session_id = OLD.session_id;
+    UPDATE message_mutation_revisions SET revision = revision + 1
+    WHERE session_id = NEW.session_id AND NEW.session_id <> OLD.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS message_mutation_delete
+AFTER DELETE ON messages
+BEGIN
+    UPDATE message_mutation_revisions SET revision = revision + 1
+    WHERE session_id = OLD.session_id;
+END;
+
 CREATE TABLE IF NOT EXISTS working_context_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

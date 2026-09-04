@@ -225,13 +225,19 @@ journal and atomic `archive_and_compact` fence. Rows beyond the watermark are
 cloned back into the live tail by the same transaction. Original rows remain
 soft-archived and searchable.
 
-The cold source identity hashes every bounded source projection row, including
-raw payload lengths, through the captured watermark. Thus membership or any
-source change that can alter the recovery candidate rearms automatic work; a
-change wholly inside an intentionally omitted giant-field middle does not,
-because it produces the same bounded archive reference. Strategy identity
+The cold source identity hashes the captured mutation revision and every
+bounded source projection row, including raw payload lengths, through the
+captured watermark. Thus membership or any existing-row mutation rearms
+automatic work, including a same-size change inside an intentionally omitted
+giant-field middle. Strategy identity
 combines the hard caps with the normal compressor's credential-free engine,
 main/auxiliary route and fallback-policy fingerprint.
+
+The identity is paired with a durable update/delete revision captured before
+paging and compared inside the publication transaction. The max-id watermark
+continues to admit concurrent appends, but any mutation of an existing source
+row rejects the stale candidate before archive state changes. A later attempt
+then reads the new bytes and produces a new source identity.
 
 Input pages are reduced locally into a bounded binary hierarchy, then one
 refinement operation invokes the configured compressor's bounded provider
@@ -245,6 +251,14 @@ tokenizer uncertainty;
 final provider-shaped budget validation remains authoritative. Pre-provenance
 user rows remain exact and visible behind a hidden strict-alternation wrapper
 instead of being relabelled as trusted human input.
+Every text-bearing column is bounded in the SQLite projection before Python
+materialization. Stored byte lengths are measured through BLOB casts because
+Hermes structured content is NUL-prefixed TEXT and SQLite's TEXT length stops
+at that sentinel. The page policy must hold at least one complete worst-case
+bounded row, and page row count is derived from that full per-row envelope.
+Recent rows are retained and evicted as complete user-turn groups, so an
+assistant tool call and its results cannot be split into orphan rows that a
+later replay repair would silently discard.
 An individual recent payload that exceeds the working-row bound is represented
 by bounded head/tail evidence plus its immutable archived row id; the raw body
 remains exact in the archive. This is the explicit exception to verbatim-tail

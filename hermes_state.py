@@ -168,6 +168,10 @@ class SessionResumeTooLargeError(ValueError):
         )
 
 
+class SessionCompactionSourceChangedError(RuntimeError):
+    """A durable source row changed while a compaction was being built."""
+
+
 class SessionExportTooLargeError(ValueError):
     def __init__(
         self,
@@ -11311,6 +11315,18 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
             ).fetchone()
         return int(row[0]) if row else 0
 
+    def get_message_mutation_revision(self, session_id: str) -> int:
+        """Return the durable update/delete CAS revision for a transcript."""
+        if not session_id:
+            return 0
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT revision FROM message_mutation_revisions "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     def register_compression_recovery(
         self, session_id: str, message_ids: List[int], *, generation: int = 0,
         watermark: int = 0, projection_fingerprint: str = "",
@@ -11391,6 +11407,7 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        source_mutation_revision: Optional[int] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -11430,6 +11447,11 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
 
+        Source-CAS safety: when *source_mutation_revision* is provided, the
+        commit also verifies that no existing message row was updated or
+        deleted while the candidate was being built. Appends remain governed
+        by the watermark and are cloned into the live tail as before.
+
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
         session's JSON config in the same transaction; a ``None`` value
@@ -11451,6 +11473,19 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before "
                         "commit; refusing to publish a stale compaction"
+                    )
+
+            if source_mutation_revision is not None:
+                revision_row = conn.execute(
+                    "SELECT revision FROM message_mutation_revisions "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                current_revision = int(revision_row[0]) if revision_row else 0
+                if current_revision != int(source_mutation_revision):
+                    raise SessionCompactionSourceChangedError(
+                        f"Session {session_id!r} changed while compaction was "
+                        "building; refusing to publish a stale projection"
                     )
 
             patched_model_config = None
@@ -11619,22 +11654,49 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
             "display_metadata",
             "provenance_metadata",
         )
+        scalar_limits = {
+            "session_id": 512,
+            "role": 64,
+            "tool_call_id": 256,
+            "tool_name": 256,
+            "effect_disposition": 128,
+            "timestamp": 128,
+            "finish_reason": 128,
+            "platform_message_id": 512,
+            "display_kind": 128,
+            "origin_kind": 128,
+            "turn_kind": 128,
+            "trust_kind": 128,
+        }
+        # Hermes encodes structured content as NUL-prefixed TEXT. SQLite's
+        # length(TEXT) stops at the first U+0000, so every admission bound must
+        # measure the stored bytes rather than text characters.
+        def byte_length(column: str) -> str:
+            return f"length(CAST({column} AS BLOB))"
+
         sidecar_overflow = " OR ".join(
-            f"length({column}) > {cap}" for column in heavy_sidecars
+            f"{byte_length(column)} > {cap}" for column in heavy_sidecars
         )
-        source_payload_chars = " + ".join(
-            f"COALESCE(length({column}), 0)"
-            for column in ("content", *heavy_sidecars)
+        scalar_overflow = " OR ".join(
+            f"{byte_length(column)} > {limit}"
+            for column, limit in scalar_limits.items()
+        )
+        payload_overflow = f"({sidecar_overflow}) OR ({scalar_overflow})"
+        source_payload_bytes = " + ".join(
+            f"COALESCE({byte_length(column)}, 0)"
+            for column in ("content", *heavy_sidecars, *scalar_limits)
         )
         content_expr = (
             "CASE "
-            f"WHEN length(content) > {cap} "
-            "AND substr(content, 1, 6) = char(0) || 'json:' "
+            f"WHEN {byte_length('content')} > {cap} "
+            "AND substr(CAST(content AS BLOB), 1, 6) = X'006A736F6E3A' "
             f"THEN {reference} "
-            f"WHEN length(content) > {cap} "
+            f"WHEN typeof(content) = 'blob' AND {byte_length('content')} > {cap} "
+            f"THEN {reference} "
+            f"WHEN {byte_length('content')} > {cap} "
             f"THEN substr(content, 1, {head}) || char(10) || '... ' || "
             f"{reference} || char(10) || substr(content, -{tail}) "
-            f"WHEN {sidecar_overflow} "
+            f"WHEN {payload_overflow} "
             f"THEN substr(COALESCE(content, ''), 1, "
             f"max(0, {cap} - length({reference}) - 1)) || char(10) || {reference} "
             "ELSE content END AS content"
@@ -11642,8 +11704,16 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
 
         def bounded(column: str) -> str:
             return (
-                f"CASE WHEN length({column}) > {cap} "
+                f"CASE WHEN {byte_length(column)} > {cap} "
                 f"THEN NULL ELSE {column} END AS {column}"
+            )
+
+        def bounded_scalar(column: str) -> str:
+            limit = scalar_limits[column]
+            return (
+                f"CASE WHEN {byte_length(column)} > {limit} "
+                f"THEN substr({column}, 1, {limit}) "
+                f"ELSE {column} END AS {column}"
             )
 
         # A minimal extracted call contains three clipped identity fields plus
@@ -11651,7 +11721,7 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
         max_tool_calls = max(1, min(32, cap // 768))
         bounded_tool_calls = f"""
             CASE
-              WHEN length(tool_calls) > {cap} AND json_valid(tool_calls)
+              WHEN {byte_length('tool_calls')} > {cap} AND json_valid(tool_calls)
               THEN (
                 SELECT json_group_array(
                     json_object(
@@ -11675,26 +11745,37 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                      LIMIT {max_tool_calls}
                   ) AS call
               )
-              WHEN length(tool_calls) > {cap} THEN NULL
+              WHEN {byte_length('tool_calls')} > {cap} THEN NULL
               ELSE tool_calls
             END AS tool_calls
         """
 
         sql = f"""
-            SELECT id, session_id, role, {content_expr},
-                   tool_call_id, {bounded_tool_calls}, tool_name,
-                   effect_disposition, timestamp, token_count, finish_reason,
+            SELECT id, {bounded_scalar('session_id')}, {bounded_scalar('role')},
+                   {content_expr}, {bounded_scalar('tool_call_id')},
+                   {bounded_tool_calls}, {bounded_scalar('tool_name')},
+                   {bounded_scalar('effect_disposition')},
+                   {bounded_scalar('timestamp')},
+                   CASE WHEN typeof(token_count) IN ('integer', 'real')
+                        THEN token_count ELSE NULL END AS token_count,
+                   {bounded_scalar('finish_reason')},
                    {bounded('reasoning')}, {bounded('reasoning_content')},
                    {bounded('reasoning_details')},
                    {bounded('codex_reasoning_items')},
                    {bounded('codex_message_items')},
-                   platform_message_id, observed, _compressed_summary,
-                   active, compacted, {bounded('api_content')}, display_kind,
-                   {bounded('display_metadata')}, origin_kind, turn_kind,
-                   trust_kind, {bounded('provenance_metadata')},
-                   CASE WHEN length(content) > {cap} OR {sidecar_overflow}
+                   {bounded_scalar('platform_message_id')},
+                   CASE WHEN observed = 1 THEN 1 ELSE 0 END AS observed,
+                   CASE WHEN _compressed_summary = 1 THEN 1 ELSE 0
+                        END AS _compressed_summary,
+                   1 AS active,
+                   CASE WHEN compacted = 1 THEN 1 ELSE 0 END AS compacted,
+                   {bounded('api_content')}, {bounded_scalar('display_kind')},
+                   {bounded('display_metadata')}, {bounded_scalar('origin_kind')},
+                   {bounded_scalar('turn_kind')}, {bounded_scalar('trust_kind')},
+                   {bounded('provenance_metadata')},
+                   CASE WHEN {byte_length('content')} > {cap} OR {payload_overflow}
                         THEN 1 ELSE 0 END AS _resume_payload_clipped,
-                   ({source_payload_chars}) AS _resume_source_payload_chars
+                   ({source_payload_bytes}) AS _resume_source_payload_bytes
               FROM messages
              WHERE session_id = ? AND active = 1 AND id > ? AND id <= ?
              ORDER BY id ASC

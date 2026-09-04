@@ -64,9 +64,11 @@ class ResumeHardCompactionPolicy:
             raise ValueError("max_tail_message_chars must be at least 1000")
         if self.max_projection_tokens < 1_000:
             raise ValueError("max_projection_tokens must be at least 1000")
-        if self.max_page_materialized_chars < self.max_tail_message_chars:
+        minimum_page_chars = self.max_tail_message_chars * 10 + 4_096
+        if self.max_page_materialized_chars < minimum_page_chars:
             raise ValueError(
-                "max_page_materialized_chars must cover at least one bounded row"
+                "max_page_materialized_chars must cover one worst-case "
+                f"bounded row ({minimum_page_chars} chars)"
             )
         if self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -163,7 +165,7 @@ def _clean_message(message: Mapping[str, Any]) -> dict[str, Any]:
         "_db_persisted",
         "_resume_archive_rows",
         "_resume_payload_clipped",
-        "_resume_source_payload_chars",
+        "_resume_source_payload_bytes",
     ):
         cleaned.pop(key, None)
     return cleaned
@@ -559,6 +561,9 @@ def compact_oversized_resume(
     """Publish a bounded model-facing projection without deleting raw history."""
     policy = policy or ResumeHardCompactionPolicy()
     policy.validate()
+    source_mutation_revision = int(
+        db.get_message_mutation_revision(session_id) or 0
+    )
     watermark = int(db.get_active_message_watermark(session_id) or 0)
     if watermark <= 0:
         return ResumeHardCompactionResult("no_progress", 0, 0, watermark)
@@ -589,28 +594,64 @@ def compact_oversized_resume(
     # Reserve two rows for the strict-template wrapper needed by legacy user
     # rows whose provenance cannot safely be upgraded during recovery.
     max_tail_rows = policy.target_rows - 2
-    tail: deque[dict[str, Any]] = deque()
-    tail_token_costs: deque[int] = deque()
+    tail_groups: deque[tuple[list[dict[str, Any]], int]] = deque()
+    tail_rows = 0
     tail_tokens = 0
+    current_group: list[dict[str, Any]] = []
+    current_group_tokens = 0
+    current_group_reduced = False
     summary_chunk: list[dict[str, Any]] = []
     source_rows = 0
     after_id = 0
     committed = False
     admitted = False
     source_hasher = hashlib.sha256(
-        f"resume-hard-v2:{session_id}:{watermark}".encode()
+        (
+            f"resume-hard-v2:{session_id}:{watermark}:"
+            f"mutation={source_mutation_revision}"
+        ).encode()
     )
     # The source reader bounds ten payload-bearing columns independently.
     # Adapt row count so even their worst-case combined page stays within the
     # configured working-memory envelope.
-    effective_page_rows = max(
-        1,
-        min(
-            policy.page_rows,
-            policy.max_page_materialized_chars
-            // (policy.max_tail_message_chars * 10),
-        ),
+    per_row_materialized_chars = policy.max_tail_message_chars * 10 + 4_096
+    effective_page_rows = min(
+        policy.page_rows,
+        policy.max_page_materialized_chars // per_row_materialized_chars,
     )
+
+    def reduce_rows(rows: Sequence[dict[str, Any]]) -> None:
+        """Stream rows into the bounded reducer without retaining a split group."""
+        nonlocal summary_chunk
+        for item in rows:
+            summary_chunk.append(item)
+            if len(summary_chunk) >= policy.summary_chunk_rows:
+                reducer.add(summary_chunk)
+                summary_chunk = []
+                _report_progress(progress, "summarizing", source_rows)
+
+    def retain_complete_group(
+        rows: list[dict[str, Any]], group_tokens: int
+    ) -> None:
+        """Keep a whole recent user turn or reduce it as one semantic unit."""
+        nonlocal tail_rows, tail_tokens
+        if not rows:
+            return
+        if len(rows) > max_tail_rows or group_tokens > policy.max_projection_tokens:
+            reduce_rows(rows)
+            return
+        while tail_groups and (
+            tail_rows + len(rows) > max_tail_rows
+            or tail_tokens + group_tokens > policy.max_projection_tokens
+        ):
+            evicted, evicted_tokens = tail_groups.popleft()
+            tail_rows -= len(evicted)
+            tail_tokens -= evicted_tokens
+            reduce_rows(evicted)
+        tail_groups.append((rows, group_tokens))
+        tail_rows += len(rows)
+        tail_tokens += group_tokens
+
     try:
         while True:
             page = db.get_compaction_source_page(
@@ -645,21 +686,43 @@ def compact_oversized_resume(
                 row_tokens = estimate_provider_wire_tokens(
                     {"messages": [_clean_message(bounded_row)]}
                 )
-                while tail and (
-                    len(tail) >= max_tail_rows
-                    or tail_tokens + row_tokens > policy.max_projection_tokens
+                # A user row starts a semantic turn. Everything until the next
+                # user row — including any assistant call and all tool results
+                # — is retained or reduced together. This prevents row-count
+                # pressure from leaving orphan tool results for repair to drop.
+                if bounded_row.get("role") == "user" and (
+                    current_group or current_group_reduced
                 ):
-                    summary_chunk.append(tail.popleft())
-                    tail_tokens -= tail_token_costs.popleft()
-                tail.append(bounded_row)
-                tail_token_costs.append(row_tokens)
-                tail_tokens += row_tokens
-                if len(summary_chunk) >= policy.summary_chunk_rows:
-                    reducer.add(summary_chunk)
-                    summary_chunk = []
-                    _report_progress(progress, "summarizing", source_rows)
+                    if current_group:
+                        retain_complete_group(
+                            current_group,
+                            current_group_tokens,
+                        )
+                    current_group = []
+                    current_group_tokens = 0
+                    current_group_reduced = False
+
+                if current_group_reduced:
+                    reduce_rows([bounded_row])
+                else:
+                    current_group.append(bounded_row)
+                    current_group_tokens += row_tokens
+                    if (
+                        len(current_group) > max_tail_rows
+                        or current_group_tokens > policy.max_projection_tokens
+                    ):
+                        # An individually oversized live turn cannot be split
+                        # safely. Stream the whole turn through the reducer and
+                        # keep reducing its continuation until the next user.
+                        reduce_rows(current_group)
+                        current_group = []
+                        current_group_tokens = 0
+                        current_group_reduced = True
             if len(page) < effective_page_rows:
                 break
+
+        if current_group:
+            retain_complete_group(current_group, current_group_tokens)
 
         admission = db.claim_context_compaction(
             session_id,
@@ -687,7 +750,11 @@ def compact_oversized_resume(
         if refresher.lost:
             raise ResumeHardCompactionBusy("session compression lease was lost")
 
-        retained_tail = list(tail)
+        retained_tail = [
+            message
+            for group, _group_tokens in tail_groups
+            for message in group
+        ]
         first_user = next(
             (
                 index
@@ -763,6 +830,7 @@ def compact_oversized_resume(
             candidate,
             watermark=watermark,
             lock_holder=holder,
+            source_mutation_revision=source_mutation_revision,
         )
         committed = True
         try:
