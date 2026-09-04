@@ -20,6 +20,7 @@ from agent.compression_v3 import (
     prepare_api_request,
     prune_tool_pressure_projection,
     estimate_projection_tokens,
+    provider_request_budget,
 )
 from agent.compression_v3 import _provider_wire_token_bound
 from agent.compression_v3 import _bind_recovery_identity
@@ -36,12 +37,57 @@ def test_provider_wire_estimate_stays_in_token_domain_with_explicit_overhead():
         "tools": [{"type": "function", "name": "x", "parameters": {"required": ["x"]}}],
         "max_output_tokens": 17,
     }
-    serialized = json.dumps(request, ensure_ascii=True, sort_keys=True, default=str)
+    serialized = json.dumps(
+        request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     serialized_bytes = len(serialized.encode("utf-8"))
     estimate = _provider_wire_token_bound(request)
 
     assert estimate >= (serialized_bytes + 2) // 3
     assert estimate < serialized_bytes
+
+
+def test_provider_wire_estimate_does_not_measure_unicode_as_ascii_escapes():
+    request = {
+        "instructions": "Отвечай по-русски. " * 1_000,
+        "input": [{"role": "user", "content": "продолжай работу " * 2_000}],
+        "max_output_tokens": 1_024,
+    }
+    escaped_bytes = len(
+        json.dumps(request, ensure_ascii=True, separators=(",", ":")).encode()
+    )
+    utf8_bytes = len(
+        json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
+    )
+
+    estimate = _provider_wire_token_bound(request)
+
+    assert escaped_bytes > utf8_bytes * 2
+    assert estimate < escaped_bytes // 3
+    assert estimate >= (utf8_bytes + 2) // 3
+
+
+def test_provider_request_budget_uses_active_model_window_and_output_reserve():
+    agent = SimpleNamespace(
+        _config_context_length=12_000,
+        _compression_safety_margin=500,
+    )
+    request = {
+        "input": [{"role": "user", "content": "x" * 6_000}],
+        "max_output_tokens": 2_000,
+    }
+
+    decision = provider_request_budget(agent, request)
+
+    assert decision.context_window == 12_000
+    assert decision.output_reserve == 2_000
+    assert decision.safety_margin == 500
+    assert decision.safe_input_budget == 9_500
+    assert decision.fits is True
 
 
 def test_codex_responses_incident_sized_wire_reaches_transport_once():
