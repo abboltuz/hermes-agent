@@ -114,6 +114,11 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
     agent.tool_delay = 0
     agent.save_trajectories = False
     agent.max_compression_attempts = 1
+    # Keep this synthetic 1K context internally consistent with the final-wire
+    # gate. The test exercises rearm semantics, not an impossible 1K input
+    # window paired with AIAgent's much larger default output reservation.
+    agent.max_tokens = 64
+    agent._compression_safety_margin = 0
 
     compressor = MagicMock()
     compressor.protect_first_n = 3
