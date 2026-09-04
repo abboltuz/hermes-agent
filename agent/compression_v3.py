@@ -98,7 +98,10 @@ def _thaw(value: Any) -> Any:
 
 
 def _projection_fingerprint(messages: Sequence[Mapping[str, Any]]) -> str:
-    frozen = _freeze([dict(message) for message in messages])
+    # Persistence/recovery sidecars may be stamped between provider calls but
+    # do not change the semantic provider prefix. Ignore them just like the
+    # final wire sanitizer so append-safe candidates survive ordinary flushes.
+    frozen = _freeze(_strip_provider_private([dict(message) for message in messages]))
     payload = json.dumps(
         frozen,
         sort_keys=True,
@@ -109,6 +112,33 @@ def _projection_fingerprint(messages: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _sample_background_messages(
+    messages: Sequence[Mapping[str, Any]], *, max_chars: int
+) -> list[dict[str, Any]]:
+    """Evenly sample worker input while retaining both conversation edges."""
+    copied = [dict(message) for message in messages]
+    encoded = json.dumps(copied, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return copied
+    if len(copied) <= 2:
+        return copied
+    # Select whole messages so tool envelopes remain structurally meaningful.
+    # The candidate is optional: deterministic projection still owns liveness.
+    target_messages = max(2, int(len(copied) * max_chars / len(encoded)))
+    target_messages = min(len(copied), target_messages)
+    indices = {
+        round(index * (len(copied) - 1) / (target_messages - 1))
+        for index in range(target_messages)
+    }
+    sampled = [copied[index] for index in sorted(indices)]
+    while (
+        len(sampled) > 2
+        and len(json.dumps(sampled, ensure_ascii=False, default=str)) > max_chars
+    ):
+        sampled.pop(len(sampled) // 2)
+    return sampled
+
+
 @dataclass(frozen=True)
 class BackgroundCompressionSnapshot:
     """Immutable, live-runtime-free input owned by the background worker."""
@@ -117,6 +147,7 @@ class BackgroundCompressionSnapshot:
     generation: int
     source_length: int
     messages: tuple[Any, ...]
+    latest_human: Any | None
     route: tuple[Any, ...]
     prefix_fingerprint: str
     schema_hash: str
@@ -152,12 +183,37 @@ def build_background_snapshot(
     if safe_length <= 0:
         return None
     stable = stable[:safe_length]
+    route_copy = dict(route)
+    try:
+        route_context = int(route_copy.get("context_length") or 0)
+    except (TypeError, ValueError):
+        route_context = 0
+    try:
+        route_output = int(route_copy.get("max_tokens") or 4096)
+    except (TypeError, ValueError):
+        route_output = 4096
+    # Prefer resolved model metadata. Before the lazy probe runs, use Hermes'
+    # supported-model floor (64K), not a provider/model-name lookup table.
+    route_context = route_context if route_context > 0 else 64_000
+    input_tokens = max(8_192, route_context - max(1, route_output) - 2_048)
+    sampled = _sample_background_messages(
+        stable, max_chars=input_tokens * _PROVIDER_WIRE_BYTES_PER_TOKEN
+    )
+    latest_human = next(
+        (
+            dict(message)
+            for message in reversed(stable)
+            if message.get("role") == "user" and is_human_intent(message)
+        ),
+        None,
+    )
     return BackgroundCompressionSnapshot(
         session_id=str(session_id),
         generation=int(generation),
         source_length=safe_length,
-        messages=tuple(_freeze(message) for message in stable),
-        route=_freeze(dict(route)),
+        messages=tuple(_freeze(message) for message in sampled),
+        latest_human=_freeze(latest_human) if latest_human is not None else None,
+        route=_freeze(route_copy),
         prefix_fingerprint=_projection_fingerprint(stable),
         schema_hash=str(schema_hash or ""),
         deadline=float(
@@ -913,6 +969,54 @@ def emergency_context_cut(
     return CutResult(original, "context_projection_unfit", False, identity, validation.reason)
 
 
+def _maybe_schedule_background_projection(
+    agent: Any,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    current_tokens: int,
+    context_window: int,
+    schema_hash: str,
+) -> CompressionCoordinator | None:
+    """Speculate above a ratio threshold; never wait for semantic work."""
+    policy = getattr(agent, "_compression_v3_background_config", None)
+    route = getattr(agent, "_compression_v3_route", None)
+    if (
+        not isinstance(policy, BackgroundCompressionConfig)
+        or not policy.enabled
+        or not compression_route_is_eligible(route)
+        or current_tokens < context_window * policy.start_ratio
+    ):
+        return None
+    coordinator = ensure_compression_coordinator(
+        agent, trigger="background_pressure", urgency=1
+    )
+    route = dict(route)
+    resolved_aux_context = getattr(
+        agent, "_aux_compression_context_length", None
+    )
+    if isinstance(resolved_aux_context, int) and resolved_aux_context > 0:
+        route["context_length"] = resolved_aux_context
+    generation = int(getattr(agent, "_compression_generation", 0) or 0)
+    # A completed older-prefix candidate remains useful with an append-only
+    # tail.  Do not spend another remote call merely because the transcript
+    # grew while the first summary was running.
+    if coordinator.project_background(
+        messages, generation=generation, schema_hash=schema_hash
+    ) is not None:
+        return coordinator
+    snapshot = build_background_snapshot(
+        coordinator.session_id,
+        generation,
+        messages,
+        route=route,
+        schema_hash=schema_hash,
+        deadline=time.monotonic() + policy.deadline_seconds,
+    )
+    if snapshot is not None:
+        coordinator.start_background(snapshot, run_background_compression_worker)
+    return coordinator
+
+
 def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Apply the v3 fit gate to the actual provider-bound request."""
     # Keep sidecars available to compression/recovery, and sanitize only the
@@ -961,9 +1065,24 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
     budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
     wire_budget = provider_request_budget(agent, wire_request)
+    schema_hash = (
+        _projection_fingerprint(tools)
+        if isinstance(tools, Sequence) and not isinstance(tools, (str, bytes))
+        else ""
+    )
+    coordinator = _maybe_schedule_background_projection(
+        agent,
+        messages,
+        current_tokens=wire_budget.estimated_input_tokens,
+        context_window=context_window,
+        schema_hash=schema_hash,
+    )
     if budget.fits(messages) and wire_budget.fits:
         return wire_request
-    coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
+    if coordinator is None:
+        coordinator = ensure_compression_coordinator(
+            agent, trigger="pre_send_fit_gate", urgency=3
+        )
     def _candidate_wire_fits(candidate_messages: Sequence[Mapping[str, Any]]) -> bool:
         candidate_request = dict(request)
         candidate_request["messages"] = list(candidate_messages)
@@ -973,6 +1092,18 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
             output_reserve=output_reserve,
             safety_margin=safety_margin,
         )
+    background_messages = coordinator.project_background(
+        messages,
+        generation=int(getattr(agent, "_compression_generation", 0) or 0),
+        schema_hash=schema_hash,
+    )
+    if (
+        background_messages is not None
+        and budget.fits(background_messages)
+        and _candidate_wire_fits(background_messages)
+    ):
+        request["messages"] = background_messages
+        return _strip_provider_private(request)
     result = emergency_context_cut(
         messages,
         budget,
@@ -1062,12 +1193,13 @@ def run_background_compression_worker(
 
     response = call_llm(
         task="compression",
-        provider=str(route["provider"]),
-        model=str(route["model"]),
+        provider=(str(route["provider"]) if route.get("provider") else None),
+        model=(str(route["model"]) if route.get("model") else None),
         base_url=route.get("base_url") or None,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=int(route.get("max_tokens") or 4096),
         timeout=max(1.0, snapshot.deadline - time.monotonic()),
+        reasoning_config={"enabled": False},
     )
     choices = getattr(response, "choices", None) or []
     response_message = getattr(choices[0], "message", None) if choices else None
@@ -1091,13 +1223,10 @@ def run_background_compression_worker(
             "content": "[COMPRESSION SUMMARY]\n" + summary.strip(),
         }
     )
-    latest_human = next(
-        (
-            dict(message)
-            for message in reversed(messages)
-            if message.get("role") == "user" and is_human_intent(message)
-        ),
-        None,
+    latest_human = (
+        _thaw(snapshot.latest_human)
+        if snapshot.latest_human is not None
+        else None
     )
     if latest_human is not None:
         retained.append(latest_human)
@@ -1125,13 +1254,15 @@ class CompressionSnapshot:
 
 
 def compression_route_is_eligible(route: Mapping[str, Any] | None) -> bool:
-    """Require an explicit separately certified fast non-reasoning route."""
+    """Require a certified non-reasoning auxiliary route or its auto resolver."""
     return bool(
         isinstance(route, Mapping)
-        and route.get("provider")
-        and route.get("model")
         and route.get("certified_fast") is True
         and route.get("reasoning") is False
+        and (
+            route.get("resolution") == "auxiliary_auto"
+            or (route.get("provider") and route.get("model"))
+        )
     )
 
 

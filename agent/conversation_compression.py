@@ -2000,6 +2000,10 @@ def check_compression_model_feasibility(agent: Any) -> None:
             provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")),
             custom_providers=agent._custom_providers,
         )
+        # Background request projection uses the same resolved capability to
+        # bound its immutable worker snapshot. This is metadata only; the
+        # worker still receives no live agent or provider client.
+        agent._aux_compression_context_length = aux_context
 
         # Hard floor: the auxiliary compression model must have at least
         # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model

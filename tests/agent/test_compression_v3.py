@@ -25,6 +25,7 @@ from agent.compression_v3 import (
     estimate_projection_tokens,
     provider_request_budget,
     resolve_background_compression_config,
+    run_background_compression_worker,
 )
 from agent.compression_v3 import _provider_wire_token_bound
 from agent.compression_v3 import _bind_recovery_identity
@@ -577,6 +578,40 @@ def test_background_snapshot_stops_before_incomplete_tool_round():
     assert snapshot.source_length == 3
 
 
+def test_background_worker_preserves_latest_human_verbatim_after_sampling(
+    monkeypatch,
+):
+    latest = {"role": "user", **HUMAN, "content": "KEEP THIS EXACTLY"}
+    messages = [{"role": "user", **HUMAN, "content": "first"}]
+    messages.extend(
+        {"role": "assistant", "content": f"bulk-{index}-" + "x" * 20_000}
+        for index in range(8)
+    )
+    messages.extend([latest, {"role": "assistant", "content": "ack"}])
+    snapshot = build_background_snapshot(
+        "sampled",
+        1,
+        messages,
+        route={
+            "resolution": "auxiliary_auto",
+            "certified_fast": True,
+            "reasoning": False,
+            "context_length": 12_000,
+        },
+    )
+    assert snapshot is not None
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+        ),
+    )
+
+    candidate = run_background_compression_worker(snapshot)
+
+    assert candidate.messages[-1] == latest
+
+
 def test_background_job_coalesces_and_adopts_append_only_tail():
     messages = [{"role": "user", **HUMAN, "content": "current task"}]
     snapshot = build_background_snapshot(
@@ -611,6 +646,7 @@ def test_background_job_coalesces_and_adopts_append_only_tail():
     release.set()
     assert first is not None
     first.result(timeout=1)
+    messages[0]["_db_persisted"] = True
     live = messages + [{"role": "assistant", "content": "new answer"}]
     projected = owner.project_background(
         live, generation=3, schema_hash="tools-v1"
@@ -650,6 +686,98 @@ def test_background_candidate_rejects_changed_prefix_or_schema():
     assert owner.project_background(
         messages, generation=1, schema_hash="schema-b"
     ) is None
+
+
+def test_fit_request_starts_background_work_without_waiting(monkeypatch):
+    from agent import compression_v3
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    def worker(snapshot):
+        entered.set()
+        release.wait(1)
+        return CompressionCandidate(
+            snapshot.session_id,
+            snapshot.generation,
+            snapshot.source_length,
+            snapshot.prefix_fingerprint,
+            snapshot.schema_hash,
+            [{"role": "assistant", "content": "summary"}],
+        )
+
+    monkeypatch.setattr(compression_v3, "run_background_compression_worker", worker)
+    agent = SimpleNamespace(
+        session_id="nonblocking-fit",
+        _config_context_length=1_000,
+        _compression_safety_margin=0,
+        _compression_generation=0,
+        _compression_v3_background_config=BackgroundCompressionConfig(
+            True, 0.05, 30
+        ),
+        _compression_v3_route={
+            "provider": "aux",
+            "model": "fast",
+            "certified_fast": True,
+            "reasoning": False,
+        },
+    )
+    request = {
+        "messages": [{"role": "user", **HUMAN, "content": "x" * 300}],
+        "tools": [],
+        "max_tokens": 8,
+    }
+    try:
+        assert prepare_api_request(agent, request)["messages"] == request["messages"]
+        assert entered.wait(1)
+        assert agent._compression_coordinator.poll_background() is None
+    finally:
+        release.set()
+
+
+def test_unfit_request_uses_deterministic_cut_while_background_is_pending(
+    monkeypatch,
+):
+    from agent import compression_v3
+
+    release = threading.Event()
+
+    def worker(snapshot):
+        release.wait(1)
+        raise AssertionError("pending semantic result must not be awaited")
+
+    monkeypatch.setattr(compression_v3, "run_background_compression_worker", worker)
+    messages = [{"role": "user", **HUMAN, "content": "latest task"}]
+    for index in range(8):
+        messages.extend(_round(index, body="bulk " * 500))
+    for row_id, message in enumerate(messages, start=1):
+        message["_row_id"] = row_id
+    agent = SimpleNamespace(
+        session_id="nonblocking-unfit",
+        _config_context_length=2_200,
+        _compression_safety_margin=0,
+        _compression_generation=0,
+        _session_db=SimpleNamespace(
+            register_compression_recovery=lambda *_args, **_kwargs: "recovery-1"
+        ),
+        _compression_v3_background_config=BackgroundCompressionConfig(
+            True, 0.05, 30
+        ),
+        _compression_v3_route={
+            "provider": "aux",
+            "model": "fast",
+            "certified_fast": True,
+            "reasoning": False,
+        },
+    )
+    try:
+        prepared = prepare_api_request(
+            agent, {"messages": messages, "tools": [], "max_tokens": 8}
+        )
+        assert len(prepared["messages"]) < len(messages)
+        assert agent._compression_coordinator.poll_background() is None
+    finally:
+        release.set()
 
 
 def test_budget_includes_wire_floor_and_blocks_unfit_projection():
@@ -840,6 +968,7 @@ def test_snapshot_adoption_splices_post_watermark_tail_once():
 
 def test_background_route_requires_explicit_certification():
     assert compression_route_is_eligible({"provider": "p", "model": "m", "certified_fast": True, "reasoning": False})
+    assert compression_route_is_eligible({"resolution": "auxiliary_auto", "certified_fast": True, "reasoning": False})
     assert not compression_route_is_eligible({"provider": "p", "model": "m", "reasoning": False})
     assert not compression_route_is_eligible({"provider": "p", "model": "m", "certified_fast": True, "reasoning": True})
 

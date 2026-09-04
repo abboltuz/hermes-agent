@@ -4540,6 +4540,14 @@ class AIAgent:
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
+        coordinator = getattr(self, "_compression_coordinator", None)
+        if coordinator is not None:
+            try:
+                coordinator.close_background()
+            except Exception:
+                logger.debug(
+                    "compression background shutdown failed", exc_info=True
+                )
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])

@@ -766,6 +766,15 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        # Start an optional semantic summary before the foreground reaches its
+        # hard fit boundary. It uses the existing auxiliary.compression route
+        # resolver with reasoning disabled; deterministic request projection
+        # remains the immediate fallback and never waits for this worker.
+        "background": {
+            "enabled": True,
+            "start_ratio": 0.55,
+            "deadline_seconds": 120,
+        },
         "checkpoint_required": False, # Fail closed before lossy compaction unless an
                                       # active memory provider confirms checkpoint API
                                       # compatibility and completes the checkpoint.

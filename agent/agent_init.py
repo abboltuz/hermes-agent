@@ -1806,6 +1806,75 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Freeze the optional background-compression policy and a scalar-only
+    # auxiliary route.  The worker never receives the live agent, credentials,
+    # SessionDB, or mutable transcript.  Eligibility is capability-based: an
+    # explicit route, separate from the foreground, with reasoning disabled.
+    try:
+        from agent.compression_v3 import resolve_background_compression_config
+
+        _compression_section = _agent_cfg.get("compression", {})
+        if not isinstance(_compression_section, dict):
+            _compression_section = {}
+        agent._compression_v3_background_config = (
+            resolve_background_compression_config(
+                _compression_section.get("background", {})
+            )
+        )
+        _auxiliary_section = _agent_cfg.get("auxiliary", {})
+        _aux_compression = (
+            _auxiliary_section.get("compression", {})
+            if isinstance(_auxiliary_section, dict)
+            else {}
+        )
+        if not isinstance(_aux_compression, dict):
+            _aux_compression = {}
+        _route_provider = str(_aux_compression.get("provider") or "").strip()
+        _route_model = str(_aux_compression.get("model") or "").strip()
+        _route_base_url = str(_aux_compression.get("base_url") or "").strip()
+        _route_reasoning = str(
+            _aux_compression.get("reasoning_effort") or ""
+        ).strip().lower()
+        _auto_route = (
+            _route_provider.lower() in {"", "auto"} and not _route_model
+        )
+        _main_identity = (
+            str(getattr(agent, "provider", "") or ""),
+            str(getattr(agent, "model", "") or ""),
+            str(getattr(agent, "base_url", "") or ""),
+        )
+        _route_identity = (_route_provider, _route_model, _route_base_url)
+        _explicit_route = (
+            _route_provider.lower() not in {"", "auto", "main"}
+            and bool(_route_model)
+            and _route_identity != _main_identity
+        )
+        agent._compression_v3_route = {
+            key: _aux_compression.get(key)
+            for key in ("provider", "model", "base_url", "max_tokens", "context_length")
+            if _aux_compression.get(key) not in (None, "")
+        }
+        agent._compression_v3_route.update(
+            {
+                "resolution": "auxiliary_auto" if _auto_route else "explicit",
+                # Auto resolution is safe for speculation because the worker
+                # supplies a no-reasoning call override and never blocks the
+                # foreground. Explicit routes remain opt-in and must declare
+                # none/minimal reasoning in their task config.
+                "certified_fast": _auto_route
+                or (
+                    _explicit_route
+                    and _route_reasoning in {"none", "minimal"}
+                ),
+                "reasoning": False
+                if _auto_route
+                else _route_reasoning not in {"none", "minimal"},
+            }
+        )
+    except Exception:
+        agent._compression_v3_background_config = None
+        agent._compression_v3_route = {}
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

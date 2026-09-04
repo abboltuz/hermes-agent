@@ -4756,6 +4756,16 @@ def show_config():
     enabled = compression.get('enabled', True)
     print(f"  Enabled:      {'yes' if enabled else 'no'}")
     if enabled:
+        _background = compression.get('background', {})
+        if isinstance(_background, dict):
+            print(
+                "  Background:   "
+                + ("enabled" if _background.get('enabled', True) is True else "disabled")
+            )
+            if _background.get('enabled', True) is True:
+                print(
+                    f"  Early start:  {float(_background.get('start_ratio', 0.55)) * 100:.0f}%"
+                )
         print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
         _tt = compression.get('threshold_tokens')
         if _tt is not None:
