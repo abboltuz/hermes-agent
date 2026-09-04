@@ -2593,6 +2593,33 @@ def _compression_source_fingerprint(messages: list, system_message: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _compression_strategy_fingerprint(agent: Any, focus_topic: Optional[str]) -> str:
+    """Rearm failed work when its engine, route, budget or policy changes.
+
+    Persist only the digest. Credentials and incidental counters are deliberately
+    excluded; changing a worker/process generation is not a changed strategy.
+    """
+    from agent.auxiliary_client import _get_auxiliary_task_config
+
+    compressor = getattr(agent, "context_compressor", None)
+    aux = _get_auxiliary_task_config("compression")
+    fields = (
+        "model", "provider", "api_mode", "summary_model", "context_length",
+        "protect_first_n", "protect_last_n", "summary_target_ratio", "tail_mode",
+    )
+    policy = {
+        "version": 1,
+        "engine": f"{type(compressor).__module__}.{type(compressor).__qualname__}",
+        "focus": focus_topic,
+        "engine_policy": {key: getattr(compressor, key, None) for key in fields},
+        "auxiliary": {key: aux.get(key) for key in (
+            "provider", "model", "base_url", "context_length", "max_tokens",
+            "timeout", "reasoning_effort",
+        )},
+    }
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -2627,12 +2654,17 @@ def compress_context(
     logical_id = str(getattr(agent, "_conversation_root_id", lambda: None)() or getattr(agent, "session_id", ""))
     generation = int(getattr(agent, "_compression_generation", 0) or 0)
     fingerprint = _compression_source_fingerprint(messages, system_message)
+    try:
+        strategy = _compression_strategy_fingerprint(agent, focus_topic)
+    except Exception:
+        logger.warning("Context compaction policy unavailable; keeping previous context", exc_info=True)
+        return messages, getattr(agent, "_cached_system_prompt", None) or system_message or ""
     request = CompressionRequest(
         logical_id,
         generation,
         trigger,
         urgency=3 if force else 1,
-        source_fingerprint=fingerprint,
+        source_fingerprint=f"{fingerprint}:{strategy}",
         row_watermark=len(messages),
         estimated_pressure=int(approx_tokens or 0),
         force=force,
@@ -2642,6 +2674,28 @@ def compress_context(
     if admission.outcome != "admitted":
         existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
         return messages, existing_prompt
+    db = getattr(agent, "_session_db", None)
+    # Class-level detection does not accidentally opt Mock/legacy duck-typed
+    # stores into a persistence contract they do not implement.
+    durable_claim = getattr(type(db), "claim_context_compaction", None)
+    durable_owner = None
+    if callable(durable_claim):
+        owner = uuid.uuid4().hex
+        try:
+            durable_admission = db.claim_context_compaction(
+                logical_id, fingerprint, strategy, owner=owner, force=force,
+            )
+        except Exception:
+            # Fail closed on journal contention/failure without changing history.
+            logger.warning("Context compaction admission unavailable; keeping previous context", exc_info=True)
+            durable_admission = "deferred_lock"
+        if durable_admission == "admitted":
+            durable_owner = owner
+        elif durable_admission != "unpersisted":
+            coordinator.finish_execution(request, "deferred_lock")
+            existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
+            return messages, existing_prompt
+    outcome = "aborted"
     try:
         result = _compress_context_impl(
             agent,
@@ -2677,6 +2731,13 @@ def compress_context(
         coordinator.finish_execution(request, "aborted")
         raise
     finally:
+        if durable_owner is not None:
+            try:
+                db.finish_context_compaction(logical_id, owner=durable_owner, outcome=outcome)
+            except Exception:
+                # An unfinished receipt remains running and then expires to a
+                # terminal state. Never mask a committed result or cancellation.
+                logger.warning("Context compaction receipt unavailable", exc_info=True)
         if coordinator.outcome not in {"aborted", "no_progress", "timed_out", "deferred_lock", "cooldown", "native_delegated", "committed"}:
             coordinator.finish_execution(request, "aborted")
 

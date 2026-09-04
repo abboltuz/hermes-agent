@@ -1,0 +1,87 @@
+# Bounded working context and lossless searchable archive
+
+Status: implementation in progress, not a released capability.
+Implementation base: `0be448cacf4198f5ef044f3c308d585c466b3a89` (`cekasha/main`).
+No production migration or runtime activation is authorized by this document.
+
+## Product contract
+
+A conversation retains its identity and complete raw history. Provider requests
+use a bounded, versioned working context rather than loading the entire archive.
+The context contains structured task state, hierarchical summaries, exact anchors,
+recent complete turns, bounded archive retrieval, and unresolved tool effects.
+Archive retrieval returns source provenance. Summaries are derived data, never
+the sole record of the conversation.
+
+Context capacity is checked on the final provider-shaped request, including tool
+schemas and output reserve. The current byte/token heuristic is an estimate, not
+a proof for arbitrary tokenizers or multimodal inputs. Unsupported counting must
+not be described as an unconditional fit guarantee.
+
+Compaction builds a candidate away from the session-open path and publishes it
+atomically against its source revision. Incomplete summaries and stale candidates
+are rejected. Unmatched tool calls must not be summarized away or replayed as new
+effects. Publication is episodic, preserving the cached prefix between episodes.
+
+Opening a conversation must not require an archive scan, agent initialization,
+or completion of a compaction job. Existing Desktop pagination/windowing is reused.
+Archive storage and indexing must not monopolize the hot control-plane database.
+Migration preserves raw payloads and verifies identities/counts/hashes before
+switching readers; it is resumable and never rewrites a live multi-GB database
+in one request.
+
+## Implementation sequence and evidence gates
+
+1. Durable execution admission and terminal receipts (current increment).
+2. Versioned context snapshots, bounded candidate validation, atomic publication,
+   and resume from snapshot plus a fenced post-snapshot tail.
+3. Searchable raw archive separation, artifact references, hierarchical summaries,
+   structured state and exact anchors; maintain existing recovery APIs.
+4. Independent session-open/control path, worker resource isolation, lazy legacy
+   migration, and large-history end-to-end tests.
+5. Exact-candidate independent review, recall/cache-cost evaluation, and explicit
+   owner approval before integration or runtime activation.
+
+Passing tests for step 1 does not establish steps 2–5.
+
+## Durable admission increment
+
+`context_compaction_jobs` stores hashes and receipts, not transcript bodies.
+Its key is `(conversation, source fingerprint, strategy fingerprint)`, deliberately
+excluding the process-local generation. Strategy includes engine identity,
+configured summarizer route, context policy and focus. Automatic callers sharing
+one logical conversation join or defer instead of executing twice.
+
+`running` transitions to `committed`, `no_progress`, `timed_out` or `aborted`.
+These outcomes suppress identical automatic work after a process restart.
+`cooldown`, `deferred_lock` and `native_delegated` are retryable nonexecution
+outcomes. A different source/strategy or explicit force rearms a terminal job;
+force cannot steal a live job. An abandoned lease expires to a terminal state,
+not into another automatic attempt. A unique owner token fences receipt writes.
+The existing compression lock/commit fence still controls transcript publication.
+
+Journal admission uses the existing short activity-write contention budget and
+fails closed without modifying the transcript. Failure to write a completion
+receipt does not mask cancellation or a successfully returned result. The
+unfinished receipt remains conservative until expiration or explicit recovery.
+This first increment retains the existing legacy untagged compression-call
+contract; these callers and direct engine compaction entry points still need to
+converge on the snapshot publication service in step 2.
+
+## Required verification beyond the current increment
+
+- Restart and multiple real connections/processes: one admitted source/strategy;
+  no stale-owner publication or receipts.
+- Candidate rejection preserves the prior snapshot and raw event identities.
+- Concurrent appends and interrupted tool groups survive compaction exactly.
+- Repeated compactions do not clone the retained raw tail.
+- Final request budget includes transport-specific fields and multimodal costs;
+  oversized mandatory input returns an explicit actionable failure.
+- Archive search and user-visible history retain exact provenance after migration.
+- Opening, stopping and navigating other chats remain responsive during heavy
+  compaction/indexing; measure tail latency against large synthetic archives.
+- Recall with recovery and cache reuse do not regress against the checked-in
+  compaction evaluation corpus.
+- Migration interruption, storage failure and downgrade have explicit tested
+  behavior. Installed state, provider credentials and live sessions are not test
+  fixtures.

@@ -521,6 +521,20 @@ CREATE TABLE IF NOT EXISTS compression_recovery (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS context_compaction_jobs (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_fingerprint TEXT NOT NULL,
+    strategy_fingerprint TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, source_fingerprint, strategy_fingerprint)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_context_compaction_running
+    ON context_compaction_jobs(session_id) WHERE outcome = 'running';
+
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
