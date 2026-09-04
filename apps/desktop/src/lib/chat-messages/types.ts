@@ -2,7 +2,7 @@ import type { ThreadMessageLike } from '@assistant-ui/react'
 import { type BillingBlock } from '@hermes/shared'
 
 import type { ErrorSurface } from '@/lib/error-surface'
-import type { MessageReaction, SessionMessage, UsageStats } from '@/types/hermes'
+import type { MessageReaction, SessionMessage, SessionPreparation, UsageStats } from '@/types/hermes'
 
 export interface TimelinePartMetadata {
   /** Unix seconds when this visible activity segment began. Fractional values
@@ -124,6 +124,8 @@ export type GatewayEventPayload = {
   count?: number
   // status.update (kind=process → background process completion/watch-match)
   kind?: string
+  // session.resume_progress — state of the independent model-history build.
+  preparation?: SessionPreparation
   // pane.reveal (agent focusing a desktop pane via the focus_pane tool)
   pane?: string
   // layout.apply (agent applying a layout preset via the apply_layout tool)

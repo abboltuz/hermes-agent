@@ -119,7 +119,8 @@ describe('useSessionTileDelegate resumeTile', () => {
     vi.mocked(getLatestSessionMessages).mockReturnValueOnce(history.promise)
     vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({
       session_id: 'live-ready',
-      messages: [{ row_id: 9, role: 'assistant', content: 'resume tail' }]
+      messages: [{ row_id: 9, role: 'assistant', content: 'resume tail' }],
+      preparation: { attempt: 1, phase: 'history', status: 'preparing' }
     } as never)
     const updateSessionState = vi.fn()
     const runtimeIdByStoredSessionIdRef = { current: new Map<string, string>() }
@@ -141,6 +142,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     const initialUpdate = updateSessionState.mock.calls[0][1]
     let state = initialUpdate({ messages: [] })
     expect(state.messages.map((message: ChatMessage) => message.rowId)).toEqual([9])
+    expect(state.preparation).toEqual({ attempt: 1, phase: 'history', status: 'preparing' })
 
     history.resolve({
       session_id: 'runtime-ready',

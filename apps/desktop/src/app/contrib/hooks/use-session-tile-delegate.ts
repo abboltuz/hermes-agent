@@ -280,6 +280,7 @@ export function useSessionTileDelegate({
           state => ({
             ...state,
             busy: Boolean(info?.running),
+            preparation: resumed.preparation,
             // Persist the session's own model/provider from resume so the tile
             // pill does not wait on a chrome-scoped catalog read (#93892).
             ...(typeof info?.model === 'string' ? { model: info.model } : {}),

@@ -1588,6 +1588,7 @@ export function useSessionActions({
             ...(runtimeInfo ?? {}),
             messages: visibleMessagesForView,
             transcriptProvenance,
+            preparation: resumed.preparation,
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.

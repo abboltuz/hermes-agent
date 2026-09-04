@@ -150,15 +150,15 @@ Profile store construction, legacy title/adoption fallback, lineage resolution
 and workspace metadata also remain on the acknowledgement path; bounded resource
 isolation and large-archive latency are not yet proven.
 
-## Independent tile browsing increment
+## Independent browsing and retained preparation increment
 
-A Desktop session tile now treats persisted history and the agent runtime as two
-independent products. It starts the owner-scoped REST tail read and deferred
-`session.resume` together, but neither result hides or cancels the other. A
-runtime failure is surfaced immediately rather than waiting for a slow history
-read; a later history result can still replace the empty error screen with the
-normal transcript in read-only mode. If history arrives first, it remains visible
-while the runtime connects, after a failure, and during an explicit retry.
+Desktop primary chats and session tiles now treat persisted history and the agent
+runtime as two independent products. They start the owner-scoped REST tail read
+and deferred `session.resume` together, but neither result hides or cancels the
+other. If history arrives first, it remains visible while model-facing preparation
+runs, after a preparation failure, and during an explicit retry. The composer and
+mutation controls stay unavailable until preparation reaches `ready`; history
+browsing and copy/read navigation do not depend on that state.
 
 The preview is transient presentation state keyed by stored session and owner
 route. It is never persisted as a second conversation and never fabricated as a
@@ -169,16 +169,30 @@ while it was connecting are grafted onto the newer live tail instead of being
 silently replaced by the latest REST page. Persisted messages use their durable
 database row as renderer identity, so independently loaded pages cannot collide
 through a timestamp-derived UI key. The shared message renderer is used without
-a composer or mutation controls; copy/read navigation remains available.
+mutation controls while preparation is blocked; copy/read navigation remains
+available.
 
-This increment establishes browse availability for the tile path, not complete
-backend preparation recovery. The gateway still reports worker hydration failure
-as a generic session error and discards the runtime handle. A distinct persisted
-`preparing`/`preparation_failed` protocol state, a retained browse handle and a
-bounded retry command are still required. The primary route already paints REST
-history independently, but it must converge on that same explicit state machine.
-No multi-gigabyte archive latency, cold-storage isolation or migration behavior
-is established by the Desktop tests in this increment.
+Deferred resume exposes an explicit runtime preparation state:
+`preparing`, `preparation_failed`, or `ready`. A failed history build retains the
+same runtime id instead of making the readable transcript depend on a second
+resume. `session.resume.retry` starts one explicit, generation-fenced attempt on
+that retained runtime and is idempotent while the attempt is already preparing or
+ready. There is no hidden retry loop. A tagged compatibility error accompanies
+the structured progress event for older clients; the Desktop recognizes the tag
+as preparation state rather than fabricating a failed assistant turn or toast.
+
+Each attempt captures its own completion fences. Waiters follow a newer
+generation and cannot interpret an empty agent slot as success. A dedicated
+profile DB is transferred to a newly built agent before that agent can be
+published. Registry membership, generation validation and publication share the
+same lock order as close and retry. Consequently publication gives teardown the
+only owner, while an invalidated local build closes its agent and handle exactly
+once.
+
+This increment establishes independent bounded browsing and preparation recovery;
+it does not yet establish a physically separate cold archive, multi-gigabyte
+archive latency, migration behavior, or the complete searchable archive described
+in steps 3–4.
 
 ## Required verification beyond the current increment
 
