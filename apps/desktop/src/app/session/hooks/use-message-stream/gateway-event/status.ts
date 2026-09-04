@@ -1,3 +1,4 @@
+import { mergeSessionPreparation } from '@/app/session/retry-preparation'
 import { translateNow } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { coerceGatewayText } from '@/lib/chat-runtime'
@@ -25,7 +26,10 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
 
   if (event.type === 'session.resume_progress') {
     if (sessionId && payload?.preparation) {
-      updateSessionState(sessionId, state => ({ ...state, preparation: payload.preparation }))
+      updateSessionState(sessionId, state => ({
+        ...state,
+        preparation: mergeSessionPreparation(state.preparation, payload.preparation)
+      }))
     }
 
     return true

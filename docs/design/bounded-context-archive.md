@@ -180,6 +180,9 @@ that retained runtime and is idempotent while the attempt is already preparing o
 ready. There is no hidden retry loop. A tagged compatibility error accompanies
 the structured progress event for older clients; the Desktop recognizes the tag
 as preparation state rather than fabricating a failed assistant turn or toast.
+RPC acknowledgements and progress events merge monotonically by attempt and
+terminality, so an out-of-order `preparing` response cannot overwrite an already
+observed `ready` or `preparation_failed` event.
 
 Each attempt captures its own completion fences. Waiters follow a newer
 generation and cannot interpret an empty agent slot as success. A dedicated

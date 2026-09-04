@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 
 import { graftRefreshedTailOntoBackfill, mergePersistedTailIntoRuntime } from '@/app/chat/transcript-backfill'
+import { mergeSessionPreparation } from '@/app/session/retry-preparation'
 import { getLatestSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
 import { $sessions, knownSessionOwner } from '@/store/session'
@@ -280,7 +281,7 @@ export function useSessionTileDelegate({
           state => ({
             ...state,
             busy: Boolean(info?.running),
-            preparation: resumed.preparation,
+            preparation: mergeSessionPreparation(state.preparation, resumed.preparation),
             // Persist the session's own model/provider from resume so the tile
             // pill does not wait on a chrome-scoped catalog read (#93892).
             ...(typeof info?.model === 'string' ? { model: info.model } : {}),

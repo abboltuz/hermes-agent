@@ -97,4 +97,27 @@ describe('deferred resume preparation events', () => {
       status: 'ready'
     })
   })
+
+  it('ignores a stale preparing acknowledgement received after ready', () => {
+    act(() =>
+      stream.handleEvent({
+        payload: {
+          preparation: { attempt: 1, message_count: 42, phase: 'history', status: 'ready' }
+        },
+        session_id: SID,
+        type: 'session.resume_progress'
+      })
+    )
+    act(() =>
+      stream.handleEvent({
+        payload: {
+          preparation: { attempt: 1, phase: 'history', status: 'preparing' }
+        },
+        session_id: SID,
+        type: 'session.resume_progress'
+      })
+    )
+
+    expect(stream.state().preparation?.status).toBe('ready')
+  })
 })
