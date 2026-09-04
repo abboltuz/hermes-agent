@@ -208,6 +208,34 @@ describe('mergePersistedTailIntoRuntime', () => {
     expect(mergePersistedTailIntoRuntime(optimistic, persisted)).toEqual(optimistic)
   })
 
+  it('dedupes a committed assistant only inside its proven user turn', () => {
+    const persisted = [
+      { ...chat('stored-user', 9), semanticId: 'desktop:prompt-9' },
+      { ...chat('stored-assistant', 10), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    const live = [
+      { ...chat('user-optimistic'), semanticId: 'desktop:prompt-9' },
+      { ...chat('assistant-stream'), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(live, persisted)).toEqual(live)
+  })
+
+  it('keeps identical assistant text under different identified user turns', () => {
+    const persisted = [
+      { ...chat('stored-user', 9), semanticId: 'desktop:older' },
+      { ...chat('stored-assistant', 10), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    const live = [
+      { ...chat('user-optimistic'), semanticId: 'desktop:newer' },
+      { ...chat('assistant-stream'), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(live, persisted)).toEqual([...persisted, ...live])
+  })
+
   it('does not collapse text-identical turns with different semantic identities', () => {
     const persisted = [{ ...chat('stored-user', 9), semanticId: 'desktop:older' }]
     const optimistic = [{ ...chat('user-optimistic'), semanticId: 'desktop:newer' }]

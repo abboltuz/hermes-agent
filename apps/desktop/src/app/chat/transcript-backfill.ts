@@ -16,7 +16,7 @@
  */
 
 import { getOlderSessionMessages } from '@/hermes'
-import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText, toChatMessages } from '@/lib/chat-messages'
 import { recordTranscriptBackfillPage, type TranscriptProfileScope, transcriptTailState } from '@/store/transcript-tail'
 
 /** Older rows likely exist beyond what the in-memory store holds. */
@@ -90,11 +90,54 @@ export function mergePersistedTailIntoRuntime(
   const widths = runtimeCount + 1
   const lcs = new Uint32Array((persistedCount + 1) * widths)
 
+  const precedingUsers = (messages: ChatMessage[]) => {
+    let preceding: ChatMessage | undefined
+
+    return messages.map(message => {
+      const current = preceding
+
+      if (message.role === 'user') {
+        preceding = message
+      }
+
+      return current
+    })
+  }
+
+  const persistedUsers = precedingUsers(persistedTail)
+  const runtimeUsers = precedingUsers(currentRuntime)
+  const normalizedText = (message: ChatMessage) => chatMessageText(message).replace(/\s+/g, ' ').trim()
+
+  const orderedIdentityMatches = (persistedIndex: number, runtimeIndex: number) => {
+    const persisted = persistedTail[persistedIndex]
+    const runtime = currentRuntime[runtimeIndex]
+
+    if (sameTranscriptIdentity(persisted, runtime)) {
+      return true
+    }
+
+    if (persisted.role !== 'assistant' || runtime.role !== 'assistant') {
+      return false
+    }
+
+    const persistedUser = persistedUsers[persistedIndex]
+    const runtimeUser = runtimeUsers[runtimeIndex]
+    const persistedText = normalizedText(persisted)
+
+    return (
+      Boolean(persistedUser) &&
+      Boolean(runtimeUser) &&
+      sameTranscriptIdentity(persistedUser!, runtimeUser!) &&
+      Boolean(persistedText) &&
+      persistedText === normalizedText(runtime)
+    )
+  }
+
   for (let persistedIndex = persistedCount - 1; persistedIndex >= 0; persistedIndex -= 1) {
     for (let runtimeIndex = runtimeCount - 1; runtimeIndex >= 0; runtimeIndex -= 1) {
       const offset = persistedIndex * widths + runtimeIndex
 
-      lcs[offset] = sameTranscriptIdentity(persistedTail[persistedIndex], currentRuntime[runtimeIndex])
+      lcs[offset] = orderedIdentityMatches(persistedIndex, runtimeIndex)
         ? lcs[(persistedIndex + 1) * widths + runtimeIndex + 1] + 1
         : Math.max(lcs[(persistedIndex + 1) * widths + runtimeIndex], lcs[offset + 1])
     }
@@ -105,7 +148,7 @@ export function mergePersistedTailIntoRuntime(
   let runtimeIndex = 0
 
   while (persistedIndex < persistedCount && runtimeIndex < runtimeCount) {
-    if (sameTranscriptIdentity(persistedTail[persistedIndex], currentRuntime[runtimeIndex])) {
+    if (orderedIdentityMatches(persistedIndex, runtimeIndex)) {
       merged.push(currentRuntime[runtimeIndex])
       persistedIndex += 1
       runtimeIndex += 1
