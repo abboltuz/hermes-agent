@@ -41,7 +41,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_compaction_text, redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -1220,11 +1220,7 @@ def _redact_compaction_text(text: Any) -> str:
       tokens, and URL userinfo never need to survive summarization the way
       they must survive live navigation flows.
     """
-    return redact_sensitive_text(
-        text or "",
-        force=True,
-        redact_url_credentials=True,
-    )
+    return redact_compaction_text(text)
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:

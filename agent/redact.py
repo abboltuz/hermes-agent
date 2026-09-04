@@ -1009,6 +1009,20 @@ def redact_sensitive_text(
     return text
 
 
+def redact_compaction_text(text: object) -> str:
+    """Apply the mandatory redaction policy for summarizer egress.
+
+    Compaction text can be persisted and repeatedly reintroduced into later
+    requests, so it must not honor the live-output redaction opt-out. URL
+    credentials are also non-actionable once text crosses this boundary.
+    """
+    return redact_sensitive_text(
+        text or "",
+        force=True,
+        redact_url_credentials=True,
+    )
+
+
 # Commands whose stdout is an environment-variable dump (KEY=value lines),
 # NOT source code. For these, terminal-output redaction must run the
 # ENV-assignment pass (code_file=False) so opaque tokens with no recognized

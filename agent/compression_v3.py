@@ -22,6 +22,7 @@ import weakref
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agent.message_provenance import is_human_intent
+from agent.redact import redact_compaction_text
 
 
 _RECOVERY_PREFIX = "[COMPACTION RECOVERY] session="
@@ -210,8 +211,12 @@ def build_background_snapshot(
     # supported-model floor (64K), not a provider/model-name lookup table.
     route_context = route_context if route_context > 0 else 64_000
     input_tokens = max(8_192, route_context - max(1, route_output) - 2_048)
+    # Persistence/compression sidecars are owner-process metadata, not
+    # summarizer input. Secret redaction stays at the final text egress below
+    # so the separately retained latest human task remains verbatim.
+    worker_messages = _strip_provider_private(stable)
     sampled = _sample_background_messages(
-        stable, max_chars=input_tokens * _PROVIDER_WIRE_BYTES_PER_TOKEN
+        worker_messages, max_chars=input_tokens * _PROVIDER_WIRE_BYTES_PER_TOKEN
     )
     latest_human = next(
         (
@@ -1249,12 +1254,15 @@ def run_background_compression_worker(
     if not compression_route_is_eligible(route):
         raise RuntimeError("background compression route is not eligible")
     messages = [_thaw(message) for message in snapshot.messages]
+    serialized_messages = redact_compaction_text(
+        json.dumps(messages, ensure_ascii=False, default=str)
+    )
     prompt = (
         "Create a dense continuation summary of this conversation. Preserve "
         "decisions, constraints, approvals, identifiers, paths, errors, completed "
         "work, and unresolved next steps. Do not invent facts. Return only the "
         "summary.\n\n"
-        + json.dumps(messages, ensure_ascii=False, default=str)
+        + serialized_messages
     )
     from agent.auxiliary_client import call_llm
 

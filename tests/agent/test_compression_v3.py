@@ -632,6 +632,56 @@ def test_background_worker_preserves_latest_human_verbatim_after_sampling(
     assert candidate.messages[-1] == latest
 
 
+def test_background_worker_strips_sidecars_and_redacts_summary_egress(monkeypatch):
+    secret = "sk-proj-" + ("a" * 40)
+    oauth_url = (
+        "https://localhost/callback?code=opaque-code-123"
+        "&access_token=opaque-token-456&state=keep"
+    )
+    latest = {
+        "role": "user",
+        **HUMAN,
+        "content": f"continue with {secret} via {oauth_url}",
+        "_row_id": 42,
+        "_db_persisted": True,
+    }
+    snapshot = build_background_snapshot(
+        "redacted-background",
+        1,
+        [latest],
+        route={
+            "provider": "aux",
+            "model": "fast",
+            "certified_fast": True,
+            "reasoning": False,
+        },
+    )
+    assert snapshot is not None
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    candidate = run_background_compression_worker(snapshot)
+
+    prompt = captured["messages"][0]["content"]
+    assert secret not in prompt
+    assert "sk-proj-" not in prompt
+    assert "code=opaque-code-123" not in prompt
+    assert "access_token=opaque-token-456" not in prompt
+    assert "code=***" in prompt
+    assert "access_token=***" in prompt
+    assert "state=keep" in prompt
+    assert "_row_id" not in prompt
+    assert "_db_persisted" not in prompt
+    assert candidate.messages[-1] == latest
+
+
 def test_background_job_coalesces_and_adopts_append_only_tail():
     messages = [{"role": "user", **HUMAN, "content": "current task"}]
     snapshot = build_background_snapshot(
