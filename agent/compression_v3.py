@@ -274,9 +274,7 @@ def _emergency_native_wire_projection(
     current_output = base.get("max_output_tokens")
     emergency_output = max(128, min(4_096, context_window // 16))
     if isinstance(current_output, int) and current_output > 0:
-        base["max_output_tokens"] = min(current_output, emergency_output)
-    else:
-        base["max_output_tokens"] = emergency_output
+        emergency_output = min(current_output, emergency_output)
 
     compacted_input = [
         _compact_responses_emergency_item(item)
@@ -322,11 +320,25 @@ def _emergency_native_wire_projection(
             )
         candidates.append([bounded_user])
 
-    for candidate_input in candidates:
-        candidate = dict(base)
-        candidate["input"] = candidate_input
-        if provider_request_budget(agent, candidate).fits:
-            return candidate
+    # Preserve a useful response allowance first, then search down to the
+    # provider-valid positive minimum before calling the required request
+    # floor irreducible. A small tool-heavy request can miss the boundary by
+    # only its output reserve; stopping at an arbitrary 128-token floor would
+    # incorrectly terminate a turn that the provider can still answer.
+    output_candidates = list(
+        dict.fromkeys(
+            min(emergency_output, cap)
+            for cap in (emergency_output, 64, 16, 1)
+            if min(emergency_output, cap) > 0
+        )
+    )
+    for output_cap in output_candidates:
+        for candidate_input in candidates:
+            candidate = dict(base)
+            candidate["max_output_tokens"] = output_cap
+            candidate["input"] = candidate_input
+            if provider_request_budget(agent, candidate).fits:
+                return candidate
     return None
 
 
