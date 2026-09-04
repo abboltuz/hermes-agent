@@ -3079,6 +3079,137 @@ class TestHandleMaxIterations:
         ) == 1
         assert agent.client.chat.completions.create.call_count == 1
 
+    @pytest.mark.parametrize("in_place", [True, False])
+    def test_terminal_summary_compaction_rebases_real_session_db(
+        self, agent, monkeypatch, tmp_path, in_place
+    ):
+        from agent.compression_v3 import ContextProjectionUnfit
+        from agent.iteration_budget import IterationBudget
+        from agent.turn_finalizer import finalize_turn
+        from hermes_state import SessionDB
+
+        parent_id = f"terminal-summary-{'in-place' if in_place else 'rotation'}"
+        child_id = f"{parent_id}-child"
+        db = SessionDB(db_path=tmp_path / f"{parent_id}.db")
+        db.create_session(session_id=parent_id, source="test")
+        original = [
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "current task"},
+        ]
+        db.append_messages_batch(parent_id, original)
+        messages = db.get_messages_as_conversation(
+            parent_id, include_row_ids=True
+        )
+        conversation_history = list(messages)
+
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = parent_id
+        agent.max_iterations = 1
+        agent.iteration_budget = IterationBudget(1)
+        assert agent.iteration_budget.consume() is True
+        agent._last_flushed_db_idx = len(messages)
+        agent._flushed_db_message_session_id = parent_id
+        agent._flushed_db_message_ids = {
+            id(message) for message in messages
+        }
+        agent._cached_system_prompt = "policy"
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 64
+        agent.save_trajectories = False
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Recovered summary"
+        )
+        monkeypatch.setattr(agent, "_save_session_log", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            agent, "_cleanup_task_resources", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook", lambda *_a, **_k: []
+        )
+
+        gate_calls = 0
+        refusal = ContextProjectionUnfit(CutResult(
+            messages=[],
+            outcome="context_projection_unfit",
+            provider_call_allowed=False,
+            reason="final provider wire payload exceeds safe context budget",
+        ))
+
+        def refuse_once(_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 1:
+                raise refusal
+            return dict(request)
+
+        compacted = [
+            {"role": "user", "content": "compacted terminal task"}
+        ]
+
+        def commit_compaction(messages, _system_message, **_kwargs):
+            if in_place:
+                db.archive_and_compact(parent_id, compacted)
+                agent._last_flushed_db_idx = 0
+                agent._flushed_db_message_session_id = parent_id
+                agent._flushed_db_message_ids = set()
+            else:
+                db.publish_compression_child(
+                    parent_session_id=parent_id,
+                    child_session_id=child_id,
+                    source="test",
+                    messages=compacted,
+                    require_compression_lease=False,
+                )
+                agent.session_id = child_id
+                agent._last_flushed_db_idx = len(compacted)
+                agent._flushed_db_message_session_id = child_id
+                agent._flushed_db_message_ids = {
+                    id(message) for message in compacted
+                }
+            agent._last_compression_attempt_recorded = True
+            agent._last_compression_attempt_in_place = in_place
+            agent._last_compaction_in_place = in_place
+            return compacted, "compressed policy"
+
+        with (
+            patch(
+                "agent.compression_v3.prepare_api_request",
+                side_effect=refuse_once,
+            ),
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=commit_compaction,
+            ),
+        ):
+            result = finalize_turn(
+                agent,
+                final_response=None,
+                api_call_count=1,
+                interrupted=False,
+                failed=False,
+                messages=messages,
+                conversation_history=conversation_history,
+                effective_task_id="task",
+                turn_id="turn",
+                user_message="current task",
+                original_user_message="current task",
+                _should_review_memory=False,
+                _turn_exit_reason="budget_exhausted",
+            )
+
+        active_session_id = parent_id if in_place else child_id
+        active = db.get_messages(active_session_id)
+        contents = [message.get("content") for message in active]
+        assert result["final_response"].startswith("Recovered summary")
+        assert contents.count("compacted terminal task") == 1
+        assert contents.count("Recovered summary") == 1
+        assert len(active) == 3
+        assert agent._iteration_summary_compaction_recovered is False
+        db.close()
+
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),

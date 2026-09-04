@@ -197,6 +197,23 @@ def finalize_turn(
             )
         try:
             final_response = agent._handle_max_iterations(messages, api_call_count)
+            # The iteration-summary path can now compact and recursively
+            # rebuild its provider request. It cannot return a local variable,
+            # so consume the explicit boundary handoff it published before the
+            # final durable flush. For in-place mode this is the exact list of
+            # rows archive_and_compact already inserted; for rotation it is
+            # None so the child-session cursor owns deduplication.
+            if (
+                getattr(
+                    agent, "_iteration_summary_compaction_recovered", False
+                )
+                is True
+            ):
+                conversation_history = getattr(
+                    agent, "_iteration_summary_compression_history", None
+                )
+                agent._iteration_summary_compaction_recovered = False
+                agent._iteration_summary_compression_history = None
         except Exception as summary_error:
             # The summary provider gate is a terminal refusal for this exact
             # wire. Keep the ownership boundary here so run_conversation

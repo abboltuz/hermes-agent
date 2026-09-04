@@ -2898,6 +2898,11 @@ def handle_max_iterations(
     _fit_recovery_attempt: int = 0,
 ) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    if _fit_recovery_attempt == 0:
+        # Per-invocation handoff consumed by turn_finalizer. Strictly reset it
+        # so a cached gateway agent can never reuse a prior turn's baseline.
+        agent._iteration_summary_compaction_recovered = False
+        agent._iteration_summary_compression_history = None
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (hermes chat -Q, oneshot, background
@@ -3299,6 +3304,7 @@ def handle_max_iterations(
             from agent.conversation_compression import (
                 PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE,
                 compression_skipped_due_to_lock,
+                conversation_history_after_compression,
                 wait_for_concurrent_compression,
             )
 
@@ -3372,6 +3378,17 @@ def handle_max_iterations(
                 # Keep the caller-owned transcript object authoritative even
                 # when compaction returns a replacement projection.
                 messages[:] = list(recovered)
+                previous_history = getattr(
+                    agent, "_iteration_summary_compression_history", None
+                )
+                agent._iteration_summary_compression_history = (
+                    conversation_history_after_compression(
+                        agent,
+                        messages,
+                        previous_history,
+                    )
+                )
+                agent._iteration_summary_compaction_recovered = True
                 return handle_max_iterations(
                     agent,
                     messages,
