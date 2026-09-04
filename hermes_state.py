@@ -11499,25 +11499,38 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                 )
 
             # Concurrent tail: active rows that arrived after the watermark.
-            # Snapshot their ids and tool_calls now — the clone below needs a
-            # stable id list, and the tool-call count keeps sessions.* honest.
+            # Snapshot ids without materializing payloads; the clone below
+            # needs a stable id list, and SQL computes the tool-call count.
             tail_ids: list[int] = []
             tail_tool_calls = 0
             if watermark is not None:
-                for row in conn.execute(
-                    "SELECT id, tool_calls FROM messages "
+                tail_rows = conn.execute(
+                    "SELECT id, role FROM messages "
                     "WHERE session_id = ? AND active = 1 AND id > ? "
                     "ORDER BY id",
                     (session_id, int(watermark)),
-                ).fetchall():
-                    tail_ids.append(int(row["id"]))
-                    raw = row["tool_calls"]
-                    if raw:
-                        try:
-                            parsed = json.loads(raw) if isinstance(raw, str) else raw
-                            tail_tool_calls += len(parsed) if isinstance(parsed, list) else 0
-                        except (TypeError, ValueError):
-                            pass
+                ).fetchall()
+                if (
+                    source_mutation_revision is not None
+                    and tail_rows
+                    and tail_rows[0]["role"] == "tool"
+                ):
+                    raise SessionCompactionSourceChangedError(
+                        f"Session {session_id!r} appended a tool result across "
+                        "the compaction watermark; retrying the complete turn"
+                    )
+                tail_ids = [int(row["id"]) for row in tail_rows]
+                if tail_ids:
+                    tail_tool_calls = int(
+                        conn.execute(
+                            "SELECT COALESCE(SUM(CASE "
+                            "WHEN json_valid(tool_calls) "
+                            "THEN json_array_length(tool_calls) ELSE 0 END), 0) "
+                            "FROM messages WHERE session_id = ? AND active = 1 "
+                            "AND id > ?",
+                            (session_id, int(watermark)),
+                        ).fetchone()[0]
+                    )
 
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs

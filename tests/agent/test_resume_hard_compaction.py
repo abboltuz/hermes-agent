@@ -104,6 +104,75 @@ def test_hard_compaction_keeps_concurrent_append_after_watermark(tmp_path):
     ) == 2
 
 
+def test_tool_result_appended_across_watermark_aborts_then_retries_complete_turn(
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 20)
+    call_id = "cross-watermark-call"
+    db.append_message("chat", "user", "run the tool", **HUMAN_PROVENANCE)
+    call_row_id = db.append_message(
+        "chat",
+        "assistant",
+        "tool call pending",
+        tool_calls=[
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": "A" * 100_000,
+                },
+            }
+        ],
+    )
+    appended = False
+
+    def append_result_during_refinement(*_args):
+        nonlocal appended
+        if not appended:
+            appended = True
+            db.append_message(
+                "chat",
+                "tool",
+                "result across watermark",
+                tool_call_id=call_id,
+            )
+        return "bounded summary"
+
+    policy = ResumeHardCompactionPolicy(
+        target_rows=8,
+        max_tail_message_chars=2_000,
+    )
+    with pytest.raises(
+        SessionCompactionSourceChangedError,
+        match="tool result across the compaction watermark",
+    ):
+        compact_oversized_resume(
+            db,
+            "chat",
+            policy=policy,
+            summarize=append_result_during_refinement,
+        )
+
+    after_abort = db.get_messages("chat")
+    assert all(row["compacted"] == 0 for row in after_abort)
+    assert after_abort[-2]["id"] == call_row_id
+    assert after_abort[-1]["tool_call_id"] == call_id
+
+    retried = compact_oversized_resume(
+        db,
+        "chat",
+        policy=policy,
+        summarize=append_result_during_refinement,
+    )
+    assert retried.outcome == "committed"
+    active = db.get_model_resume_conversation("chat")
+    assert not any(row.get("role") == "tool" for row in active)
+    raw = db.get_messages("chat", include_inactive=True)
+    assert any(row.get("tool_call_id") == call_id for row in raw)
+
+
 def test_hard_compaction_uses_bounded_deterministic_fallback(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     _seed(db, 60)

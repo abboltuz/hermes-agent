@@ -238,6 +238,9 @@ paging and compared inside the publication transaction. The max-id watermark
 continues to admit concurrent appends, but any mutation of an existing source
 row rejects the stale candidate before archive state changes. A later attempt
 then reads the new bytes and produces a new source identity.
+If the append tail begins with a tool result, publication also aborts before
+mutation: the watermark split a call/result pair. The next bounded attempt
+captures both sides and reduces or retains the complete turn.
 
 Input pages are reduced locally into a bounded binary hierarchy, then one
 refinement operation invokes the configured compressor's bounded provider
