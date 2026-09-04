@@ -2004,6 +2004,10 @@ def run_conversation(
     # the transport boundary, so a later refusal after more tool output is a
     # new episode rather than another strike against the whole user turn.
     provider_wire_compression_attempts = 0
+    # Request-local last resort, armed only after the normal compactor exhausts
+    # one pressure episode. Reset at every turn boundary and provider success
+    # so an emergency projection can never leak into unrelated work.
+    agent._provider_wire_emergency_projection = False
     # One resolved per-turn compression attempt cap, shared by the legacy
     # sites that consume ``compression_attempts``: the pre-API pressure gate,
     # overflow/413 retry handlers, and the post-tool compaction gate. The
@@ -3598,6 +3602,7 @@ def run_conversation(
                         max_compression_attempts,
                     )
                     provider_wire_compression_attempts = 0
+                agent._provider_wire_emergency_projection = False
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -4640,13 +4645,79 @@ def run_conversation(
                         _retry.restart_with_compressed_messages = True
                         break
 
-                    # A bounded no-progress backstop remains necessary for an
-                    # irreducible system/tool/user floor. This is no longer a
-                    # provider error and no provider call was attempted.
+                    # The regular compaction strategy exhausted this pressure
+                    # episode. Escalate once to a forced boundary and arm the
+                    # final-wire gate's request-only minimal projection. The
+                    # cap limits one strategy; it must not terminate a model
+                    # turn that can still fit by shedding optional replay bulk.
+                    if not agent._provider_wire_emergency_projection:
+                        logger.warning(
+                            "provider-wire compaction strategy exhausted after "
+                            "%d attempts; escalating to forced recovery: %s",
+                            max_compression_attempts,
+                            _unfit_summary,
+                        )
+                        agent._provider_wire_emergency_projection = True
+                        provider_wire_compression_attempts = 0
+                        _wire_pressure_input = messages
+                        messages, active_system_prompt = agent._compress_context(
+                            messages,
+                            system_message,
+                            approx_tokens=max(
+                                request_pressure_tokens,
+                                int(
+                                    getattr(
+                                        api_error,
+                                        "estimated_input_tokens",
+                                        0,
+                                    )
+                                    or 0
+                                ),
+                            ),
+                            task_id=effective_task_id,
+                            force=True,
+                            trigger="pre_send_fit_emergency",
+                        )
+                        if (
+                            messages is _wire_pressure_input
+                            and compression_skipped_due_to_lock(agent)
+                        ):
+                            joined_messages = wait_for_concurrent_compression(
+                                agent, messages
+                            )
+                            if joined_messages is None:
+                                _refund_unattempted_provider_call()
+                                agent._persist_session(
+                                    messages, conversation_history
+                                )
+                                return _compression_deferred_result(
+                                    agent, messages, api_call_count
+                                )
+                            messages = joined_messages
+                            active_system_prompt = (
+                                getattr(agent, "_cached_system_prompt", None)
+                                or active_system_prompt
+                            )
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages, conversation_history
+                        )
+                        agent._empty_content_retries = 0
+                        agent._thinking_prefill_retries = 0
+                        agent._last_content_with_tools = None
+                        agent._last_content_tools_all_housekeeping = False
+                        agent._mute_post_response = False
+                        _preflight_compression_blocked = False
+                        _retry.restart_with_compressed_messages = True
+                        break
+
+                    # The forced boundary and the minimal provider projection
+                    # both failed. Only the required instruction/current-user
+                    # floor remains, so there is no smaller truthful model
+                    # request to dispatch.
                     agent._flush_status_buffer()
                     logger.error(
-                        "provider-wire auto-compaction made no fit progress "
-                        "after %d attempts: %s",
+                        "provider-wire irreducible request floor remained "
+                        "unfit after forced recovery (%d regular attempts): %s",
                         max_compression_attempts,
                         _unfit_summary,
                     )
@@ -4657,7 +4728,8 @@ def run_conversation(
                         "messages": messages,
                         "completed": False,
                         "failed": True,
-                        "compression_exhausted": True,
+                        "context_projection_irreducible": True,
+                        "failure_reason": "context_projection_irreducible",
                         "error_type": type(api_error).__name__,
                         "error": str(api_error),
                         "api_calls": api_call_count,

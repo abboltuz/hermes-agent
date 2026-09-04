@@ -184,6 +184,156 @@ def _wire_request_fits(agent: Any, request: Mapping[str, Any], *, output_reserve
     return provider_request_budget(agent, request).fits
 
 
+def _compact_responses_emergency_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Bound replay-only Responses bodies while preserving their envelope."""
+    compacted = dict(item)
+    item_type = compacted.get("type")
+    if item_type == "function_call":
+        arguments = compacted.get("arguments")
+        if isinstance(arguments, str) and len(arguments) > _MAX_PREVIEW:
+            # Responses requires replayed arguments to remain valid JSON.
+            # The matching output carries the useful historical result, so a
+            # syntactically valid marker is safer than slicing raw JSON.
+            compacted["arguments"] = json.dumps(
+                {"_emergency_projection": "arguments omitted"},
+                separators=(",", ":"),
+            )
+    elif item_type == "function_call_output":
+        output = compacted.get("output")
+        if isinstance(output, str) and len(output) > _MAX_PREVIEW:
+            compacted["output"] = (
+                "[Emergency context projection: tool output shortened] "
+                + output[:_MAX_PREVIEW]
+            )
+        elif isinstance(output, list):
+            bounded_parts = []
+            for part in output:
+                if not isinstance(part, Mapping):
+                    continue
+                bounded = dict(part)
+                text = bounded.get("text")
+                if isinstance(text, str) and len(text) > _MAX_PREVIEW:
+                    bounded["text"] = text[:_MAX_PREVIEW]
+                # Historical images are optional replay material and dominate
+                # serialized request size. The current user image, if any,
+                # lives in a user item rather than a function output.
+                if bounded.get("type") != "input_image":
+                    bounded_parts.append(bounded)
+            compacted["output"] = bounded_parts
+    elif compacted.get("role") == "assistant":
+        content = compacted.get("content")
+        if isinstance(content, str) and len(content) > _MAX_PREVIEW:
+            compacted["content"] = content[:_MAX_PREVIEW]
+    return compacted
+
+
+def _keep_complete_responses_tool_pairs(
+    items: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop orphaned Responses calls/results from a request-only projection."""
+    calls = {
+        str(item.get("call_id"))
+        for item in items
+        if item.get("type") == "function_call" and item.get("call_id")
+    }
+    outputs = {
+        str(item.get("call_id"))
+        for item in items
+        if item.get("type") == "function_call_output" and item.get("call_id")
+    }
+    complete = calls & outputs
+    return [
+        dict(item)
+        for item in items
+        if item.get("type") not in {"function_call", "function_call_output"}
+        or str(item.get("call_id")) in complete
+    ]
+
+
+def _emergency_native_wire_projection(
+    agent: Any,
+    request: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Build a bounded request-only Responses projection after compaction stalls.
+
+    Normal recovery always compacts the canonical durable transcript first.
+    This last-resort projection is enabled only by the conversation loop after
+    that strategy exhausts its pressure-episode budget. It keeps the latest
+    user task and complete tool envelopes, removes optional replay bulk, and
+    temporarily disables tool schemas so context pressure cannot terminate an
+    otherwise continuable turn.
+    """
+    raw_input = request.get("input")
+    if not isinstance(raw_input, list):
+        return None
+    context_window = provider_request_budget(agent, request).context_window
+    if not isinstance(context_window, int) or context_window <= 0:
+        return None
+
+    base = dict(request)
+    base.pop("tools", None)
+    base.pop("tool_choice", None)
+    base.pop("parallel_tool_calls", None)
+    base.pop("context_management", None)
+    current_output = base.get("max_output_tokens")
+    emergency_output = max(128, min(4_096, context_window // 16))
+    if isinstance(current_output, int) and current_output > 0:
+        base["max_output_tokens"] = min(current_output, emergency_output)
+    else:
+        base["max_output_tokens"] = emergency_output
+
+    compacted_input = [
+        _compact_responses_emergency_item(item)
+        for item in raw_input
+        if isinstance(item, Mapping)
+        and item.get("type") not in {"reasoning", "compaction"}
+    ]
+    user_indices = [
+        index
+        for index, item in enumerate(compacted_input)
+        if item.get("role") == "user"
+    ]
+    if not user_indices:
+        return None
+
+    latest_user_index = user_indices[-1]
+    anchor_user_index = user_indices[-2] if len(user_indices) >= 2 else latest_user_index
+    current_user = dict(compacted_input[latest_user_index])
+    anchored_tail = [dict(item) for item in compacted_input[anchor_user_index:]]
+    # A synthetic continuation can be the newest user-shaped item. Preserve a
+    # bounded copy of the preceding user item as well so the real task remains
+    # visible without allowing an old pasted payload to dominate the fallback.
+    if anchor_user_index != latest_user_index:
+        anchor_content = anchored_tail[0].get("content")
+        if isinstance(anchor_content, str) and len(anchor_content) > _MAX_PREVIEW:
+            anchored_tail[0]["content"] = anchor_content[:_MAX_PREVIEW]
+    tail = _keep_complete_responses_tool_pairs(anchored_tail)
+    user_floor = [
+        dict(item)
+        for item in tail
+        if item.get("role") == "user"
+    ]
+    candidates = [tail, user_floor, [current_user]]
+    for char_cap in (4_096, 1_024, 256):
+        bounded_user = dict(current_user)
+        content = bounded_user.get("content")
+        if isinstance(content, str) and len(content) > char_cap:
+            head = max(1, char_cap // 2)
+            bounded_user["content"] = (
+                content[:head]
+                + "\n[Emergency projection omitted oversized middle]\n"
+                + content[-head:]
+            )
+        candidates.append([bounded_user])
+
+    for candidate_input in candidates:
+        candidate = dict(base)
+        candidate["input"] = candidate_input
+        if provider_request_budget(agent, candidate).fits:
+            return candidate
+    return None
+
+
 def _has_incomplete_tool_group(messages: Sequence[Mapping[str, Any]]) -> bool:
     """Return whether the projection ends with an unanswered tool call."""
     calls = _tool_call_ids(messages)
@@ -649,6 +799,12 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
         wire_budget = provider_request_budget(agent, wire_request)
         if not wire_budget.fits:
+            if bool(getattr(agent, "_provider_wire_emergency_projection", False)):
+                emergency_request = _emergency_native_wire_projection(
+                    agent, wire_request
+                )
+                if emergency_request is not None:
+                    return emergency_request
             raise ContextProjectionUnfit(CutResult(
                 [], "context_projection_unfit", False,
                 reason="final provider wire payload exceeds safe context budget",

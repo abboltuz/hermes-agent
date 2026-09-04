@@ -747,6 +747,67 @@ def test_responses_wire_floor_is_rejected_before_provider():
         prepare_api_request(agent, request)
 
 
+def test_responses_emergency_projection_keeps_current_task_and_fits_wire():
+    agent = SimpleNamespace(
+        session_id="s",
+        _config_context_length=1_200,
+        _compression_safety_margin=0,
+        _provider_wire_emergency_projection=True,
+    )
+    current_task = "finish the current investigation"
+    request = {
+        "model": "gpt-5.6-sol",
+        "instructions": "policy",
+        "input": [
+            {"role": "user", "content": "old context " * 4_000},
+            {"role": "assistant", "content": "old answer " * 4_000},
+            {"role": "user", "content": current_task},
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "web_search",
+                "arguments": "{\"q\":\"context windows\"}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "large result " * 4_000,
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "large_tool",
+                "description": "schema " * 2_000,
+                "parameters": {"type": "object"},
+            }
+        ],
+        "max_output_tokens": 4_000,
+        "store": False,
+    }
+
+    prepared = prepare_api_request(agent, request)
+
+    assert provider_request_budget(agent, prepared).fits is True
+    assert any(
+        item.get("role") == "user" and item.get("content") == current_task
+        for item in prepared["input"]
+    )
+    call_ids = {
+        item.get("call_id")
+        for item in prepared["input"]
+        if item.get("type") == "function_call"
+    }
+    output_ids = {
+        item.get("call_id")
+        for item in prepared["input"]
+        if item.get("type") == "function_call_output"
+    }
+    assert call_ids == output_ids
+    assert prepared.get("tools") in (None, [])
+    assert prepared["max_output_tokens"] < request["max_output_tokens"]
+
+
 def test_pre_send_gate_without_persistence_returns_typed_unfit():
     agent = type("Agent", (), {"session_id": "s", "_compression_generation": 2, "_config_context_length": 300, "_compression_safety_margin": 10})()
     call_id = "call-1"

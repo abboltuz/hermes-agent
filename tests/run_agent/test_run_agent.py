@@ -230,18 +230,58 @@ def test_context_projection_attempt_budget_rearms_after_provider_success(
     )
 
 
-@pytest.mark.parametrize("compression_enabled,max_attempts", [(False, 3), (True, 0)])
-def test_context_projection_terminal_backstop_refunds_pretransport_iteration(
-    agent, compression_enabled, max_attempts
-):
+def test_context_projection_exhaustion_escalates_to_forced_recovery(agent):
+    """The regular episode cap changes strategy instead of ending the turn."""
+    refusal = ContextProjectionUnfit(CutResult(
+        messages=[],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="final provider wire payload exceeds safe context budget",
+    ))
+    responses = iter([refusal, refusal, _mock_response(content="continued")])
+
+    def refuse_twice(*_args, **_kwargs):
+        result = next(responses)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    agent.compression_enabled = True
+    agent.max_compression_attempts = 1
+    agent._interruptible_api_call = refuse_twice
+
+    def compact(current_messages, _system_message, **_kwargs):
+        return [dict(message) for message in current_messages], "compressed policy"
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_compress_context", side_effect=compact) as compress,
+    ):
+        outcome = agent.run_conversation("continue automatically")
+
+    assert outcome["completed"] is True
+    assert outcome["final_response"] == "continued"
+    assert outcome["api_calls"] == 1
+    assert [call.kwargs.get("force", False) for call in compress.call_args_list] == [
+        False,
+        True,
+    ]
+    assert [call.kwargs["trigger"] for call in compress.call_args_list] == [
+        "pre_send_fit_recovery",
+        "pre_send_fit_emergency",
+    ]
+
+
+def test_context_projection_disabled_refunds_pretransport_iteration(agent):
     refusal = ContextProjectionUnfit(CutResult(
         messages=[],
         outcome="context_projection_unfit",
         provider_call_allowed=False,
         reason="irreducible request floor",
     ))
-    agent.compression_enabled = compression_enabled
-    agent.max_compression_attempts = max_attempts
+    agent.compression_enabled = False
     agent._interruptible_api_call = MagicMock(side_effect=refusal)
     with (
         patch.object(agent, "_persist_session"),
