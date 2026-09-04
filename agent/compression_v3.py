@@ -259,9 +259,9 @@ def _emergency_native_wire_projection(
     Normal recovery always compacts the canonical durable transcript first.
     This last-resort projection is enabled only by the conversation loop after
     that strategy exhausts its pressure-episode budget. It keeps the latest
-    user task and complete tool envelopes, removes optional replay bulk, and
-    temporarily disables tool schemas so context pressure cannot terminate an
-    otherwise continuable turn.
+    user task and complete tool envelopes while removing optional replay bulk.
+    Request controls, especially the active toolset, remain unchanged so the
+    recovery does not break prompt-cache or capability continuity.
     """
     raw_input = request.get("input")
     if not isinstance(raw_input, list):
@@ -271,10 +271,6 @@ def _emergency_native_wire_projection(
         return None
 
     base = dict(request)
-    base.pop("tools", None)
-    base.pop("tool_choice", None)
-    base.pop("parallel_tool_calls", None)
-    base.pop("context_management", None)
     current_output = base.get("max_output_tokens")
     emergency_output = max(128, min(4_096, context_window // 16))
     if isinstance(current_output, int) and current_output > 0:

@@ -777,11 +777,14 @@ def test_responses_emergency_projection_keeps_current_task_and_fits_wire():
         "tools": [
             {
                 "type": "function",
-                "name": "large_tool",
-                "description": "schema " * 2_000,
+                "name": "web_search",
+                "description": "Search the web",
                 "parameters": {"type": "object"},
             }
         ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "context_management": [{"type": "compaction", "compact_threshold": 900}],
         "max_output_tokens": 4_000,
         "store": False,
     }
@@ -804,8 +807,40 @@ def test_responses_emergency_projection_keeps_current_task_and_fits_wire():
         if item.get("type") == "function_call_output"
     }
     assert call_ids == output_ids
-    assert prepared.get("tools") in (None, [])
+    assert prepared["tools"] == request["tools"]
+    assert prepared["tool_choice"] == request["tool_choice"]
+    assert prepared["parallel_tool_calls"] is request["parallel_tool_calls"]
+    assert prepared["context_management"] == request["context_management"]
     assert prepared["max_output_tokens"] < request["max_output_tokens"]
+
+
+def test_responses_emergency_projection_refuses_to_drop_oversized_toolset():
+    agent = SimpleNamespace(
+        session_id="s",
+        _config_context_length=300,
+        _compression_safety_margin=0,
+        _provider_wire_emergency_projection=True,
+    )
+    request = {
+        "model": "gpt-5.6-sol",
+        "instructions": "policy",
+        "input": [{"role": "user", "content": "continue"}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "required_tool",
+                "description": "schema " * 2_000,
+                "parameters": {"type": "object"},
+            }
+        ],
+        "tool_choice": "auto",
+        "max_output_tokens": 128,
+    }
+
+    with pytest.raises(ContextProjectionUnfit):
+        prepare_api_request(agent, request)
+
+    assert request["tools"][0]["name"] == "required_tool"
 
 
 def test_pre_send_gate_without_persistence_returns_typed_unfit():
