@@ -9802,6 +9802,133 @@ def _resume_preparation_payload(session: dict | None) -> dict | None:
     return dict(preparation) if isinstance(preparation, dict) else None
 
 
+def _resume_hard_summary_callback(session: dict):
+    """Build the cold-resume summarizer from the session's persisted route."""
+    from agent.context_compressor import ContextCompressor
+
+    overrides = session.get("resume_runtime_overrides") or {}
+    model_override = overrides.get("model_override") or {}
+    compressor = ContextCompressor(
+        model=str(model_override.get("model") or "resume-hard-summary"),
+        provider=str(
+            model_override.get("provider")
+            or overrides.get("provider_override")
+            or ""
+        ),
+        base_url=str(model_override.get("base_url") or ""),
+        api_mode=str(model_override.get("api_mode") or ""),
+        config_context_length=128_000,
+        quiet_mode=True,
+        # Hard-recovery already supplies a hierarchical bounded digest. Lean
+        # augmentation can issue additional chunk-digest calls; keep this
+        # refinement to one bounded compressor operation. The compressor may
+        # still apply its configured finite auxiliary-to-main fallback.
+        tail_mode="legacy",
+    )
+
+    def summarize(messages, previous_summary):
+        compressor._previous_summary = previous_summary
+        compressor._summary_has_user_turn = any(
+            bool(message.get("_compressed_summary_has_user_turn"))
+            for message in messages
+            if isinstance(message, dict)
+        )
+        return compressor._generate_summary(list(messages))
+
+    return summarize
+
+
+def _recover_oversized_model_resume(
+    sid: str,
+    session: dict,
+    stored_id: str,
+    db,
+    error,
+    *,
+    attempt: int,
+) -> None:
+    """Hard-summarize an oversized cold tip while retaining its raw archive."""
+    loaded_cfg = _load_cfg() or {}
+    compression_cfg = loaded_cfg.get("compression") or {}
+    if not isinstance(compression_cfg, dict):
+        compression_cfg = {}
+    if is_truthy_value(compression_cfg.get("checkpoint_required"), default=False):
+        raise RuntimeError(
+            "BLOCKED_MISSING_PREREQUISITE: automatic cold-resume compaction "
+            "cannot run while compression.checkpoint_required is enabled; "
+            "the checkpoint provider is initialized only after resume"
+        )
+
+    from agent.resume_hard_compaction import (
+        ResumeHardCompactionPolicy,
+        compact_oversized_resume,
+    )
+
+    # Compact well below the row guard so concurrent tail appends and the
+    # summary carrier have runway. The final provider-shaped token gate still
+    # decides actual dispatch fit; this target is the cold materialization cap.
+    limit = int(getattr(error, "limit", 512) or 512)
+    if limit < 4:
+        # A replay-safe hard projection needs room for the summary carrier,
+        # legacy alternation wrapper and at least one live tail row. Preserve
+        # the original transcript instead of publishing a candidate that the
+        # configured guard will reject anyway.
+        raise error
+    target_rows = max(4, min(512, limit // 2))
+    history_lock = session["history_lock"]
+
+    def progress(phase: str, count: int) -> None:
+        with history_lock:
+            preparation = session.get("resume_preparation") or {}
+            if (
+                _sessions.get(sid) is not session
+                or int(preparation.get("attempt") or 0) != attempt
+            ):
+                return
+            session["resume_preparation"] = {
+                "attempt": attempt,
+                "message": (
+                    f"Building bounded context from {count} durable message(s)"
+                    if phase == "summarizing"
+                    else f"Published bounded context with {count} active message(s)"
+                ),
+                "phase": "compaction",
+                "status": "preparing",
+            }
+        _emit(
+            "session.resume_progress",
+            sid,
+            {
+                "phase": "compaction",
+                "status": "loading",
+                "preparation": _resume_preparation_payload(session),
+            },
+        )
+
+    profile_home = session.get("profile_home")
+    home_token = set_hermes_home_override(profile_home or _hermes_home)
+    secret_token = None
+    try:
+        if profile_home:
+            secret_token = set_secret_scope(
+                build_profile_secret_scope(Path(profile_home))
+            )
+        compact_oversized_resume(
+            db,
+            stored_id,
+            policy=ResumeHardCompactionPolicy(target_rows=target_rows),
+            summarize=_resume_hard_summary_callback(session),
+            progress=progress,
+            # An explicit preparation retry may rearm a terminal receipt for
+            # the same unchanged legacy source. Automatic first open may not.
+            force=attempt > 1,
+        )
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
 def _resume_hydration_db(session: dict):
     """Open the exact profile store for an explicit preparation retry."""
     profile_home = str(session.get("profile_home") or "").strip()
@@ -9847,11 +9974,35 @@ def _schedule_resume_hydration(
                     "preparation": _resume_preparation_payload(session),
                 },
             )
-            _assert_session_resume_safe(
-                db, stored_id, session.get("resume_message_count"),
-                profile_home=session.get("profile_home"),
-                model_only=model_only,
-            )
+            try:
+                _assert_session_resume_safe(
+                    db, stored_id, session.get("resume_message_count"),
+                    profile_home=session.get("profile_home"),
+                    model_only=model_only,
+                )
+            except Exception as exc:
+                from hermes_state import SessionResumeTooLargeError
+
+                if not model_only or not isinstance(exc, SessionResumeTooLargeError):
+                    raise
+                _recover_oversized_model_resume(
+                    sid,
+                    session,
+                    stored_id,
+                    db,
+                    exc,
+                    attempt=attempt,
+                )
+                # Publication must actually satisfy the same owner-scoped
+                # admission that rejected the legacy tip. Never assume the
+                # compactor's storage bound equals the configured policy.
+                _assert_session_resume_safe(
+                    db,
+                    stored_id,
+                    None,
+                    profile_home=session.get("profile_home"),
+                    model_only=True,
+                )
             db.reopen_session(stored_id)
             if model_only:
                 # Desktop owns display hydration through the independently

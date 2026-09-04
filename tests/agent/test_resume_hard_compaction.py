@@ -1,0 +1,388 @@
+from types import SimpleNamespace
+
+import pytest
+
+import agent.resume_hard_compaction as hard_compaction
+from agent.resume_hard_compaction import (
+    ResumeHardCompactionUnsafe,
+    ResumeHardCompactionPolicy,
+    _LeaseRefresher,
+    compact_oversized_resume,
+)
+from hermes_state import SessionDB
+
+
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
+def _seed(db: SessionDB, count: int) -> None:
+    db.create_session("chat", source="tui")
+    db.append_messages_batch(
+        "chat",
+        [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"message-{index}",
+                **(HUMAN_PROVENANCE if index % 2 == 0 else {}),
+            }
+            for index in range(count)
+        ],
+    )
+
+
+def test_hard_compaction_streams_and_preserves_lossless_archive(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 1_000)
+    seen_batches = []
+
+    def summarize(batch, previous):
+        seen_batches.append(
+            (
+                len(batch),
+                previous is not None,
+                batch[0]["role"],
+                batch[0]["_compressed_summary_has_user_turn"],
+            )
+        )
+        return f"rolling summary through {batch[-1]['content']}"
+
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=21, page_rows=37, summary_chunk_rows=41
+        ),
+        summarize=summarize,
+    )
+
+    assert result.outcome == "committed"
+    assert result.source_rows == 1_000
+    assert result.active_rows <= 21
+    assert result.used_generated_summary is True
+    assert seen_batches == [(1, False, "assistant", True)]
+    active = db.get_model_resume_conversation("chat")
+    assert active[0]["_compressed_summary"] is True
+    assert active[-1]["content"] == "message-999"
+    raw = db.get_messages("chat", include_inactive=True)
+    assert len(raw) >= 1_000 + result.active_rows
+    assert sum(1 for row in raw if row["active"] == 0 and row["compacted"] == 1) >= 1_000
+
+
+def test_hard_compaction_keeps_concurrent_append_after_watermark(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 80)
+    appended = False
+
+    def summarize(batch, previous):
+        nonlocal appended
+        if not appended:
+            appended = True
+            db.append_message("chat", "user", "arrived during compaction")
+        return "bounded summary"
+
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=11, page_rows=13, summary_chunk_rows=17
+        ),
+        summarize=summarize,
+    )
+
+    assert result.outcome == "committed"
+    active = db.get_model_resume_conversation("chat")
+    assert active[-1]["content"] == "arrived during compaction"
+    assert sum(
+        row["content"] == "arrived during compaction"
+        for row in db.get_messages("chat", include_inactive=True)
+    ) == 2
+
+
+def test_hard_compaction_uses_bounded_deterministic_fallback(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 60)
+
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=9, page_rows=7, summary_chunk_rows=8
+        ),
+        summarize=lambda *_args: None,
+    )
+
+    assert result.outcome == "committed"
+    assert result.used_generated_summary is False
+    active = db.get_model_resume_conversation("chat")
+    assert len(active) <= 9
+    assert active[0]["_compressed_summary"] is True
+    assert "deterministic fallback" in active[0]["content"]
+
+
+def test_tail_alignment_feeds_displaced_prefix_back_into_summary(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 23)
+    summarized = []
+
+    def summarize(batch, previous):
+        summarized.append(batch[0]["content"])
+        return "bounded summary"
+
+    compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=6, page_rows=7, summary_chunk_rows=20
+        ),
+        summarize=summarize,
+    )
+
+    # The four-row ring begins at assistant message-19, then aligns to the
+    # following human boundary. That displaced assistant must be summarized,
+    # not silently discarded from both the summary and exact tail.
+    assert "message-19" in summarized[0]
+    active = db.get_model_resume_conversation("chat")
+    assert active[0]["content"].endswith("message-20")
+
+
+def test_committed_publication_survives_receipt_write_failure(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 40)
+    real_finish = db.finish_context_compaction
+
+    def fail_committed_receipt(session_id, *, owner, outcome):
+        if outcome == "committed":
+            raise RuntimeError("journal unavailable")
+        return real_finish(session_id, owner=owner, outcome=outcome)
+
+    monkeypatch.setattr(db, "finish_context_compaction", fail_committed_receipt)
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(target_rows=8),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    assert result.outcome == "committed"
+    assert len(db.get_model_resume_conversation("chat")) <= 8
+
+
+def test_legacy_unknown_user_tail_stays_exact_and_visible(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("chat", source="tui")
+    for index in range(20):
+        db.append_message(
+            "chat",
+            "user" if index % 2 == 0 else "assistant",
+            f"legacy-{index}",
+        )
+
+    compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(target_rows=7),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    active = db.get_model_resume_conversation("chat")
+    assert len(active) <= 7
+    assert active[0]["display_kind"] == "hidden"
+    assert active[1]["_compressed_summary"] is True
+    assert active[2]["content"] == "legacy-16"
+    assert active[-1]["content"] == "legacy-19"
+
+
+def test_single_huge_tail_payload_becomes_bounded_archive_reference(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 20)
+    huge = "H" * 2_000_000
+    huge_id = db.append_message("chat", "assistant", huge)
+
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=8,
+            max_tail_message_chars=4_000,
+        ),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    assert result.outcome == "committed"
+    active = db.get_model_resume_conversation("chat")
+    assert len(active[-1]["content"]) <= 4_000
+    assert str(huge_id) in active[-1]["content"]
+    assert "archived at message rows" in active[-1]["content"]
+    raw_huge = next(
+        row
+        for row in db.get_messages("chat", include_inactive=True)
+        if row["id"] == huge_id
+    )
+    assert raw_huge["content"] == huge
+    assert raw_huge["active"] == 0
+    assert raw_huge["compacted"] == 1
+
+
+def test_single_huge_api_sidecar_cannot_bypass_tail_bound(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 20)
+    huge_api = "ephemeral-context:" + "E" * 2_000_000
+    source_id = db.append_message(
+        "chat",
+        "user",
+        "visible request",
+        api_content=huge_api,
+        **HUMAN_PROVENANCE,
+    )
+
+    compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=8,
+            max_tail_message_chars=4_000,
+        ),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    active = db.get_model_resume_conversation("chat")
+    retained = active[-1]
+    assert "api_content" not in retained
+    assert "visible request" in retained["content"]
+    assert f"archived at message row {source_id}" in retained["content"]
+    raw_source = next(
+        row
+        for row in db.get_messages("chat", include_inactive=True)
+        if row["id"] == source_id
+    )
+    assert raw_source["api_content"] == huge_api
+
+
+def test_generated_summary_and_progress_are_independently_bounded(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 40)
+
+    def broken_progress(_phase, _count):
+        raise RuntimeError("renderer disconnected")
+
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=8,
+            max_summary_chars=1_000,
+        ),
+        summarize=lambda *_args: "S" * 100_000,
+        progress=broken_progress,
+    )
+
+    assert result.outcome == "committed"
+    summary = db.get_model_resume_conversation("chat")[0]
+    assert summary["_compressed_summary"] is True
+    assert len(summary["content"]) < 1_100
+    assert "summary middle truncated" in summary["content"]
+
+
+def test_invalid_candidate_preserves_original_rows(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 40)
+    before = db.get_messages("chat", include_inactive=True)
+    monkeypatch.setattr(
+        hard_compaction,
+        "validate_projection",
+        lambda _candidate: SimpleNamespace(valid=False, reason="broken tool pair"),
+    )
+
+    with pytest.raises(ResumeHardCompactionUnsafe, match="broken tool pair"):
+        compact_oversized_resume(
+            db,
+            "chat",
+            policy=ResumeHardCompactionPolicy(target_rows=8),
+            summarize=lambda *_args: "bounded summary",
+        )
+
+    assert db.get_messages("chat", include_inactive=True) == before
+
+
+def test_large_tool_call_stays_paired_through_archive_reference(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 20)
+    tool_call_id = "call-large"
+    call_row_id = db.append_message(
+        "chat",
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": "A" * 100_000,
+                },
+            }
+        ],
+    )
+    db.append_message(
+        "chat",
+        "tool",
+        "tool result",
+        tool_call_id=tool_call_id,
+    )
+
+    compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=8,
+            max_tail_message_chars=2_000,
+        ),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    active = db.get_model_resume_conversation("chat")
+    assistant = next(row for row in active if row.get("tool_calls"))
+    tool = next(row for row in active if row.get("role") == "tool")
+    assert assistant["tool_calls"][0]["id"] == tool_call_id
+    assert tool["tool_call_id"] == tool_call_id
+    assert str(call_row_id) in assistant["tool_calls"][0]["function"]["arguments"]
+
+
+def test_lease_refresher_tolerates_one_blip_but_bounds_persistent_failure():
+    class RefreshDB:
+        def __init__(self, results):
+            self.results = list(results)
+            self.calls = 0
+            self.refresher = None
+
+        def refresh_compression_lock(self, *_args, **_kwargs):
+            self.calls += 1
+            result = self.results.pop(0) if self.results else True
+            if result and self.refresher is not None:
+                self.refresher._stop.set()
+            return result
+
+    transient = RefreshDB([False, True])
+    transient_refresher = _LeaseRefresher(
+        transient, "chat", "holder", ttl=0.3
+    )
+    transient.refresher = transient_refresher
+    transient_refresher._stop.wait = (
+        lambda _interval: transient_refresher._stop.is_set()
+    )
+    transient_refresher._run()
+    assert transient.calls == 2
+    assert transient_refresher.lost is False
+
+    persistent = RefreshDB([False] * 20)
+    persistent_refresher = _LeaseRefresher(
+        persistent, "chat", "holder", ttl=0.3
+    )
+    persistent_refresher._stop.wait = lambda _interval: False
+    persistent_refresher._run()
+    assert persistent.calls == persistent_refresher._max_consecutive_failures
+    assert persistent_refresher.lost is True

@@ -64,6 +64,11 @@ def test_resume_applies_owner_profile_guard(
     monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_a, **_k: None)
     monkeypatch.setattr(
+        server,
+        "_resume_hard_summary_callback",
+        lambda _session: (lambda _batch, _previous: "bounded profile summary"),
+    )
+    monkeypatch.setattr(
         server, "_emit", lambda event, _sid, data: progress.append((event, data))
     )
 
@@ -84,12 +89,15 @@ def test_resume_applies_owner_profile_guard(
         assert observed == [owner]
         if deferred:
             assert response["result"]["hydrating"] is True
-            statuses = [
-                data["status"]
+            progress_events = [
+                data
                 for event, data in progress
                 if event == "session.resume_progress"
             ]
-            assert statuses == ["loading", "failed" if owner_limit else "complete"]
+            assert progress_events[0]["status"] == "loading"
+            assert progress_events[-1]["status"] == (
+                "failed" if owner_limit else "complete"
+            )
         elif owner_limit:
             assert response["error"]["code"] == 4130
         else:

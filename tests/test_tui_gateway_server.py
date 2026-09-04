@@ -3750,6 +3750,123 @@ def test_model_only_deferred_resume_preserves_compacted_summary_marker(
         db.close()
 
 
+def test_model_only_deferred_resume_hard_compacts_oversized_tip(
+    monkeypatch, tmp_path
+):
+    from hermes_state import (
+        SessionDB,
+        SessionExportTooLargeError,
+        SessionResumeTooLargeError,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("oversized-chat", source="tui")
+    db.append_messages_batch(
+        "oversized-chat",
+        [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"turn-{index}",
+                **(HUMAN_PROVENANCE if index % 2 == 0 else {}),
+            }
+            for index in range(30)
+        ],
+    )
+
+    def ten_row_guard(db_handle, stored_id, *_args, **_kwargs):
+        try:
+            db_handle.assert_export_safe(stored_id, max_messages=10)
+        except SessionExportTooLargeError as exc:
+            raise SessionResumeTooLargeError(
+                exc.message_count,
+                10,
+                scope="in its model-facing working segment",
+            ) from exc
+
+    monkeypatch.setattr(server, "_assert_session_resume_safe", ten_row_guard)
+    monkeypatch.setattr(
+        server,
+        "_resume_hard_summary_callback",
+        lambda _session: (lambda _batch, _previous: "rolling bounded summary"),
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event, _sid, payload: emitted.append((event, payload))
+    )
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+
+    sid = "live-oversized-chat"
+    ready = threading.Event()
+    session = _session(
+        session_key="oversized-chat",
+        resume_hydrating=True,
+        resume_history_ready=ready,
+        agent_ready=threading.Event(),
+        resume_message_count=30,
+        resume_preparation={
+            "attempt": 1,
+            "phase": "history",
+            "status": "preparing",
+        },
+    )
+    server._sessions[sid] = session
+    try:
+        server._schedule_resume_hydration(
+            sid, "oversized-chat", db, model_only=True
+        )
+        assert ready.wait(timeout=3.0)
+        assert session["resume_preparation"]["status"] == "ready"
+        assert len(session["history"]) <= 5
+        assert session["history"][0]["_compressed_summary"] is True
+        assert any(
+            event == "session.resume_progress"
+            and payload.get("phase") == "compaction"
+            for event, payload in emitted
+        )
+        raw = db.get_messages("oversized-chat", include_inactive=True)
+        assert sum(row["compacted"] == 1 for row in raw) >= 30
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_model_only_hard_compaction_honors_required_checkpoint(
+    monkeypatch, tmp_path
+):
+    from hermes_state import SessionDB, SessionResumeTooLargeError
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("checkpoint-chat", source="tui")
+    db.append_message("checkpoint-chat", "user", "must remain", **HUMAN_PROVENANCE)
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"compression": {"checkpoint_required": True}},
+    )
+
+    sid = "live-checkpoint-chat"
+    session = _session(
+        session_key="checkpoint-chat",
+        resume_preparation={"attempt": 1, "phase": "history", "status": "preparing"},
+    )
+    server._sessions[sid] = session
+    try:
+        with pytest.raises(RuntimeError, match="BLOCKED_MISSING_PREREQUISITE"):
+            server._recover_oversized_model_resume(
+                sid,
+                session,
+                "checkpoint-chat",
+                db,
+                SessionResumeTooLargeError(11, 10),
+                attempt=1,
+            )
+        assert db.get_messages("checkpoint-chat")[0]["content"] == "must remain"
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     first_released = threading.Event()
     retry_started = threading.Event()

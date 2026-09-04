@@ -214,6 +214,37 @@ it does not yet establish a physically separate cold archive, multi-gigabyte
 archive latency, migration behavior, or the complete searchable archive described
 in steps 3–4.
 
+## Cold oversized-tip recovery increment
+
+A legacy session whose active tip itself exceeds resume admission is reduced in
+the existing deferred preparation worker, never on the chat-open response path.
+The worker keyset-pages durable rows to a captured watermark, rolls the old
+prefix through the configured compression route, keeps a bounded exact recent
+tail, and publishes through the existing compression lease, durable admission
+journal and atomic `archive_and_compact` fence. Rows beyond the watermark are
+cloned back into the live tail by the same transaction. Original rows remain
+soft-archived and searchable.
+
+Input pages are reduced locally into a bounded binary hierarchy, then one
+refinement operation invokes the configured compressor's bounded provider
+fallback policy. Provider failure keeps the existing redacted deterministic
+handoff rather than deleting raw history or retrying indefinitely. Summary
+text and active row count have independent hard caps;
+final provider-shaped budget validation remains authoritative. Pre-provenance
+user rows remain exact and visible behind a hidden strict-alternation wrapper
+instead of being relabelled as trusted human input.
+An individual recent payload that exceeds the working-row bound is represented
+by bounded head/tail evidence plus its immutable archived row id; the raw body
+remains exact in the archive. This is the explicit exception to verbatim-tail
+retention needed to keep a single multi-megabyte tool result from defeating the
+hard bound.
+
+An owner that enables `compression.checkpoint_required` is failed closed at this
+stage: cold-resume recovery cannot claim that an external checkpoint provider
+ran before that provider is initialized. This is explicit preparation failure,
+not a silent bypass. A later provider-independent checkpoint service can remove
+that limitation without weakening the configured contract.
+
 ## Required verification beyond the current increment
 
 - Restart and multiple real connections/processes: one admitted source/strategy;
