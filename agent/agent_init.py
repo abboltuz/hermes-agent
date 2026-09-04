@@ -1854,6 +1854,12 @@ def init_agent(
             for key in ("provider", "model", "base_url", "max_tokens", "context_length")
             if _aux_compression.get(key) not in (None, "")
         }
+        if _auto_route:
+            # Passing provider="auto" is an explicit override at call_llm's
+            # public seam. Omit route identity instead so the normal
+            # auxiliary.compression resolver owns provider/model selection.
+            for _auto_key in ("provider", "model", "base_url"):
+                agent._compression_v3_route.pop(_auto_key, None)
         agent._compression_v3_route.update(
             {
                 "resolution": "auxiliary_auto" if _auto_route else "explicit",
