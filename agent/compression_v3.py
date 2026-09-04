@@ -73,6 +73,7 @@ def automatic_projection_lane_enabled(agent: Any) -> bool:
     route = getattr(agent, "_compression_v3_route", None)
     return bool(
         getattr(agent, "compression_enabled", True)
+        and not getattr(agent, "_persist_disabled", False)
         and isinstance(policy, BackgroundCompressionConfig)
         and policy.enabled
         and compression_route_is_eligible(route)
@@ -1169,6 +1170,11 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         int(getattr(agent, "_compression_generation", 0) or 0),
         int(getattr(agent, "_session_watermark", 0) or 0),
     ):
+        if projection_pressure and wire_budget.fits:
+            # A speculative request-only optimization may not turn a healthy
+            # provider call into a local failure merely because this runtime
+            # has no durable recovery binder (detached/test/plugin agents).
+            return wire_request
         raise ContextProjectionUnfit(
             replace(
                 result,

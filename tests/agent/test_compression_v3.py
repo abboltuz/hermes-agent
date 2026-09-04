@@ -570,6 +570,9 @@ def test_automatic_projection_lane_is_capability_gated():
     assert automatic_projection_lane_enabled(agent) is True
     agent._compression_v3_route["reasoning"] = True
     assert automatic_projection_lane_enabled(agent) is False
+    agent._compression_v3_route["reasoning"] = False
+    agent._persist_disabled = True
+    assert automatic_projection_lane_enabled(agent) is False
 
 
 def test_background_snapshot_stops_before_incomplete_tool_round():
