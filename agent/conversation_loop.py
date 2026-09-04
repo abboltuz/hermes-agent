@@ -4517,11 +4517,24 @@ def run_conversation(
                     or getattr(api_error, "outcome", None) == "context_projection_unfit"
                 ):
                     _unfit_summary = agent._summarize_api_error(api_error)
+
+                    def _refund_unattempted_provider_call() -> None:
+                        """Undo accounting consumed before the final wire gate."""
+                        nonlocal api_call_count
+
+                        api_call_count = max(0, api_call_count - 1)
+                        agent._api_call_count = api_call_count
+                        try:
+                            agent.iteration_budget.refund()
+                        except Exception:
+                            pass
+
                     if not getattr(agent, "compression_enabled", True):
                         agent._buffer_vprint(
                             "❌ Final model request exceeds the active context "
                             "budget and auto-compaction is disabled."
                         )
+                        _refund_unattempted_provider_call()
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _unfit_summary,
@@ -4531,7 +4544,7 @@ def run_conversation(
                             "compaction_disabled": True,
                             "error_type": type(api_error).__name__,
                             "error": str(api_error),
-                            "api_calls": max(0, api_call_count - 1),
+                            "api_calls": api_call_count,
                         }
 
                     compression_attempts += 1
@@ -4585,11 +4598,12 @@ def run_conversation(
                             )
                             if joined_messages is None:
                                 compression_attempts -= 1
+                                _refund_unattempted_provider_call()
                                 agent._persist_session(
                                     messages, conversation_history
                                 )
                                 return _compression_deferred_result(
-                                    agent, messages, max(0, api_call_count - 1)
+                                    agent, messages, api_call_count
                                 )
                             messages = joined_messages
                             active_system_prompt = (
@@ -4623,6 +4637,7 @@ def run_conversation(
                         max_compression_attempts,
                         _unfit_summary,
                     )
+                    _refund_unattempted_provider_call()
                     agent._persist_session(messages, conversation_history)
                     return {
                         "final_response": _unfit_summary,
@@ -4632,7 +4647,7 @@ def run_conversation(
                         "compression_exhausted": True,
                         "error_type": type(api_error).__name__,
                         "error": str(api_error),
-                        "api_calls": max(0, api_call_count - 1),
+                        "api_calls": api_call_count,
                     }
 
                 # -----------------------------------------------------------

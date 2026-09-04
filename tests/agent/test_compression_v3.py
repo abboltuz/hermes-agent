@@ -74,6 +74,7 @@ def test_provider_wire_estimate_does_not_measure_unicode_as_ascii_escapes():
 def test_provider_request_budget_uses_active_model_window_and_output_reserve():
     agent = SimpleNamespace(
         _config_context_length=12_000,
+        context_compressor=SimpleNamespace(context_length=12_000),
         _compression_safety_margin=500,
     )
     request = {
@@ -88,6 +89,25 @@ def test_provider_request_budget_uses_active_model_window_and_output_reserve():
     assert decision.safety_margin == 500
     assert decision.safe_input_budget == 9_500
     assert decision.fits is True
+
+
+def test_provider_request_budget_honors_runtime_context_downgrade():
+    agent = SimpleNamespace(
+        _config_context_length=1_000_000,
+        context_compressor=SimpleNamespace(context_length=200_000),
+        _compression_safety_margin=1_024,
+    )
+    request = {
+        "input": [{"role": "user", "content": "x" * 600_000}],
+        "max_output_tokens": 16_000,
+    }
+
+    decision = provider_request_budget(agent, request)
+
+    assert decision.context_window == 200_000
+    assert decision.safe_input_budget == 182_976
+    assert decision.estimated_input_tokens > decision.safe_input_budget
+    assert decision.fits is False
 
 
 def test_codex_responses_incident_sized_wire_reaches_transport_once():

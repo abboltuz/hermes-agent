@@ -116,6 +116,7 @@ def test_context_projection_unfit_auto_compacts_and_retries_without_provider_err
     assert outcome["completed"] is True
     assert outcome["final_response"] == "recovered"
     assert outcome["api_calls"] == 1
+    assert agent.iteration_budget.used == 1
 
 
 def test_context_projection_unfit_joins_running_compaction_before_retry(agent):
@@ -160,6 +161,33 @@ def test_context_projection_unfit_joins_running_compaction_before_retry(agent):
     assert outcome["completed"] is True
     assert outcome["final_response"] == "continued after compact"
     assert not outcome.get("compression_deferred")
+
+
+@pytest.mark.parametrize("compression_enabled,max_attempts", [(False, 3), (True, 0)])
+def test_context_projection_terminal_backstop_refunds_pretransport_iteration(
+    agent, compression_enabled, max_attempts
+):
+    refusal = ContextProjectionUnfit(CutResult(
+        messages=[],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="irreducible request floor",
+    ))
+    agent.compression_enabled = compression_enabled
+    agent.max_compression_attempts = max_attempts
+    agent._interruptible_api_call = MagicMock(side_effect=refusal)
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        outcome = agent.run_conversation("irreducible task")
+
+    assert outcome["failed"] is True
+    assert outcome["api_calls"] == 0
+    assert agent._api_call_count == 0
+    assert agent.iteration_budget.used == 0
+    assert agent._interruptible_api_call.call_count == 1
 
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
@@ -2848,13 +2876,16 @@ class TestHandleMaxIterations:
         agent._config_context_length = 1
         agent._compression_safety_margin = 0
         agent.max_tokens = 1
+        agent.max_compression_attempts = 0
         calls = []
         agent._run_codex_stream = lambda request: calls.append(request)
 
-        with pytest.raises(ContextProjectionUnfit):
-            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "oversized task"}], 1
+        )
 
         assert calls == []
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_is_reapplied_to_codex_retry_before_responses_sdk(self, agent):
         agent.api_mode = "codex_responses"
@@ -2864,6 +2895,7 @@ class TestHandleMaxIterations:
         agent._base_url_hostname = "chatgpt.com"
         agent.model = "gpt-5.5"
         agent._cached_system_prompt = "policy"
+        agent.max_compression_attempts = 0
         provider_calls = []
         agent._run_codex_stream = lambda request: (provider_calls.append(request), SimpleNamespace(
             status="completed",
@@ -2883,8 +2915,9 @@ class TestHandleMaxIterations:
         try:
             with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
                 with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-                    with pytest.raises(ContextProjectionUnfit):
-                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    result = agent._handle_max_iterations(
+                        [{"role": "user", "content": "safe task"}], 1
+                    )
                     complete_logical.assert_called_once_with(
                         complete_logical.call_args.args[0], outcome="failed"
                     )
@@ -2893,6 +2926,7 @@ class TestHandleMaxIterations:
 
         assert len(provider_calls) == 1
         assert gate_calls == 3
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_blocks_irreducible_anthropic_request_before_messages_sdk(self, agent):
         agent.api_mode = "anthropic_messages"
@@ -2904,13 +2938,16 @@ class TestHandleMaxIterations:
         agent._config_context_length = 1
         agent._compression_safety_margin = 0
         agent.max_tokens = 1
+        agent.max_compression_attempts = 0
         calls = []
         agent._anthropic_messages_create = lambda request, **kwargs: calls.append(request)
 
-        with pytest.raises(ContextProjectionUnfit):
-            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "oversized task"}], 1
+        )
 
         assert calls == []
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_is_reapplied_to_anthropic_retry_before_messages_sdk(self, agent):
         agent.api_mode = "anthropic_messages"
@@ -2919,6 +2956,7 @@ class TestHandleMaxIterations:
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "claude-3-5-sonnet"
         agent._cached_system_prompt = "policy"
+        agent.max_compression_attempts = 0
         provider_calls = []
         agent._anthropic_messages_create = lambda request, **kwargs: (provider_calls.append(request), SimpleNamespace(content=[], stop_reason="end_turn", usage=None))[1]
         original_context = agent._config_context_length
@@ -2935,8 +2973,9 @@ class TestHandleMaxIterations:
         try:
             with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
                 with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-                    with pytest.raises(ContextProjectionUnfit):
-                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    result = agent._handle_max_iterations(
+                        [{"role": "user", "content": "safe task"}], 1
+                    )
                     complete_logical.assert_called_once_with(
                         complete_logical.call_args.args[0], outcome="failed"
                     )
@@ -2945,26 +2984,29 @@ class TestHandleMaxIterations:
 
         assert len(provider_calls) == 1
         assert gate_calls == 3
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_blocks_irreducible_openai_request_before_sdk(self, agent):
         agent._cached_system_prompt = "policy"
         agent._config_context_length = 1
         agent._compression_safety_margin = 0
         agent.max_tokens = 1
+        agent.max_compression_attempts = 0
         agent.client.chat.completions.create = MagicMock(
             side_effect=AssertionError("provider must not be called")
         )
 
-        with pytest.raises(ContextProjectionUnfit):
-            agent._handle_max_iterations(
-                [{"role": "user", "content": "oversized task"}],
-                1,
-            )
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "oversized task"}],
+            1,
+        )
 
         assert agent.client.chat.completions.create.call_count == 0
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_is_reapplied_to_retry_before_sdk(self, agent):
         agent._cached_system_prompt = "policy"
+        agent.max_compression_attempts = 0
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),
             AssertionError("retry provider must not be called"),
@@ -2982,14 +3024,59 @@ class TestHandleMaxIterations:
             return prepare_api_request(current_agent, request)
 
         with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
-            with pytest.raises(ContextProjectionUnfit):
-                agent._handle_max_iterations(
-                    [{"role": "user", "content": "safe first task"}],
-                    1,
-                )
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "safe first task"}],
+                1,
+            )
 
         agent._config_context_length = original_context
         assert gate_calls == 3
+        assert agent.client.chat.completions.create.call_count == 1
+        assert "could not fit after automatic context compaction" in result
+
+    def test_summary_gate_auto_compacts_and_rebuilds_before_sdk(self, agent):
+        from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+
+        refusal = ContextProjectionUnfit(CutResult(
+            messages=[],
+            outcome="context_projection_unfit",
+            provider_call_allowed=False,
+            reason="final provider wire payload exceeds safe context budget",
+        ))
+        gate_calls = 0
+
+        def refuse_once(_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 1:
+                raise refusal
+            return dict(request)
+
+        compacted = [{"role": "user", "content": "compacted task"}]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Recovered summary"
+        )
+        with (
+            patch(
+                "agent.compression_v3.prepare_api_request",
+                side_effect=refuse_once,
+            ),
+            patch.object(
+                agent,
+                "_compress_context",
+                return_value=(compacted, "compressed policy"),
+            ) as compress,
+        ):
+            messages = [{"role": "user", "content": "oversized task"}]
+            result = agent._handle_max_iterations(messages, 1)
+
+        assert result == "Recovered summary"
+        assert gate_calls == 3
+        assert compress.call_args.kwargs["trigger"] == "pre_send_fit_recovery"
+        assert sum(
+            message.get("content") == MAX_ITERATIONS_SUMMARY_REQUEST
+            for message in messages
+        ) == 1
         assert agent.client.chat.completions.create.call_count == 1
 
     def test_summary_retries_share_relay_identity(self, agent):

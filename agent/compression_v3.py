@@ -110,11 +110,19 @@ class ProviderRequestBudget:
 def provider_request_budget(agent: Any, request: Mapping[str, Any]) -> ProviderRequestBudget:
     """Measure one final provider request against the active model budget."""
     compressor = getattr(agent, "context_compressor", None)
-    context_window = getattr(agent, "_config_context_length", None)
-    if not isinstance(context_window, int) or context_window <= 0:
-        context_window = getattr(compressor, "context_length", None)
-    if not isinstance(context_window, int) or context_window <= 0:
-        context_window = None
+    configured_window = getattr(agent, "_config_context_length", None)
+    effective_window = getattr(compressor, "context_length", None)
+    known_windows = [
+        value
+        for value in (configured_window, effective_window)
+        if isinstance(value, int) and value > 0
+    ]
+    # ``_config_context_length`` describes the selected route, while the
+    # compressor tracks the effective window learned at runtime. Providers can
+    # downgrade a route (for example Anthropic 1M -> 200K) without rewriting
+    # the configured value. Use the conservative intersection so a stale large
+    # config can never authorize a request the active route already rejected.
+    context_window = min(known_windows) if known_windows else None
 
     output_reserve = request.get(
         "max_tokens", request.get("max_completion_tokens", 0)

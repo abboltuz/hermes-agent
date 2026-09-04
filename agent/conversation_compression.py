@@ -1302,6 +1302,28 @@ def wait_for_concurrent_compression(
     if not session_id or not callable(holder_getter) or not callable(loader):
         return None
 
+    # Capture the active durable identity set before the owner releases its
+    # lease. In-place compaction archives every row in this snapshot and
+    # inserts/clones a fresh active projection with new row ids atomically.
+    # Merely seeing the lock disappear is not proof of success: an owner may
+    # abort, refuse a would-grow summary, or time out and release unchanged.
+    try:
+        before_rows = loader(session_id, include_row_ids=True)
+    except Exception as exc:
+        logger.warning(
+            "concurrent compression join baseline read failed for session=%s: %s",
+            session_id,
+            exc,
+        )
+        return None
+    before_row_ids = {
+        int(message["_row_id"])
+        for message in before_rows
+        if isinstance(message, dict)
+        and isinstance(message.get("_row_id"), int)
+        and int(message["_row_id"]) > 0
+    } if isinstance(before_rows, list) else set()
+
     if timeout_seconds is None:
         _idle_timeout, configured_ceiling = resolve_context_compression_timeouts()
         timeout_seconds = (
@@ -1385,6 +1407,22 @@ def wait_for_concurrent_compression(
             )
             return None
         if not isinstance(recovered, list) or not recovered:
+            return None
+        recovered_row_ids = {
+            int(message["_row_id"])
+            for message in recovered
+            if isinstance(message, dict)
+            and isinstance(message.get("_row_id"), int)
+            and int(message["_row_id"]) > 0
+        }
+        if not before_row_ids or not recovered_row_ids.isdisjoint(before_row_ids):
+            logger.info(
+                "concurrent compression lock released without a proven in-place "
+                "commit: session=%s before_ids=%d active_ids=%d",
+                session_id,
+                len(before_row_ids),
+                len(recovered_row_ids),
+            )
             return None
         agent._last_flushed_db_idx = len(recovered)
         agent._flushed_db_message_session_id = session_id

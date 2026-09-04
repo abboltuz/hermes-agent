@@ -2890,7 +2890,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+def handle_max_iterations(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    _fit_recovery_attempt: int = 0,
+) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
@@ -3290,10 +3296,100 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         from agent.compression_v3 import ContextProjectionUnfit
 
         if isinstance(e, ContextProjectionUnfit):
-            # An unfit summary is a terminal provider-gate refusal, not a
-            # successful fallback string. Let the conversation/turn-finalizer
-            # record the typed failure and prevent relay success accounting.
-            raise
+            from agent.conversation_compression import (
+                PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE,
+                compression_skipped_due_to_lock,
+                wait_for_concurrent_compression,
+            )
+
+            max_attempts = int(
+                getattr(agent, "max_compression_attempts", 3) or 0
+            )
+            if (
+                getattr(agent, "compression_enabled", True)
+                and _fit_recovery_attempt < max_attempts
+            ):
+                wire_tokens = getattr(e, "estimated_input_tokens", None)
+                if not isinstance(wire_tokens, int) or wire_tokens <= 0:
+                    wire_tokens = estimate_request_context_tokens(
+                        {"messages": api_messages}
+                    )
+                safe_budget = getattr(e, "safe_input_budget", None)
+                if not isinstance(safe_budget, int) or safe_budget < 0:
+                    safe_budget = int(
+                        getattr(
+                            getattr(agent, "context_compressor", None),
+                            "threshold_tokens",
+                            0,
+                        )
+                        or 0
+                    )
+                emit_status = getattr(agent, "_emit_status", None)
+                if callable(emit_status):
+                    emit_status(
+                        PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE.format(
+                            tokens=wire_tokens,
+                            budget=safe_budget,
+                        )
+                    )
+                logger.info(
+                    "iteration-summary wire pressure triggered auto-compaction: "
+                    "estimated_input=%s safe_input=%s attempt=%d/%d",
+                    wire_tokens,
+                    safe_budget,
+                    _fit_recovery_attempt + 1,
+                    max_attempts,
+                )
+
+                # The summary nudge is runtime-only and this invocation will
+                # append it again after recovery. Remove it before compacting
+                # so retries never accumulate duplicate synthetic user turns.
+                if (
+                    messages
+                    and isinstance(messages[-1], dict)
+                    and messages[-1].get("content") == MAX_ITERATIONS_SUMMARY_REQUEST
+                    and messages[-1].get("display_kind") == "hidden"
+                ):
+                    messages.pop()
+                pressure_input = messages
+                recovered, _active_system_prompt = agent._compress_context(
+                    messages,
+                    None,
+                    approx_tokens=wire_tokens,
+                    trigger="pre_send_fit_recovery",
+                )
+                if (
+                    recovered is pressure_input
+                    and compression_skipped_due_to_lock(agent)
+                ):
+                    recovered = wait_for_concurrent_compression(agent, messages)
+                    if recovered is None:
+                        return (
+                            "I reached the iteration limit while context "
+                            "compaction was still completing. The conversation "
+                            "was preserved, but no final summary was generated."
+                        )
+                # Keep the caller-owned transcript object authoritative even
+                # when compaction returns a replacement projection.
+                messages[:] = list(recovered)
+                return handle_max_iterations(
+                    agent,
+                    messages,
+                    api_call_count,
+                    _fit_recovery_attempt=_fit_recovery_attempt + 1,
+                )
+
+            logger.error(
+                "iteration-summary request remained unfit after %d automatic "
+                "compaction attempts: %s",
+                _fit_recovery_attempt,
+                e,
+            )
+            return (
+                "I reached the iteration limit, but the final summary request "
+                "could not fit after automatic context compaction. The "
+                "conversation was preserved."
+            )
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:

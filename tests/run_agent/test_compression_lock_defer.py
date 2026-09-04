@@ -179,6 +179,11 @@ class TestLockSkipSignalTypePin:
 
 class TestConcurrentCompressionJoin:
     def test_in_place_winner_is_reloaded_and_request_can_continue(self):
+        durable_before = [
+            {"role": "user", "content": "old task", "_row_id": 1},
+            {"role": "assistant", "content": "old answer", "_row_id": 2},
+            {"role": "user", "content": "current task", "_row_id": 3},
+        ]
         compacted = [
             {"role": "user", "content": "summary", "_row_id": 7},
             {"role": "assistant", "content": "ready", "_row_id": 8},
@@ -188,6 +193,7 @@ class TestConcurrentCompressionJoin:
         class DB:
             def __init__(self):
                 self.holders = [LOCK_HOLDER, LOCK_HOLDER, None]
+                self.loads = [durable_before, compacted]
 
             def get_compression_lock_holder(self, _session_id):
                 return self.holders.pop(0)
@@ -196,7 +202,7 @@ class TestConcurrentCompressionJoin:
                 return {"ended_at": None, "end_reason": None}
 
             def get_messages_as_conversation(self, _session_id, **_kwargs):
-                return [dict(message) for message in compacted]
+                return [dict(message) for message in self.loads.pop(0)]
 
         statuses = []
         compressor = SimpleNamespace()
@@ -229,6 +235,161 @@ class TestConcurrentCompressionJoin:
         assert joining_agent._last_flushed_db_idx == len(compacted)
         assert compressor.last_prompt_tokens == -1
         assert compressor.awaiting_real_usage_after_compression is True
+
+    @staticmethod
+    def _real_db_agent(db, session_id):
+        return SimpleNamespace(
+            _compression_skipped_due_to_lock=LOCK_HOLDER,
+            _session_db=db,
+            session_id=session_id,
+            _emit_status=MagicMock(),
+            _interrupt_requested=False,
+            _cached_system_prompt="policy",
+            context_compressor=SimpleNamespace(),
+            tools=[],
+            _memory_manager=None,
+            platform="cli",
+        )
+
+    def test_real_session_db_proves_in_place_commit(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "join-in-place.db")
+        session_id = "join-in-place"
+        db.create_session(session_id=session_id, source="test")
+        original = [
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "current task"},
+        ]
+        compacted = [
+            {"role": "user", "content": "summary"},
+            {"role": "user", "content": "current task"},
+        ]
+        db.append_messages_batch(session_id, original)
+        watermark = db.get_active_message_watermark(session_id)
+        assert db.try_acquire_compression_lock(
+            session_id, LOCK_HOLDER, ttl_seconds=60
+        )
+        original_holder_getter = db.get_compression_lock_holder
+        polls = 0
+
+        def finish_on_second_poll(_session_id):
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                return original_holder_getter(session_id)
+            db.archive_and_compact(
+                session_id,
+                compacted,
+                watermark=watermark,
+                lock_holder=LOCK_HOLDER,
+            )
+            db.release_compression_lock(session_id, LOCK_HOLDER)
+            return None
+
+        db.get_compression_lock_holder = finish_on_second_poll
+        joining_agent = self._real_db_agent(db, session_id)
+
+        result = wait_for_concurrent_compression(
+            joining_agent,
+            original,
+            timeout_seconds=1,
+            poll_interval_seconds=0.01,
+        )
+
+        assert [message["content"] for message in result] == [
+            "summary",
+            "current task",
+        ]
+        assert joining_agent._last_compaction_in_place is True
+        assert db.has_archived_messages(session_id) is True
+        db.close()
+
+    def test_real_session_db_does_not_adopt_aborted_owner(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "join-aborted.db")
+        session_id = "join-aborted"
+        db.create_session(session_id=session_id, source="test")
+        original = [{"role": "user", "content": "unchanged task"}]
+        db.append_messages_batch(session_id, original)
+        assert db.try_acquire_compression_lock(
+            session_id, LOCK_HOLDER, ttl_seconds=60
+        )
+        original_holder_getter = db.get_compression_lock_holder
+        polls = 0
+
+        def abort_on_second_poll(_session_id):
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                return original_holder_getter(session_id)
+            db.release_compression_lock(session_id, LOCK_HOLDER)
+            return None
+
+        db.get_compression_lock_holder = abort_on_second_poll
+        joining_agent = self._real_db_agent(db, session_id)
+
+        result = wait_for_concurrent_compression(
+            joining_agent,
+            original,
+            timeout_seconds=1,
+            poll_interval_seconds=0.01,
+        )
+
+        assert result is None
+        assert not hasattr(joining_agent, "_last_compaction_in_place")
+        assert db.has_archived_messages(session_id) is False
+        db.close()
+
+    def test_real_session_db_adopts_rotated_child(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "join-rotation.db")
+        parent_id = "join-parent"
+        child_id = "join-child"
+        db.create_session(session_id=parent_id, source="test")
+        original = [{"role": "user", "content": "old task"}]
+        compacted = [{"role": "user", "content": "rotated summary"}]
+        db.append_messages_batch(parent_id, original)
+        watermark = db.get_active_message_watermark(parent_id)
+        assert db.try_acquire_compression_lock(
+            parent_id, LOCK_HOLDER, ttl_seconds=60
+        )
+        original_holder_getter = db.get_compression_lock_holder
+        polls = 0
+
+        def rotate_on_second_poll(_session_id):
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                return original_holder_getter(parent_id)
+            db.publish_compression_child(
+                parent_session_id=parent_id,
+                child_session_id=child_id,
+                source="test",
+                messages=compacted,
+                compression_lock_holder=LOCK_HOLDER,
+                watermark=watermark,
+            )
+            db.release_compression_lock(parent_id, LOCK_HOLDER)
+            return None
+
+        db.get_compression_lock_holder = rotate_on_second_poll
+        joining_agent = self._real_db_agent(db, parent_id)
+
+        result = wait_for_concurrent_compression(
+            joining_agent,
+            original,
+            timeout_seconds=1,
+            poll_interval_seconds=0.01,
+        )
+
+        assert [message["content"] for message in result] == ["rotated summary"]
+        assert joining_agent.session_id == child_id
+        assert joining_agent._last_compaction_in_place is False
+        db.close()
 
 
 # ---------------------------------------------------------------------------
