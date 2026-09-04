@@ -90,23 +90,30 @@ export function mergePersistedTailIntoRuntime(
   const widths = runtimeCount + 1
   const lcs = new Uint32Array((persistedCount + 1) * widths)
 
-  const precedingUsers = (messages: ChatMessage[]) => {
+  const turnContexts = (messages: ChatMessage[]) => {
     let preceding: ChatMessage | undefined
+    let assistantOrdinal = 0
 
     return messages.map(message => {
-      const current = preceding
+      const context = { assistantOrdinal, precedingUser: preceding }
 
       if (message.role === 'user') {
         preceding = message
+        assistantOrdinal = 0
+      } else if (message.role === 'assistant') {
+        assistantOrdinal += 1
       }
 
-      return current
+      return context
     })
   }
 
-  const persistedUsers = precedingUsers(persistedTail)
-  const runtimeUsers = precedingUsers(currentRuntime)
+  const persistedContexts = turnContexts(persistedTail)
+  const runtimeContexts = turnContexts(currentRuntime)
   const normalizedText = (message: ChatMessage) => chatMessageText(message).replace(/\s+/g, ' ').trim()
+
+  const sameOrStrictExtension = (left: string, right: string) =>
+    left === right || (Boolean(left) && Boolean(right) && (left.startsWith(right) || right.startsWith(left)))
 
   const orderedIdentityMatches = (persistedIndex: number, runtimeIndex: number) => {
     const persisted = persistedTail[persistedIndex]
@@ -120,16 +127,18 @@ export function mergePersistedTailIntoRuntime(
       return false
     }
 
-    const persistedUser = persistedUsers[persistedIndex]
-    const runtimeUser = runtimeUsers[runtimeIndex]
+    const persistedContext = persistedContexts[persistedIndex]
+    const runtimeContext = runtimeContexts[runtimeIndex]
+    const persistedUser = persistedContext.precedingUser
+    const runtimeUser = runtimeContext.precedingUser
     const persistedText = normalizedText(persisted)
 
     return (
       Boolean(persistedUser) &&
       Boolean(runtimeUser) &&
       sameTranscriptIdentity(persistedUser!, runtimeUser!) &&
-      Boolean(persistedText) &&
-      persistedText === normalizedText(runtime)
+      persistedContext.assistantOrdinal === runtimeContext.assistantOrdinal &&
+      sameOrStrictExtension(persistedText, normalizedText(runtime))
     )
   }
 

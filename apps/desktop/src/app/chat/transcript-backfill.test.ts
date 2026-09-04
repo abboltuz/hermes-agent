@@ -222,6 +222,32 @@ describe('mergePersistedTailIntoRuntime', () => {
     expect(mergePersistedTailIntoRuntime(live, persisted)).toEqual(live)
   })
 
+  it('keeps one live assistant while its proven persisted copy is further ahead', () => {
+    const persisted = [
+      { ...chat('stored-user', 9), semanticId: 'desktop:prompt-9' },
+      { ...chat('stored-assistant', 10), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    const pending = [
+      { ...chat('user-optimistic'), semanticId: 'desktop:prompt-9' },
+      {
+        ...chat('assistant-stream'),
+        pending: true,
+        role: 'assistant' as const,
+        parts: [{ type: 'text' as const, text: 'Do' }]
+      }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(pending, persisted)).toEqual(pending)
+
+    const complete = [
+      pending[0],
+      { ...pending[1], pending: false, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(complete, persisted)).toEqual(complete)
+  })
+
   it('keeps identical assistant text under different identified user turns', () => {
     const persisted = [
       { ...chat('stored-user', 9), semanticId: 'desktop:older' },
