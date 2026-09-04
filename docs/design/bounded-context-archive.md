@@ -258,7 +258,9 @@ at that sentinel. The page policy must hold at least one complete worst-case
 bounded row, and page row count is derived from that full per-row envelope.
 Recent rows are retained and evicted as complete user-turn groups, so an
 assistant tool call and its results cannot be split into orphan rows that a
-later replay repair would silently discard.
+later replay repair would silently discard. If a tool-call list itself must be
+clipped by the SQL field cap, its complete turn is reduced instead of
+publishing a partial set of call/result identities.
 An individual recent payload that exceeds the working-row bound is represented
 by bounded head/tail evidence plus its immutable archived row id; the raw body
 remains exact in the archive. This is the explicit exception to verbatim-tail

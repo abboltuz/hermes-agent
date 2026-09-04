@@ -165,6 +165,7 @@ def _clean_message(message: Mapping[str, Any]) -> dict[str, Any]:
         "_db_persisted",
         "_resume_archive_rows",
         "_resume_payload_clipped",
+        "_resume_tool_calls_clipped",
         "_resume_source_payload_bytes",
     ):
         cleaned.pop(key, None)
@@ -187,6 +188,9 @@ def _bounded_tail_message(
     ]
     source_row = source_rows[0] if source_rows else 0
     source_was_clipped = bool(message.get("_resume_payload_clipped"))
+    tool_calls_were_clipped = bool(
+        message.get("_resume_tool_calls_clipped")
+    )
     cleaned = _clean_message(message)
     if len(source_rows) > 1:
         row_label = ", ".join(str(row_id) for row_id in source_rows)
@@ -239,6 +243,8 @@ def _bounded_tail_message(
         # Keep the signal until same-role repair has propagated all source row
         # identities. _clean_message always removes it from provider payloads.
         cleaned["_resume_payload_clipped"] = True
+    if tool_calls_were_clipped:
+        cleaned["_resume_tool_calls_clipped"] = True
 
     tool_calls = cleaned.get("tool_calls")
     if tool_calls:
@@ -708,7 +714,8 @@ def compact_oversized_resume(
                     current_group.append(bounded_row)
                     current_group_tokens += row_tokens
                     if (
-                        len(current_group) > max_tail_rows
+                        bounded_row.get("_resume_tool_calls_clipped")
+                        or len(current_group) > max_tail_rows
                         or current_group_tokens > policy.max_projection_tokens
                     ):
                         # An individually oversized live turn cannot be split

@@ -310,7 +310,9 @@ def test_invalid_candidate_preserves_original_rows(tmp_path, monkeypatch):
     assert db.get_messages("chat", include_inactive=True) == before
 
 
-def test_large_tool_call_stays_paired_through_archive_reference(tmp_path):
+def test_large_tool_call_group_is_reduced_with_raw_archive_preserved(
+    tmp_path, monkeypatch
+):
     db = SessionDB(tmp_path / "state.db")
     _seed(db, 20)
     tool_call_id = "call-large"
@@ -336,6 +338,15 @@ def test_large_tool_call_stays_paired_through_archive_reference(tmp_path):
         tool_call_id=tool_call_id,
     )
 
+    reduced_rows = []
+    real_add = hard_compaction._RollingReducer.add
+
+    def observed_add(self, messages):
+        reduced_rows.extend(dict(message) for message in messages)
+        return real_add(self, messages)
+
+    monkeypatch.setattr(hard_compaction._RollingReducer, "add", observed_add)
+
     compact_oversized_resume(
         db,
         "chat",
@@ -347,11 +358,18 @@ def test_large_tool_call_stays_paired_through_archive_reference(tmp_path):
     )
 
     active = db.get_model_resume_conversation("chat")
-    assistant = next(row for row in active if row.get("tool_calls"))
-    tool = next(row for row in active if row.get("role") == "tool")
-    assert assistant["tool_calls"][0]["id"] == tool_call_id
-    assert tool["tool_call_id"] == tool_call_id
-    assert str(call_row_id) in assistant["tool_calls"][0]["function"]["arguments"]
+    assert not any(row.get("role") == "tool" for row in active)
+    reduced_call = next(row for row in reduced_rows if row.get("tool_calls"))
+    reduced_tool = next(row for row in reduced_rows if row.get("role") == "tool")
+    assert reduced_call["tool_calls"][0]["id"] == tool_call_id
+    assert reduced_tool["tool_call_id"] == tool_call_id
+    assert str(call_row_id) in reduced_call["tool_calls"][0]["function"]["arguments"]
+    raw_call = next(
+        row
+        for row in db.get_messages("chat", include_inactive=True)
+        if row["id"] == call_row_id
+    )
+    assert raw_call["tool_calls"][0]["function"]["arguments"] == "A" * 100_000
 
 
 def test_tool_group_wider_than_tail_is_reduced_without_orphan_loss(
@@ -402,6 +420,66 @@ def test_tool_group_wider_than_tail_is_reduced_without_orphan_loss(
 
     reduced_contents = {row.get("content") for row in reduced_rows}
     assert {f"wide-result-{index}" for index in range(4)} <= reduced_contents
+    assert any(row.get("tool_calls") for row in reduced_rows)
+    active = db.get_model_resume_conversation("chat")
+    assert [row["content"] for row in active[-2:]] == [
+        "latest request",
+        "latest answer",
+    ]
+
+
+def test_clipped_tool_call_list_reduces_every_result(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 120)
+    call_ids = [f"clipped-call-{index}" for index in range(40)]
+    db.append_message("chat", "user", "many tool calls", **HUMAN_PROVENANCE)
+    db.append_message(
+        "chat",
+        "assistant",
+        "issuing many calls",
+        tool_calls=[
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "A" * 200,
+                },
+            }
+            for call_id in call_ids
+        ],
+    )
+    for index, call_id in enumerate(call_ids):
+        db.append_message(
+            "chat",
+            "tool",
+            f"clipped-result-{index}",
+            tool_call_id=call_id,
+        )
+    db.append_message("chat", "assistant", "many calls complete")
+    db.append_message("chat", "user", "latest request", **HUMAN_PROVENANCE)
+    db.append_message("chat", "assistant", "latest answer")
+
+    reduced_rows = []
+    real_add = hard_compaction._RollingReducer.add
+
+    def observed_add(self, messages):
+        reduced_rows.extend(dict(message) for message in messages)
+        return real_add(self, messages)
+
+    monkeypatch.setattr(hard_compaction._RollingReducer, "add", observed_add)
+    compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=100,
+            max_tail_message_chars=2_000,
+        ),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    reduced_contents = {row.get("content") for row in reduced_rows}
+    assert {f"clipped-result-{index}" for index in range(40)} <= reduced_contents
     assert any(row.get("tool_calls") for row in reduced_rows)
     active = db.get_model_resume_conversation("chat")
     assert [row["content"] for row in active[-2:]] == [

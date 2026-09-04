@@ -11775,6 +11775,8 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                    {bounded('provenance_metadata')},
                    CASE WHEN {byte_length('content')} > {cap} OR {payload_overflow}
                         THEN 1 ELSE 0 END AS _resume_payload_clipped,
+                   CASE WHEN {byte_length('tool_calls')} > {cap}
+                        THEN 1 ELSE 0 END AS _resume_tool_calls_clipped,
                    ({source_payload_bytes}) AS _resume_source_payload_bytes
               FROM messages
              WHERE session_id = ? AND active = 1 AND id > ? AND id <= ?
