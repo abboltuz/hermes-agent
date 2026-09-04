@@ -709,6 +709,30 @@ def test_background_candidate_rejects_changed_prefix_or_schema():
     ) is None
 
 
+def test_deterministic_projection_reuses_prefix_with_append_only_tail():
+    source = [{"role": "user", **HUMAN, "content": "task", "_row_id": 1}]
+    projected = [
+        {"role": "system", "content": "recovery"},
+        dict(source[0]),
+    ]
+    owner = CompressionCoordinator(session_id="active-reuse")
+
+    assert owner.publish_active_projection(
+        source, projected, generation=2, schema_hash="schema"
+    ) is True
+    source[0]["_db_persisted"] = True
+    live = source + [{"role": "assistant", "content": "answer"}]
+
+    reused = owner.project_active(live, generation=2, schema_hash="schema")
+    assert reused is not None
+    assert [message["content"] for message in reused] == [
+        "recovery", "task", "answer"
+    ]
+    assert owner.project_active(
+        live, generation=2, schema_hash="different"
+    ) is None
+
+
 def test_fit_request_starts_background_work_without_waiting(monkeypatch):
     from agent import compression_v3
 

@@ -1137,6 +1137,18 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
                     "with the compacted projection."
                 )
         return _strip_provider_private(request)
+    active_messages = coordinator.project_active(
+        messages,
+        generation=int(getattr(agent, "_compression_generation", 0) or 0),
+        schema_hash=schema_hash,
+    )
+    if (
+        active_messages is not None
+        and budget.fits(active_messages)
+        and _candidate_wire_fits(active_messages)
+    ):
+        request["messages"] = active_messages
+        return _strip_provider_private(request)
     result = emergency_context_cut(
         messages,
         budget,
@@ -1184,7 +1196,12 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
             ),
             provider_request_budget(agent, wire_request),
         )
-    coordinator.active_projection = [dict(message) for message in result.messages]
+    coordinator.publish_active_projection(
+        messages,
+        result.messages,
+        generation=int(getattr(agent, "_compression_generation", 0) or 0),
+        schema_hash=schema_hash,
+    )
     # Binding may replace the provisional recovery marker in retained rows;
     # serialize only after that owner-process mutation is complete.
     return _strip_provider_private(request)
@@ -1334,6 +1351,7 @@ class CompressionCoordinator:
         self._attempt: CompressionAttempt | None = None
         self.outcome: str | None = None
         self.active_projection: list[dict[str, Any]] | None = None
+        self._active_candidate: CompressionCandidate | None = None
         self._tool_pressure_fingerprint: str | None = None
         self._admission_lock = threading.RLock()
         self._active_admission: tuple[int, str, str] | None = None
@@ -1553,6 +1571,59 @@ class CompressionCoordinator:
         self.outcome = "background_candidate_adopted"
         if self._background_notified_prefix != candidate.prefix_hash:
             self.telemetry.append("background_adopted")
+        return [dict(message) for message in combined]
+
+    def publish_active_projection(
+        self,
+        source: Sequence[Mapping[str, Any]],
+        projected: Sequence[Mapping[str, Any]],
+        *,
+        generation: int,
+        schema_hash: str,
+    ) -> bool:
+        """Remember a deterministic projection for append-only reuse."""
+        candidate = CompressionCandidate(
+            session_id=self.session_id,
+            generation=int(generation),
+            watermark=len(source),
+            prefix_hash=_projection_fingerprint(source),
+            schema_hash=str(schema_hash or ""),
+            messages=[dict(message) for message in projected],
+        )
+        if not validate_projection(candidate.messages).valid:
+            return False
+        with self._admission_lock:
+            self._active_candidate = candidate
+            self.active_projection = [dict(message) for message in projected]
+        return True
+
+    def project_active(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        generation: int,
+        schema_hash: str,
+    ) -> list[dict[str, Any]] | None:
+        """Splice new rows onto the stable deterministic projection."""
+        with self._admission_lock:
+            candidate = self._active_candidate
+        if (
+            candidate is None
+            or candidate.session_id != self.session_id
+            or candidate.generation != generation
+            or candidate.schema_hash != str(schema_hash or "")
+            or candidate.watermark > len(messages)
+            or _projection_fingerprint(messages[: candidate.watermark])
+            != candidate.prefix_hash
+        ):
+            return None
+        combined = [dict(message) for message in candidate.messages]
+        combined.extend(dict(message) for message in messages[candidate.watermark :])
+        if not validate_projection(combined).valid:
+            return None
+        self.active_projection = combined
+        self.outcome = "active_projection_reused"
+        self.telemetry.append("active_projection_reused")
         return [dict(message) for message in combined]
 
     def take_background_adoption_notice(self) -> bool:
