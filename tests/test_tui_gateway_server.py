@@ -3905,6 +3905,8 @@ def test_superseded_agent_build_closes_exact_agent_and_profile_db(monkeypatch, t
 
         def close(self):
             closed["agent"] += 1
+            if getattr(self, "_owns_session_db", False):
+                self._session_db.close()
 
     session = {
         "agent": None,
@@ -3943,6 +3945,91 @@ def test_superseded_agent_build_closes_exact_agent_and_profile_db(monkeypatch, t
         assert session["agent"] is None
         assert closed == {"agent": 1, "db": 1}
     finally:
+        server._sessions.pop(sid, None)
+
+
+def test_published_agent_owns_profile_db_before_concurrent_close(monkeypatch, tmp_path):
+    sid = "published-agent-close-race"
+    ready = threading.Event()
+    published = threading.Event()
+    release_build = threading.Event()
+    closed = {"agent": 0}
+    dbs = []
+
+    class _DB:
+        def __init__(self, db_path=None):
+            self.db_path = db_path
+            self.closed = 0
+            dbs.append(self)
+
+        def close(self):
+            self.closed += 1
+
+    class _Agent:
+        model = "test"
+
+        def __init__(self, db):
+            self._session_db = db
+
+        def close(self):
+            closed["agent"] += 1
+            if getattr(self, "_owns_session_db", False):
+                self._session_db.close()
+
+    session = {
+        "agent": None,
+        "agent_build_generation": 0,
+        "agent_error": None,
+        "agent_ready": ready,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": "published-stored",
+        "profile_home": str(tmp_path),
+        "source": "desktop",
+    }
+    server._sessions[sid] = session
+
+    monkeypatch.setattr("hermes_state.SessionDB", _DB)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda _sid, _key, **kwargs: _Agent(kwargs["session_db"]),
+    )
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: None)
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: None)
+    monkeypatch.setattr(server, "reset_hermes_home_override", lambda _token: None)
+    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+
+    def _after_publish():
+        assert session["agent"] is not None
+        assert getattr(session["agent"], "_owns_session_db", False) is True
+        published.set()
+        assert release_build.wait(timeout=2.0)
+        return ("", "")
+
+    monkeypatch.setattr(server, "_config_model_target", _after_publish)
+
+    try:
+        server._start_agent_build(sid, session)
+        assert published.wait(timeout=1.0)
+
+        assert server._close_session_by_id(sid) is True
+        assert closed == {"agent": 1}
+        assert dbs[0].closed == 1
+
+        release_build.set()
+        assert ready.wait(timeout=1.0)
+        assert closed == {"agent": 1}
+        assert dbs[0].closed == 1
+    finally:
+        release_build.set()
         server._sessions.pop(sid, None)
 
 

@@ -1095,36 +1095,39 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
 
-    with session["history_lock"]:
-        preparation = session.get("resume_preparation")
-        if not isinstance(preparation, dict):
-            return _err(rid, 4018, "session has no deferred preparation")
+    with _sessions_lock:
+        if _sessions.get(sid) is not session:
+            return _err(rid, 4001, "session not found")
+        with session["history_lock"]:
+            preparation = session.get("resume_preparation")
+            if not isinstance(preparation, dict):
+                return _err(rid, 4018, "session has no deferred preparation")
 
-        status = preparation.get("status")
-        if status in {"preparing", "ready"}:
-            return _ok(
-                rid,
-                {"session_id": sid, "preparation": _resume_preparation_payload(session)},
-            )
-        if status != "preparation_failed":
-            return _err(rid, 4019, f"preparation is not retryable: {status or 'unknown'}")
+            status = preparation.get("status")
+            if status in {"preparing", "ready"}:
+                return _ok(
+                    rid,
+                    {"session_id": sid, "preparation": _resume_preparation_payload(session)},
+                )
+            if status != "preparation_failed":
+                return _err(rid, 4019, f"preparation is not retryable: {status or 'unknown'}")
 
-        attempt = int(preparation.get("attempt") or 0) + 1
-        session["agent_build_generation"] = int(
-            session.get("agent_build_generation") or 0
-        ) + 1
-        session["agent_build_started"] = False
-        session.pop("_agent_build_thread", None)
-        session["resume_history_ready"] = threading.Event()
-        session["agent_ready"] = threading.Event()
-        session["resume_hydrating"] = True
-        session.pop("resume_history_error", None)
-        session["agent_error"] = None
-        session["resume_preparation"] = {
-            "attempt": attempt,
-            "phase": "history",
-            "status": "preparing",
-        }
+            attempt = int(preparation.get("attempt") or 0) + 1
+            session["agent_build_generation"] = int(
+                session.get("agent_build_generation") or 0
+            ) + 1
+            session["agent_build_started"] = False
+            session.pop("_agent_build_thread", None)
+            session["resume_history_ready"] = threading.Event()
+            session["agent_ready"] = threading.Event()
+            session["resume_hydrating"] = True
+            session.pop("resume_history_error", None)
+            session["agent_error"] = None
+            session["resume_preparation"] = {
+                "attempt": attempt,
+                "phase": "history",
+                "status": "preparing",
+            }
 
     db, owns_db = _resume_hydration_db(session)
     if db is None:

@@ -2772,6 +2772,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         session_db = None
         owns_db = False
         built_agent = None
+        db_transferred_to_built_agent = False
+        published_built_agent = False
         profile_home = current.get("profile_home")
         try:
             if history_ready is not None:
@@ -2848,6 +2850,17 @@ def _start_agent_build(sid: str, session: dict) -> None:
             finally:
                 _clear_session_context(tokens)
 
+            # Establish ownership before the agent becomes reachable from the
+            # session record. Then every close race has exactly one owner: if
+            # publication wins, session teardown closes it; if close/retry wins,
+            # this builder closes its still-local agent. There is no interval
+            # where teardown can see the agent while its dedicated DB is still
+            # builder-owned.
+            if owns_db and session_db is not None:
+                if not _transfer_db_to_agent(built_agent, session_db):
+                    raise RuntimeError("failed to transfer dedicated session database to agent")
+                db_transferred_to_built_agent = True
+
             # Bot Mode gate hint: the DB title lands post-first-turn
             # (pending_title), but the system prompt builds at turn START —
             # hand the agent its intended title so the "Bot Chat" protocol
@@ -2859,13 +2872,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             # Retry can invalidate this generation while provider discovery is
-            # still constructing the agent. Publish under the same lock retry
-            # uses, so generation validation and ownership transfer cannot be
-            # split by a replacement attempt.
-            with history_lock:
-                if int(current.get("agent_build_generation") or 0) != build_generation:
-                    return
-                current["agent"] = built_agent
+            # still constructing the agent. Membership + generation + publish
+            # are one atomic ownership claim relative to session.close/pop and
+            # session.resume.retry (both use this lock order).
+            with _sessions_lock:
+                with history_lock:
+                    if (
+                        _sessions.get(sid) is not current
+                        or int(current.get("agent_build_generation") or 0)
+                        != build_generation
+                    ):
+                        return
+                    current["agent"] = built_agent
+                    published_built_agent = True
             agent = built_agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
@@ -2970,35 +2989,24 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
-            with history_lock:
-                generation_current = (
-                    int(current.get("agent_build_generation") or 0)
-                    == build_generation
-                )
-                published_exact_agent = (
-                    generation_current
-                    and not replaced
-                    and built_agent is not None
-                    and current.get("agent") is built_agent
-                )
-                if not generation_current and current.get("agent") is built_agent:
-                    current["agent"] = None
             # A locally-constructed agent invalidated before publication owns
-            # provider/MCP/client resources outside SessionDB. Dispose it
-            # explicitly; closing only the DB leaks those resources.
-            if built_agent is not None and not published_exact_agent:
+            # its dedicated DB plus provider/MCP/client resources. Dispose that
+            # one local owner explicitly. Once published, teardown owns it even
+            # if the session was popped while this finally block was starting.
+            disposed_local_agent = False
+            if built_agent is not None and not published_built_agent:
                 try:
                     if hasattr(built_agent, "close"):
                         built_agent.close()
+                        disposed_local_agent = True
                 except Exception:
                     logger.debug("failed to close superseded agent build for %s", sid, exc_info=True)
-            # Dedicated profile handle: transfer only to the exact local agent
-            # published by this generation. Every stale/error/reaped path keeps
-            # ownership here and closes the handle.
+            # A transfer failure (or a fake/legacy agent without close()) keeps
+            # DB ownership local. Avoid double-close when agent.close() already
+            # discharged a successful transfer.
             if owns_db and session_db is not None:
-                if not (
-                    published_exact_agent
-                    and _transfer_db_to_agent(built_agent, session_db)
+                if not db_transferred_to_built_agent or (
+                    not published_built_agent and not disposed_local_agent
                 ):
                     with contextlib.suppress(Exception):
                         session_db.close()
