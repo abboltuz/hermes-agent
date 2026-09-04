@@ -9,7 +9,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
 import { clearClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
-import { notify } from '@/store/notifications'
+import { isDiskFullErrorMessage, notify } from '@/store/notifications'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { clearAllPrompts } from '@/store/prompts'
 import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
@@ -356,15 +356,35 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       surfaceBillingBlock(sessionId, payload.billing)
     }
 
+    // ``message.complete`` is the normal terminal carrier for provider and
+    // runtime failures. Keep the inline error card, but also raise a durable
+    // in-app alert so a failed turn cannot look like the agent simply stopped
+    // when the bubble is outside the viewport. Billing and disk-full failures
+    // already have dedicated alerts with better recovery guidance.
+    if (
+      failure &&
+      !payload?.billing &&
+      !isDiskFullErrorMessage(failure.error)
+    ) {
+      notify({
+        id: `turn-error:${sessionId}`,
+        kind: 'error',
+        title: translateNow('notifications.native.turnErrorTitle'),
+        message: failure.error
+      })
+    }
+
     if (isActiveEvent) {
       setTurnStartedAt(null)
 
-      // Pet beat: a finished turn always celebrates — go straight to the
-      // jump, never linger on the run/reason pose. One atom update (clears
-      // toolRunning/reasoning AND sets celebrate together) so no stray "run"
-      // frame leaks to the sprite — including the popped-out overlay, which
-      // mirrors each activity change. The jump runs ~2 loops, then settles.
-      flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+      // A terminal failure must look like a failure, not a successful stop.
+      // Keep the completion jump for healthy turns and switch failures to the
+      // same error beat used by explicit gateway ``error`` events.
+      if (failure) {
+        flashPetActivity({ error: true, reasoning: false, toolRunning: false })
+      } else {
+        flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+      }
 
       // Light up the pet's mail icon if the user wasn't looking when the turn
       // finished — a glanceable "new message" hint on the popped-out overlay.

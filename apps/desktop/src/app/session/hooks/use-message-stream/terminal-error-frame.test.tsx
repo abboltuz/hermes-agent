@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { chatMessageText } from '@/lib/chat-messages'
+import { $notifications, clearNotifications } from '@/store/notifications'
+import { $petActivity, setPetActivity } from '@/store/pet'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 
@@ -33,6 +35,8 @@ function lastAssistant() {
 describe('terminal error message.complete frames', () => {
   afterEach(() => {
     cleanup()
+    clearNotifications()
+    setPetActivity({})
     vi.restoreAllMocks()
   })
 
@@ -94,6 +98,30 @@ describe('terminal error message.complete frames', () => {
     const bubble = lastAssistant()
     expect(bubble?.error).toBe('rate limited')
     expect(bubble?.errorSurface).toEqual({ layer: 'provider', code: 'rate_limit', retryable: true })
+  })
+
+  it('raises a visible error notification instead of reporting turnDone', async () => {
+    mountStream()
+    await start()
+
+    await completeWithError({
+      text: 'Error: unsupported parameter',
+      error: 'HTTP 400: unsupported parameter',
+      error_surface: { layer: 'provider', code: 'bad_request', retryable: false },
+      recoverable: true
+    })
+
+    expect($notifications.get()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: `turn-error:${SID}`,
+          kind: 'error',
+          message: 'HTTP 400: unsupported parameter'
+        })
+      ])
+    )
+    expect($petActivity.get().error).toBe(true)
+    expect($petActivity.get().celebrate).not.toBe(true)
   })
 
   it('ignores a garbled error_surface payload (older/foreign backends)', async () => {

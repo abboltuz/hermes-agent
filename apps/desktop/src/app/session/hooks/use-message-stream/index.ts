@@ -772,12 +772,21 @@ export function useMessageStream({
         void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
       }
 
-      dispatchNativeNotification({
-        body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
-        kind: 'turnDone',
-        sessionId,
-        title: translateNow('notifications.native.turnDoneTitle')
-      })
+      if (failure) {
+        dispatchNativeNotification({
+          body: failure.error.slice(0, 140),
+          kind: 'turnError',
+          sessionId,
+          title: translateNow('notifications.native.turnErrorTitle')
+        })
+      } else {
+        dispatchNativeNotification({
+          body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
+          kind: 'turnDone',
+          sessionId,
+          title: translateNow('notifications.native.turnDoneTitle')
+        })
+      }
     },
     [hydrateFromStoredSession, scheduleSessionsRefresh, updateSessionState]
   )
