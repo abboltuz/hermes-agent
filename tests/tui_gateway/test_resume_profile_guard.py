@@ -106,6 +106,139 @@ def test_resume_applies_owner_profile_guard(
         reset_hermes_home_override(ambient)
 
 
+@pytest.mark.parametrize(
+    ("launch_required", "owner_required", "blocked"),
+    [(False, True, True), (True, False, False)],
+)
+def test_hard_recovery_checkpoint_policy_uses_owner_profile(
+    tmp_path,
+    monkeypatch,
+    launch_required,
+    owner_required,
+    blocked,
+):
+    launch = tmp_path / "launch"
+    owner = tmp_path / "owner"
+    for home, required in (
+        (launch, launch_required),
+        (owner, owner_required),
+    ):
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "compression:\n"
+            f"  checkpoint_required: {'true' if required else 'false'}\n",
+            encoding="utf-8",
+        )
+
+    db = SessionDB(owner / "state.db")
+    db.create_session("chat", "desktop")
+    for index in range(30):
+        db.append_message(
+            "chat",
+            "user" if index % 2 == 0 else "assistant",
+            f"message-{index}",
+        )
+
+    monkeypatch.setattr(server, "_hermes_home", launch)
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_resume_hard_summary_callback",
+        lambda _session: (lambda _batch, _previous: "bounded owner summary"),
+    )
+    sid = "owner-checkpoint-policy"
+    session = {
+        "history_lock": threading.Lock(),
+        "profile_home": str(owner),
+        "resume_preparation": {
+            "attempt": 1,
+            "phase": "history",
+            "status": "preparing",
+        },
+    }
+    server._sessions[sid] = session
+
+    ambient = set_hermes_home_override(launch)
+    try:
+        if blocked:
+            with pytest.raises(RuntimeError, match="BLOCKED_MISSING_PREREQUISITE"):
+                server._recover_oversized_model_resume(
+                    sid,
+                    session,
+                    "chat",
+                    db,
+                    SessionResumeTooLargeError(30, 10),
+                    attempt=1,
+                )
+            assert len(db.get_messages("chat")) == 30
+        else:
+            server._recover_oversized_model_resume(
+                sid,
+                session,
+                "chat",
+                db,
+                SessionResumeTooLargeError(30, 10),
+                attempt=1,
+            )
+            assert len(db.get_model_resume_conversation("chat")) <= 5
+            assert sum(
+                row["compacted"] == 1
+                for row in db.get_messages("chat", include_inactive=True)
+            ) >= 30
+        assert get_hermes_home() == launch
+    finally:
+        reset_hermes_home_override(ambient)
+        db.close()
+
+
+def test_hard_summary_callback_carries_credential_free_route_identity(monkeypatch):
+    import agent.context_compressor as context_compressor
+    import agent.conversation_compression as conversation_compression
+
+    captured = {}
+
+    class FakeCompressor:
+        context_length = 96_000
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _generate_summary(self, _messages):
+            return "summary"
+
+    monkeypatch.setattr(context_compressor, "ContextCompressor", FakeCompressor)
+    monkeypatch.setattr(
+        conversation_compression,
+        "compression_strategy_fingerprint_for_engine",
+        lambda compressor, focus: (
+            "credential-free-route"
+            if isinstance(compressor, FakeCompressor) and focus is None
+            else "wrong"
+        ),
+    )
+
+    callback = server._resume_hard_summary_callback(
+        {
+            "resume_runtime_overrides": {
+                "provider_override": "custom:work",
+                "model_override": {
+                    "model": "model-a",
+                    "provider": "custom:work",
+                    "base_url": "https://model.invalid/v1",
+                    "api_mode": "openai",
+                },
+            }
+        }
+    )
+
+    assert callback._resume_context_window == 96_000
+    assert callback._resume_strategy_identity == "credential-free-route"
+    assert captured["model"] == "model-a"
+    assert captured["provider"] == "custom:work"
+    assert "api_key" not in captured
+
+
 @pytest.mark.parametrize("owner_limit", [0, 2])
 def test_launch_profile_guard_restores_foreign_caller_context(
     tmp_path, monkeypatch, owner_limit

@@ -11578,6 +11578,156 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
 
         return self._execute_write(_do)
 
+    def get_compaction_source_page(
+        self,
+        session_id: str,
+        *,
+        after_id: int,
+        through_id: int,
+        limit: int,
+        max_field_chars: int,
+    ) -> List[Dict[str, Any]]:
+        """Read one active keyset page without materializing unbounded fields.
+
+        Cold recovery may be invoked precisely because a legacy row contains a
+        multi-megabyte payload. ``get_messages()`` intentionally returns exact
+        bodies, so using it here would allocate those bodies before recovery's
+        caps could run. This projection clips payload columns in SQLite and
+        leaves the authoritative rows untouched. The returned content carries
+        its durable row id whenever any sidecar was clipped.
+        """
+        if not session_id:
+            return []
+        page_limit = max(1, int(limit))
+        cap = max(1_000, int(max_field_chars))
+        # Leave room for the archive marker itself so the SQL projection — not
+        # only a later Python cleanup pass — obeys ``max_field_chars``.
+        text_payload_cap = max(2, cap - 128)
+        head = max(1, text_payload_cap * 3 // 4)
+        tail = max(1, text_payload_cap - head)
+        reference = (
+            "'[Full durable payload archived at message row ' || id || '.]'"
+        )
+        heavy_sidecars = (
+            "tool_calls",
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+            "api_content",
+            "display_metadata",
+            "provenance_metadata",
+        )
+        sidecar_overflow = " OR ".join(
+            f"length({column}) > {cap}" for column in heavy_sidecars
+        )
+        source_payload_chars = " + ".join(
+            f"COALESCE(length({column}), 0)"
+            for column in ("content", *heavy_sidecars)
+        )
+        content_expr = (
+            "CASE "
+            f"WHEN length(content) > {cap} "
+            "AND substr(content, 1, 6) = char(0) || 'json:' "
+            f"THEN {reference} "
+            f"WHEN length(content) > {cap} "
+            f"THEN substr(content, 1, {head}) || char(10) || '... ' || "
+            f"{reference} || char(10) || substr(content, -{tail}) "
+            f"WHEN {sidecar_overflow} "
+            f"THEN substr(COALESCE(content, ''), 1, "
+            f"max(0, {cap} - length({reference}) - 1)) || char(10) || {reference} "
+            "ELSE content END AS content"
+        )
+
+        def bounded(column: str) -> str:
+            return (
+                f"CASE WHEN length({column}) > {cap} "
+                f"THEN NULL ELSE {column} END AS {column}"
+            )
+
+        # A minimal extracted call contains three clipped identity fields plus
+        # JSON structure. Keep the complete aggregate below the field cap.
+        max_tool_calls = max(1, min(32, cap // 768))
+        bounded_tool_calls = f"""
+            CASE
+              WHEN length(tool_calls) > {cap} AND json_valid(tool_calls)
+              THEN (
+                SELECT json_group_array(
+                    json_object(
+                        'id', substr(json_extract(call.value, '$.id'), 1, 256),
+                        'type', substr(COALESCE(
+                            json_extract(call.value, '$.type'), 'function'
+                        ), 1, 64),
+                        'function', json_object(
+                            'name', substr(json_extract(
+                                call.value, '$.function.name'
+                            ), 1, 256),
+                            'arguments', printf(
+                                '{{"archive_message_rows":[%d]}}', messages.id
+                            )
+                        )
+                    )
+                )
+                  FROM (
+                    SELECT value
+                      FROM json_each(messages.tool_calls)
+                     LIMIT {max_tool_calls}
+                  ) AS call
+              )
+              WHEN length(tool_calls) > {cap} THEN NULL
+              ELSE tool_calls
+            END AS tool_calls
+        """
+
+        sql = f"""
+            SELECT id, session_id, role, {content_expr},
+                   tool_call_id, {bounded_tool_calls}, tool_name,
+                   effect_disposition, timestamp, token_count, finish_reason,
+                   {bounded('reasoning')}, {bounded('reasoning_content')},
+                   {bounded('reasoning_details')},
+                   {bounded('codex_reasoning_items')},
+                   {bounded('codex_message_items')},
+                   platform_message_id, observed, _compressed_summary,
+                   active, compacted, {bounded('api_content')}, display_kind,
+                   {bounded('display_metadata')}, origin_kind, turn_kind,
+                   trust_kind, {bounded('provenance_metadata')},
+                   CASE WHEN length(content) > {cap} OR {sidecar_overflow}
+                        THEN 1 ELSE 0 END AS _resume_payload_clipped,
+                   ({source_payload_chars}) AS _resume_source_payload_chars
+              FROM messages
+             WHERE session_id = ? AND active = 1 AND id > ? AND id <= ?
+             ORDER BY id ASC
+             LIMIT ?
+        """
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                sql,
+                (session_id, int(after_id), int(through_id), page_limit),
+            ).fetchall()
+
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            msg = dict(row)
+            if msg.pop("_compressed_summary", 0):
+                msg["_compressed_summary"] = True
+            msg["content"] = self._decode_content(msg.get("content"))
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(
+                    msg["display_metadata"]
+                )
+            if msg.get("provenance_metadata") is not None:
+                msg["provenance_metadata"] = self._decode_provenance_metadata(
+                    msg["provenance_metadata"]
+                )
+            result.append(normalize_message_for_durable_write(msg))
+        return result
+
     def get_messages(
         self,
         session_id: str,

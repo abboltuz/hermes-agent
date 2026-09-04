@@ -18,7 +18,7 @@ import secrets
 import threading
 from typing import Any, Callable, Mapping, Sequence
 
-from agent.compression_v3 import validate_projection
+from agent.compression_v3 import estimate_provider_wire_tokens, validate_projection
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -48,6 +48,9 @@ class ResumeHardCompactionPolicy:
     summary_chunk_rows: int = 256
     max_summary_chars: int = 32_000
     max_tail_message_chars: int = 16_000
+    max_projection_tokens: int = 48_000
+    max_page_materialized_chars: int = 4_000_000
+    strategy_identity: str = ""
     lease_seconds: float = 300.0
 
     def validate(self) -> None:
@@ -59,6 +62,12 @@ class ResumeHardCompactionPolicy:
             raise ValueError("max_summary_chars must be at least 1000")
         if self.max_tail_message_chars < 1_000:
             raise ValueError("max_tail_message_chars must be at least 1000")
+        if self.max_projection_tokens < 1_000:
+            raise ValueError("max_projection_tokens must be at least 1000")
+        if self.max_page_materialized_chars < self.max_tail_message_chars:
+            raise ValueError(
+                "max_page_materialized_chars must cover at least one bounded row"
+            )
         if self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
 
@@ -153,6 +162,8 @@ def _clean_message(message: Mapping[str, Any]) -> dict[str, Any]:
         "_row_id",
         "_db_persisted",
         "_resume_archive_rows",
+        "_resume_payload_clipped",
+        "_resume_source_payload_chars",
     ):
         cleaned.pop(key, None)
     return cleaned
@@ -173,6 +184,7 @@ def _bounded_tail_message(
         if int(row_id or 0) > 0
     ]
     source_row = source_rows[0] if source_rows else 0
+    source_was_clipped = bool(message.get("_resume_payload_clipped"))
     cleaned = _clean_message(message)
     if len(source_rows) > 1:
         row_label = ", ".join(str(row_id) for row_id in source_rows)
@@ -216,6 +228,15 @@ def _bounded_tail_message(
         cleaned["content"] = (
             append_reference(current) if isinstance(current, str) else reference
         )
+
+    if source_was_clipped:
+        current = cleaned.get("content")
+        cleaned["content"] = (
+            append_reference(current) if isinstance(current, str) else reference
+        )
+        # Keep the signal until same-role repair has propagated all source row
+        # identities. _clean_message always removes it from provider payloads.
+        cleaned["_resume_payload_clipped"] = True
 
     tool_calls = cleaned.get("tool_calls")
     if tool_calls:
@@ -430,8 +451,14 @@ def _compose_candidate(
                 for item in exact_tail[run_start:run_end]
                 for row_id in item.get("_resume_archive_rows", [])
             ]
+            run_was_clipped = any(
+                bool(item.get("_resume_payload_clipped"))
+                for item in exact_tail[run_start:run_end]
+            )
             for item in exact_tail[run_start:run_end]:
                 item["_resume_archive_rows"] = run_rows
+                if run_was_clipped:
+                    item["_resume_payload_clipped"] = True
         run_start = run_end
 
     from agent.agent_runtime_helpers import repair_message_sequence
@@ -498,6 +525,28 @@ def _compose_candidate(
     return candidate
 
 
+def _first_complete_tail_group_end(
+    tail: Sequence[Mapping[str, Any]],
+) -> int:
+    """Return a safe boundary after the oldest retained conversational group."""
+    if not tail:
+        return 0
+    role = tail[0].get("role")
+    if role == "user":
+        index = 1
+        if index < len(tail) and tail[index].get("role") == "assistant":
+            index += 1
+            while index < len(tail) and tail[index].get("role") == "tool":
+                index += 1
+        return index
+    if role == "assistant":
+        index = 1
+        while index < len(tail) and tail[index].get("role") == "tool":
+            index += 1
+        return index
+    return 1
+
+
 def compact_oversized_resume(
     db: Any,
     session_id: str,
@@ -514,29 +563,15 @@ def compact_oversized_resume(
     if watermark <= 0:
         return ResumeHardCompactionResult("no_progress", 0, 0, watermark)
 
-    source_fingerprint = hashlib.sha256(
-        f"resume-hard-v1:{session_id}:{watermark}".encode()
-    ).hexdigest()
     strategy_fingerprint = hashlib.sha256(
         (
-            f"resume-hard-v1:{policy.target_rows}:{policy.page_rows}:"
+            f"resume-hard-v2:{policy.target_rows}:{policy.page_rows}:"
             f"{policy.summary_chunk_rows}:{policy.max_summary_chars}:"
-            f"{policy.max_tail_message_chars}"
+            f"{policy.max_tail_message_chars}:{policy.max_projection_tokens}:"
+            f"{policy.max_page_materialized_chars}:{policy.strategy_identity}"
         ).encode()
     ).hexdigest()
     owner = secrets.token_hex(16)
-    admission = db.claim_context_compaction(
-        session_id,
-        source_fingerprint,
-        strategy_fingerprint,
-        owner=owner,
-        force=force,
-    )
-    if admission != "admitted":
-        raise ResumeHardCompactionBusy(
-            f"hard-summary compaction admission is {admission}"
-        )
-
     holder = (
         f"resume-hard:pid={os.getpid()}:tid={threading.get_ident()}:"
         f"nonce={secrets.token_hex(8)}"
@@ -544,9 +579,6 @@ def compact_oversized_resume(
     if not db.try_acquire_compression_lock(
         session_id, holder, ttl_seconds=policy.lease_seconds
     ):
-        db.finish_context_compaction(
-            session_id, owner=owner, outcome="deferred_lock"
-        )
         raise ResumeHardCompactionBusy("session compression lease is busy")
 
     refresher = _LeaseRefresher(
@@ -556,37 +588,91 @@ def compact_oversized_resume(
     reducer = _RollingReducer(policy.max_summary_chars)
     # Reserve two rows for the strict-template wrapper needed by legacy user
     # rows whose provenance cannot safely be upgraded during recovery.
-    tail = deque(maxlen=policy.target_rows - 2)
+    max_tail_rows = policy.target_rows - 2
+    tail: deque[dict[str, Any]] = deque()
+    tail_token_costs: deque[int] = deque()
+    tail_tokens = 0
     summary_chunk: list[dict[str, Any]] = []
     source_rows = 0
     after_id = 0
     committed = False
+    admitted = False
+    source_hasher = hashlib.sha256(
+        f"resume-hard-v2:{session_id}:{watermark}".encode()
+    )
+    # The source reader bounds ten payload-bearing columns independently.
+    # Adapt row count so even their worst-case combined page stays within the
+    # configured working-memory envelope.
+    effective_page_rows = max(
+        1,
+        min(
+            policy.page_rows,
+            policy.max_page_materialized_chars
+            // (policy.max_tail_message_chars * 10),
+        ),
+    )
     try:
-        stop = False
-        while not stop:
-            page = db.get_messages(
+        while True:
+            page = db.get_compaction_source_page(
                 session_id,
-                limit=policy.page_rows,
                 after_id=after_id,
+                through_id=watermark,
+                limit=effective_page_rows,
+                max_field_chars=policy.max_tail_message_chars,
             )
             if not page:
                 break
             for row in page:
                 row_id = int(row.get("id") or 0)
-                if row_id > watermark:
-                    stop = True
-                    break
                 after_id = max(after_id, row_id)
                 source_rows += 1
-                if len(tail) == tail.maxlen:
+                fingerprint_payload = json.dumps(
+                    row,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+                source_hasher.update(len(fingerprint_payload).to_bytes(8, "big"))
+                source_hasher.update(fingerprint_payload)
+                bounded_row = _bounded_tail_message(
+                    row, policy.max_tail_message_chars
+                )
+                # Preserve only the immutable source identity while the row is
+                # resident. _clean_message removes it before summary/provider
+                # materialization; compose uses it for archive references.
+                bounded_row["id"] = row_id
+                row_tokens = estimate_provider_wire_tokens(
+                    {"messages": [_clean_message(bounded_row)]}
+                )
+                while tail and (
+                    len(tail) >= max_tail_rows
+                    or tail_tokens + row_tokens > policy.max_projection_tokens
+                ):
                     summary_chunk.append(tail.popleft())
-                tail.append(row)
+                    tail_tokens -= tail_token_costs.popleft()
+                tail.append(bounded_row)
+                tail_token_costs.append(row_tokens)
+                tail_tokens += row_tokens
                 if len(summary_chunk) >= policy.summary_chunk_rows:
                     reducer.add(summary_chunk)
                     summary_chunk = []
                     _report_progress(progress, "summarizing", source_rows)
-            if len(page) < policy.page_rows:
+            if len(page) < effective_page_rows:
                 break
+
+        admission = db.claim_context_compaction(
+            session_id,
+            source_hasher.hexdigest(),
+            strategy_fingerprint,
+            owner=owner,
+            force=force,
+        )
+        if admission != "admitted":
+            raise ResumeHardCompactionBusy(
+                f"hard-summary compaction admission is {admission}"
+            )
+        admitted = True
 
         if summary_chunk:
             reducer.add(summary_chunk)
@@ -616,10 +702,41 @@ def compact_oversized_resume(
             reducer.add(retained_tail[:first_user])
             retained_tail = retained_tail[first_user:]
 
+        # Reserve the full possible summary envelope, then roll complete oldest
+        # groups out of the exact tail until the complete model-facing message
+        # payload fits its aggregate estimated budget. A row cap alone cannot
+        # protect a route from hundreds of individually large messages.
+        reducer.materialize()
+        budget_summary = _ensure_summary_envelope(
+            "S" * policy.max_summary_chars,
+            policy.max_summary_chars,
+        )
+        while retained_tail:
+            budget_candidate = _compose_candidate(
+                budget_summary,
+                retained_tail,
+                has_human_turn=reducer.has_human_turn,
+                max_summary_chars=policy.max_summary_chars,
+                max_tail_message_chars=policy.max_tail_message_chars,
+            )
+            if (
+                estimate_provider_wire_tokens({"messages": budget_candidate})
+                <= policy.max_projection_tokens
+            ):
+                break
+            group_end = _first_complete_tail_group_end(retained_tail)
+            # The newest conversational group is the irreducible live intent.
+            # If it cannot fit even after every older group is reduced, fail
+            # explicitly and leave the original active projection untouched.
+            if group_end <= 0 or group_end >= len(retained_tail):
+                break
+            reducer.add(retained_tail[:group_end])
+            retained_tail = retained_tail[group_end:]
+            reducer.materialize()
+
         # Exactly one compressor refinement operation per cold recovery.
         # Paging and hierarchy reduction above are local, bounded work, so a
         # 20k-row legacy tip cannot turn into dozens of per-page round-trips.
-        reducer.materialize()
         reducer.refine(summarize)
 
         candidate = _compose_candidate(
@@ -632,6 +749,14 @@ def compact_oversized_resume(
         if len(candidate) > policy.target_rows:
             raise ResumeHardCompactionUnsafe(
                 "hard-summary candidate exceeds its row budget"
+            )
+        estimated_projection_tokens = estimate_provider_wire_tokens(
+            {"messages": candidate}
+        )
+        if estimated_projection_tokens > policy.max_projection_tokens:
+            raise ResumeHardCompactionUnsafe(
+                "hard-summary candidate exceeds its estimated token budget "
+                f"({estimated_projection_tokens} > {policy.max_projection_tokens})"
             )
         active_rows = db.archive_and_compact(
             session_id,
@@ -658,7 +783,7 @@ def compact_oversized_resume(
             reducer.used_generated_summary,
         )
     except Exception:
-        if not committed:
+        if admitted and not committed:
             try:
                 db.finish_context_compaction(
                     session_id, owner=owner, outcome="aborted"

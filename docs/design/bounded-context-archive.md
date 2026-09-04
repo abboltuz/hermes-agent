@@ -225,11 +225,23 @@ journal and atomic `archive_and_compact` fence. Rows beyond the watermark are
 cloned back into the live tail by the same transaction. Original rows remain
 soft-archived and searchable.
 
+The cold source identity hashes every bounded source projection row, including
+raw payload lengths, through the captured watermark. Thus membership or any
+source change that can alter the recovery candidate rearms automatic work; a
+change wholly inside an intentionally omitted giant-field middle does not,
+because it produces the same bounded archive reference. Strategy identity
+combines the hard caps with the normal compressor's credential-free engine,
+main/auxiliary route and fallback-policy fingerprint.
+
 Input pages are reduced locally into a bounded binary hierarchy, then one
 refinement operation invokes the configured compressor's bounded provider
 fallback policy. Provider failure keeps the existing redacted deterministic
 handoff rather than deleting raw history or retrying indefinitely. Summary
-text and active row count have independent hard caps;
+text, active row count, individual replay rows and the aggregate estimated
+history payload have independent hard caps. The pre-agent history allowance
+uses 37.5% of the resolved route window (capped at 64K estimated tokens),
+reserving the majority for system instructions, tool schemas, output and
+tokenizer uncertainty;
 final provider-shaped budget validation remains authoritative. Pre-provenance
 user rows remain exact and visible behind a hidden strict-alternation wrapper
 instead of being relabelled as trusted human input.

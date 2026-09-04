@@ -1,8 +1,10 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 
 import agent.resume_hard_compaction as hard_compaction
+from agent.compression_v3 import estimate_provider_wire_tokens
 from agent.resume_hard_compaction import (
     ResumeHardCompactionUnsafe,
     ResumeHardCompactionPolicy,
@@ -386,3 +388,155 @@ def test_lease_refresher_tolerates_one_blip_but_bounds_persistent_failure():
     persistent_refresher._run()
     assert persistent.calls == persistent_refresher._max_consecutive_failures
     assert persistent_refresher.lost is True
+
+
+def test_giant_prefix_and_tail_fields_are_bounded_before_python_reduction(
+    tmp_path, monkeypatch
+):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("chat", source="tui")
+    huge = "Z" * 2_000_000
+    prefix_id = db.append_message(
+        "chat",
+        "user",
+        huge,
+        api_content=huge,
+        **HUMAN_PROVENANCE,
+    )
+    db.append_message(
+        "chat",
+        "assistant",
+        "prefix answer",
+        reasoning=huge,
+        reasoning_details=[{"text": huge}],
+    )
+    for index in range(40):
+        db.append_message(
+            "chat",
+            "user" if index % 2 == 0 else "assistant",
+            f"middle-{index}",
+            **(HUMAN_PROVENANCE if index % 2 == 0 else {}),
+        )
+    tail_user_id = db.append_message(
+        "chat",
+        "user",
+        "latest exact request",
+        api_content=huge,
+        **HUMAN_PROVENANCE,
+    )
+    tail_assistant_id = db.append_message(
+        "chat",
+        "assistant",
+        huge,
+        reasoning_content=huge,
+        codex_message_items=[{"payload": huge}],
+    )
+
+    materialized_page_bytes = []
+    real_page = db.get_compaction_source_page
+
+    def observed_page(*args, **kwargs):
+        page = real_page(*args, **kwargs)
+        materialized_page_bytes.append(
+            len(json.dumps(page, ensure_ascii=False, default=str).encode("utf-8"))
+        )
+        return page
+
+    monkeypatch.setattr(db, "get_compaction_source_page", observed_page)
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=8,
+            page_rows=20,
+            max_summary_chars=1_000,
+            max_tail_message_chars=2_000,
+            max_projection_tokens=3_000,
+            max_page_materialized_chars=100_000,
+        ),
+        summarize=lambda *_args: "bounded summary",
+    )
+
+    assert result.outcome == "committed"
+    assert materialized_page_bytes
+    assert max(materialized_page_bytes) < 150_000
+    active = db.get_model_resume_conversation("chat")
+    assert (
+        estimate_provider_wire_tokens({"messages": active})
+        <= 3_000
+    )
+    raw = {
+        row["id"]: row
+        for row in db.get_messages("chat", include_inactive=True)
+        if row["id"] in {prefix_id, tail_user_id, tail_assistant_id}
+    }
+    assert raw[prefix_id]["content"] == huge
+    assert raw[prefix_id]["api_content"] == huge
+    assert raw[tail_user_id]["api_content"] == huge
+    assert raw[tail_assistant_id]["content"] == huge
+    assert raw[tail_assistant_id]["reasoning_content"] == huge
+
+
+def test_changed_source_projection_rearms_terminal_receipt(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 40)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            hard_compaction,
+            "validate_projection",
+            lambda _candidate: SimpleNamespace(valid=False, reason="reject once"),
+        )
+        with pytest.raises(ResumeHardCompactionUnsafe):
+            compact_oversized_resume(
+                db,
+                "chat",
+                policy=ResumeHardCompactionPolicy(target_rows=8),
+                summarize=lambda *_args: "bounded summary",
+            )
+
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ? AND id = ("
+            "SELECT MIN(id) FROM messages WHERE session_id = ?)",
+            ("changed-in-place", "chat", "chat"),
+        )
+    )
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(target_rows=8),
+        summarize=lambda *_args: "bounded summary",
+    )
+    assert result.outcome == "committed"
+
+
+def test_changed_route_strategy_rearms_terminal_receipt(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    _seed(db, 40)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            hard_compaction,
+            "validate_projection",
+            lambda _candidate: SimpleNamespace(valid=False, reason="reject once"),
+        )
+        with pytest.raises(ResumeHardCompactionUnsafe):
+            compact_oversized_resume(
+                db,
+                "chat",
+                policy=ResumeHardCompactionPolicy(
+                    target_rows=8,
+                    strategy_identity="route-a",
+                ),
+                summarize=lambda *_args: "bounded summary",
+            )
+
+    result = compact_oversized_resume(
+        db,
+        "chat",
+        policy=ResumeHardCompactionPolicy(
+            target_rows=8,
+            strategy_identity="route-b",
+        ),
+        summarize=lambda *_args: "bounded summary",
+    )
+    assert result.outcome == "committed"

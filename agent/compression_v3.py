@@ -83,6 +83,16 @@ def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
     return max(_tokens(public), serialized_tokens)
 
 
+def estimate_provider_wire_tokens(request: Mapping[str, Any]) -> int:
+    """Public estimated token cost for one provider-shaped request.
+
+    This deliberately carries the same estimated (not verified) semantics as
+    :func:`provider_request_budget`; cold-resume compaction uses it to enforce
+    an aggregate projection cap before an agent exists.
+    """
+    return _provider_wire_token_bound(request)
+
+
 @dataclass(frozen=True)
 class ProviderRequestBudget:
     """One model/route-specific budget decision for a provider request.
@@ -172,7 +182,7 @@ def provider_request_budget(agent: Any, request: Mapping[str, Any]) -> ProviderR
         context_window=context_window,
         output_reserve=output_reserve,
         safety_margin=safety_margin,
-        estimated_input_tokens=_provider_wire_token_bound(request),
+        estimated_input_tokens=estimate_provider_wire_tokens(request),
     )
 
 

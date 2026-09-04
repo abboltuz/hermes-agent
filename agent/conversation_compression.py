@@ -2594,7 +2594,10 @@ def _compression_source_fingerprint(messages: list, system_message: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _compression_strategy_fingerprint(agent: Any, focus_topic: Optional[str]) -> str:
+def compression_strategy_fingerprint_for_engine(
+    compressor: Any,
+    focus_topic: Optional[str],
+) -> str:
     """Rearm failed work when its engine, route, budget or policy changes.
 
     Persist only the digest. Credentials and incidental counters are deliberately
@@ -2602,7 +2605,6 @@ def _compression_strategy_fingerprint(agent: Any, focus_topic: Optional[str]) ->
     """
     from agent.auxiliary_client import _get_auxiliary_task_config
 
-    compressor = getattr(agent, "context_compressor", None)
     aux = _get_auxiliary_task_config("compression")
     def endpoint_identity(value: Any) -> str:
         if not isinstance(value, str) or not value:
@@ -2641,6 +2643,14 @@ def _compression_strategy_fingerprint(agent: Any, focus_topic: Optional[str]) ->
                            if isinstance(entry, dict)],
     }
     return hashlib.sha256(json.dumps(policy, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _compression_strategy_fingerprint(agent: Any, focus_topic: Optional[str]) -> str:
+    """Compatibility wrapper for normal agent-driven compaction admission."""
+    return compression_strategy_fingerprint_for_engine(
+        getattr(agent, "context_compressor", None),
+        focus_topic,
+    )
 
 
 def compress_context(

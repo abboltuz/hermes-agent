@@ -9817,7 +9817,6 @@ def _resume_hard_summary_callback(session: dict):
         ),
         base_url=str(model_override.get("base_url") or ""),
         api_mode=str(model_override.get("api_mode") or ""),
-        config_context_length=128_000,
         quiet_mode=True,
         # Hard-recovery already supplies a hierarchical bounded digest. Lean
         # augmentation can issue additional chunk-digest calls; keep this
@@ -9835,6 +9834,38 @@ def _resume_hard_summary_callback(session: dict):
         )
         return compressor._generate_summary(list(messages))
 
+    try:
+        summarize._resume_context_window = int(compressor.context_length)
+    except Exception:
+        summarize._resume_context_window = 128_000
+    try:
+        from agent.conversation_compression import (
+            compression_strategy_fingerprint_for_engine,
+        )
+
+        summarize._resume_strategy_identity = compression_strategy_fingerprint_for_engine(
+            compressor,
+            None,
+        )
+    except Exception:
+        # Stripped/scaffold builds may omit the normal compression module.
+        # Retain a credential-free minimal route identity so a model/provider
+        # change still rearms a prior terminal recovery receipt.
+        summarize._resume_strategy_identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "model": model_override.get("model") or "",
+                    "provider": (
+                        model_override.get("provider")
+                        or overrides.get("provider_override")
+                        or ""
+                    ),
+                    "api_mode": model_override.get("api_mode") or "",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
     return summarize
 
 
@@ -9847,7 +9878,39 @@ def _recover_oversized_model_resume(
     *,
     attempt: int,
 ) -> None:
-    """Hard-summarize an oversized cold tip while retaining its raw archive."""
+    """Run cold recovery entirely inside the stored session owner's scope."""
+    profile_home = session.get("profile_home")
+    home_token = set_hermes_home_override(profile_home or _hermes_home)
+    secret_token = None
+    try:
+        if profile_home:
+            secret_token = set_secret_scope(
+                build_profile_secret_scope(Path(profile_home))
+            )
+        _recover_oversized_model_resume_in_owner_scope(
+            sid,
+            session,
+            stored_id,
+            db,
+            error,
+            attempt=attempt,
+        )
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _recover_oversized_model_resume_in_owner_scope(
+    sid: str,
+    session: dict,
+    stored_id: str,
+    db,
+    error,
+    *,
+    attempt: int,
+) -> None:
+    """Hard-summarize an oversized tip after owner scope is installed."""
     loaded_cfg = _load_cfg() or {}
     compression_cfg = loaded_cfg.get("compression") or {}
     if not isinstance(compression_cfg, dict):
@@ -9875,6 +9938,23 @@ def _recover_oversized_model_resume(
         # configured guard will reject anyway.
         raise error
     target_rows = max(4, min(512, limit // 2))
+    summary_callback = _resume_hard_summary_callback(session)
+    context_window = int(
+        getattr(summary_callback, "_resume_context_window", 128_000) or 128_000
+    )
+    # This is explicitly an estimated pre-agent history allowance. Reserve the
+    # majority of the discovered/configured window for system instructions,
+    # tool schemas, output and tokenizer uncertainty; the final provider-shaped
+    # gate remains authoritative after agent construction.
+    max_projection_tokens = max(1_000, min(64_000, int(context_window * 0.375)))
+    max_summary_chars = max(1_000, min(32_000, max_projection_tokens))
+    max_tail_message_chars = max(
+        1_000,
+        min(16_000, max_projection_tokens * 2),
+    )
+    strategy_identity = str(
+        getattr(summary_callback, "_resume_strategy_identity", "") or ""
+    )
     history_lock = session["history_lock"]
 
     def progress(phase: str, count: int) -> None:
@@ -9905,28 +9985,22 @@ def _recover_oversized_model_resume(
             },
         )
 
-    profile_home = session.get("profile_home")
-    home_token = set_hermes_home_override(profile_home or _hermes_home)
-    secret_token = None
-    try:
-        if profile_home:
-            secret_token = set_secret_scope(
-                build_profile_secret_scope(Path(profile_home))
-            )
-        compact_oversized_resume(
-            db,
-            stored_id,
-            policy=ResumeHardCompactionPolicy(target_rows=target_rows),
-            summarize=_resume_hard_summary_callback(session),
-            progress=progress,
-            # An explicit preparation retry may rearm a terminal receipt for
-            # the same unchanged legacy source. Automatic first open may not.
-            force=attempt > 1,
-        )
-    finally:
-        if secret_token is not None:
-            reset_secret_scope(secret_token)
-        reset_hermes_home_override(home_token)
+    compact_oversized_resume(
+        db,
+        stored_id,
+        policy=ResumeHardCompactionPolicy(
+            target_rows=target_rows,
+            max_summary_chars=max_summary_chars,
+            max_tail_message_chars=max_tail_message_chars,
+            max_projection_tokens=max_projection_tokens,
+            strategy_identity=strategy_identity,
+        ),
+        summarize=summary_callback,
+        progress=progress,
+        # An explicit preparation retry may rearm a terminal receipt for
+        # the same unchanged legacy source. Automatic first open may not.
+        force=attempt > 1,
+    )
 
 
 def _resume_hydration_db(session: dict):
