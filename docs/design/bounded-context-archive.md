@@ -18,6 +18,11 @@ schemas and output reserve. The current byte/token heuristic is an estimate, not
 a proof for arbitrary tokenizers or multimodal inputs. Unsupported counting must
 not be described as an unconditional fit guarantee.
 
+Owner decision (2026-09-04): preserve compatibility on routes without reliable
+counting. Explicitly distinguish verified and estimated budgets. Estimated routes
+use headroom and bounded overflow recovery; absence of a known window is not
+evidence that the request fits. Do not disable these providers by default.
+
 Compaction builds a candidate away from the session-open path and publishes it
 atomically against its source revision. Incomplete summaries and stale candidates
 are rejected. Unmatched tool calls must not be summarized away or replayed as new

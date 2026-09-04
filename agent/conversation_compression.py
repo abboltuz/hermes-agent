@@ -66,6 +66,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
@@ -2603,19 +2604,41 @@ def _compression_strategy_fingerprint(agent: Any, focus_topic: Optional[str]) ->
 
     compressor = getattr(agent, "context_compressor", None)
     aux = _get_auxiliary_task_config("compression")
+    def endpoint_identity(value: Any) -> str:
+        if not isinstance(value, str) or not value:
+            return ""
+        parts = urlsplit(value)
+        query = sorted((key, item) for key, item in parse_qsl(parts.query, keep_blank_values=True)
+                       if not any(secret in key.lower() for secret in (
+                           "key", "token", "secret", "password", "signature", "credential", "auth",
+                       )))
+        return urlunsplit((parts.scheme.lower(), parts.netloc.rsplit("@", 1)[-1].lower(),
+                           parts.path.rstrip("/"), urlencode(query), ""))
+
+    def route_policy(route: dict) -> dict:
+        return {
+            **{key: route.get(key) for key in (
+                "provider", "model", "api_mode", "context_length", "max_tokens",
+                "timeout", "reasoning_effort", "reasoning_enabled",
+            )},
+            "base_url": endpoint_identity(route.get("base_url")),
+        }
+
     fields = (
         "model", "provider", "api_mode", "summary_model", "context_length",
         "protect_first_n", "protect_last_n", "summary_target_ratio", "tail_mode",
+        "max_tokens", "min_tail_user_messages", "threshold_tokens", "threshold_tokens_cap",
+        "abort_on_summary_failure",
     )
     policy = {
         "version": 1,
         "engine": f"{type(compressor).__module__}.{type(compressor).__qualname__}",
         "focus": focus_topic,
         "engine_policy": {key: getattr(compressor, key, None) for key in fields},
-        "auxiliary": {key: aux.get(key) for key in (
-            "provider", "model", "base_url", "context_length", "max_tokens",
-            "timeout", "reasoning_effort",
-        )},
+        "inherited_endpoint": endpoint_identity(getattr(compressor, "base_url", None)),
+        "auxiliary": route_policy(aux),
+        "fallback_chain": [route_policy(entry) for entry in (aux.get("fallback_chain") or [])
+                           if isinstance(entry, dict)],
     }
     return hashlib.sha256(json.dumps(policy, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -2656,6 +2679,11 @@ def compress_context(
     fingerprint = _compression_source_fingerprint(messages, system_message)
     try:
         strategy = _compression_strategy_fingerprint(agent, focus_topic)
+        compressor = getattr(agent, "context_compressor", None)
+        blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
+        # A failure can ARM cooldown while executing. Only a block that already
+        # existed before the attempt qualifies as retryable nonexecution.
+        cooldown_preexisting = bool(callable(blocked) and not force and blocked(compressor))
     except Exception:
         logger.warning("Context compaction policy unavailable; keeping previous context", exc_info=True)
         return messages, getattr(agent, "_cached_system_prompt", None) or system_message or ""
@@ -2710,9 +2738,7 @@ def compress_context(
             commit_fence=commit_fence,
         )
         if result[0] is messages:
-            compressor = getattr(agent, "context_compressor", None)
-            blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
-            if callable(blocked) and not force and blocked(compressor):
+            if cooldown_preexisting:
                 outcome = "cooldown"
             elif getattr(agent, "_compression_skipped_due_to_lock", None):
                 outcome = "deferred_lock"
