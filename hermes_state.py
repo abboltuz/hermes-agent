@@ -11716,35 +11716,8 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                 f"ELSE {column} END AS {column}"
             )
 
-        # A minimal extracted call contains three clipped identity fields plus
-        # JSON structure. Keep the complete aggregate below the field cap.
-        max_tool_calls = max(1, min(32, cap // 768))
         bounded_tool_calls = f"""
             CASE
-              WHEN {byte_length('tool_calls')} > {cap} AND json_valid(tool_calls)
-              THEN (
-                SELECT json_group_array(
-                    json_object(
-                        'id', substr(json_extract(call.value, '$.id'), 1, 256),
-                        'type', substr(COALESCE(
-                            json_extract(call.value, '$.type'), 'function'
-                        ), 1, 64),
-                        'function', json_object(
-                            'name', substr(json_extract(
-                                call.value, '$.function.name'
-                            ), 1, 256),
-                            'arguments', printf(
-                                '{{"archive_message_rows":[%d]}}', messages.id
-                            )
-                        )
-                    )
-                )
-                  FROM (
-                    SELECT value
-                      FROM json_each(messages.tool_calls)
-                     LIMIT {max_tool_calls}
-                  ) AS call
-              )
               WHEN {byte_length('tool_calls')} > {cap} THEN NULL
               ELSE tool_calls
             END AS tool_calls

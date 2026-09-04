@@ -64,7 +64,7 @@ class ResumeHardCompactionPolicy:
             raise ValueError("max_tail_message_chars must be at least 1000")
         if self.max_projection_tokens < 1_000:
             raise ValueError("max_projection_tokens must be at least 1000")
-        minimum_page_chars = self.max_tail_message_chars * 10 + 4_096
+        minimum_page_chars = self.max_tail_message_chars * 10 + 8_192
         if self.max_page_materialized_chars < minimum_page_chars:
             raise ValueError(
                 "max_page_materialized_chars must cover one worst-case "
@@ -620,7 +620,7 @@ def compact_oversized_resume(
     # The source reader bounds ten payload-bearing columns independently.
     # Adapt row count so even their worst-case combined page stays within the
     # configured working-memory envelope.
-    per_row_materialized_chars = policy.max_tail_message_chars * 10 + 4_096
+    per_row_materialized_chars = policy.max_tail_message_chars * 10 + 8_192
     effective_page_rows = min(
         policy.page_rows,
         policy.max_page_materialized_chars // per_row_materialized_chars,

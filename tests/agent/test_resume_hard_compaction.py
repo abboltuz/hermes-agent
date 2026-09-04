@@ -359,11 +359,16 @@ def test_large_tool_call_group_is_reduced_with_raw_archive_preserved(
 
     active = db.get_model_resume_conversation("chat")
     assert not any(row.get("role") == "tool" for row in active)
-    reduced_call = next(row for row in reduced_rows if row.get("tool_calls"))
+    reduced_call = next(
+        row
+        for row in reduced_rows
+        if row.get("role") == "assistant"
+        and str(call_row_id) in str(row.get("content"))
+    )
     reduced_tool = next(row for row in reduced_rows if row.get("role") == "tool")
-    assert reduced_call["tool_calls"][0]["id"] == tool_call_id
+    assert not reduced_call.get("tool_calls")
     assert reduced_tool["tool_call_id"] == tool_call_id
-    assert str(call_row_id) in reduced_call["tool_calls"][0]["function"]["arguments"]
+    assert "archived at message row" in reduced_call["content"]
     raw_call = next(
         row
         for row in db.get_messages("chat", include_inactive=True)
@@ -480,7 +485,11 @@ def test_clipped_tool_call_list_reduces_every_result(tmp_path, monkeypatch):
 
     reduced_contents = {row.get("content") for row in reduced_rows}
     assert {f"clipped-result-{index}" for index in range(40)} <= reduced_contents
-    assert any(row.get("tool_calls") for row in reduced_rows)
+    assert any(
+        row.get("role") == "assistant"
+        and "archived at message row" in str(row.get("content"))
+        for row in reduced_rows
+    )
     active = db.get_model_resume_conversation("chat")
     assert [row["content"] for row in active[-2:]] == [
         "latest request",
@@ -615,6 +624,65 @@ def test_giant_prefix_and_tail_fields_are_bounded_before_python_reduction(
     assert raw[tail_assistant_id]["content"] == huge
     assert raw[tail_assistant_id]["tool_name"] == huge
     assert raw[tail_assistant_id]["reasoning_content"] == huge
+
+
+def test_sql_projection_caps_escaped_tool_identity_and_near_limit_sidecars(
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("chat", source="tui")
+    near_cap = "N" * 900
+    control_id = "\x01" * 256
+    source_id = db.append_message(
+        "chat",
+        "assistant",
+        near_cap,
+        tool_calls=[
+            {
+                "id": control_id,
+                "type": "\x02" * 64,
+                "function": {
+                    "name": "\x03" * 256,
+                    "arguments": "{}",
+                },
+            }
+        ],
+        tool_name=near_cap,
+        reasoning=near_cap,
+        reasoning_content=near_cap,
+        reasoning_details=near_cap,
+        codex_reasoning_items=near_cap,
+        codex_message_items=near_cap,
+        api_content=near_cap,
+        display_metadata={"note": "N" * 850},
+    )
+
+    page = db.get_compaction_source_page(
+        "chat",
+        after_id=0,
+        through_id=source_id,
+        limit=1,
+        max_field_chars=1_000,
+    )
+
+    assert len(page) == 1
+    projected = page[0]
+    assert projected.get("tool_calls") is None
+    assert projected["_resume_tool_calls_clipped"] == 1
+    assert "archived at message row" in projected["content"]
+    assert len(json.dumps(page, ensure_ascii=False).encode("utf-8")) < 18_192
+    for value in projected.values():
+        if isinstance(value, str):
+            assert len(value.encode("utf-8")) <= 1_000
+
+    raw = next(
+        row
+        for row in db.get_messages("chat", include_inactive=True)
+        if row["id"] == source_id
+    )
+    assert raw["tool_calls"][0]["id"] == control_id
+    assert raw["reasoning"] == near_cap
+    assert raw["api_content"] == near_cap
 
 
 def test_source_mutation_during_paging_rejects_stale_publication(
