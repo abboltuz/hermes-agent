@@ -55,6 +55,10 @@ function sameTranscriptIdentity(left: ChatMessage, right: ChatMessage): boolean 
     return left.rowId === right.rowId
   }
 
+  if (left.semanticId || right.semanticId) {
+    return Boolean(left.semanticId) && left.semanticId === right.semanticId
+  }
+
   return left.id === right.id
 }
 
@@ -76,11 +80,47 @@ export function mergePersistedTailIntoRuntime(
     return persistedTail
   }
 
-  const prefix = persistedTail.filter(
-    persisted => !currentRuntime.some(current => sameTranscriptIdentity(current, persisted))
-  )
+  // Build a shortest common supersequence. Persisted and runtime are both
+  // chronological, but either may omit rows the other carries; prepending all
+  // missing persisted rows would reorder a gap inside an overlap. The LCS
+  // anchors those gaps, and the runtime object wins at each shared identity so
+  // richer live/pending state survives hydration.
+  const persistedCount = persistedTail.length
+  const runtimeCount = currentRuntime.length
+  const widths = runtimeCount + 1
+  const lcs = new Uint32Array((persistedCount + 1) * widths)
 
-  return prefix.length === 0 ? currentRuntime : [...prefix, ...currentRuntime]
+  for (let persistedIndex = persistedCount - 1; persistedIndex >= 0; persistedIndex -= 1) {
+    for (let runtimeIndex = runtimeCount - 1; runtimeIndex >= 0; runtimeIndex -= 1) {
+      const offset = persistedIndex * widths + runtimeIndex
+
+      lcs[offset] = sameTranscriptIdentity(persistedTail[persistedIndex], currentRuntime[runtimeIndex])
+        ? lcs[(persistedIndex + 1) * widths + runtimeIndex + 1] + 1
+        : Math.max(lcs[(persistedIndex + 1) * widths + runtimeIndex], lcs[offset + 1])
+    }
+  }
+
+  const merged: ChatMessage[] = []
+  let persistedIndex = 0
+  let runtimeIndex = 0
+
+  while (persistedIndex < persistedCount && runtimeIndex < runtimeCount) {
+    if (sameTranscriptIdentity(persistedTail[persistedIndex], currentRuntime[runtimeIndex])) {
+      merged.push(currentRuntime[runtimeIndex])
+      persistedIndex += 1
+      runtimeIndex += 1
+    } else if (lcs[(persistedIndex + 1) * widths + runtimeIndex] >= lcs[persistedIndex * widths + runtimeIndex + 1]) {
+      merged.push(persistedTail[persistedIndex])
+      persistedIndex += 1
+    } else {
+      merged.push(currentRuntime[runtimeIndex])
+      runtimeIndex += 1
+    }
+  }
+
+  merged.push(...persistedTail.slice(persistedIndex), ...currentRuntime.slice(runtimeIndex))
+
+  return merged
 }
 
 /**

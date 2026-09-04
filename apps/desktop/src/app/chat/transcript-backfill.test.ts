@@ -190,6 +190,30 @@ describe('mergePersistedTailIntoRuntime', () => {
     expect(merged.map(message => message.id)).toEqual(['a', 'b-live', 'c-live'])
     expect(merged.map(message => message.rowId)).toEqual([1, 2, 3])
   })
+
+  it('inserts a persisted gap inside an ordered runtime overlap', () => {
+    const persisted = [chat('stored-a', 1), chat('stored-b', 2), chat('stored-c', 3)]
+    const live = [chat('live-a', 1), chat('live-c', 3), chat('live-d', 4)]
+
+    const merged = mergePersistedTailIntoRuntime(live, persisted)
+
+    expect(merged.map(message => message.id)).toEqual(['live-a', 'stored-b', 'live-c', 'live-d'])
+    expect(merged.map(message => message.rowId)).toEqual([1, 2, 3, 4])
+  })
+
+  it('dedupes a newly persisted optimistic turn by semantic identity', () => {
+    const persisted = [{ ...chat('stored-user', 9), semanticId: 'desktop:prompt-9' }]
+    const optimistic = [{ ...chat('user-optimistic'), semanticId: 'desktop:prompt-9' }]
+
+    expect(mergePersistedTailIntoRuntime(optimistic, persisted)).toEqual(optimistic)
+  })
+
+  it('does not collapse text-identical turns with different semantic identities', () => {
+    const persisted = [{ ...chat('stored-user', 9), semanticId: 'desktop:older' }]
+    const optimistic = [{ ...chat('user-optimistic'), semanticId: 'desktop:newer' }]
+
+    expect(mergePersistedTailIntoRuntime(optimistic, persisted)).toEqual([...persisted, ...optimistic])
+  })
 })
 
 describe('backfillOlderTranscriptPage', () => {
