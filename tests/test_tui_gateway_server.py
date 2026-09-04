@@ -3658,11 +3658,7 @@ def test_deferred_resume_acknowledges_before_materialization_guard(monkeypatch, 
         def get_ancestor_display_prefix(self, _target):
             raise AssertionError("model-only hydration loaded ancestor prefix")
 
-        def get_messages_as_conversation(self, target, **kwargs):
-            assert kwargs == {
-                "repair_alternation": True,
-                "include_row_ids": True,
-            }
+        def get_model_resume_conversation(self, target):
             reads.append(("model", target))
             return []
 
@@ -3700,6 +3696,60 @@ def test_deferred_resume_acknowledges_before_materialization_guard(monkeypatch, 
         caller.join(timeout=3)
 
 
+def test_model_only_deferred_resume_preserves_compacted_summary_marker(
+    monkeypatch, tmp_path
+):
+    """The Desktop fast path must hydrate the exact model-facing projection."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("compacted-chat", source="tui")
+    db.append_message("compacted-chat", "user", "old question")
+    db.append_message("compacted-chat", "assistant", "old answer")
+    db.archive_and_compact(
+        "compacted-chat",
+        [
+            {
+                "role": "user",
+                "content": "durable summary",
+                "_compressed_summary": True,
+            }
+        ],
+    )
+
+    sid = "live-compacted-chat"
+    ready = threading.Event()
+    session = _session(
+        session_key="compacted-chat",
+        resume_hydrating=True,
+        resume_history_ready=ready,
+        agent_ready=threading.Event(),
+        resume_message_count=1,
+        resume_preparation={
+            "attempt": 1,
+            "phase": "history",
+            "status": "preparing",
+        },
+    )
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+
+    try:
+        server._schedule_resume_hydration(
+            sid, "compacted-chat", db, model_only=True
+        )
+        assert ready.wait(timeout=2.0)
+        assert session["resume_preparation"]["status"] == "ready"
+        assert session["history"][0]["content"] == "durable summary"
+        assert session["history"][0]["_compressed_summary"] is True
+        assert session["display_history_prefix"] == []
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     first_released = threading.Event()
     retry_started = threading.Event()
@@ -3718,12 +3768,8 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
         def reopen_session(self, _target):
             pass
 
-        def get_messages_as_conversation(self, _target, **kwargs):
+        def get_model_resume_conversation(self, _target):
             nonlocal attempts
-            assert kwargs == {
-                "repair_alternation": True,
-                "include_row_ids": True,
-            }
             attempts += 1
             if attempts == 1:
                 first_released.set()

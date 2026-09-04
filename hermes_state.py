@@ -12289,6 +12289,37 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
         )
         return model_history, display_history
 
+    def get_model_resume_conversation(
+        self, session_id: str
+    ) -> List[Dict[str, Any]]:
+        """Return only the tip's model-facing history for live replay.
+
+        Unlike :meth:`get_messages_as_conversation`, this projection preserves
+        the durable ``_compressed_summary`` marker required by pre-compress
+        checkpoint providers.  Unlike :meth:`get_resume_conversations`, it
+        never materializes ancestor/display lineage.  Callers must apply the
+        model-facing resume admission guard before invoking this method.
+        """
+        snapshot_rows = self._read_working_context_rows(session_id)
+        if snapshot_rows is not None:
+            rows = snapshot_rows
+        else:
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
+                    "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+
+        return self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=True,
+            include_row_ids=True,
+            include_summary_markers=True,
+        )
+
     def get_resume_message_count(self, session_id: str) -> int:
         """Count active rows that a full resume would materialize."""
         session_ids = self._session_lineage_root_to_tip(session_id)

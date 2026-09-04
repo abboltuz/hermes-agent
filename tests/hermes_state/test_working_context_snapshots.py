@@ -75,6 +75,8 @@ def test_publication_has_only_references_and_survives_restart(db):
         assert model[0]["_compressed_summary"] is True
         assert model[0]["api_content"] == " exact wire summary"
         assert display[0]["_row_id"] == expected[0]["_row_id"]
+        model_only = resumed.get_model_resume_conversation("chat")
+        assert model_only == model
 
 
 def test_concurrent_append_is_tail_and_is_not_cloned_by_read(db):

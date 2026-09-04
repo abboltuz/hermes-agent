@@ -9859,11 +9859,7 @@ def _schedule_resume_hydration(
                 # only the tip's bounded working context; loading the full
                 # lineage here would make agent readiness scale with archive
                 # size a second time, despite messages_omitted=true.
-                raw_history = db.get_messages_as_conversation(
-                    stored_id,
-                    repair_alternation=True,
-                    include_row_ids=True,
-                )
+                raw_history = db.get_model_resume_conversation(stored_id)
                 display_history = raw_history
                 prefix = []
             else:
