@@ -1406,12 +1406,48 @@ def test_responses_emergency_projection_never_rewrites_current_user_task():
     assert request["input"] == [{"role": "user", "content": current_task}]
 
 
-def test_pre_send_gate_without_persistence_returns_typed_unfit():
+def test_pre_send_gate_without_persistence_uses_request_only_projection():
     agent = type("Agent", (), {"session_id": "s", "_compression_generation": 2, "_config_context_length": 300, "_compression_safety_margin": 10})()
     call_id = "call-1"
     request = {"messages": [{"role": "system", "content": "policy"}, {"role": "user", **HUMAN, "content": "task"}, {"role": "assistant", "tool_calls": [{"id": call_id}]}, {"role": "tool", "tool_call_id": call_id, "content": "x" * 3000}], "max_tokens": 10}
-    with pytest.raises(ContextProjectionUnfit):
-        prepare_api_request(agent, request)
+    prepared = prepare_api_request(agent, request)
+
+    assert provider_request_budget(agent, prepared).fits is True
+    assert len(prepared["messages"][-1]["content"]) < 3000
+    assert request["messages"][-1]["content"] == "x" * 3000
+
+
+def test_pre_send_gate_continues_when_recovery_registration_fails():
+    class DB:
+        def register_compression_recovery(self, *_args, **_kwargs):
+            raise RuntimeError("database unavailable")
+
+    agent = SimpleNamespace(
+        session_id="s",
+        _session_db=DB(),
+        _compression_generation=2,
+        _config_context_length=300,
+        _compression_safety_margin=10,
+    )
+    call_id = "call-1"
+    request = {
+        "messages": [
+            {"role": "system", "content": "policy"},
+            {"role": "user", **HUMAN, "content": "task"},
+            {"role": "assistant", "tool_calls": [{"id": call_id}]},
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": "x" * 3000,
+                "_row_id": 1,
+            },
+        ],
+        "max_tokens": 10,
+    }
+
+    prepared = prepare_api_request(agent, request)
+
+    assert provider_request_budget(agent, prepared).fits is True
     assert request["messages"][-1]["content"] == "x" * 3000
 
 

@@ -1188,20 +1188,12 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         int(getattr(agent, "_compression_generation", 0) or 0),
         int(getattr(agent, "_session_watermark", 0) or 0),
     ):
-        if projection_pressure and wire_budget.fits:
-            # A speculative request-only optimization may not turn a healthy
-            # provider call into a local failure merely because this runtime
-            # has no durable recovery binder (detached/test/plugin agents).
-            return wire_request
-        raise ContextProjectionUnfit(
-            replace(
-                result,
-                outcome="context_projection_unfit",
-                provider_call_allowed=False,
-                reason="durable recovery registration failed",
-            ),
-            provider_request_budget(agent, wire_request),
-        )
+        # Durable registration controls whether this projection can become a
+        # reusable in-memory recovery view; it does not control whether a
+        # physically fitting provider request may proceed. The canonical
+        # transcript was not mutated, so detached/plugin agents can safely use
+        # this projection for the current request and rebuild it next turn.
+        return wire_request
     coordinator.publish_active_projection(
         messages,
         result.messages,
