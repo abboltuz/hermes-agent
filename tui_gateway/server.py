@@ -2538,11 +2538,33 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
 
 def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
-    ready = session.get("agent_ready")
-    if ready is not None and not ready.wait(timeout=timeout):
-        return _err(rid, 5032, "agent initialization timed out")
-    err = session.get("agent_error")
-    return _err(rid, 5032, err) if err else None
+    deadline = time.monotonic() + timeout
+    history_lock = session.setdefault("history_lock", threading.Lock())
+    while True:
+        with history_lock:
+            ready = session.get("agent_ready")
+            generation = int(session.get("agent_build_generation") or 0)
+        if ready is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not ready.wait(timeout=remaining):
+            return _err(rid, 5032, "agent initialization timed out")
+        with history_lock:
+            # An explicit preparation retry replaces both the Event and its
+            # result. Follow the new generation instead of interpreting an old
+            # signalled Event against freshly-cleared error state.
+            if (
+                session.get("agent_ready") is not ready
+                or int(session.get("agent_build_generation") or 0) != generation
+            ):
+                continue
+            err = session.get("agent_error")
+            agent = session.get("agent")
+        if err:
+            return _err(rid, 5032, err)
+        if agent is None:
+            return _err(rid, 5032, "agent initialization completed without an agent")
+        return None
 
 
 # The deferred prompt path waits in short slices so a cancel is honored
@@ -2598,21 +2620,11 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     Returns ``None`` on success OR when the turn was cancelled mid-wait (the
     caller's cancel branch owns that messaging), an ``_err`` dict otherwise.
     """
-    ready = session.get("agent_ready")
-    if ready is None:
-        return None
     start = time.monotonic()
     cap = _agent_build_wait_cap()
     notified_slow = False
-    while not ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
-        with session["history_lock"]:
-            cancelled = session.get("_turn_cancel_requested") or not session.get(
-                "running"
-            )
-        if cancelled:
-            # The caller's cancel/not-running branch emits the user-visible
-            # event for this — bail without an error of our own.
-            return None
+    history_lock = session.setdefault("history_lock", threading.Lock())
+    while True:
         waited = time.monotonic() - start
         if waited >= cap:
             return _err(
@@ -2621,46 +2633,93 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
                 f"agent initialization timed out after {int(waited)}s — "
                 "your message was not sent; retry once the session is ready",
             )
-        build_thread = session.get("_agent_build_thread")
-        if (
-            build_thread is not None
-            and not build_thread.is_alive()
-            and not ready.is_set()
-        ):
-            # _build's ``finally`` guarantees ready.set(); a dead thread with
-            # ready still unset means the build died hard (interpreter-level
-            # kill) — don't wait on a corpse for the rest of the cap.
-            return _err(
-                rid,
-                5032,
-                session.get("agent_error")
-                or "agent initialization failed before completing",
-            )
-        if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
-            # One keyed, replace-in-place notice: the desktop shows it as a
-            # toast, the TUI in its status bar. Without this the extended wait
-            # would be exactly the silent hang this function exists to fix.
-            notified_slow = True
-            _emit(
-                "notification.show",
-                sid,
-                {
-                    "text": (
-                        "Still starting the agent (tool discovery / model "
-                        "setup) — your message will be sent as soon as it's "
-                        "ready."
-                    ),
-                    "level": "info",
-                    "kind": "agent",
-                    "ttl_ms": None,
-                    "key": _AGENT_BUILD_SLOW_NOTICE_KEY,
-                    "id": _AGENT_BUILD_SLOW_NOTICE_KEY,
-                },
-            )
-    if notified_slow:
-        _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
-    err = session.get("agent_error")
-    return _err(rid, 5032, err) if err else None
+        with history_lock:
+            ready = session.get("agent_ready")
+            generation = int(session.get("agent_build_generation") or 0)
+        if ready is None:
+            return None
+        while not ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
+            with history_lock:
+                cancelled = session.get("_turn_cancel_requested") or not session.get(
+                    "running"
+                )
+                generation_changed = (
+                    session.get("agent_ready") is not ready
+                    or int(session.get("agent_build_generation") or 0) != generation
+                )
+                build_thread = session.get("_agent_build_thread")
+                build_error = session.get("agent_error")
+            if cancelled:
+                # The caller's cancel/not-running branch emits the user-visible
+                # event for this — bail without an error of our own.
+                return None
+            if generation_changed:
+                break
+            waited = time.monotonic() - start
+            if waited >= cap:
+                return _err(
+                    rid,
+                    5032,
+                    f"agent initialization timed out after {int(waited)}s — "
+                    "your message was not sent; retry once the session is ready",
+                )
+            if (
+                build_thread is not None
+                and not build_thread.is_alive()
+                and not ready.is_set()
+            ):
+                # _build's ``finally`` guarantees ready.set(); a dead thread with
+                # ready still unset means the build died hard (interpreter-level
+                # kill) — don't wait on a corpse for the rest of the cap.
+                return _err(
+                    rid,
+                    5032,
+                    build_error or "agent initialization failed before completing",
+                )
+            if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
+                # One keyed, replace-in-place notice: the desktop shows it as a
+                # toast, the TUI in its status bar. Without this the extended wait
+                # would be exactly the silent hang this function exists to fix.
+                notified_slow = True
+                _emit(
+                    "notification.show",
+                    sid,
+                    {
+                        "text": (
+                            "Still starting the agent (tool discovery / model "
+                            "setup) — your message will be sent as soon as it's "
+                            "ready."
+                        ),
+                        "level": "info",
+                        "kind": "agent",
+                        "ttl_ms": None,
+                        "key": _AGENT_BUILD_SLOW_NOTICE_KEY,
+                        "id": _AGENT_BUILD_SLOW_NOTICE_KEY,
+                    },
+                )
+        else:
+            # Event completion and its result belong to one generation. Read
+            # both under the same lock used by session.resume.retry; otherwise
+            # retry can replace the Event and clear the error between them.
+            with history_lock:
+                if (
+                    session.get("agent_ready") is not ready
+                    or int(session.get("agent_build_generation") or 0) != generation
+                ):
+                    continue
+                err = session.get("agent_error")
+                agent = session.get("agent")
+            if notified_slow:
+                _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
+            if err:
+                return _err(rid, 5032, err)
+            if agent is None:
+                return _err(rid, 5032, "agent initialization completed without an agent")
+            return None
+
+        # The inner wait observed a replacement generation. Preserve the
+        # original total timeout and progress-notice state, then follow it.
+        continue
 
 
 def _start_agent_build(sid: str, session: dict) -> None:
@@ -2684,6 +2743,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # prompt/RPC builds the agent normally so the user can talk to the session.
     if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
         return
+    history_lock = session.setdefault("history_lock", threading.Lock())
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
         if ready.is_set() or session.get("agent_build_started"):
@@ -2711,14 +2771,17 @@ def _start_agent_build(sid: str, session: dict) -> None:
         secret_token = None
         session_db = None
         owns_db = False
+        built_agent = None
         profile_home = current.get("profile_home")
         try:
             if history_ready is not None:
                 if not history_ready.wait(timeout=300.0):
                     raise TimeoutError("session history hydration timed out")
-                if int(current.get("agent_build_generation") or 0) != build_generation:
-                    return
-                if history_error := current.get("resume_history_error"):
+                with history_lock:
+                    if int(current.get("agent_build_generation") or 0) != build_generation:
+                        return
+                    history_error = current.get("resume_history_error")
+                if history_error:
                     raise RuntimeError(str(history_error))
                 with _sessions_lock:
                     if _sessions.get(sid) is not current:
@@ -2781,7 +2844,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
-                agent = _make_agent(sid, key, **kw)
+                built_agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
 
@@ -2791,15 +2854,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # gate (agent/system_prompt.py) doesn't depend on write order.
             _title_hint = str(current.get("pending_title") or "").strip()
             if _title_hint:
-                agent._session_title_hint = _title_hint
+                built_agent._session_title_hint = _title_hint
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             # Retry can invalidate this generation while provider discovery is
-            # still constructing the agent. Do not publish a superseded build.
-            if int(current.get("agent_build_generation") or 0) != build_generation:
-                return
-            current["agent"] = agent
+            # still constructing the agent. Publish under the same lock retry
+            # uses, so generation validation and ownership transfer cannot be
+            # split by a replacement attempt.
+            with history_lock:
+                if int(current.get("agent_build_generation") or 0) != build_generation:
+                    return
+                current["agent"] = built_agent
+            agent = built_agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -2872,8 +2939,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # the same runtime. Its old build waiter may unwind after the retry
             # has installed a fresh ready event; fence that stale waiter from
             # poisoning the new generation.
-            if int(current.get("agent_build_generation") or 0) == build_generation:
-                current["agent_error"] = str(e)
+            with history_lock:
+                generation_current = (
+                    int(current.get("agent_build_generation") or 0)
+                    == build_generation
+                )
+                if generation_current:
+                    current["agent_error"] = str(e)
+            if generation_current:
                 _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
@@ -2897,16 +2970,36 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
-            # Dedicated profile handle: hand it to the agent that will actually
-            # be torn down, or close it here when no such agent exists. Both
-            # non-transfer cases are real: the except above (build raised, so
-            # nothing holds the handle) and `replaced` (the session was reaped
-            # mid-build, so this agent is discarded and _teardown_session will
-            # never reach it). Transferring to a discarded agent would leak the
-            # handle exactly as before.
+            with history_lock:
+                generation_current = (
+                    int(current.get("agent_build_generation") or 0)
+                    == build_generation
+                )
+                published_exact_agent = (
+                    generation_current
+                    and not replaced
+                    and built_agent is not None
+                    and current.get("agent") is built_agent
+                )
+                if not generation_current and current.get("agent") is built_agent:
+                    current["agent"] = None
+            # A locally-constructed agent invalidated before publication owns
+            # provider/MCP/client resources outside SessionDB. Dispose it
+            # explicitly; closing only the DB leaks those resources.
+            if built_agent is not None and not published_exact_agent:
+                try:
+                    if hasattr(built_agent, "close"):
+                        built_agent.close()
+                except Exception:
+                    logger.debug("failed to close superseded agent build for %s", sid, exc_info=True)
+            # Dedicated profile handle: transfer only to the exact local agent
+            # published by this generation. Every stale/error/reaped path keeps
+            # ownership here and closes the handle.
             if owns_db and session_db is not None:
-                built = None if replaced else current.get("agent")
-                if not _transfer_db_to_agent(built, session_db):
+                if not (
+                    published_exact_agent
+                    and _transfer_db_to_agent(built_agent, session_db)
+                ):
                     with contextlib.suppress(Exception):
                         session_db.close()
             ready.set()
@@ -6313,7 +6406,9 @@ def _current_profile_name() -> str:
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
 # v6: plugins.manage list rows carry the canonical registry key; toggles are
 #     key-addressed (keyless rows render read-only in Desktop Settings).
-DESKTOP_BACKEND_CONTRACT = 6
+# v7: deferred session.resume exposes model-history preparation state and the
+#     idempotent session.resume.retry RPC while retaining a readable runtime.
+DESKTOP_BACKEND_CONTRACT = 7
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:

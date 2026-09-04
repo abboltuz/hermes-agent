@@ -3850,6 +3850,102 @@ def test_stale_agent_build_waiter_cannot_poison_retry_generation():
         server._sessions.pop(sid, None)
 
 
+def test_prompt_waiter_never_treats_replaced_ready_event_as_agent_success():
+    new_ready = threading.Event()
+    new_ready.set()
+    sid = "retry-prompt-wait-generation"
+    session = {
+        "agent": None,
+        "agent_build_generation": 0,
+        "agent_error": "old preparation failed",
+        "history_lock": threading.Lock(),
+        "running": True,
+    }
+
+    class _OldReady:
+        def wait(self, timeout=None):
+            # Exact race: the failed generation wakes this waiter, then retry
+            # replaces the Event and clears its error before the waiter can
+            # inspect the result.
+            with session["history_lock"]:
+                session["agent_build_generation"] = 1
+                session["agent_ready"] = new_ready
+                session["agent_error"] = None
+            return True
+
+        def is_set(self):
+            return True
+
+    session["agent_ready"] = _OldReady()
+
+    err = server._wait_agent_for_prompt(session, "rid", sid)
+
+    assert err is not None
+    assert "without an agent" in err["error"]["message"]
+
+
+def test_superseded_agent_build_closes_exact_agent_and_profile_db(monkeypatch, tmp_path):
+    sid = "superseded-agent-build"
+    ready = threading.Event()
+    history_ready = threading.Event()
+    history_ready.set()
+    closed = {"agent": 0, "db": 0}
+    created = {}
+
+    class _DB:
+        def __init__(self, db_path=None):
+            self.db_path = db_path
+
+        def close(self):
+            closed["db"] += 1
+
+    class _Agent:
+        def __init__(self, db):
+            self._session_db = db
+
+        def close(self):
+            closed["agent"] += 1
+
+    session = {
+        "agent": None,
+        "agent_build_generation": 0,
+        "agent_error": None,
+        "agent_ready": ready,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "resume_history_ready": history_ready,
+        "session_key": "superseded-stored",
+        "profile_home": str(tmp_path),
+        "source": "desktop",
+    }
+    server._sessions[sid] = session
+
+    def _make_agent(_sid, _key, **kwargs):
+        agent = _Agent(kwargs["session_db"])
+        created["agent"] = agent
+        with session["history_lock"]:
+            session["agent_build_generation"] = 1
+        return agent
+
+    monkeypatch.setattr("hermes_state.SessionDB", _DB)
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: None)
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: None)
+    monkeypatch.setattr(server, "reset_hermes_home_override", lambda _token: None)
+    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
+
+    try:
+        server._start_agent_build(sid, session)
+        assert ready.wait(timeout=1.0)
+
+        assert created["agent"] is not None
+        assert session["agent"] is None
+        assert closed == {"agent": 1, "db": 1}
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_session_resume_deferred_history_close_cancels_build(monkeypatch):
     history_started = threading.Event()
     release_history = threading.Event()
