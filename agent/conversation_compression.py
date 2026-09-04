@@ -108,6 +108,15 @@ COMPACTION_STATUS = (
 )
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
+CONCURRENT_COMPACTION_WAIT_STATUS = (
+    "⏳ Context compaction is already running — waiting before the model call..."
+)
+CONCURRENT_COMPACTION_WAIT_HEARTBEAT_TEMPLATE = (
+    "⏳ Context compaction is still running ({seconds:.0f}s) — waiting..."
+)
+CONCURRENT_COMPACTION_RESUME_STATUS = (
+    "✓ Context compaction finished — rebuilding the model request..."
+)
 
 
 def _strip_marker_for_comparison(msgs: Any) -> Any:
@@ -156,6 +165,10 @@ PRE_API_COMPRESSION_STATUS_TEMPLATE = (
     "📦 Pre-API compression: ~{tokens:,} tokens "
     "near the context/output limit. Compacting before the next model call."
 )
+PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE = (
+    "📦 Final model request is ~{tokens:,} tokens for a ~{budget:,}-token "
+    "input budget. Compacting automatically before retrying."
+)
 PREFLIGHT_COMPRESSION_STATUS_TEMPLATE = (
     "📦 Preflight compression: ~{tokens:,} tokens "
     ">= {threshold:,} threshold. This may take a moment."
@@ -198,7 +211,11 @@ CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
 # same constants the emission sites use) through the gateway noise filter.
 ROUTINE_COMPRESSION_STATUS_SAMPLES = (
     COMPACTION_STATUS,
+    CONCURRENT_COMPACTION_WAIT_STATUS,
+    CONCURRENT_COMPACTION_WAIT_HEARTBEAT_TEMPLATE.format(seconds=30),
+    CONCURRENT_COMPACTION_RESUME_STATUS,
     PRE_API_COMPRESSION_STATUS_TEMPLATE.format(tokens=123456),
+    PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE.format(tokens=250000, budget=220000),
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(tokens=120000, threshold=100000),
     IDLE_COMPACTION_STATUS_TEMPLATE.format(idle_seconds=3600, tokens=120000),
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(tokens=250000, attempt=1, cap=3),
@@ -732,6 +749,7 @@ HARD_PRESSURE_COMPRESSION_MAX_SECONDS = 120.0
 _HARD_PRESSURE_COMPRESSION_TRIGGERS = frozenset({
     "preflight_auto", "pre_api_auto", "mid_loop_pressure",
     "payload_413_recovery", "context_overflow_recovery",
+    "pre_send_fit_recovery",
 })
 
 
@@ -1256,6 +1274,162 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     """
     _sig = getattr(agent, "_compression_skipped_due_to_lock", None)
     return _sig is True or isinstance(_sig, str)
+
+
+def wait_for_concurrent_compression(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    timeout_seconds: Optional[float] = None,
+    poll_interval_seconds: float = 0.1,
+    heartbeat_seconds: float = 30.0,
+) -> Optional[List[Dict[str, Any]]]:
+    """Join an already-running same-session compaction and reload its result.
+
+    A hard provider-budget signal must not become a user-visible error merely
+    because manual or background compaction already owns the session lock.
+    Wait for that owner to publish its durable result, then adopt the rotated
+    child or reload the in-place active rows.  ``None`` means the join could
+    not be proven safe (missing DB API, timeout, interruption, or reload
+    failure); callers may retain their existing soft-defer fallback.
+    """
+    if not compression_skipped_due_to_lock(agent):
+        return None
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    holder_getter = getattr(session_db, "get_compression_lock_holder", None)
+    loader = getattr(session_db, "get_messages_as_conversation", None)
+    if not session_id or not callable(holder_getter) or not callable(loader):
+        return None
+
+    if timeout_seconds is None:
+        _idle_timeout, configured_ceiling = resolve_context_compression_timeouts()
+        timeout_seconds = (
+            configured_ceiling
+            if configured_ceiling > 0
+            else DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+        )
+    try:
+        timeout_seconds = max(0.0, float(timeout_seconds))
+        poll_interval_seconds = max(0.01, float(poll_interval_seconds))
+        heartbeat_seconds = max(1.0, float(heartbeat_seconds))
+    except (TypeError, ValueError):
+        return None
+    if timeout_seconds <= 0:
+        return None
+
+    emit_status = getattr(agent, "_emit_status", None)
+    if callable(emit_status):
+        emit_status(CONCURRENT_COMPACTION_WAIT_STATUS)
+    started_at = time.monotonic()
+    next_heartbeat = heartbeat_seconds
+    while True:
+        if bool(getattr(agent, "_interrupt_requested", False)):
+            logger.info(
+                "concurrent compression join interrupted: session=%s",
+                session_id,
+            )
+            return None
+        try:
+            holder = holder_getter(session_id)
+        except Exception as exc:
+            logger.warning(
+                "concurrent compression join lock read failed for session=%s: %s",
+                session_id,
+                exc,
+            )
+            return None
+        if not holder:
+            break
+        elapsed = time.monotonic() - started_at
+        if elapsed >= timeout_seconds:
+            logger.warning(
+                "concurrent compression join timed out after %.1fs for session=%s",
+                elapsed,
+                session_id,
+            )
+            return None
+        if elapsed >= next_heartbeat:
+            if callable(emit_status):
+                emit_status(
+                    CONCURRENT_COMPACTION_WAIT_HEARTBEAT_TEMPLATE.format(
+                        seconds=elapsed
+                    )
+                )
+            touch = getattr(agent, "_touch_activity", None)
+            if callable(touch):
+                try:
+                    touch("waiting for concurrent context compaction")
+                except Exception:
+                    pass
+            next_heartbeat += heartbeat_seconds
+        time.sleep(min(poll_interval_seconds, timeout_seconds - elapsed))
+
+    # Rotation mode publishes a new live child; its adoption helper also
+    # rebinds session-scoped compressor, memory, logging, and DB cursors.
+    recovered = recover_rotated_compression_session(agent)
+    joined_in_place = recovered is None
+    if recovered is None:
+        # In-place mode keeps the same session id and atomically swaps active
+        # rows.  The current user turn was crash-persisted before the provider
+        # boundary, and archive_and_compact preserves rows beyond its start
+        # watermark, so this reload contains both the compacted prefix and any
+        # concurrent user tail.
+        try:
+            recovered = loader(session_id, include_row_ids=True)
+        except Exception as exc:
+            logger.warning(
+                "concurrent compression join reload failed for session=%s: %s",
+                session_id,
+                exc,
+            )
+            return None
+        if not isinstance(recovered, list) or not recovered:
+            return None
+        agent._last_flushed_db_idx = len(recovered)
+        agent._flushed_db_message_session_id = session_id
+        agent._flushed_db_message_ids = {
+            id(message) for message in recovered if isinstance(message, dict)
+        }
+
+    # The preceding ``compress_context`` lock-skip recorded a no-boundary
+    # attempt on this agent. Replace that bookkeeping with the boundary we just
+    # joined so persistence and gateway history offsets follow the winner's
+    # actual mode.
+    agent._last_compression_attempt_recorded = True
+    agent._last_compression_attempt_in_place = joined_in_place
+    agent._last_compaction_in_place = joined_in_place
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        try:
+            active_system_prompt = (
+                getattr(agent, "_cached_system_prompt", None) or ""
+            )
+            compressor.last_compression_rough_tokens = estimate_request_tokens_rough(
+                recovered,
+                system_prompt=active_system_prompt,
+                tools=getattr(agent, "tools", None) or None,
+            )
+            compressor.last_prompt_tokens = -1
+            compressor.awaiting_real_usage_after_compression = True
+        except Exception as exc:
+            logger.debug(
+                "joined compression usage rearm skipped for %s: %s",
+                type(compressor).__name__,
+                exc,
+            )
+
+    agent._compression_skipped_due_to_lock = None
+    if callable(emit_status):
+        emit_status(CONCURRENT_COMPACTION_RESUME_STATUS)
+    logger.info(
+        "joined concurrent compression: session=%s messages=%d->%d wait=%.1fs",
+        session_id,
+        len(messages),
+        len(recovered),
+        time.monotonic() - started_at,
+    )
+    return recovered
 
 
 def _adopt_live_compression_child(

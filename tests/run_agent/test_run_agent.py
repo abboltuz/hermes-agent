@@ -80,8 +80,10 @@ def agent():
 from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
 
-def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkeypatch):
-    """An unchanged typed fit refusal is not retried by the production loop."""
+def test_context_projection_unfit_auto_compacts_and_retries_without_provider_error(
+    agent, monkeypatch
+):
+    """Final-wire pressure rebuilds the turn after automatic compaction."""
     gate_attempts = []
     result = CutResult(
         messages=[{"role": "system", "content": "policy"}],
@@ -92,27 +94,72 @@ def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkey
 
     def refuse_once(*_args, **_kwargs):
         gate_attempts.append(True)
-        raise ContextProjectionUnfit(result)
+        if len(gate_attempts) == 1:
+            raise ContextProjectionUnfit(result)
+        return _mock_response(content="recovered")
 
     agent._interruptible_api_call = refuse_once
-    agent.client.chat.completions.create = MagicMock(
-        side_effect=AssertionError("provider must not be called")
-    )
+    compacted = [{"role": "user", "content": "irreducible task"}]
+    compress = MagicMock(return_value=(compacted, "compressed policy"))
     monkeypatch.setattr(run_agent.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("retry sleep")))
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_compress_context", compress),
     ):
         outcome = agent.run_conversation("irreducible task")
 
-    assert len(gate_attempts) == 1
-    assert agent.client.chat.completions.create.call_count == 0
-    assert outcome["completed"] is False
-    assert outcome["failed"] is True
-    assert outcome["error_type"] == "ContextProjectionUnfit"
-    assert outcome["error"] == "irreducible request floor"
-    assert outcome["api_calls"] == 0
+    assert len(gate_attempts) == 2
+    compress.assert_called_once()
+    assert compress.call_args.kwargs["trigger"] == "pre_send_fit_recovery"
+    assert outcome["completed"] is True
+    assert outcome["final_response"] == "recovered"
+    assert outcome["api_calls"] == 1
+
+
+def test_context_projection_unfit_joins_running_compaction_before_retry(agent):
+    """A prompt submitted during /compress waits for its durable result."""
+    refusal = ContextProjectionUnfit(CutResult(
+        messages=[],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="final provider wire payload exceeds safe context budget",
+    ))
+    attempts = 0
+
+    def refuse_then_succeed(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise refusal
+        return _mock_response(content="continued after compact")
+
+    def lose_compression_lock(messages, system_message, **_kwargs):
+        agent._compression_skipped_due_to_lock = "manual-compress-holder"
+        return messages, system_message
+
+    compacted = [{"role": "user", "content": "current task"}]
+    agent._interruptible_api_call = refuse_then_succeed
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(
+            agent, "_compress_context", side_effect=lose_compression_lock
+        ),
+        patch(
+            "agent.conversation_loop.wait_for_concurrent_compression",
+            return_value=compacted,
+        ) as join,
+    ):
+        outcome = agent.run_conversation("current task")
+
+    join.assert_called_once()
+    assert attempts == 2
+    assert outcome["completed"] is True
+    assert outcome["final_response"] == "continued after compact"
+    assert not outcome.get("compression_deferred")
 
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]

@@ -12,9 +12,10 @@ the #69870 lock-skip signal (``agent._compression_skipped_due_to_lock``):
 A temporary lock defer misclassified as exhaustion == session wipe.
 
 These tests pin the fix: when a compression pass returns its input unchanged
-AND the type-pinned lock-skip flag is set, the attempt is refunded and the
-turn ends (when it cannot proceed) with a soft ``compression_deferred``
-result distinct from ``compression_exhausted``.
+AND the type-pinned lock-skip flag is set, the attempt is refunded. A hard
+provider-pressure path joins and reloads the concurrent compaction when its
+durable lock API is available; only an unjoinable path ends with the legacy
+soft ``compression_deferred`` result distinct from ``compression_exhausted``.
 
 Salvaged from PR #49874 (@helix4u), rebuilt on the landed #69870 signal.
 """
@@ -26,7 +27,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.conversation_compression import compression_skipped_due_to_lock
+from agent.conversation_compression import (
+    CONCURRENT_COMPACTION_RESUME_STATUS,
+    CONCURRENT_COMPACTION_WAIT_STATUS,
+    compression_skipped_due_to_lock,
+    wait_for_concurrent_compression,
+)
 from run_agent import AIAgent
 import run_agent
 
@@ -169,6 +175,60 @@ class TestLockSkipSignalTypePin:
         for junk in (1, 1.0, ["holder"], {"holder": True}, object(), MagicMock()):
             a = SimpleNamespace(_compression_skipped_due_to_lock=junk)
             assert compression_skipped_due_to_lock(a) is False, junk
+
+
+class TestConcurrentCompressionJoin:
+    def test_in_place_winner_is_reloaded_and_request_can_continue(self):
+        compacted = [
+            {"role": "user", "content": "summary", "_row_id": 7},
+            {"role": "assistant", "content": "ready", "_row_id": 8},
+            {"role": "user", "content": "current task", "_row_id": 9},
+        ]
+
+        class DB:
+            def __init__(self):
+                self.holders = [LOCK_HOLDER, LOCK_HOLDER, None]
+
+            def get_compression_lock_holder(self, _session_id):
+                return self.holders.pop(0)
+
+            def get_session(self, _session_id):
+                return {"ended_at": None, "end_reason": None}
+
+            def get_messages_as_conversation(self, _session_id, **_kwargs):
+                return [dict(message) for message in compacted]
+
+        statuses = []
+        compressor = SimpleNamespace()
+        joining_agent = SimpleNamespace(
+            _compression_skipped_due_to_lock=LOCK_HOLDER,
+            _session_db=DB(),
+            session_id="session-1",
+            _emit_status=statuses.append,
+            _interrupt_requested=False,
+            _cached_system_prompt="policy",
+            context_compressor=compressor,
+            tools=[],
+        )
+        original = [{"role": "user", "content": "current task"}]
+
+        result = wait_for_concurrent_compression(
+            joining_agent,
+            original,
+            timeout_seconds=1,
+            poll_interval_seconds=0.01,
+        )
+
+        assert result == compacted
+        assert statuses == [
+            CONCURRENT_COMPACTION_WAIT_STATUS,
+            CONCURRENT_COMPACTION_RESUME_STATUS,
+        ]
+        assert joining_agent._compression_skipped_due_to_lock is None
+        assert joining_agent._last_compression_attempt_in_place is True
+        assert joining_agent._last_flushed_db_idx == len(compacted)
+        assert compressor.last_prompt_tokens == -1
+        assert compressor.awaiting_real_usage_after_compression is True
 
 
 # ---------------------------------------------------------------------------
