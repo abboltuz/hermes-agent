@@ -1999,8 +1999,13 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
-    # One resolved per-turn compression attempt cap, shared by every site that
-    # consumes ``compression_attempts``: the pre-API pressure gate, the
+    # Final provider-wire refusals have their own pressure-episode budget.
+    # A successful provider response proves that the rebuilt request crossed
+    # the transport boundary, so a later refusal after more tool output is a
+    # new episode rather than another strike against the whole user turn.
+    provider_wire_compression_attempts = 0
+    # One resolved per-turn compression attempt cap, shared by the legacy
+    # sites that consume ``compression_attempts``: the pre-API pressure gate,
     # overflow/413 retry handlers, and the post-tool compaction gate. The
     # counter is a consecutive unverified/ineffective-attempt backstop: a
     # completed compaction rearms it only after a successful provider response
@@ -3585,6 +3590,14 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                if provider_wire_compression_attempts:
+                    logger.info(
+                        "Provider-wire pressure episode recovered after the "
+                        "provider accepted a rebuilt request (attempts=%d/%d)",
+                        provider_wire_compression_attempts,
+                        max_compression_attempts,
+                    )
+                    provider_wire_compression_attempts = 0
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -4547,8 +4560,8 @@ def run_conversation(
                             "api_calls": api_call_count,
                         }
 
-                    compression_attempts += 1
-                    if compression_attempts <= max_compression_attempts:
+                    provider_wire_compression_attempts += 1
+                    if provider_wire_compression_attempts <= max_compression_attempts:
                         _wire_tokens = getattr(
                             api_error, "estimated_input_tokens", None
                         )
@@ -4572,7 +4585,7 @@ def run_conversation(
                             "provider=%s model=%s",
                             _wire_tokens,
                             _safe_budget,
-                            compression_attempts,
+                            provider_wire_compression_attempts,
                             max_compression_attempts,
                             agent.provider,
                             agent.model,
@@ -4597,7 +4610,7 @@ def run_conversation(
                                 agent, messages
                             )
                             if joined_messages is None:
-                                compression_attempts -= 1
+                                provider_wire_compression_attempts -= 1
                                 _refund_unattempted_provider_call()
                                 agent._persist_session(
                                     messages, conversation_history
@@ -4613,7 +4626,7 @@ def run_conversation(
                             # The lock winner, not this turn, consumed the
                             # compaction attempt. Keep the local backstop for
                             # genuine post-join pressure.
-                            compression_attempts -= 1
+                            provider_wire_compression_attempts -= 1
 
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history

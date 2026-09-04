@@ -163,6 +163,73 @@ def test_context_projection_unfit_joins_running_compaction_before_retry(agent):
     assert not outcome.get("compression_deferred")
 
 
+def test_context_projection_attempt_budget_rearms_after_provider_success(
+    agent,
+):
+    """A long tool turn gets a fresh wire-pressure episode after each call."""
+    refusal = ContextProjectionUnfit(CutResult(
+        messages=[],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="final provider wire payload exceeds safe context budget",
+    ))
+    tool_call = _mock_tool_call(
+        name="web_search",
+        arguments="{}",
+        call_id="pressure-episode-1",
+    )
+    usage = {
+        "prompt_tokens": 1_000,
+        "completion_tokens": 20,
+        "total_tokens": 1_020,
+    }
+    responses = iter([
+        refusal,
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+            usage=usage,
+        ),
+        refusal,
+        _mock_response(content="continued", usage=usage),
+    ])
+
+    def pressure_then_provider(*_args, **_kwargs):
+        result = next(responses)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    agent.compression_enabled = True
+    agent.max_compression_attempts = 1
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent._interruptible_api_call = pressure_then_provider
+    agent.save_trajectories = False
+
+    def compact(current_messages, _system_message, **_kwargs):
+        return [dict(message) for message in current_messages], "compressed policy"
+
+    with (
+        patch("run_agent.handle_function_call", return_value="search result"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_compress_context", side_effect=compact) as compress,
+    ):
+        outcome = agent.run_conversation("research and continue")
+
+    assert outcome["completed"] is True
+    assert outcome["final_response"] == "continued"
+    assert outcome["api_calls"] == 2
+    assert compress.call_count == 2
+    assert all(
+        call.kwargs["trigger"] == "pre_send_fit_recovery"
+        for call in compress.call_args_list
+    )
+
+
 @pytest.mark.parametrize("compression_enabled,max_attempts", [(False, 3), (True, 0)])
 def test_context_projection_terminal_backstop_refunds_pretransport_iteration(
     agent, compression_enabled, max_attempts
