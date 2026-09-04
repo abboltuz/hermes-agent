@@ -814,6 +814,47 @@ def test_responses_emergency_projection_keeps_current_task_and_fits_wire():
     assert prepared["max_output_tokens"] < request["max_output_tokens"]
 
 
+def test_responses_emergency_projection_preserves_transport_output_shape():
+    """A late fit recovery must not invent controls omitted by transport."""
+    agent = SimpleNamespace(
+        session_id="s",
+        _config_context_length=1_200,
+        _compression_safety_margin=0,
+        _provider_wire_emergency_projection=True,
+    )
+    current_task = "continue the current task without changing the request schema"
+    request = {
+        "model": "gpt-5.6-sol",
+        "instructions": "policy",
+        "input": [
+            {"role": "user", "content": "old context " * 4_000},
+            {"role": "assistant", "content": "old answer " * 4_000},
+            {"role": "user", "content": current_task},
+        ],
+        "tools": [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "context_management": [{"type": "compaction", "compact_threshold": 900}],
+        # Codex backend intentionally omits max_output_tokens. The context
+        # layer receives the already-built wire shape and must preserve that
+        # transport decision while reducing optional replay history.
+        "store": False,
+    }
+
+    prepared = prepare_api_request(agent, request)
+
+    assert provider_request_budget(agent, prepared).fits is True
+    assert "max_output_tokens" not in prepared
+    assert any(
+        item.get("role") == "user" and item.get("content") == current_task
+        for item in prepared["input"]
+    )
+    assert prepared["tools"] == request["tools"]
+    assert prepared["tool_choice"] == request["tool_choice"]
+    assert prepared["parallel_tool_calls"] is request["parallel_tool_calls"]
+    assert prepared["context_management"] == request["context_management"]
+
+
 def test_responses_emergency_projection_refuses_to_drop_oversized_toolset():
     agent = SimpleNamespace(
         session_id="s",
