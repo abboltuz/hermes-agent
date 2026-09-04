@@ -86,6 +86,11 @@ def test_single_query_main_skips_clear_on_exit_summary(monkeypatch):
 
         def chat(self, query, images=None):
             calls.append(("chat", query, images))
+            self._last_structured_result = {
+                "completed": True,
+                "failed": False,
+                "final_response": "done",
+            }
             return "done"
 
         def _print_exit_summary(self, clear_screen=True):
@@ -114,6 +119,71 @@ def test_single_query_main_skips_clear_on_exit_summary(monkeypatch):
     assert len(clear_calls) == 0, (
         "_clear_terminal_on_exit must NOT be called in single-query mode"
     )
+
+
+@pytest.mark.parametrize("failure_reason", [None, "rate_limit", "billing"])
+def test_single_query_main_propagates_structured_failure_exit(
+    monkeypatch, failure_reason
+):
+    calls = []
+    result = {
+        "completed": False,
+        "failed": True,
+        "final_response": "",
+        "error": "final provider wire payload exceeds safe context budget",
+    }
+    if failure_reason is not None:
+        result["failure_reason"] = failure_reason
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-exit-test")
+        from hermes_cli import kanban_db
+
+        monkeypatch.setattr(
+            kanban_db,
+            "connect",
+            lambda: (_ for _ in ()).throw(RuntimeError("no database in unit test")),
+        )
+        expected_exit = kanban_db.KANBAN_RATE_LIMIT_EXIT_CODE
+    else:
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        expected_exit = 1
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = SimpleNamespace(print=lambda *_a, **_kw: None)
+            self.session_id = "sq-failure"
+            self.agent = SimpleNamespace(
+                session_id="sq-failure",
+                platform="cli",
+            )
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            calls.append(("claim", surface, stderr))
+            return True
+
+        def _show_security_advisories(self):
+            calls.append("advisories")
+
+        def chat(self, query, images=None):
+            calls.append(("chat", query, images))
+            self._last_structured_result = result
+            return "Error: final provider wire payload exceeds safe context budget"
+
+        def _print_exit_summary(self, clear_screen=True):
+            calls.append(("summary", clear_screen))
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    assert exc_info.value.code == expected_exit
+    assert calls[-1] == ("finalize", "sq-failure")
 
 
 # ── Verify interactive mode still clears ────────────────────────────────────

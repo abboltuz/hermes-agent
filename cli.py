@@ -1485,6 +1485,22 @@ def _should_run_kanban_goal_loop(result) -> bool:
     )
 
 
+def _single_query_exit_code(result: Any) -> int:
+    """Map a structured one-shot result to the process exit contract."""
+    if not isinstance(result, Mapping) or not result.get("failed"):
+        return 0
+    if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+        "failure_reason"
+    ) in ("rate_limit", "billing"):
+        try:
+            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+            return KANBAN_RATE_LIMIT_EXIT_CODE
+        except Exception:
+            pass
+    return 1
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     terminal_transition = _kanban_terminal_transition_for_cli(cli)
@@ -16432,6 +16448,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
+        self._last_structured_result = None
 
         # Reset the per-turn interrupt flag. Any subsequent path that
         # discovers an interrupt (below, after run_conversation) will flip
@@ -16956,6 +16973,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Normal completion: agent thread should be done already,
                 # but guard against edge cases.
                 agent_thread.join(timeout=30)
+
+            # Retain the structured outcome as soon as the worker resolves so
+            # later presentation cleanup cannot erase fatal process status.
+            # The human-facing return value stays the rendered response string.
+            self._last_structured_result = (
+                result if isinstance(result, dict) else None
+            )
 
             # Freeze per-prompt elapsed timer once the agent thread has
             # exited (or been abandoned as a daemon after interrupt).
@@ -21838,20 +21862,7 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
-                        sys.exit(_exit_code)
+                        sys.exit(_single_query_exit_code(result))
 
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)
@@ -21877,6 +21888,11 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _exit_code = _single_query_exit_code(
+                    getattr(cli, "_last_structured_result", None)
+                )
+                if _exit_code:
+                    sys.exit(_exit_code)
         finally:
             _finalize_single_query(cli)
         return
