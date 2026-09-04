@@ -294,13 +294,10 @@ def _emergency_native_wire_projection(
     anchor_user_index = user_indices[-2] if len(user_indices) >= 2 else latest_user_index
     current_user = dict(compacted_input[latest_user_index])
     anchored_tail = [dict(item) for item in compacted_input[anchor_user_index:]]
-    # A synthetic continuation can be the newest user-shaped item. Preserve a
-    # bounded copy of the preceding user item as well so the real task remains
-    # visible without allowing an old pasted payload to dominate the fallback.
-    if anchor_user_index != latest_user_index:
-        anchor_content = anchored_tail[0].get("content")
-        if isinstance(anchor_content, str) and len(anchor_content) > _MAX_PREVIEW:
-            anchored_tail[0]["content"] = anchor_content[:_MAX_PREVIEW]
+    # A synthetic continuation can be the newest user-shaped item, so first
+    # try the preceding user anchor as well. User-authored content is never
+    # rewritten here: history/tool replay may be demoted, but a user message
+    # is either sent verbatim or omitted as a whole from a smaller candidate.
     tail = _keep_complete_responses_tool_pairs(anchored_tail)
     user_floor = [
         dict(item)
@@ -308,17 +305,6 @@ def _emergency_native_wire_projection(
         if item.get("role") == "user"
     ]
     candidates = [tail, user_floor, [current_user]]
-    for char_cap in (4_096, 1_024, 256):
-        bounded_user = dict(current_user)
-        content = bounded_user.get("content")
-        if isinstance(content, str) and len(content) > char_cap:
-            head = max(1, char_cap // 2)
-            bounded_user["content"] = (
-                content[:head]
-                + "\n[Emergency projection omitted oversized middle]\n"
-                + content[-head:]
-            )
-        candidates.append([bounded_user])
 
     # Preserve a useful response allowance first, then search down to the
     # provider-valid positive minimum before calling the required request

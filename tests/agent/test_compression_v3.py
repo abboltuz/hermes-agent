@@ -876,6 +876,27 @@ def test_responses_emergency_projection_reduces_output_to_positive_minimum():
     assert prepared["input"] == request["input"]
 
 
+def test_responses_emergency_projection_never_rewrites_current_user_task():
+    agent = SimpleNamespace(
+        session_id="s",
+        _config_context_length=1_000,
+        _compression_safety_margin=0,
+        _provider_wire_emergency_projection=True,
+    )
+    current_task = "start:" + (" preserve every detail" * 700) + ":end"
+    request = {
+        "model": "gpt-5.6-sol",
+        "instructions": "policy",
+        "input": [{"role": "user", "content": current_task}],
+        "max_output_tokens": 128,
+    }
+
+    with pytest.raises(ContextProjectionUnfit):
+        prepare_api_request(agent, request)
+
+    assert request["input"] == [{"role": "user", "content": current_task}]
+
+
 def test_pre_send_gate_without_persistence_returns_typed_unfit():
     agent = type("Agent", (), {"session_id": "s", "_compression_generation": 2, "_config_context_length": 300, "_compression_safety_margin": 10})()
     call_id = "call-1"
