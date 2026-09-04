@@ -9023,6 +9023,20 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
 
         return self._execute_write(_do) or []
 
+    def get_session_for_resume(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Read navigation/runtime metadata without draining usage writes.
+
+        Opening a chat does not require exact billing counters or its complete
+        system prompt. Keep both the token flush and prompt join off this read
+        path; agent preparation still loads its authoritative runtime state.
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                f"SELECT {self._compact_session_cols()} FROM sessions s WHERE s.id = ?",
+                (session_id,),
+            ).fetchone()
+        return self._session_row_dict(row) if row else None
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         # Cost/usage readers (/status, /usage, gateway endpoints) reach the

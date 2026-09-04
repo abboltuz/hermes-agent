@@ -9633,6 +9633,30 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+def _assert_session_resume_safe(db, stored_id: str, message_count=None) -> None:
+    """One materialization safety policy for eager and background resume."""
+    from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
+
+    try:
+        safety_check = getattr(db, "assert_resume_safe", None)
+        if callable(safety_check):
+            safety_check(stored_id)
+        else:
+            limit = resolved_max_resume_messages()
+            count = int(message_count or 0)
+            if limit and count > limit:
+                raise SessionResumeTooLargeError(count, limit)
+    except SessionResumeTooLargeError:
+        raise
+    except Exception as exc:
+        # Preserve compatibility with legacy/adaptor stores: only a proven
+        # over-limit blocks; counting failures are observable, not a new outage.
+        logger.warning(
+            "resume safety check failed for %s (proceeding without guard): %s",
+            stored_id, exc,
+        )
+
+
 def _schedule_resume_hydration(
     sid: str, stored_id: str, db, *, close_db: bool = False
 ) -> None:
@@ -9648,6 +9672,7 @@ def _schedule_resume_hydration(
                 sid,
                 {"phase": "history", "status": "loading"},
             )
+            _assert_session_resume_safe(db, stored_id, session.get("resume_message_count"))
             db.reopen_session(stored_id)
             raw_history, display_history = db.get_resume_conversations(stored_id)
             prefix = db.get_ancestor_display_prefix(stored_id)

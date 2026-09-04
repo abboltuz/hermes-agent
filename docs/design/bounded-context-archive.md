@@ -128,6 +128,26 @@ context-window contract, including tool schemas and multimodal accounting.
 This prerequisite is not the bounded snapshot validator or a universal fit
 guarantee, and does not replace the remaining work in steps 2–5.
 
+## Opening acknowledgement increment
+
+Desktop's primary chat and tile now both request deferred model-history loading
+and omit the duplicate WebSocket transcript; their authenticated REST page read
+remains separate. Previously the tile omitted returned messages but still waited
+for synchronous history materialization. Deferred resumes read compact runtime
+metadata without flushing usage writes or joining the persisted system prompt.
+The existing materialization safety guard runs in the history worker, before
+reopening or reading transcript bodies; eager and watch clients retain their
+synchronous contract. Profile DB ownership remains with the worker until it
+closes the dedicated handle.
+
+Tests hold the guard behind a real synchronization barrier and prove that the
+acknowledgement returns first, including when the eventual result is oversized.
+They do not establish complete independent browsing: failed history preparation
+still discards the runtime handle, and the UI still needs a distinct recoverable
+preparation state. Profile store construction, legacy title/adoption fallback,
+lineage resolution and workspace metadata also remain on the acknowledgement
+path; bounded resource isolation and large-archive latency are not yet proven.
+
 ## Required verification beyond the current increment
 
 - Restart and multiple real connections/processes: one admitted source/strategy;

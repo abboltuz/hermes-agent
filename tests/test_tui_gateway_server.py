@@ -3608,6 +3608,80 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
                 server._sessions.pop(sid, None)
 
 
+@pytest.mark.parametrize("oversized", [False, True])
+def test_deferred_resume_acknowledges_before_materialization_guard(monkeypatch, oversized):
+    from hermes_state import SessionResumeTooLargeError
+
+    guard_started = threading.Event()
+    release_guard = threading.Event()
+    response_ready = threading.Event()
+    finished = threading.Event()
+    reads = []
+    response = {}
+
+    class GuardedDB:
+        def get_session_for_resume(self, target):
+            return {"id": target, "message_count": 100000 if oversized else 2}
+
+        def get_session(self, target):
+            # Teardown may inspect lifecycle metadata after the worker exits;
+            # forbid the heavy read specifically during acknowledgement.
+            assert release_guard.is_set(), "acknowledgement read full metadata"
+            return self.get_session_for_resume(target)
+
+        def resolve_resume_session_id(self, target):
+            return target
+
+        def assert_resume_safe(self, _target):
+            guard_started.set()
+            assert release_guard.wait(timeout=3)
+            if oversized:
+                raise SessionResumeTooLargeError(100000, 20000)
+
+        def reopen_session(self, target):
+            reads.append(("reopen", target))
+
+        def get_resume_conversations(self, target):
+            reads.append(("history", target))
+            return [], []
+
+        def get_ancestor_display_prefix(self, _target):
+            return []
+
+    def emitted(event, _sid, payload):
+        if event == "session.resume_progress" and payload.get("status") in {"complete", "failed"}:
+            finished.set()
+
+    monkeypatch.setattr(server, "_get_db", lambda: GuardedDB())
+    monkeypatch.setattr(server, "_emit", emitted)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_lazy_resume_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
+
+    def request():
+        response.update(server._methods["session.resume"]("open", {
+            "session_id": "guarded-chat", "source": "desktop",
+            "defer_history": True, "omit_messages": True,
+        }))
+        response_ready.set()
+
+    caller = threading.Thread(target=request)
+    caller.start()
+    try:
+        assert guard_started.wait(timeout=1)
+        assert response_ready.wait(timeout=1), "opening waited for the history guard"
+        assert response["result"]["hydrating"] is True
+        assert reads == []
+        release_guard.set()
+        assert finished.wait(timeout=1)
+        assert reads == ([] if oversized else [("reopen", "guarded-chat"), ("history", "guarded-chat")])
+    finally:
+        release_guard.set()
+        caller.join(timeout=3)
+
+
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     first_released = threading.Event()
     build_started = threading.Event()

@@ -383,6 +383,11 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
     defer_history = is_truthy_value(params.get("defer_history", False))
+    background_history = (
+        defer_history
+        and not is_truthy_value(params.get("eager_build", False))
+        and not is_truthy_value(params.get("lazy", False))
+    )
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
@@ -404,7 +409,16 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _db_unavailable_error(rid, code=5000)
 
-        found = db.get_session(target)
+        # Older adapters retain their existing contract. Real deferred resumes
+        # do not drain pending usage writes or fetch the stored system prompt.
+        metadata_reader = getattr(type(db), "get_session_for_resume", None)
+
+        def _resume_metadata(session_id):
+            if background_history and callable(metadata_reader):
+                return metadata_reader(db, session_id)
+            return db.get_session(session_id)
+
+        found = _resume_metadata(target)
         if not found:
             found = db.get_session_by_title(target)
             if found:
@@ -558,38 +572,18 @@ def _(rid, params: dict) -> dict:
                 tip = target
             if tip and tip != target:
                 target = tip
-                found = db.get_session(target) or found
+                found = _resume_metadata(target) or found
 
-        # Every interactive resume path materializes the model history, even when
-        # omit_messages suppresses the response copy. Count the complete lineage
-        # before any reopen/history read so a runaway transcript cannot exhaust
-        # the dashboard. The metadata fallback keeps lightweight test/adaptor DBs
-        # that predate the shared SessionDB guard compatible. The limit resolves
-        # from config (sessions.max_resume_messages, 0 disables).
-        from hermes_state import (
-            SessionResumeTooLargeError,
-            resolved_max_resume_messages,
-        )
+        # Keep the safety gate before materialization, but off the acknowledgement
+        # path when a worker owns history loading. Merely hiding the returned
+        # messages is not deferred loading (older clients keep that distinction).
+        if not background_history:
+            from hermes_state import SessionResumeTooLargeError
 
-        safety_check = getattr(db, "assert_resume_safe", None)
-        try:
-            if callable(safety_check):
-                safety_check(target)
-            else:
-                resume_limit = resolved_max_resume_messages()
-                stored_message_count = int(found.get("message_count") or 0)
-                if resume_limit and stored_message_count > resume_limit:
-                    raise SessionResumeTooLargeError(stored_message_count, resume_limit)
-        except SessionResumeTooLargeError as exc:
-            return _err(rid, 4130, str(exc))
-        except Exception as exc:
-            # Fail OPEN: a transient guard failure (locked DB, schema skew on
-            # an adaptor store) must not turn the safety check into a new way
-            # to lose access to a session. Only a genuine over-limit blocks.
-            logger.warning(
-                "resume safety check failed for %s (proceeding without guard): %s",
-                target, exc,
-            )
+            try:
+                _assert_session_resume_safe(db, target, found.get("message_count"))
+            except SessionResumeTooLargeError as exc:
+                return _err(rid, 4130, str(exc))
 
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
@@ -729,7 +723,7 @@ def _(rid, params: dict) -> dict:
         # omit_messages read below (cold resume default) is skipped entirely, so
         # the transcript is never loaded twice for one resume. omit_messages only
         # governs the response shape of the non-deferred paths.
-        if defer_history and not is_truthy_value(params.get("eager_build", False)):
+        if background_history:
             sid = uuid.uuid4().hex[:8]
             source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)

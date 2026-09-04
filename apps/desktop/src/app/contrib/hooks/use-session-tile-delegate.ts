@@ -196,6 +196,10 @@ export function useSessionTileDelegate({
             requestForSessionProfile<SessionResumeResponse>(owner, requestGateway, 'session.resume', {
               session_id: storedSessionId,
               cols: 96,
+              source: 'desktop',
+              // Same opening contract as the primary chat: REST owns the
+              // displayed page; model-history preparation runs off the RPC.
+              defer_history: true,
               omit_messages: true,
               ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
             })

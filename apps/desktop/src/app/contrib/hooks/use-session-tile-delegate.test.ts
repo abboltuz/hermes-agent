@@ -96,7 +96,9 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-x',
         cols: 96,
         profile: 'ai-engineer',
-        omit_messages: true
+        omit_messages: true,
+        defer_history: true,
+        source: 'desktop'
       },
       undefined,
       undefined
@@ -124,7 +126,9 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-y',
         cols: 96,
         profile: 'default',
-        omit_messages: true
+        omit_messages: true,
+        defer_history: true,
+        source: 'desktop'
       },
       undefined,
       undefined
@@ -146,6 +150,8 @@ describe('useSessionTileDelegate resumeTile', () => {
       session_id: 'stored-shared',
       cols: 96,
       omit_messages: true,
+      defer_history: true,
+      source: 'desktop',
       profile: 'default'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -175,6 +181,8 @@ describe('useSessionTileDelegate resumeTile', () => {
       session_id: 'stored-remote',
       cols: 96,
       omit_messages: true,
+      defer_history: true,
+      source: 'desktop',
       profile: 'backend-oxcoder'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -218,7 +226,9 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-b',
         cols: 96,
         profile: 'default',
-        omit_messages: true
+        omit_messages: true,
+        defer_history: true,
+        source: 'desktop'
       },
       undefined,
       undefined
