@@ -9633,10 +9633,13 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
-def _assert_session_resume_safe(db, stored_id: str, message_count=None) -> None:
-    """One materialization safety policy for eager and background resume."""
+def _assert_session_resume_safe(
+    db, stored_id: str, message_count=None, *, profile_home=None
+) -> None:
+    """Apply the owning profile's policy, independent of caller/thread context."""
     from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
 
+    home_token = set_hermes_home_override(profile_home or _hermes_home)
     try:
         safety_check = getattr(db, "assert_resume_safe", None)
         if callable(safety_check):
@@ -9655,6 +9658,8 @@ def _assert_session_resume_safe(db, stored_id: str, message_count=None) -> None:
             "resume safety check failed for %s (proceeding without guard): %s",
             stored_id, exc,
         )
+    finally:
+        reset_hermes_home_override(home_token)
 
 
 def _schedule_resume_hydration(
@@ -9672,7 +9677,10 @@ def _schedule_resume_hydration(
                 sid,
                 {"phase": "history", "status": "loading"},
             )
-            _assert_session_resume_safe(db, stored_id, session.get("resume_message_count"))
+            _assert_session_resume_safe(
+                db, stored_id, session.get("resume_message_count"),
+                profile_home=session.get("profile_home"),
+            )
             db.reopen_session(stored_id)
             raw_history, display_history = db.get_resume_conversations(stored_id)
             prefix = db.get_ancestor_display_prefix(stored_id)

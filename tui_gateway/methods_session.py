@@ -581,7 +581,9 @@ def _(rid, params: dict) -> dict:
             from hermes_state import SessionResumeTooLargeError
 
             try:
-                _assert_session_resume_safe(db, target, found.get("message_count"))
+                _assert_session_resume_safe(
+                    db, target, found.get("message_count"), profile_home=profile_home
+                )
             except SessionResumeTooLargeError as exc:
                 return _err(rid, 4130, str(exc))
 

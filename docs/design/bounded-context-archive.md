@@ -138,7 +138,11 @@ metadata without flushing usage writes or joining the persisted system prompt.
 The existing materialization safety guard runs in the history worker, before
 reopening or reading transcript bodies; eager and watch clients retain their
 synchronous contract. Profile DB ownership remains with the worker until it
-closes the dedicated handle.
+closes the dedicated handle. Both guard paths explicitly bind the owning profile
+while resolving policy, then restore the caller's prior context. A background
+thread must not substitute launch-profile limits for the target profile's limits.
+Real separate-profile configuration and SQLite tests cover both a stricter owner
+and an owner that disabled the guard, plus foreign-context restoration.
 
 Tests hold the guard behind a real synchronization barrier and prove that the
 acknowledgement returns first, including when the eventual result is oversized.
