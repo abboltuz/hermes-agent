@@ -152,6 +152,20 @@ describe('tile history without an agent runtime', () => {
     expect(screen.getByText('A preserved answer')).toBeTruthy()
     expect(screen.getByText('An older exact question')).toBeTruthy()
     expect(attempt!.current()!.map(message => message.rowId)).toEqual([1, 2])
+
+    act(() =>
+      attempt!.publish(
+        toChatMessages([
+          { id: 2, role: 'assistant', content: 'A refreshed preserved answer' },
+          { id: 3, role: 'assistant', content: 'A newly persisted answer' }
+        ] as never),
+        scope
+      )
+    )
+    expect(screen.getByText('An older exact question')).toBeTruthy()
+    expect(await screen.findByText('A refreshed preserved answer')).toBeTruthy()
+    expect(screen.getByText('A newly persisted answer')).toBeTruthy()
+    expect(attempt!.current()!.map(message => message.rowId)).toEqual([1, 2, 3])
   })
 
   it('promotes a late history result after runtime failure into the readable pane', async () => {

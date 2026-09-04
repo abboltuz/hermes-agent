@@ -74,7 +74,7 @@ import { useSessionTileActions } from './session-tile-actions'
 import { type SessionView, SessionViewProvider } from './session-view'
 import { SessionContextMenu } from './sidebar/session-actions-menu'
 import { lastVisibleMessageIsUser } from './thread-loading'
-import { mergeOlderTranscriptPage } from './transcript-backfill'
+import { graftRefreshedTailOntoBackfill, mergeOlderTranscriptPage } from './transcript-backfill'
 
 import { ChatView, StoredSessionTranscript } from '.'
 
@@ -401,7 +401,8 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
         publish: (messages, profile) => {
           if (!cancelled) {
             previewScope.set(profile)
-            preview.set(messages)
+            const current = preview.get()
+            preview.set(current ? graftRefreshedTailOntoBackfill(messages, current) : messages)
           }
         },
         current: () => (cancelled ? null : preview.get()),

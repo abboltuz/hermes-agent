@@ -122,12 +122,64 @@ describe('useSessionTileDelegate resumeTile', () => {
       messages: [{ row_id: 9, role: 'assistant', content: 'resume tail' }]
     } as never)
     const updateSessionState = vi.fn()
-    renderTile(vi.fn(), { updateSessionState })
+    const runtimeIdByStoredSessionIdRef = { current: new Map<string, string>() }
+    const publish = vi.fn()
+    renderTile(vi.fn(), { runtimeIdByStoredSessionIdRef, updateSessionState })
 
-    await expect(sessionTileDelegate()!.resumeTile('runtime-ready')).resolves.toBe('live-ready')
+    await expect(
+      sessionTileDelegate()!.resumeTile('runtime-ready', {
+        publish,
+        current: () => null,
+        isCurrent: () => true
+      })
+    ).resolves.toBe('live-ready')
     expect(updateSessionState).toHaveBeenCalledOnce()
+    // useSessionStateCache establishes this reverse binding as part of the
+    // first update; the mock records updaters, so mirror that side effect.
+    runtimeIdByStoredSessionIdRef.current.set('runtime-ready', 'live-ready')
 
-    history.resolve({ session_id: 'runtime-ready', messages: [] })
+    const initialUpdate = updateSessionState.mock.calls[0][1]
+    let state = initialUpdate({ messages: [] })
+    expect(state.messages.map((message: ChatMessage) => message.rowId)).toEqual([9])
+
+    history.resolve({
+      session_id: 'runtime-ready',
+      messages: [
+        { id: 7, role: 'user', content: 'persisted question' },
+        { id: 8, role: 'assistant', content: 'persisted answer' }
+      ]
+    } as never)
+    await waitFor(() => expect(updateSessionState).toHaveBeenCalledTimes(2))
+    const lateUpdate = updateSessionState.mock.calls[1][1]
+    state = lateUpdate(state)
+
+    expect(publish).toHaveBeenCalledOnce()
+    expect(state.messages.map((message: ChatMessage) => message.rowId)).toEqual([7, 8, 9])
+  })
+
+  it('drops a late archive tail after the stored session is rebound elsewhere', async () => {
+    setSessions([row({ id: 'rebound', profile: 'owner' })])
+    const history = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(history.promise)
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({ session_id: 'old-runtime' } as never)
+    const runtimeIdByStoredSessionIdRef = { current: new Map<string, string>() }
+    const updateSessionState = vi.fn()
+    const publish = vi.fn()
+    renderTile(vi.fn(), { runtimeIdByStoredSessionIdRef, updateSessionState })
+
+    await sessionTileDelegate()!.resumeTile('rebound', {
+      publish,
+      current: () => null,
+      isCurrent: () => true
+    })
+    runtimeIdByStoredSessionIdRef.current.set('rebound', 'new-runtime')
+    history.resolve({
+      session_id: 'rebound',
+      messages: [{ id: 1, role: 'user', content: 'stale tail' }]
+    } as never)
+
+    await waitFor(() => expect(publish).toHaveBeenCalledOnce())
+    expect(updateSessionState).toHaveBeenCalledOnce()
   })
 
   it('carries preview backfill into the runtime without overwriting a newer live tail', async () => {

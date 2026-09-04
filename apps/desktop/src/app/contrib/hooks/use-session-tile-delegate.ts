@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 
-import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import { graftRefreshedTailOntoBackfill, mergePersistedTailIntoRuntime } from '@/app/chat/transcript-backfill'
 import { getLatestSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
 import { $sessions, knownSessionOwner } from '@/store/session'
@@ -192,11 +192,37 @@ export function useSessionTileDelegate({
             : owner
 
         let prefetched: Awaited<ReturnType<typeof getLatestSessionMessages>> | null | undefined
+        let boundRuntimeId: string | undefined
 
         const prefetchPromise = getLatestSessionMessages(storedSessionId, restScope)
           .then(page => {
             prefetched = page
-            transcript?.publish(toChatMessages(page.messages), restScope)
+            const messages = toChatMessages(page.messages)
+            transcript?.publish(messages, restScope)
+
+            // Runtime may have won the race and replaced the preview surface.
+            // Join the late persisted tail to that exact binding as well; the
+            // stored-id fence prevents an old request from painting a runtime
+            // that has since been re-homed.
+            if (boundRuntimeId) {
+              const expectedRuntimeId = boundRuntimeId
+
+              if (runtimeIdByStoredSessionIdRef.current.get(storedSessionId) !== expectedRuntimeId) {
+                return page
+              }
+
+              updateSessionState(
+                expectedRuntimeId,
+                state =>
+                  state.storedSessionId && state.storedSessionId !== storedSessionId
+                    ? state
+                    : {
+                        ...state,
+                        messages: mergePersistedTailIntoRuntime(state.messages, messages)
+                      },
+                storedSessionId
+              )
+            }
 
             return page
           })
@@ -243,6 +269,8 @@ export function useSessionTileDelegate({
         if (transcript && !transcript.isCurrent()) {
           return runtimeId
         }
+
+        boundRuntimeId = runtimeId
 
         const info = resumed?.info
         const initialMessages = transcript?.current() ?? toChatMessages(prefetched?.messages ?? resumed?.messages ?? [])

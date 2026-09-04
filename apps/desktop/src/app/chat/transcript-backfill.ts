@@ -59,6 +59,31 @@ function sameTranscriptIdentity(left: ChatMessage, right: ChatMessage): boolean 
 }
 
 /**
+ * Attach a persisted tail that arrived after a runtime was already bound.
+ * Runtime messages win on overlap because they can contain richer streaming
+ * state; persisted rows fill the chronological prefix. Exact stored/runtime
+ * fencing belongs to the caller — this function only reconciles one session.
+ */
+export function mergePersistedTailIntoRuntime(
+  currentRuntime: ChatMessage[],
+  persistedTail: ChatMessage[]
+): ChatMessage[] {
+  if (persistedTail.length === 0) {
+    return currentRuntime
+  }
+
+  if (currentRuntime.length === 0) {
+    return persistedTail
+  }
+
+  const prefix = persistedTail.filter(
+    persisted => !currentRuntime.some(current => sameTranscriptIdentity(current, persisted))
+  )
+
+  return prefix.length === 0 ? currentRuntime : [...prefix, ...currentRuntime]
+}
+
+/**
  * Re-anchor a refreshed TAIL onto a transcript that has backfilled older
  * pages. Background refreshes and post-turn rehydrates re-read only the
  * newest page; replacing the store with that page outright would silently

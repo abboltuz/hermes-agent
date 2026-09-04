@@ -8,6 +8,7 @@ import {
   backfillOlderTranscriptPage,
   graftRefreshedTailOntoBackfill,
   mergeOlderTranscriptPage,
+  mergePersistedTailIntoRuntime,
   transcriptBackfillAvailable
 } from './transcript-backfill'
 
@@ -170,6 +171,24 @@ describe('graftRefreshedTailOntoBackfill', () => {
     const refreshed = [chat('a', 1), chat('b', 2)]
 
     expect(graftRefreshedTailOntoBackfill(refreshed, previous)).toBe(refreshed)
+  })
+})
+
+describe('mergePersistedTailIntoRuntime', () => {
+  it('hydrates an empty runtime from a late persisted tail', () => {
+    const persisted = [chat('a', 1), chat('b', 2)]
+
+    expect(mergePersistedTailIntoRuntime([], persisted)).toBe(persisted)
+  })
+
+  it('keeps live messages authoritative while filling their persisted prefix', () => {
+    const persisted = [chat('a', 1), chat('b-stored', 2)]
+    const live = [chat('b-live', 2), chat('c-live', 3)]
+
+    const merged = mergePersistedTailIntoRuntime(live, persisted)
+
+    expect(merged.map(message => message.id)).toEqual(['a', 'b-live', 'c-live'])
+    expect(merged.map(message => message.rowId)).toEqual([1, 2, 3])
   })
 })
 
