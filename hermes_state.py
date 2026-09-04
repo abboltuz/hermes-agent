@@ -102,6 +102,7 @@ from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
 from hermes_state_context import SessionContextMixin
+from hermes_state_snapshots import SessionSnapshotMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -4048,7 +4049,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionContextMixin, SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
+class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -11517,6 +11518,7 @@ class SessionDB(SessionContextMixin, SessionSearchMixin, SessionSchemaMixin, Ses
                     "model_config = ? WHERE id = ?",
                     (inserted, tool_calls_total, patched_model_config, session_id),
                 )
+            self._publish_working_context_snapshot(conn, session_id)
             return inserted
 
         return self._execute_write(_do)
@@ -11947,6 +11949,13 @@ class SessionDB(SessionContextMixin, SessionSearchMixin, SessionSchemaMixin, Ses
         verbatim.
         """
         session_ids = [session_id]
+        if not include_ancestors and not include_inactive:
+            snapshot_rows = self._read_working_context_rows(session_id)
+            if snapshot_rows is not None:
+                return self._rows_to_conversation(
+                    snapshot_rows, session_id=session_id, include_ancestors=False,
+                    repair_alternation=repair_alternation, include_row_ids=include_row_ids,
+                )
         if include_ancestors and not self._is_explicit_branch_session(session_id):
             session_ids = self._session_lineage_root_to_tip(session_id)
 
@@ -12218,6 +12227,19 @@ class SessionDB(SessionContextMixin, SessionSearchMixin, SessionSchemaMixin, Ses
             if self._is_explicit_branch_session(session_id)
             else self._session_lineage_root_to_tip(session_id)
         )
+        if session_ids == [session_id]:
+            snapshot_rows = self._read_working_context_rows(session_id)
+            if snapshot_rows is not None:
+                return (
+                    self._rows_to_conversation(
+                        snapshot_rows, session_id=session_id, include_ancestors=False,
+                        repair_alternation=True, include_row_ids=True, include_summary_markers=True,
+                    ),
+                    self._rows_to_conversation(
+                        snapshot_rows, session_id=session_id, include_ancestors=True,
+                        repair_alternation=False, include_row_ids=True,
+                    ),
+                )
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(

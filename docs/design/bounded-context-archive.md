@@ -37,7 +37,7 @@ in one request.
 
 ## Implementation sequence and evidence gates
 
-1. Durable execution admission and terminal receipts (current increment).
+1. Durable execution admission and terminal receipts (implemented).
 2. Versioned context snapshots, bounded candidate validation, atomic publication,
    and resume from snapshot plus a fenced post-snapshot tail.
 3. Searchable raw archive separation, artifact references, hierarchical summaries,
@@ -48,6 +48,36 @@ in one request.
    owner approval before integration or runtime activation.
 
 Passing tests for step 1 does not establish steps 2–5.
+
+## Versioned manifest bridge (step 2 in progress)
+
+In-place compaction now atomically publishes a versioned manifest of durable
+working-row IDs and a post-commit watermark. The manifest contains no copied
+message bodies. Single-session model reload and resume use primary-key probes
+for these references plus an indexed post-watermark tail, pinned in one SQLite
+read transaction. Multi-segment legacy lineage and sessions without a manifest
+still use the legacy reader; opening those remains part of the later migration
+and control-plane work.
+
+The materialized working projection is capped at 8,192 rows and 16 MiB of stored
+projection fields, measured before body materialization. These are storage/read
+safety bounds, not provider token limits or total-process RSS guarantees. An
+oversized candidate rolls back the whole publication; an oversized appended tail
+returns an explicit error, never a partial transcript. Subsequent worker-side
+recovery and independent history browsing must handle that state before release.
+
+Legacy membership-changing writes invalidate the current manifest transactionally.
+Content and presentation updates read through the row references. Consequently
+these are versioned **membership manifests**, not immutable historical payload
+snapshots yet. Existing `archive_and_compact` still materializes its projection
+and clones its concurrent tail; replacing that behavior with immutable raw-event
+references and cold storage is required, not waived by this bridge.
+
+Verification includes byte-for-byte replay sidecars, restart, atomic rollback,
+lost publication lease, sibling rewrite during a pinned read, legacy read-only
+stores, oversized tails, and bounded query work with 10,000 synthetic archived
+rows. This is not evidence of multi-GB control-plane latency or completed cold
+archive migration.
 
 ## Durable admission increment
 

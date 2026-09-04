@@ -535,6 +535,43 @@ CREATE TABLE IF NOT EXISTS context_compaction_jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_context_compaction_running
     ON context_compaction_jobs(session_id) WHERE outcome = 'running';
 
+CREATE TABLE IF NOT EXISTS working_context_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    watermark INTEGER NOT NULL,
+    message_ids TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    payload_bytes INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(session_id, generation)
+);
+CREATE TABLE IF NOT EXISTS working_context_heads (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    snapshot_id INTEGER NOT NULL REFERENCES working_context_snapshots(id) ON DELETE CASCADE
+);
+
+-- Membership-changing writes invalidate the manifest in the same transaction,
+-- including legacy writers that do not know about snapshots. Appends above the
+-- watermark stay a readable tail. Content/sidecar changes are read through the
+-- references, not cached in this manifest, so require no payload duplication.
+CREATE TRIGGER IF NOT EXISTS working_context_message_delete AFTER DELETE ON messages
+BEGIN
+    DELETE FROM working_context_heads WHERE session_id = OLD.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS working_context_message_update
+AFTER UPDATE OF id, session_id, active ON messages
+BEGIN
+    DELETE FROM working_context_heads WHERE session_id IN (OLD.session_id, NEW.session_id);
+END;
+CREATE TRIGGER IF NOT EXISTS working_context_message_insert AFTER INSERT ON messages
+WHEN NEW.id <= COALESCE((SELECT s.watermark FROM working_context_heads h
+    JOIN working_context_snapshots s ON s.id = h.snapshot_id
+    WHERE h.session_id = NEW.session_id), -1)
+BEGIN
+    DELETE FROM working_context_heads WHERE session_id = NEW.session_id;
+END;
+
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
