@@ -8,12 +8,15 @@ an unsafe projection is refused before a provider call.
 
 from __future__ import annotations
 
+from collections import deque
+import concurrent.futures
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
 import secrets
 import threading
+import time
 import weakref
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -26,6 +29,143 @@ _MAX_PREVIEW = 240
 TOOL_PRESSURE_MIN_RECLAIM_TOKENS = 8192
 TOOL_PRESSURE_SOFT_RATIO = 0.85
 _PROVIDER_WIRE_BYTES_PER_TOKEN = 3
+_BACKGROUND_WORKERS = 2
+_BACKGROUND_DEADLINE_MAX_SECONDS = 120.0
+_BACKGROUND_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+_BACKGROUND_EXECUTOR_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class BackgroundCompressionConfig:
+    """Provider-neutral policy for speculative semantic compression."""
+
+    enabled: bool = True
+    start_ratio: float = 0.55
+    deadline_seconds: float = 120.0
+
+
+def resolve_background_compression_config(
+    config: Mapping[str, Any] | None,
+) -> BackgroundCompressionConfig:
+    raw = config if isinstance(config, Mapping) else {}
+    enabled = raw.get("enabled", True) is True
+    try:
+        start_ratio = float(raw.get("start_ratio", 0.55))
+    except (TypeError, ValueError):
+        start_ratio = 0.55
+    # Start before the ordinary soft-pressure boundary, but never on an empty
+    # transcript merely because a malformed ratio was supplied.
+    start_ratio = min(TOOL_PRESSURE_SOFT_RATIO - 0.01, max(0.05, start_ratio))
+    try:
+        deadline_seconds = float(raw.get("deadline_seconds", 120.0))
+    except (TypeError, ValueError):
+        deadline_seconds = 120.0
+    deadline_seconds = min(
+        _BACKGROUND_DEADLINE_MAX_SECONDS,
+        max(1.0, deadline_seconds),
+    )
+    return BackgroundCompressionConfig(enabled, start_ratio, deadline_seconds)
+
+
+def _background_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return one bounded process-wide pool instead of one thread per chat."""
+    global _BACKGROUND_EXECUTOR
+    with _BACKGROUND_EXECUTOR_LOCK:
+        if _BACKGROUND_EXECUTOR is None:
+            _BACKGROUND_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_BACKGROUND_WORKERS,
+                thread_name_prefix="compression-background",
+            )
+        return _BACKGROUND_EXECUTOR
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple((str(key), _freeze(item)) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return tuple(sorted((_freeze(item) for item in value), key=repr))
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, tuple):
+        if all(isinstance(item, tuple) and len(item) == 2 for item in value):
+            return {str(key): _thaw(item) for key, item in value}
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _projection_fingerprint(messages: Sequence[Mapping[str, Any]]) -> str:
+    frozen = _freeze([dict(message) for message in messages])
+    payload = json.dumps(
+        frozen,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class BackgroundCompressionSnapshot:
+    """Immutable, live-runtime-free input owned by the background worker."""
+
+    session_id: str
+    generation: int
+    source_length: int
+    messages: tuple[Any, ...]
+    route: tuple[Any, ...]
+    prefix_fingerprint: str
+    schema_hash: str
+    deadline: float
+
+
+def build_background_snapshot(
+    session_id: str,
+    generation: int,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    route: Mapping[str, Any],
+    schema_hash: str = "",
+    deadline: float | None = None,
+) -> BackgroundCompressionSnapshot | None:
+    """Freeze the longest prefix ending at a complete tool-call boundary."""
+    stable: list[dict[str, Any]] = []
+    pending_tool_ids: set[str] = set()
+    safe_length = 0
+    for message in messages:
+        if not isinstance(message, Mapping):
+            break
+        copied = dict(message)
+        stable.append(copied)
+        if copied.get("role") == "assistant":
+            for call in copied.get("tool_calls") or ():
+                if isinstance(call, Mapping) and call.get("id"):
+                    pending_tool_ids.add(str(call["id"]))
+        elif copied.get("role") == "tool" and copied.get("tool_call_id"):
+            pending_tool_ids.discard(str(copied["tool_call_id"]))
+        if not pending_tool_ids:
+            safe_length = len(stable)
+    if safe_length <= 0:
+        return None
+    stable = stable[:safe_length]
+    return BackgroundCompressionSnapshot(
+        session_id=str(session_id),
+        generation=int(generation),
+        source_length=safe_length,
+        messages=tuple(_freeze(message) for message in stable),
+        route=_freeze(dict(route)),
+        prefix_fingerprint=_projection_fingerprint(stable),
+        schema_hash=str(schema_hash or ""),
+        deadline=float(
+            deadline
+            if deadline is not None
+            else time.monotonic() + _BACKGROUND_DEADLINE_MAX_SECONDS
+        ),
+    )
 
 
 def _tokens(value: Any) -> int:
@@ -901,6 +1041,78 @@ class CompressionCandidate:
     messages: list[dict[str, Any]]
 
 
+def run_background_compression_worker(
+    snapshot: BackgroundCompressionSnapshot,
+) -> CompressionCandidate:
+    """Build a semantic request projection without touching live agent state."""
+    if time.monotonic() >= snapshot.deadline:
+        raise TimeoutError("background compression deadline expired before dispatch")
+    route = _thaw(snapshot.route)
+    if not compression_route_is_eligible(route):
+        raise RuntimeError("background compression route is not eligible")
+    messages = [_thaw(message) for message in snapshot.messages]
+    prompt = (
+        "Create a dense continuation summary of this conversation. Preserve "
+        "decisions, constraints, approvals, identifiers, paths, errors, completed "
+        "work, and unresolved next steps. Do not invent facts. Return only the "
+        "summary.\n\n"
+        + json.dumps(messages, ensure_ascii=False, default=str)
+    )
+    from agent.auxiliary_client import call_llm
+
+    response = call_llm(
+        task="compression",
+        provider=str(route["provider"]),
+        model=str(route["model"]),
+        base_url=route.get("base_url") or None,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=int(route.get("max_tokens") or 4096),
+        timeout=max(1.0, snapshot.deadline - time.monotonic()),
+    )
+    choices = getattr(response, "choices", None) or []
+    response_message = getattr(choices[0], "message", None) if choices else None
+    if isinstance(response_message, Mapping):
+        summary = response_message.get("content") or response_message.get(
+            "reasoning_content"
+        )
+    else:
+        summary = getattr(response_message, "content", None) or getattr(
+            response_message, "reasoning_content", None
+        )
+    if not isinstance(summary, str) or not summary.strip():
+        raise RuntimeError("background compression returned an empty summary")
+
+    retained = [
+        dict(message) for message in messages if message.get("role") == "system"
+    ]
+    retained.append(
+        {
+            "role": "assistant",
+            "content": "[COMPRESSION SUMMARY]\n" + summary.strip(),
+        }
+    )
+    latest_human = next(
+        (
+            dict(message)
+            for message in reversed(messages)
+            if message.get("role") == "user" and is_human_intent(message)
+        ),
+        None,
+    )
+    if latest_human is not None:
+        retained.append(latest_human)
+    if not validate_projection(retained).valid:
+        raise RuntimeError("background compression produced an invalid projection")
+    return CompressionCandidate(
+        session_id=snapshot.session_id,
+        generation=snapshot.generation,
+        watermark=snapshot.source_length,
+        prefix_hash=snapshot.prefix_fingerprint,
+        schema_hash=snapshot.schema_hash,
+        messages=retained,
+    )
+
+
 @dataclass(frozen=True)
 class CompressionSnapshot:
     """Immutable fence describing the stable prefix a worker may read."""
@@ -951,6 +1163,15 @@ class CompressionCoordinator:
         # it must not suppress a forced or deterministic recovery strategy.
         self._terminal_outcomes: dict[tuple[int, str, str], str] = {}
         self._pending_request: CompressionRequest | None = None
+        self._background_future: concurrent.futures.Future | None = None
+        self._background_snapshot: BackgroundCompressionSnapshot | None = None
+        self._background_closed = False
+        self._background_result: CompressionCandidate | None = None
+        self.telemetry: deque[str] = deque(maxlen=32)
+
+    @property
+    def closed(self) -> bool:
+        return self._background_closed
 
     def request(self, request: CompressionRequest) -> CompressionAttempt:
         if request.session_id != self.session_id:
@@ -1055,6 +1276,104 @@ class CompressionCoordinator:
         self.outcome = "no_progress"
         return True
 
+    def start_background(
+        self,
+        snapshot: BackgroundCompressionSnapshot,
+        worker: Callable[[BackgroundCompressionSnapshot], CompressionCandidate],
+    ) -> concurrent.futures.Future | None:
+        """Start or coalesce one speculative job without blocking the caller."""
+        with self._admission_lock:
+            if self._background_closed:
+                return None
+            existing = self._background_future
+            if existing is not None and not existing.done():
+                self.telemetry.append("background_joined")
+                return existing
+            if (
+                existing is not None
+                and self._background_snapshot is not None
+                and self._background_snapshot.generation == snapshot.generation
+                and self._background_snapshot.prefix_fingerprint
+                == snapshot.prefix_fingerprint
+            ):
+                self.telemetry.append("background_reused")
+                return existing
+            self._background_snapshot = snapshot
+            self._background_result = None
+            self.telemetry.append("background_started")
+            self._background_future = _background_executor().submit(worker, snapshot)
+            return self._background_future
+
+    def poll_background(self) -> CompressionCandidate | None:
+        """Return a ready candidate immediately; never wait on the worker."""
+        with self._admission_lock:
+            future = self._background_future
+            snapshot = self._background_snapshot
+            if self._background_closed or future is None or snapshot is None:
+                return None
+            if self._background_result is not None:
+                return self._background_result
+            if not future.done():
+                return None
+            try:
+                result = future.result(timeout=0)
+            except Exception:
+                self.telemetry.append("background_failed")
+                return None
+            if time.monotonic() > snapshot.deadline:
+                self.telemetry.append("background_expired")
+                return None
+            if not isinstance(result, CompressionCandidate):
+                self.telemetry.append("background_invalid")
+                return None
+            self._background_result = result
+            self.telemetry.append("background_ready")
+            return result
+
+    def project_background(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        generation: int,
+        schema_hash: str,
+    ) -> list[dict[str, Any]] | None:
+        """Append the live tail to a matching candidate on the caller thread."""
+        candidate = self.poll_background()
+        snapshot = self._background_snapshot
+        if candidate is None or snapshot is None:
+            return None
+        if candidate.session_id != self.session_id or candidate.generation != generation:
+            self.telemetry.append("background_stale_generation")
+            return None
+        if candidate.schema_hash != str(schema_hash or ""):
+            self.telemetry.append("background_stale_schema")
+            return None
+        if candidate.watermark > len(messages):
+            self.telemetry.append("background_stale_watermark")
+            return None
+        prefix = messages[: candidate.watermark]
+        if _projection_fingerprint(prefix) != candidate.prefix_hash:
+            self.telemetry.append("background_stale_prefix")
+            return None
+        combined = [dict(message) for message in candidate.messages]
+        combined.extend(dict(message) for message in messages[candidate.watermark :])
+        if not validate_projection(combined).valid:
+            self.telemetry.append("background_invalid_tail")
+            return None
+        self.active_projection = combined
+        self.outcome = "background_candidate_adopted"
+        self.telemetry.append("background_adopted")
+        return [dict(message) for message in combined]
+
+    def close_background(self) -> None:
+        """Fence late results; the shared executor remains process-owned."""
+        with self._admission_lock:
+            self._background_closed = True
+            self._background_result = None
+            future = self._background_future
+            if future is not None:
+                future.cancel()
+
 
 def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1) -> CompressionCoordinator:
     """Return the coordinator bound to an agent's current session identity."""
@@ -1075,7 +1394,7 @@ def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1
             try:
                 db_registry = weak_registry.setdefault(session_db, {})
                 coordinator = db_registry.get(logical_id)
-                if not isinstance(coordinator, CompressionCoordinator):
+                if not isinstance(coordinator, CompressionCoordinator) or coordinator.closed:
                     coordinator = CompressionCoordinator(session_id=logical_id)
                     db_registry[logical_id] = coordinator
             except TypeError:
@@ -1083,13 +1402,13 @@ def ensure_compression_coordinator(agent: Any, *, trigger: str, urgency: int = 1
                 # retain compatibility without using recyclable object ids.
                 registry_key = (logical_id, id(session_db))
                 coordinator = registry.get(registry_key)
-                if not isinstance(coordinator, CompressionCoordinator):
+                if not isinstance(coordinator, CompressionCoordinator) or coordinator.closed:
                     coordinator = CompressionCoordinator(session_id=logical_id)
                     registry[registry_key] = coordinator
         else:
             registry_key = (logical_id, id(agent))
             coordinator = registry.get(registry_key)
-            if not isinstance(coordinator, CompressionCoordinator):
+            if not isinstance(coordinator, CompressionCoordinator) or coordinator.closed:
                 coordinator = CompressionCoordinator(session_id=logical_id)
                 registry[registry_key] = coordinator
     setattr(agent, "_compression_coordinator", coordinator)

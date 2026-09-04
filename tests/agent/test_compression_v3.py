@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,8 @@ from agent.compression_v3 import (
     CompressionCandidate,
     CompressionCoordinator,
     CompressionRequest,
+    BackgroundCompressionConfig,
+    build_background_snapshot,
     build_policy_capsule,
     compression_route_is_eligible,
     ensure_compression_coordinator,
@@ -21,6 +24,7 @@ from agent.compression_v3 import (
     prune_tool_pressure_projection,
     estimate_projection_tokens,
     provider_request_budget,
+    resolve_background_compression_config,
 )
 from agent.compression_v3 import _provider_wire_token_bound
 from agent.compression_v3 import _bind_recovery_identity
@@ -538,6 +542,114 @@ def test_transient_abort_does_not_poison_unchanged_source():
 
     assert owner.terminal_outcome(request) is None
     assert owner.admit_execution(request).outcome == "admitted"
+
+
+def test_background_policy_is_ratio_based_and_bounded():
+    policy = resolve_background_compression_config(
+        {"enabled": True, "start_ratio": 99, "deadline_seconds": 999}
+    )
+
+    assert isinstance(policy, BackgroundCompressionConfig)
+    assert policy.enabled is True
+    assert policy.start_ratio < 0.85
+    assert policy.deadline_seconds == 120
+
+
+def test_background_snapshot_stops_before_incomplete_tool_round():
+    messages = [
+        {"role": "user", **HUMAN, "content": "first"},
+        *_round(1, body="done"),
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "pending",
+                "type": "function",
+                "function": {"name": "tool", "arguments": "{}"},
+            }],
+        },
+    ]
+
+    snapshot = build_background_snapshot(
+        "logical", 3, messages, route={"provider": "p", "model": "m"}
+    )
+
+    assert snapshot is not None
+    assert snapshot.source_length == 3
+
+
+def test_background_job_coalesces_and_adopts_append_only_tail():
+    messages = [{"role": "user", **HUMAN, "content": "current task"}]
+    snapshot = build_background_snapshot(
+        "logical-bg", 3, messages,
+        route={"provider": "p", "model": "m"},
+        schema_hash="tools-v1",
+    )
+    assert snapshot is not None
+    release = threading.Event()
+    candidate = CompressionCandidate(
+        "logical-bg",
+        3,
+        snapshot.source_length,
+        snapshot.prefix_fingerprint,
+        "tools-v1",
+        [
+            {"role": "assistant", "content": "summary"},
+            dict(messages[0]),
+        ],
+    )
+
+    def worker(_snapshot):
+        release.wait(1)
+        return candidate
+
+    owner = CompressionCoordinator(session_id="logical-bg")
+    first = owner.start_background(snapshot, worker)
+    second = owner.start_background(snapshot, worker)
+    assert first is second
+    assert owner.poll_background() is None
+
+    release.set()
+    assert first is not None
+    first.result(timeout=1)
+    live = messages + [{"role": "assistant", "content": "new answer"}]
+    projected = owner.project_background(
+        live, generation=3, schema_hash="tools-v1"
+    )
+
+    assert projected is not None
+    assert [item["content"] for item in projected] == [
+        "summary", "current task", "new answer"
+    ]
+    assert owner.project_background(
+        live, generation=3, schema_hash="tools-v1"
+    ) == projected
+
+
+def test_background_candidate_rejects_changed_prefix_or_schema():
+    messages = [{"role": "user", **HUMAN, "content": "original"}]
+    snapshot = build_background_snapshot(
+        "logical-stale", 1, messages,
+        route={"provider": "p", "model": "m"},
+        schema_hash="schema-a",
+    )
+    assert snapshot is not None
+    candidate = CompressionCandidate(
+        "logical-stale", 1, 1, snapshot.prefix_fingerprint, "schema-a",
+        [{"role": "assistant", "content": "summary"}, dict(messages[0])],
+    )
+    owner = CompressionCoordinator(session_id="logical-stale")
+    future = owner.start_background(snapshot, lambda _: candidate)
+    assert future is not None
+    future.result(timeout=1)
+
+    assert owner.project_background(
+        [{"role": "user", **HUMAN, "content": "edited"}],
+        generation=1,
+        schema_hash="schema-a",
+    ) is None
+    assert owner.project_background(
+        messages, generation=1, schema_hash="schema-b"
+    ) is None
 
 
 def test_budget_includes_wire_floor_and_blocks_unfit_projection():
