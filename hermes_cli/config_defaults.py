@@ -788,17 +788,15 @@ DEFAULT_CONFIG = {
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
-        "tail_mode": "legacy",        # tail retention policy (#87326):
-                                      #   "legacy" — 0.20×window verbatim tail (default)
+        "tail_mode": "lean",          # tail retention policy (#87326):
                                       #   "lean"   — clamped 2.5%-of-window tail
-                                      #              (10K floor / 25K cap) plus chunked
-                                      #              digests, a mechanical anchor index,
+                                      #              (10K floor / 25K cap) plus a detailed
+                                      #              one-call log, mechanical anchor index,
                                       #              verbatim user messages, and
                                       #              session_search recovery pointers in
-                                      #              the summary. ~3x fewer retained
-                                      #              tokens after compaction; costs a few
-                                      #              extra summarizer calls at the
-                                      #              compaction boundary.
+                                      #              the summary. ~3x fewer retained tokens.
+                                      #   "legacy" — explicit compatibility mode using a
+                                      #              0.20×threshold verbatim tail.
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
                                       # survive in the uncompressed tail. 1 = existing

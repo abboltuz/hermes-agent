@@ -6,7 +6,7 @@ Covers the July 2026 compression tuning pass:
 1. Reasoning traces (native ``reasoning`` field AND inline ``<think>``-style
    blocks) must never reach the summarizer prompt, and traces emitted BY the
    summarizer model must never be stored in the summary.
-2. Head/tail protection budgets stay proportionate (tail = 20% of threshold).
+2. Explicit legacy head/tail budgets stay proportionate to the threshold.
 3. Summary token budget is bounded to the 1K-10K envelope.
 4. Models with context windows below 512K get their compression threshold
    floored at 75% (raise-only — a higher configured value always wins).
@@ -18,10 +18,20 @@ import agent.context_compressor as cc
 from agent.context_compressor import ContextCompressor
 
 
+_HUMAN = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
 def _make(ctx: int, pct: float = 0.50) -> ContextCompressor:
     with patch.object(cc, "get_model_context_length", return_value=ctx):
         comp = ContextCompressor(
-            model="test/model", threshold_percent=pct, quiet_mode=True,
+            model="test/model",
+            threshold_percent=pct,
+            quiet_mode=True,
+            tail_mode="legacy",
         )
         # Resolve while the mock is active — lazy init (#32221) defers the
         # window probe (and the floor application) past __init__.
@@ -80,7 +90,9 @@ class TestReasoningExcludedFromSummarizer:
             choices = [FakeChoice()]
 
         with patch.object(cc, "call_llm", return_value=FakeResp()):
-            out = comp._generate_summary([{"role": "user", "content": "hi"}])
+            out = comp._generate_summary(
+                [{"role": "user", **_HUMAN, "content": "hi"}]
+            )
         assert out is not None
         assert "OUTPUT_TRACE" not in out
         assert "## Active Task" in out
@@ -117,7 +129,9 @@ class TestSummaryBudgetEnvelope:
             return FakeResp()
 
         with patch.object(cc, "call_llm", side_effect=fake_call_llm):
-            out = comp._generate_summary([{"role": "user", "content": "hi"}])
+            out = comp._generate_summary(
+                [{"role": "user", **_HUMAN, "content": "hi"}]
+            )
         assert out is not None
         assert "max_tokens" not in captured
         # The budget still lands as prompt guidance, within the envelope.
@@ -138,6 +152,7 @@ class TestSummaryBudgetEnvelope:
 
 class TestTailBudgetProportionality:
     def test_tail_budget_is_target_ratio_of_threshold(self):
+        # This class specifies the pre-lean compatibility formula explicitly.
         comp = _make(128_000)
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
         # Sanity: tail protection stays a modest slice of the window (<= 20%).

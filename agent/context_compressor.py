@@ -2281,7 +2281,7 @@ class ContextCompressor(ContextEngine):
     @property
     def tail_token_budget(self) -> int:
         if self._tail_token_budget is None:
-            if getattr(self, "tail_mode", "legacy") == "lean":
+            if getattr(self, "tail_mode", "lean") == "lean":
                 # Lean mode (#compaction-v2): the verbatim tail is a small
                 # recency window, not a context hoard — the upgraded summary
                 # (verbatim user messages, constraints section, recovery
@@ -2877,8 +2877,8 @@ class ContextCompressor(ContextEngine):
         self._apply_threshold_tokens_cap()
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
-        self.tail_token_budget = target_tokens
+        self._tail_token_budget = None
+        _ = self.tail_token_budget
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
@@ -3078,7 +3078,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
-        tail_mode: str = "legacy",
+        tail_mode: str = "lean",
     ):
         self.model = model
         self.base_url = base_url
@@ -3087,8 +3087,8 @@ class ContextCompressor(ContextEngine):
         self.api_mode = api_mode
         # Lean tail mode (#compaction-v2): "lean" = small clamped recency
         # tail + verbatim-user-message summary section + recovery pointers;
-        # "legacy" = 0.20*window tail (shipping behavior).
-        self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "legacy"
+        # "legacy" = pre-lean 0.20*threshold tail behavior.
+        self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
         # Per-model threshold overrides (longest substring match wins).
         # Stored as a plain dict; resolved in _resolve_threshold(), then the
         # small-context floor is applied on top.
@@ -4506,7 +4506,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         verbatim user messages and the recovery pointer never depend on the
         summarizer's cooperation. No-op in legacy mode.
         """
-        if getattr(self, "tail_mode", "legacy") != "lean":
+        if getattr(self, "tail_mode", "lean") != "lean":
             return summary
         if _LEAN_ANCHOR_HEADING not in summary:
             summary += _redact_compaction_text(
@@ -7414,7 +7414,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # budget binds without the tool-group alignment floor hoarding old
         # output (#compaction-v2). Runs before summary generation so the
         # recovery stubs are already in place if the summary aborts.
-        if getattr(self, "tail_mode", "legacy") == "lean":
+        if getattr(self, "tail_mode", "lean") == "lean":
             messages = self._demote_stale_tail_tools(messages, compress_end)
         # Snapshot the rehydration state so an aborted attempt below can roll
         # it back. The self-heal scan mutates ``_previous_summary`` (populating
