@@ -35,6 +35,7 @@ _BACKGROUND_WORKERS = 2
 _BACKGROUND_DEADLINE_MAX_SECONDS = 120.0
 _BACKGROUND_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
 _BACKGROUND_EXECUTOR_LOCK = threading.Lock()
+_BACKGROUND_ADMISSION = threading.BoundedSemaphore(_BACKGROUND_WORKERS)
 
 
 @dataclass(frozen=True)
@@ -83,15 +84,22 @@ def automatic_projection_lane_enabled(agent: Any) -> bool:
 
 
 def _background_executor() -> concurrent.futures.ThreadPoolExecutor:
-    """Return one bounded process-wide pool instead of one thread per chat."""
+    """Return the process-wide daemon pool used after bounded admission."""
     global _BACKGROUND_EXECUTOR
     with _BACKGROUND_EXECUTOR_LOCK:
         if _BACKGROUND_EXECUTOR is None:
-            _BACKGROUND_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            from tools.daemon_pool import DaemonThreadPoolExecutor
+
+            _BACKGROUND_EXECUTOR = DaemonThreadPoolExecutor(
                 max_workers=_BACKGROUND_WORKERS,
                 thread_name_prefix="compression-background",
             )
         return _BACKGROUND_EXECUTOR
+
+
+def _release_background_admission(_future: Any = None) -> None:
+    """Release one running/accepted speculative compression slot."""
+    _BACKGROUND_ADMISSION.release()
 
 
 def _freeze(value: Any) -> Any:
@@ -1500,14 +1508,29 @@ class CompressionCoordinator:
             ):
                 self.telemetry.append("background_reused")
                 return existing
+            # ThreadPoolExecutor's queue is unbounded. Refuse speculative work
+            # when both global slots are occupied so queued transcript
+            # snapshots cannot accumulate across gateway sessions. The live
+            # turn continues through the deterministic projection lane.
+            if not _BACKGROUND_ADMISSION.acquire(blocking=False):
+                self.telemetry.append("background_saturated")
+                return None
+            try:
+                caller_context = contextvars.copy_context()
+                future = _background_executor().submit(
+                    caller_context.run, worker, snapshot
+                )
+            except Exception as exc:
+                _release_background_admission()
+                self._background_terminal = f"submit_failed:{type(exc).__name__}"
+                self.telemetry.append("background_submit_failed")
+                return None
+            future.add_done_callback(_release_background_admission)
             self._background_snapshot = snapshot
             self._background_result = None
             self._background_terminal = None
             self.telemetry.append("background_started")
-            caller_context = contextvars.copy_context()
-            self._background_future = _background_executor().submit(
-                caller_context.run, worker, snapshot
-            )
+            self._background_future = future
             return self._background_future
 
     def poll_background(self) -> CompressionCandidate | None:

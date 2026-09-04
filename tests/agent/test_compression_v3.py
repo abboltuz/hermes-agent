@@ -765,6 +765,55 @@ def test_background_worker_inherits_caller_contextvars():
         active_profile.reset(token)
 
 
+def test_background_admission_refuses_unbounded_global_queue():
+    release = threading.Event()
+    entered = threading.Event()
+    entered_count = 0
+    entered_lock = threading.Lock()
+
+    def worker(snapshot):
+        nonlocal entered_count
+        with entered_lock:
+            entered_count += 1
+            if entered_count == 2:
+                entered.set()
+        release.wait(1)
+        return CompressionCandidate(
+            snapshot.session_id,
+            snapshot.generation,
+            snapshot.source_length,
+            snapshot.prefix_fingerprint,
+            snapshot.schema_hash,
+            [{"role": "assistant", "content": "summary"}],
+        )
+
+    owners = []
+    futures = []
+    try:
+        for index in range(12):
+            session_id = f"bounded-background-{index}"
+            snapshot = build_background_snapshot(
+                session_id,
+                1,
+                [{"role": "user", **HUMAN, "content": "task"}],
+                route={"provider": "p", "model": "m"},
+            )
+            assert snapshot is not None
+            owner = CompressionCoordinator(session_id=session_id)
+            owners.append(owner)
+            future = owner.start_background(snapshot, worker)
+            if future is not None:
+                futures.append(future)
+
+        assert entered.wait(1)
+        assert len(futures) == 2
+        assert sum("background_saturated" in owner.telemetry for owner in owners) == 10
+    finally:
+        release.set()
+        for future in futures:
+            future.result(timeout=1)
+
+
 def test_background_candidate_rejects_changed_prefix_or_schema():
     messages = [{"role": "user", **HUMAN, "content": "original"}]
     snapshot = build_background_snapshot(
