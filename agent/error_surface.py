@@ -51,6 +51,10 @@ _REASON_TO_LAYER = {
     "auth_permanent": LAYER_AUTH,
     "billing": LAYER_BILLING,
     "billing_unverified": LAYER_BILLING,
+    # These are deterministic refusals from Hermes' pre-transport context
+    # guard, not verdicts returned by the selected model/provider.
+    "context_projection_irreducible": LAYER_GATEWAY,
+    "context_projection_compaction_disabled": LAYER_GATEWAY,
 }
 
 # Transport-ish reasons: the failure is between us and the base_url, not a
@@ -76,6 +80,8 @@ _NON_RETRYABLE_REASONS = {
     "model_not_found",
     "format_error",
     "ssl_cert_verification",
+    "context_projection_irreducible",
+    "context_projection_compaction_disabled",
 }
 
 # Providers whose base_url is user-supplied rather than a known vendor —

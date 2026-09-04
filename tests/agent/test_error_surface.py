@@ -142,6 +142,19 @@ def test_result_unclassified_failure_defaults_to_provider_unknown():
     assert surface == {"layer": LAYER_PROVIDER, "code": "unknown", "retryable": True}
 
 
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "context_projection_irreducible",
+        "context_projection_compaction_disabled",
+    ),
+)
+def test_result_local_context_guards_are_gateway_nonretryable(reason):
+    surface = build_error_surface_from_result(_failed_result(reason))
+
+    assert surface == {"layer": LAYER_GATEWAY, "code": reason, "retryable": False}
+
+
 def test_result_disk_full_wins_over_reason():
     surface = build_error_surface_from_result(
         _failed_result(

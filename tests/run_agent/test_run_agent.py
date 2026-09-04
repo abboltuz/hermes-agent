@@ -291,6 +291,8 @@ def test_context_projection_disabled_refunds_pretransport_iteration(agent):
         outcome = agent.run_conversation("irreducible task")
 
     assert outcome["failed"] is True
+    assert outcome["failure_reason"] == "context_projection_compaction_disabled"
+    assert outcome["failure_retryable"] is False
     assert outcome["api_calls"] == 0
     assert agent._api_call_count == 0
     assert agent.iteration_budget.used == 0
