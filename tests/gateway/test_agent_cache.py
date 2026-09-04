@@ -135,6 +135,95 @@ class TestExtractCacheBustingConfig:
         assert out["compression.codex_app_server_auto"] == "hermes"
 
 
+    def test_reads_frozen_background_and_auxiliary_compression_settings(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {
+                "compression": {
+                    "background": {
+                        "enabled": False,
+                        "start_ratio": 0.61,
+                        "deadline_seconds": 45,
+                    }
+                },
+                "auxiliary": {
+                    "compression": {
+                        "provider": "anthropic",
+                        "model": "fast-model",
+                        "base_url": "https://example.invalid",
+                        "max_tokens": 2048,
+                        "context_length": 128000,
+                        "reasoning_effort": "minimal",
+                    }
+                },
+            }
+        )
+
+        assert out["compression.background.enabled"] is False
+        assert out["compression.background.start_ratio"] == 0.61
+        assert out["compression.background.deadline_seconds"] == 45
+        assert out["auxiliary.compression.provider"] == "anthropic"
+        assert out["auxiliary.compression.model"] == "fast-model"
+        assert out["auxiliary.compression.base_url"] == "https://example.invalid"
+        assert out["auxiliary.compression.max_tokens"] == 2048
+        assert out["auxiliary.compression.context_length"] == 128000
+        assert out["auxiliary.compression.reasoning_effort"] == "minimal"
+
+    def test_frozen_compression_setting_changes_bust_agent_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        first = {
+            "compression": {
+                "background": {
+                    "enabled": True,
+                    "start_ratio": 0.55,
+                    "deadline_seconds": 120,
+                }
+            },
+            "auxiliary": {
+                "compression": {
+                    "provider": "openai",
+                    "model": "model-a",
+                    "reasoning_effort": "none",
+                }
+            },
+        }
+        background_changed = {
+            **first,
+            "compression": {
+                "background": {
+                    "enabled": False,
+                    "start_ratio": 0.80,
+                    "deadline_seconds": 30,
+                }
+            },
+        }
+        route_changed = {
+            **first,
+            "auxiliary": {
+                "compression": {
+                    "provider": "anthropic",
+                    "model": "model-b",
+                    "reasoning_effort": "minimal",
+                }
+            },
+        }
+
+        def signature(config):
+            return GatewayRunner._agent_config_signature(
+                "m",
+                runtime,
+                [],
+                "",
+                cache_keys=GatewayRunner._extract_cache_busting_config(config),
+            )
+
+        assert signature(first) != signature(background_changed)
+        assert signature(first) != signature(route_changed)
+
+
     def test_missing_keys_yield_none(self):
         """Absent config keys must produce None values (still contribute to signature)."""
         from gateway.run import GatewayRunner
@@ -144,6 +233,9 @@ class TestExtractCacheBustingConfig:
         for section, key in GatewayRunner._CACHE_BUSTING_CONFIG_KEYS:
             assert f"{section}.{key}" in out
             assert out[f"{section}.{key}"] is None
+        for path in GatewayRunner._CACHE_BUSTING_NESTED_CONFIG_KEYS:
+            assert ".".join(path) in out
+            assert out[".".join(path)] is None
 
     def test_non_dict_section_treated_as_missing(self):
         from gateway.run import GatewayRunner
@@ -1061,4 +1153,3 @@ class TestCrossProcessInvalidationDefersCleanup:
         # Stale entry was popped, hard-teardown path never used.
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
-

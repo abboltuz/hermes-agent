@@ -27126,6 +27126,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("checkpoints", "max_total_size_mb"),
         ("checkpoints", "max_file_size_mb"),
     )
+    # Nested settings frozen by agent.agent_init for the nonblocking
+    # compression lane. Keep this list aligned with the fields consumed when
+    # `_compression_v3_background_config` and `_compression_v3_route` are
+    # constructed; a live config edit must rebuild the cached AIAgent.
+    _CACHE_BUSTING_NESTED_CONFIG_KEYS: tuple = (
+        ("compression", "background", "enabled"),
+        ("compression", "background", "start_ratio"),
+        ("compression", "background", "deadline_seconds"),
+        ("auxiliary", "compression", "provider"),
+        ("auxiliary", "compression", "model"),
+        ("auxiliary", "compression", "base_url"),
+        ("auxiliary", "compression", "max_tokens"),
+        ("auxiliary", "compression", "context_length"),
+        ("auxiliary", "compression", "reasoning_effort"),
+    )
 
     _HONCHO_CACHE_BUSTING_KEYS = (
         "honcho.peer_name",
@@ -27196,6 +27211,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 out[f"{section}.{key}"] = section_val.get(key)
             else:
                 out[f"{section}.{key}"] = None
+        for path in cls._CACHE_BUSTING_NESTED_CONFIG_KEYS:
+            value: Any = cfg
+            for component in path:
+                if not isinstance(value, dict):
+                    value = None
+                    break
+                value = value.get(component)
+            out[".".join(path)] = value
         try:
             from tools.registry import registry
 
