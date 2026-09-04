@@ -2636,12 +2636,14 @@ def compress_context(
         row_watermark=len(messages),
         estimated_pressure=int(approx_tokens or 0),
         force=force,
+        strategy="forced_semantic" if force else "semantic",
     )
     coordinator = ensure_compression_coordinator(agent, trigger=trigger, urgency=request.urgency)
     admission = coordinator.admit_execution(request)
     if admission.outcome != "admitted":
         existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
         return messages, existing_prompt
+    execution_finished = False
     try:
         result = _compress_context_impl(
             agent,
@@ -2664,20 +2666,27 @@ def compress_context(
                 outcome = "deferred_lock"
             elif getattr(agent, "api_mode", None) == "codex_app_server":
                 outcome = "native_delegated"
+            elif getattr(compressor, "_last_compress_aborted", False):
+                outcome = "summary_failed"
+            elif getattr(compressor, "_last_feasibility_skip", False):
+                outcome = "no_reclaim"
             else:
                 outcome = "no_progress"
         else:
             outcome = "committed"
         coordinator.finish_execution(request, outcome)
+        execution_finished = True
         return result
     except (KeyboardInterrupt, SystemExit):
         coordinator.finish_execution(request, "aborted")
+        execution_finished = True
         raise
     except Exception:
         coordinator.finish_execution(request, "aborted")
+        execution_finished = True
         raise
     finally:
-        if coordinator.outcome not in {"aborted", "no_progress", "timed_out", "deferred_lock", "cooldown", "native_delegated", "committed"}:
+        if not execution_finished:
             coordinator.finish_execution(request, "aborted")
 
 

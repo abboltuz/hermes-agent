@@ -882,6 +882,7 @@ class CompressionRequest:
     estimated_reclaim: int = 0
     deadline: float | None = None
     force: bool = False
+    strategy: str = "semantic"
 
 
 @dataclass(frozen=True)
@@ -943,8 +944,12 @@ class CompressionCoordinator:
         self.active_projection: list[dict[str, Any]] | None = None
         self._tool_pressure_fingerprint: str | None = None
         self._admission_lock = threading.RLock()
-        self._active_admission: tuple[int, str] | None = None
-        self._terminal_generations: set[tuple[int, str]] = set()
+        self._active_admission: tuple[int, str, str] | None = None
+        # Terminal results are scoped to both the immutable source snapshot
+        # and the strategy that produced them.  A semantic summarizer timing
+        # out must suppress duplicate semantic work for the same source, but
+        # it must not suppress a forced or deterministic recovery strategy.
+        self._terminal_outcomes: dict[tuple[int, str, str], str] = {}
         self._pending_request: CompressionRequest | None = None
 
     def request(self, request: CompressionRequest) -> CompressionAttempt:
@@ -962,10 +967,10 @@ class CompressionCoordinator:
         """Admit one executor for a logical generation and source snapshot."""
         if request.session_id != self.session_id:
             raise ValueError("compression request belongs to another session")
-        key = (request.generation, request.source_fingerprint)
+        key = (request.generation, request.source_fingerprint, request.strategy)
         with self._admission_lock:
             attempt = self.request(request)
-            if key in self._terminal_generations and not request.force:
+            if key in self._terminal_outcomes and not request.force:
                 return CompressionAdmission("no_progress_suppressed", attempt)
             if self._active_admission == key:
                 return CompressionAdmission("joined", attempt)
@@ -975,14 +980,25 @@ class CompressionCoordinator:
             return CompressionAdmission("admitted", attempt)
 
     def finish_execution(self, request: CompressionRequest, outcome: str) -> None:
-        """Release admission and retain no-progress terminals for this snapshot."""
-        key = (request.generation, request.source_fingerprint)
+        """Release admission and retain strategy-local terminal outcomes."""
+        key = (request.generation, request.source_fingerprint, request.strategy)
         with self._admission_lock:
             if self._active_admission == key:
                 self._active_admission = None
             self.outcome = outcome
-            if outcome in {"no_progress", "timed_out", "aborted"}:
-                self._terminal_generations.add(key)
+            if outcome in {
+                "no_progress",
+                "no_reclaim",
+                "summary_failed",
+                "timed_out",
+            }:
+                self._terminal_outcomes[key] = outcome
+
+    def terminal_outcome(self, request: CompressionRequest) -> str | None:
+        """Return the terminal result for this exact source and strategy."""
+        key = (request.generation, request.source_fingerprint, request.strategy)
+        with self._admission_lock:
+            return self._terminal_outcomes.get(key)
 
     @property
     def attempt(self) -> CompressionAttempt | None:

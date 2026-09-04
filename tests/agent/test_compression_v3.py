@@ -507,6 +507,39 @@ def test_compression_requests_rearm_only_for_changed_source_or_force():
     assert owner.admit_execution(forced).outcome == "admitted"
 
 
+def test_terminal_outcome_is_scoped_to_source_and_strategy():
+    owner = CompressionCoordinator(session_id="logical-strategy")
+    semantic = CompressionRequest(
+        "logical-strategy", 7, "preflight", source_fingerprint="same",
+        strategy="semantic",
+    )
+    forced = CompressionRequest(
+        "logical-strategy", 7, "wire_recovery", source_fingerprint="same",
+        strategy="forced_semantic",
+    )
+
+    assert owner.admit_execution(semantic).outcome == "admitted"
+    owner.finish_execution(semantic, "timed_out")
+
+    assert owner.terminal_outcome(semantic) == "timed_out"
+    assert owner.admit_execution(semantic).outcome == "no_progress_suppressed"
+    assert owner.terminal_outcome(forced) is None
+    assert owner.admit_execution(forced).outcome == "admitted"
+
+
+def test_transient_abort_does_not_poison_unchanged_source():
+    owner = CompressionCoordinator(session_id="logical-abort")
+    request = CompressionRequest(
+        "logical-abort", 2, "preflight", source_fingerprint="same"
+    )
+
+    assert owner.admit_execution(request).outcome == "admitted"
+    owner.finish_execution(request, "aborted")
+
+    assert owner.terminal_outcome(request) is None
+    assert owner.admit_execution(request).outcome == "admitted"
+
+
 def test_budget_includes_wire_floor_and_blocks_unfit_projection():
     budget = CompressionBudget(context_window=100, output_reserve=20, safety_margin=10, system_tokens=25, tool_schema_tokens=15)
     assert budget.safe_input_budget == 70
