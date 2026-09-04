@@ -1,5 +1,6 @@
 """Behavioral contracts for the continuable-session compression coordinator."""
 
+import contextvars
 import json
 from pathlib import Path
 import threading
@@ -680,6 +681,38 @@ def test_background_job_coalesces_and_adopts_append_only_tail():
     ) == projected
     assert owner.take_background_adoption_notice() is True
     assert owner.take_background_adoption_notice() is False
+
+
+def test_background_worker_inherits_caller_contextvars():
+    active_profile = contextvars.ContextVar("active_compression_test_profile")
+    token = active_profile.set("secondary-profile")
+    messages = [{"role": "user", **HUMAN, "content": "current task"}]
+    snapshot = build_background_snapshot(
+        "profile-scoped",
+        1,
+        messages,
+        route={"provider": "p", "model": "m"},
+    )
+    assert snapshot is not None
+
+    def worker(_snapshot):
+        assert active_profile.get(None) == "secondary-profile"
+        return CompressionCandidate(
+            "profile-scoped",
+            1,
+            snapshot.source_length,
+            snapshot.prefix_fingerprint,
+            snapshot.schema_hash,
+            [{"role": "assistant", "content": "summary"}],
+        )
+
+    try:
+        owner = CompressionCoordinator(session_id="profile-scoped")
+        future = owner.start_background(snapshot, worker)
+        assert future is not None
+        assert future.result(timeout=1).session_id == "profile-scoped"
+    finally:
+        active_profile.reset(token)
 
 
 def test_background_candidate_rejects_changed_prefix_or_schema():

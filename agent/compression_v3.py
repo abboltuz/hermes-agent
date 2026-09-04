@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 import concurrent.futures
+import contextvars
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -1503,7 +1504,10 @@ class CompressionCoordinator:
             self._background_result = None
             self._background_terminal = None
             self.telemetry.append("background_started")
-            self._background_future = _background_executor().submit(worker, snapshot)
+            caller_context = contextvars.copy_context()
+            self._background_future = _background_executor().submit(
+                caller_context.run, worker, snapshot
+            )
             return self._background_future
 
     def poll_background(self) -> CompressionCandidate | None:
