@@ -39,6 +39,25 @@ def _read_transaction(conn):
 class SessionSnapshotMixin:
     """Internal publication and indexed read paths for SessionDB."""
 
+    def has_working_context_snapshot(self, session_id):
+        """Cheap archive hint for chat-open pagination.
+
+        The head table has one primary-key row per compacted session. Unlike a
+        probe over ``messages.compacted``, this lookup never scales with archive
+        size. Pre-migration read-only stores simply have no hint.
+        """
+        with self._read_ctx() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM working_context_heads WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table: working_context_heads" in str(exc):
+                    return False
+                raise
+        return row is not None
+
     def _working_context_rows_by_id(self, conn, session_id, ids, *, materialize=True):
         if len(ids) > MAX_WORKING_CONTEXT_ROWS:
             raise WorkingContextTooLargeError(

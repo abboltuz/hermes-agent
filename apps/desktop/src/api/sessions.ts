@@ -382,13 +382,15 @@ export function getSessionMessages(
 export const LATEST_SESSION_MESSAGES_LIMIT = 120
 
 export function getLatestSessionMessages(id: string, profile?: ProfileScope): Promise<SessionMessagesResponse> {
-  // includeCompacted: durable display history must include rows preserved by
-  // in-place compaction (active=0, compacted=1); without them the transcript
-  // silently ends at the compaction boundary and earlier turns are unreachable.
+  // Fast-open reads only the bounded ACTIVE working projection. Asking the
+  // legacy includeCompacted path for a 120-row tail currently materializes the
+  // whole lossless archive before slicing it, defeating pagination on exactly
+  // the large chats this path protects. `pagination.has_more` tells the UI to
+  // enter the explicit archive backfill path when older compacted rows exist.
   return getSessionMessages(id, profile, {
     limit: LATEST_SESSION_MESSAGES_LIMIT,
     order: 'latest',
-    includeCompacted: true
+    includeCompacted: false
   }).then(page => {
     // Record whether the tail was truncated (page came back full) and where
     // the next older page starts, so "Show earlier" can backfill over REST

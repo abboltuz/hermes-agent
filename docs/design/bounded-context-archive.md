@@ -160,6 +160,15 @@ runs, after a preparation failure, and during an explicit retry. The composer an
 mutation controls stay unavailable until preparation reaches `ready`; history
 browsing and copy/read navigation do not depend on that state.
 
+The initial REST tail is now explicitly the active working projection, so its
+row limit is also a database/materialization limit. It never asks the legacy
+`include_compacted` reader to deduplicate the entire lossless archive before
+slicing 120 visible rows. An explicit `has_more` continuation bit keeps older
+compacted history discoverable; archive materialization begins only when the
+user requests an older page. This removes archive size from chat-open latency,
+but the older-page reader still needs the physical archive/index work in steps
+3–4 before its own latency is independent of total archive size.
+
 The preview is transient presentation state keyed by stored session and owner
 route. It is never persisted as a second conversation and never fabricated as a
 runtime id. Older-page reads reuse the existing bounded transcript window and

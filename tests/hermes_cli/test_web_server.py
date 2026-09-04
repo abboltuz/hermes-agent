@@ -2061,8 +2061,10 @@ class TestWebServerEndpoints:
 
         resp = self.client.get("/api/sessions/compacted-default/messages")
         assert resp.status_code == 200
-        contents = [m["content"] for m in resp.json()["messages"]]
+        payload = resp.json()
+        contents = [m["content"] for m in payload["messages"]]
         assert contents == ["summary", "live q", "live a"]
+        assert payload["pagination"]["has_more"] is True
 
     def test_get_session_messages_include_compacted_surfaces_archived_rows(self):
         """include_compacted=true returns the full display history: archived
@@ -2097,6 +2099,62 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         contents = [m["content"] for m in resp.json()["messages"]]
         assert contents == ["old q", "old a", "summary", "live q", "live a"]
+
+    def test_active_tail_continues_into_compacted_archive_without_overlap(self):
+        """Desktop can open from the active projection, then use that row
+        count as the newest-relative offset into the lossless display history.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="compacted-fast-open", source="desktop")
+            db.append_messages_batch(
+                "compacted-fast-open",
+                [
+                    {"role": "user", "content": "old q"},
+                    {"role": "assistant", "content": "old a"},
+                ],
+            )
+            db.archive_and_compact(
+                "compacted-fast-open",
+                [
+                    {
+                        "role": "assistant",
+                        "content": "summary",
+                        "_compressed_summary": True,
+                    },
+                    {"role": "user", "content": "live q"},
+                    {"role": "assistant", "content": "live a"},
+                ],
+            )
+        finally:
+            db.close()
+
+        tail = self.client.get(
+            "/api/sessions/compacted-fast-open/messages"
+            "?include_compacted=false&limit=120&order=latest"
+        )
+        assert tail.status_code == 200
+        tail_payload = tail.json()
+        assert [m["content"] for m in tail_payload["messages"]] == [
+            "summary",
+            "live q",
+            "live a",
+        ]
+        assert tail_payload["pagination"]["has_more"] is True
+
+        archive = self.client.get(
+            "/api/sessions/compacted-fast-open/messages"
+            "?include_compacted=true&limit=120&offset=3&order=latest"
+        )
+        assert archive.status_code == 200
+        archive_payload = archive.json()
+        assert [m["content"] for m in archive_payload["messages"]] == [
+            "old q",
+            "old a",
+        ]
+        assert archive_payload["pagination"]["has_more"] is False
 
     def test_get_session_messages_projects_and_dedupes_composite_carrier(self):
         from agent.context_compressor import (
@@ -2223,6 +2281,7 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         payload = resp.json()
         assert payload["pagination"] == {
+            "has_more": True,
             "limit": 500,
             "offset": 0,
             "order": "latest",

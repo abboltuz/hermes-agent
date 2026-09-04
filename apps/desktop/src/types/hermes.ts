@@ -677,6 +677,7 @@ export interface SessionSemanticEnvelope {
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
   pagination?: {
+    has_more?: boolean
     limit: number
     offset: number
     order: 'latest' | 'oldest'

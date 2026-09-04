@@ -90,7 +90,7 @@ function tailStateFromPage(page: TailPage, profile?: TranscriptProfileScope): Tr
 
   return {
     nextOffset: pagination.offset + page.messages.length,
-    possiblyTruncated: page.messages.length >= pagination.limit,
+    possiblyTruncated: pagination.has_more ?? page.messages.length >= pagination.limit,
     profile
   }
 }

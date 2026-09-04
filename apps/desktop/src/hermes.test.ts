@@ -508,7 +508,7 @@ describe('Hermes REST helpers', () => {
     })
   })
 
-  it('hydrates the latest transcript with a small tail page (120, latest, compacted rows included)', async () => {
+  it('hydrates the latest transcript from the bounded working projection', async () => {
     api.mockResolvedValue({
       messages: [],
       pagination: { limit: 120, offset: 0, order: 'latest', returned: 0 },
@@ -519,9 +519,22 @@ describe('Hermes REST helpers', () => {
 
     expect(LATEST_SESSION_MESSAGES_LIMIT).toBe(120)
     expect(api).toHaveBeenCalledWith({
-      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=120&order=latest&include_compacted=true',
+      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=120&order=latest&include_compacted=false',
       profile: 'xiaoxuxu'
     })
+  })
+
+  it('keeps archive backfill available when a short working page reports older rows', async () => {
+    $transcriptTailBySessionId.set({})
+    api.mockResolvedValue({
+      messages: [{ content: 'live tail', id: 9, role: 'assistant' }],
+      pagination: { has_more: true, limit: 120, offset: 0, order: 'latest', returned: 1 },
+      session_id: 'session-1'
+    })
+
+    await getLatestSessionMessages('session-1')
+
+    expect(transcriptTailState('session-1')).toMatchObject({ nextOffset: 1, possiblyTruncated: true })
   })
 
   it('records tail truncation state under the requested and resolved session ids', async () => {

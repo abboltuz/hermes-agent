@@ -51,8 +51,10 @@ def head(db):
 
 
 def test_publication_has_only_references_and_survives_restart(db):
+    assert db.has_working_context_snapshot("chat") is False
     original_ids = [row["id"] for row in db.get_messages("chat")]
     compact(db)
+    assert db.has_working_context_snapshot("chat") is True
     snapshot = head(db)
     active = db.get_messages("chat")
     assert snapshot["generation"] == 1
@@ -258,17 +260,18 @@ def test_publication_failure_restores_previous_head(db, monkeypatch):
 
 def test_fast_resume_reads_by_primary_key_and_bounded_tail_not_history_scan(db):
     compact(db)
+    snapshot = head(db)
     with db._read_ctx() as conn:
         reference_plan = conn.execute(
             "EXPLAIN QUERY PLAN SELECT m.content FROM json_each(?) refs "
             "CROSS JOIN messages m NOT INDEXED "
             "WHERE m.id = refs.value AND m.session_id = ? AND m.active = 1",
-            (head(db)["message_ids"], "chat"),
+            (snapshot["message_ids"], "chat"),
         ).fetchall()
         tail_plan = conn.execute(
             "EXPLAIN QUERY PLAN SELECT message_id FROM working_context_tail "
             "WHERE session_id = ? AND message_id > ? ORDER BY message_id LIMIT ?",
-            ("chat", head(db)["watermark"], 8193),
+            ("chat", snapshot["watermark"], 8193),
         ).fetchall()
     assert any("INTEGER PRIMARY KEY" in row[3] for row in reference_plan)
     assert any(

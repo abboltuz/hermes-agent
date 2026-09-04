@@ -62,6 +62,16 @@ describe('transcript tail bookkeeping', () => {
     expect(transcriptBackfillAvailable('stored-1')).toBe(false)
   })
 
+  it('honors an explicit archive continuation on a short working page', () => {
+    recordTranscriptTail('stored-1', {
+      messages: [row(1, 'working tail')],
+      pagination: { has_more: true, limit: 120, offset: 0, order: 'latest', returned: 1 }
+    })
+
+    expect(transcriptTailState('stored-1')).toMatchObject({ nextOffset: 1, possiblyTruncated: true })
+    expect(transcriptBackfillAvailable('stored-1')).toBe(true)
+  })
+
   it('treats a legacy response without pagination metadata as complete', () => {
     recordTranscriptTail('stored-1', {
       messages: Array.from({ length: 700 }, (_, index) => row(index, `m${index}`))

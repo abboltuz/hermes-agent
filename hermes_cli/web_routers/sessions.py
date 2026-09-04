@@ -628,20 +628,39 @@ async def get_session_messages(
             default_page = limit is None
             latest_page = order == "latest" or (order is None and default_page)
             _limit = 500 if default_page else min(limit, 500)
-            return sid, _limit, db.get_messages(
+            # Fetch one extra row so pagination has a continuation bit
+            # without a COUNT. For the working projection this remains a
+            # bounded indexed query regardless of total archive size.
+            read_limit = _limit + 1 if _limit > 0 else 0
+            messages = db.get_messages(
                 sid,
-                limit=_limit,
+                limit=read_limit,
                 offset=offset,
                 latest=latest_page,
                 include_compacted=include_compacted,
             )
+            has_more = len(messages) > _limit
+            if has_more:
+                messages = messages[-_limit:] if latest_page else messages[:_limit]
+            # The fast open reads only active working rows. Even when those fit
+            # in one page, archived pre-compaction rows may be available through
+            # the slower explicit backfill path. Detect that only through the
+            # O(1) manifest head or a summary marker already present in this
+            # bounded page — never scan archived messages during chat open.
+            if latest_page and not include_compacted:
+                has_more = (
+                    has_more
+                    or db.has_working_context_snapshot(sid)
+                    or any(message.get("_compressed_summary") for message in messages)
+                )
+            return sid, _limit, messages, has_more
         finally:
             db.close()
 
     result = await asyncio.to_thread(_read)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    sid, _limit, messages = result
+    sid, _limit, messages, has_more = result
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
 
@@ -670,6 +689,7 @@ async def get_session_messages(
             "offset": offset,
             "order": order or ("latest" if limit is None else "oldest"),
             "returned": len(projected_messages),
+            "has_more": has_more,
         },
     }
 
