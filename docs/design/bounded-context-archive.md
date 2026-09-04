@@ -59,6 +59,13 @@ read transaction. Multi-segment legacy lineage and sessions without a manifest
 still use the legacy reader; opening those remains part of the later migration
 and control-plane work.
 
+A small transactional tail-reference table records only active post-watermark
+appends. This avoids scanning later inactive imports and requires no new index
+build over the existing messages table. Head invalidation cascades to its tail;
+publication clears the now-covered tail in the same transaction. Manifest format
+v2 identifies this completeness contract; older manifests use legacy reads until
+republication rather than assuming a newly created empty tail index is complete.
+
 The materialized working projection is capped at 8,192 rows and 16 MiB of stored
 projection fields, measured before body materialization. These are storage/read
 safety bounds, not provider token limits or total-process RSS guarantees. An

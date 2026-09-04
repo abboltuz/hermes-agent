@@ -110,8 +110,8 @@ class SessionSnapshotMixin:
         ).fetchone()[0]
         cursor = conn.execute(
             "INSERT INTO working_context_snapshots "
-            "(session_id, generation, watermark, message_ids, row_count, payload_bytes, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(session_id, generation, watermark, message_ids, row_count, payload_bytes, created_at, format_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 2)",
             (
                 session_id,
                 generation,
@@ -121,6 +121,11 @@ class SessionSnapshotMixin:
                 byte_count,
                 time.time(),
             ),
+        )
+        # Every current tail row is covered by the newly published manifest.
+        # Also handles publication after a previously empty manifest.
+        conn.execute(
+            "DELETE FROM working_context_tail WHERE session_id = ?", (session_id,)
         )
         conn.execute(
             "INSERT INTO working_context_heads (session_id, snapshot_id) VALUES (?, ?) "
@@ -145,6 +150,11 @@ class SessionSnapshotMixin:
                     return None
                 raise
             if head is None:
+                return None
+            # A manifest created before the transactional tail registry cannot
+            # prove tail completeness. Read it through the legacy path until a
+            # fresh compaction publishes v2; never backfill by scanning at open.
+            if "format_version" not in head.keys() or head["format_version"] != 2:
                 return None
             encoded = head["message_ids"]
             if (
@@ -175,9 +185,11 @@ class SessionSnapshotMixin:
             tail = [
                 int(row[0])
                 for row in conn.execute(
-                    "SELECT id FROM messages INDEXED BY idx_messages_session_id "
-                    "WHERE session_id = ? AND id > ? AND active = 1 "
-                    "ORDER BY id LIMIT ?",
+                    # This small membership index excludes inactive imports,
+                    # including those whose IDs exceed the snapshot watermark.
+                    "SELECT message_id FROM working_context_tail "
+                    "WHERE session_id = ? AND message_id > ? "
+                    "ORDER BY message_id LIMIT ?",
                     (session_id, head["watermark"], MAX_WORKING_CONTEXT_ROWS + 1),
                 )
             ]

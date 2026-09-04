@@ -104,6 +104,39 @@ def test_new_generation_and_concurrent_compaction_tail_are_published_together(db
     ]
 
 
+def test_publication_from_empty_manifest_clears_the_now_covered_tail(db):
+    db.archive_and_compact("chat", [])
+    assert json.loads(head(db)["message_ids"]) == []
+    assert db.get_messages_as_conversation("chat") == []
+    compact(db)
+    assert len(db.get_messages_as_conversation("chat")) == 1
+    with db._read_ctx() as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM working_context_tail").fetchone()[0] == 0
+        )
+
+
+def test_old_manifest_format_never_assumes_an_empty_new_tail_registry(db):
+    compact(db)
+    db.append_message("chat", "assistant", "unregistered old-writer tail")
+
+    def old_format(conn):
+        conn.execute("UPDATE working_context_snapshots SET format_version = 1")
+        conn.execute("DELETE FROM working_context_tail")
+
+    db._execute_write(old_format)
+    with SessionDB(db.db_path) as reopened:
+        assert reopened._read_working_context_rows("chat") is None
+        assert [
+            row["content"] for row in reopened.get_messages_as_conversation("chat")
+        ] == [
+            "summary",
+            "unregistered old-writer tail",
+        ]
+        compact(reopened)
+        assert head(reopened)["format_version"] == 2
+
+
 @pytest.mark.parametrize(
     "limit_name,limit",
     [("MAX_WORKING_CONTEXT_ROWS", 0), ("MAX_WORKING_CONTEXT_BYTES", 1)],
@@ -233,13 +266,14 @@ def test_fast_resume_reads_by_primary_key_and_bounded_tail_not_history_scan(db):
             (head(db)["message_ids"], "chat"),
         ).fetchall()
         tail_plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT id FROM messages INDEXED BY idx_messages_session_id "
-            "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id LIMIT ?",
+            "EXPLAIN QUERY PLAN SELECT message_id FROM working_context_tail "
+            "WHERE session_id = ? AND message_id > ? ORDER BY message_id LIMIT ?",
             ("chat", head(db)["watermark"], 8193),
         ).fetchall()
     assert any("INTEGER PRIMARY KEY" in row[3] for row in reference_plan)
     assert any(
-        "idx_messages_session_id (session_id=? AND id>?)" in row[3] for row in tail_plan
+        "COVERING INDEX" in row[3] and "(session_id=? AND message_id>?)" in row[3]
+        for row in tail_plan
     )
 
 
@@ -293,8 +327,10 @@ def test_legacy_readonly_database_remains_readable_without_snapshot_tables(db):
             "working_context_message_delete",
             "working_context_message_update",
             "working_context_message_insert",
+            "working_context_tail_insert",
         ):
             conn.execute("DROP TRIGGER " + name)
+        conn.execute("DROP TABLE working_context_tail")
         conn.execute("DROP TABLE working_context_heads")
         conn.execute("DROP TABLE working_context_snapshots")
 
@@ -312,11 +348,14 @@ def test_legacy_readonly_database_remains_readable_without_snapshot_tables(db):
         assert head(upgraded)["generation"] == 1
 
 
+@pytest.mark.parametrize("archive_after_publication", [False, True])
 def test_large_archived_history_does_not_scale_public_resume_query_work(
-    db, monkeypatch
+    db, monkeypatch, archive_after_publication
 ):
     # Synthetic rows only. The archive is much larger than the working set;
     # instruction counts avoid hardware-dependent wall-clock assertions.
+    if archive_after_publication:
+        compact(db)
     db._execute_write(
         lambda conn: conn.executemany(
             "INSERT INTO messages (session_id, role, content, timestamp, active, compacted) "
@@ -324,7 +363,10 @@ def test_large_archived_history_does_not_scale_public_resume_query_work(
             [("archived exact result " + str(i),) for i in range(10_000)],
         )
     )
-    compact(db)
+    if not archive_after_publication:
+        compact(db)
+    assert head(db) is not None
+    db.append_message("chat", "assistant", "new active tail")
     callbacks = []
     original = db._read_ctx
 
@@ -345,5 +387,6 @@ def test_large_archived_history_does_not_scale_public_resume_query_work(
     monkeypatch.setattr(db, "_read_ctx", bounded_work)
     model, display = db.get_resume_conversations("chat")
     assert model[0]["content"] == display[0]["content"] == "summary"
+    assert model[-1]["content"] == display[-1]["content"] == "new active tail"
     assert len(callbacks) < 100
-    assert len(db.get_messages("chat", include_inactive=True)) == 10_003
+    assert len(db.get_messages("chat", include_inactive=True)) == 10_004

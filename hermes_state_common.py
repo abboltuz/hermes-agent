@@ -538,6 +538,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_context_compaction_running
 CREATE TABLE IF NOT EXISTS working_context_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    format_version INTEGER NOT NULL DEFAULT 1,
     generation INTEGER NOT NULL,
     watermark INTEGER NOT NULL,
     message_ids TEXT NOT NULL,
@@ -549,6 +550,11 @@ CREATE TABLE IF NOT EXISTS working_context_snapshots (
 CREATE TABLE IF NOT EXISTS working_context_heads (
     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
     snapshot_id INTEGER NOT NULL REFERENCES working_context_snapshots(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS working_context_tail (
+    session_id TEXT NOT NULL REFERENCES working_context_heads(session_id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    PRIMARY KEY (session_id, message_id)
 );
 
 -- Membership-changing writes invalidate the manifest in the same transaction,
@@ -570,6 +576,14 @@ WHEN NEW.id <= COALESCE((SELECT s.watermark FROM working_context_heads h
     WHERE h.session_id = NEW.session_id), -1)
 BEGIN
     DELETE FROM working_context_heads WHERE session_id = NEW.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS working_context_tail_insert AFTER INSERT ON messages
+WHEN NEW.active = 1
+BEGIN
+    INSERT INTO working_context_tail (session_id, message_id)
+    SELECT NEW.session_id, NEW.id FROM working_context_heads h
+    JOIN working_context_snapshots s ON s.id = h.snapshot_id
+    WHERE h.session_id = NEW.session_id AND NEW.id > s.watermark;
 END;
 
 CREATE TABLE IF NOT EXISTS session_turn_leases (
