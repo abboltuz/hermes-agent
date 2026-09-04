@@ -129,10 +129,14 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|auto-lowered\s+(?:this\s+)?session'?s?\s+threshold"
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
+    r"|context\s+compaction\s+is\s+already\s+running"
+    r"|context\s+compaction\s+is\s+still\s+running"
+    r"|context\s+compaction\s+finished\s+[—-]\s+rebuilding"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
+    r"|final\s+model\s+request\s+is\s+~[\d,]+\s+tokens\s+for\s+a\s+~[\d,]+-token\s+input\s+budget"
     # Buffered attempt/overflow retry chatter replayed through _emit_status
     # when a turn exhausts retries. The ", retrying"/"— compressing" anchors
     # keep manual /compress feedback ("Compressed: 30 → 12 messages") and

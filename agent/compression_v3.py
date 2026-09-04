@@ -56,7 +56,21 @@ def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
         key: value for key, value in request.items()
         if not str(key).startswith("_") and not str(key).startswith("__")
     }
-    serialized = json.dumps(public, ensure_ascii=True, sort_keys=True, default=str)
+    # Measure the UTF-8 payload rather than Python's ASCII-escaped debug form.
+    # ``ensure_ascii=True`` expands every Cyrillic/CJK code point to a six-byte
+    # ``\\uXXXX`` sequence even though provider SDKs send JSON as UTF-8.  Using
+    # that representation made the final guard disagree with both the provider
+    # tokenizer and Hermes' preflight estimate by several times on non-ASCII
+    # conversations.  Compact separators mirror the actual wire shape more
+    # closely while ``_tokens(public)`` below remains the independent
+    # structure-aware floor.
+    serialized = json.dumps(
+        public,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     serialized_bytes = len(serialized.encode("utf-8"))
     serialized_tokens = max(
         1,
@@ -64,6 +78,75 @@ def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
         // _PROVIDER_WIRE_BYTES_PER_TOKEN,
     )
     return max(_tokens(public), serialized_tokens)
+
+
+@dataclass(frozen=True)
+class ProviderRequestBudget:
+    """One model/route-specific budget decision for a provider request.
+
+    The decision is intentionally computed from the final provider-shaped
+    request.  Callers no longer need to duplicate context-window, output
+    reserve, and safety-margin arithmetic when deciding whether the same wire
+    is safe to dispatch or must first trigger compaction.
+    """
+
+    context_window: int | None
+    output_reserve: int
+    safety_margin: int
+    estimated_input_tokens: int
+
+    @property
+    def safe_input_budget(self) -> int | None:
+        if self.context_window is None:
+            return None
+        return max(0, self.context_window - self.output_reserve - self.safety_margin)
+
+    @property
+    def fits(self) -> bool:
+        safe_input_budget = self.safe_input_budget
+        return safe_input_budget is None or self.estimated_input_tokens <= safe_input_budget
+
+
+def provider_request_budget(agent: Any, request: Mapping[str, Any]) -> ProviderRequestBudget:
+    """Measure one final provider request against the active model budget."""
+    compressor = getattr(agent, "context_compressor", None)
+    configured_window = getattr(agent, "_config_context_length", None)
+    effective_window = getattr(compressor, "context_length", None)
+    known_windows = [
+        value
+        for value in (configured_window, effective_window)
+        if isinstance(value, int) and value > 0
+    ]
+    # ``_config_context_length`` describes the selected route, while the
+    # compressor tracks the effective window learned at runtime. Providers can
+    # downgrade a route (for example Anthropic 1M -> 200K) without rewriting
+    # the configured value. Use the conservative intersection so a stale large
+    # config can never authorize a request the active route already rejected.
+    context_window = min(known_windows) if known_windows else None
+
+    output_reserve = request.get(
+        "max_tokens", request.get("max_completion_tokens", 0)
+    )
+    if "max_output_tokens" in request:
+        output_reserve = request["max_output_tokens"]
+    inference_config = request.get("inferenceConfig")
+    if isinstance(inference_config, Mapping) and isinstance(
+        inference_config.get("maxTokens"), int
+    ):
+        output_reserve = inference_config["maxTokens"]
+    if not isinstance(output_reserve, int) or output_reserve < 0:
+        output_reserve = 0
+
+    safety_margin = getattr(agent, "_compression_safety_margin", 1024)
+    if not isinstance(safety_margin, int) or safety_margin < 0:
+        safety_margin = 1024
+
+    return ProviderRequestBudget(
+        context_window=context_window,
+        output_reserve=output_reserve,
+        safety_margin=safety_margin,
+        estimated_input_tokens=_provider_wire_token_bound(request),
+    )
 
 
 def _strip_provider_private(value: Any) -> Any:
@@ -93,13 +176,12 @@ def _strip_provider_private(value: Any) -> Any:
 
 
 def _wire_request_fits(agent: Any, request: Mapping[str, Any], *, output_reserve: int, safety_margin: int) -> bool:
-    context_window = getattr(agent, "_config_context_length", None)
-    if not isinstance(context_window, int) or context_window <= 0:
-        compressor = getattr(agent, "context_compressor", None)
-        context_window = getattr(compressor, "context_length", None)
-    if not isinstance(context_window, int) or context_window <= 0:
-        return True
-    return _provider_wire_token_bound(request) + output_reserve + safety_margin <= context_window
+    # ``output_reserve`` and ``safety_margin`` are retained in this private
+    # signature for compatibility with older callers.  The single public
+    # budget resolver is authoritative and derives the same values from the
+    # final request/agent pair.
+    del output_reserve, safety_margin
+    return provider_request_budget(agent, request).fits
 
 
 def _has_incomplete_tool_group(messages: Sequence[Mapping[str, Any]]) -> bool:
@@ -377,12 +459,23 @@ class CutResult:
 
 
 class ContextProjectionUnfit(RuntimeError):
-    """Raised before transport when the irreducible request floor cannot fit."""
+    """Recoverable pre-transport signal that the request needs compaction."""
 
     outcome = "context_projection_unfit"
 
-    def __init__(self, result: CutResult) -> None:
+    def __init__(
+        self,
+        result: CutResult,
+        budget: ProviderRequestBudget | None = None,
+    ) -> None:
         self.result = result
+        self.budget = budget
+        self.estimated_input_tokens = (
+            budget.estimated_input_tokens if budget is not None else None
+        )
+        self.safe_input_budget = (
+            budget.safe_input_budget if budget is not None else None
+        )
         super().__init__(result.reason or self.outcome)
 
 
@@ -554,22 +647,20 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     # Native Responses-shaped payloads have no canonical ``messages`` list.
     # They still must pass the final provider-wire guard before dispatch.
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
-        if not _wire_request_fits(
-            agent, wire_request, output_reserve=output_reserve, safety_margin=safety_margin
-        ):
+        wire_budget = provider_request_budget(agent, wire_request)
+        if not wire_budget.fits:
             raise ContextProjectionUnfit(CutResult(
                 [], "context_projection_unfit", False,
                 reason="final provider wire payload exceeds safe context budget",
-            ))
+            ), wire_budget)
         return wire_request
     if not isinstance(context_window, int) or context_window <= 0:
         return wire_request
     tools = request.get("tools") or ()
     tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
     budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
-    if budget.fits(messages) and _wire_request_fits(
-        agent, wire_request, output_reserve=output_reserve, safety_margin=safety_margin
-    ):
+    wire_budget = provider_request_budget(agent, wire_request)
+    if budget.fits(messages) and wire_budget.fits:
         return wire_request
     coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
     def _candidate_wire_fits(candidate_messages: Sequence[Mapping[str, Any]]) -> bool:
@@ -597,13 +688,21 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     ):
         if result.provider_call_allowed:
             result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="final provider wire payload exceeds safe context budget")
-        raise ContextProjectionUnfit(result)
+        raise ContextProjectionUnfit(result, provider_request_budget(agent, wire_request))
     if result.recovery_identity and not _bind_recovery_identity(
         agent, messages, result.messages, result.recovery_identity,
         int(getattr(agent, "_compression_generation", 0) or 0),
         int(getattr(agent, "_session_watermark", 0) or 0),
     ):
-        raise ContextProjectionUnfit(replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="durable recovery registration failed"))
+        raise ContextProjectionUnfit(
+            replace(
+                result,
+                outcome="context_projection_unfit",
+                provider_call_allowed=False,
+                reason="durable recovery registration failed",
+            ),
+            provider_request_budget(agent, wire_request),
+        )
     coordinator.active_projection = [dict(message) for message in result.messages]
     # Binding may replace the provisional recovery marker in retained rows;
     # serialize only after that owner-process mutation is complete.

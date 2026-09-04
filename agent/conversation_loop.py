@@ -33,8 +33,10 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    wait_for_concurrent_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
@@ -4498,10 +4500,14 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
-                # A projection refusal is deterministic for this exact request.
-                # Retrying it unchanged cannot alter the fit predicate, and may
-                # rotate credentials/routes needlessly without a larger context.
-                # Return one typed terminal result before generic retry handling.
+                # The final provider-shaped request is the authoritative budget
+                # boundary. Treat its typed refusal as COMPACTION PRESSURE, not
+                # as a provider failure: compact the canonical transcript,
+                # rebuild every route-specific field, and retry without charging
+                # an API call. This is especially important for Responses mode,
+                # whose final ``instructions``/``input`` wire no longer contains
+                # the canonical ``messages`` list that the fit gate could trim
+                # locally.
                 try:
                     from agent.compression_v3 import ContextProjectionUnfit
                 except Exception:  # pragma: no cover - import is stable in production
@@ -4511,20 +4517,137 @@ def run_conversation(
                     or getattr(api_error, "outcome", None) == "context_projection_unfit"
                 ):
                     _unfit_summary = agent._summarize_api_error(api_error)
-                    agent._buffer_vprint(
-                        f"❌ Request refused before provider call: {_unfit_summary}"
+
+                    def _refund_unattempted_provider_call() -> None:
+                        """Undo accounting consumed before the final wire gate."""
+                        nonlocal api_call_count
+
+                        api_call_count = max(0, api_call_count - 1)
+                        agent._api_call_count = api_call_count
+                        try:
+                            agent.iteration_budget.refund()
+                        except Exception:
+                            pass
+
+                    if not getattr(agent, "compression_enabled", True):
+                        agent._buffer_vprint(
+                            "❌ Final model request exceeds the active context "
+                            "budget and auto-compaction is disabled."
+                        )
+                        _refund_unattempted_provider_call()
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _unfit_summary,
+                            "messages": messages,
+                            "completed": False,
+                            "failed": True,
+                            "compaction_disabled": True,
+                            "error_type": type(api_error).__name__,
+                            "error": str(api_error),
+                            "api_calls": api_call_count,
+                        }
+
+                    compression_attempts += 1
+                    if compression_attempts <= max_compression_attempts:
+                        _wire_tokens = getattr(
+                            api_error, "estimated_input_tokens", None
+                        )
+                        if not isinstance(_wire_tokens, int) or _wire_tokens <= 0:
+                            _wire_tokens = request_pressure_tokens
+                        _safe_budget = getattr(api_error, "safe_input_budget", None)
+                        if not isinstance(_safe_budget, int) or _safe_budget < 0:
+                            _safe_budget = int(
+                                getattr(agent.context_compressor, "threshold_tokens", 0)
+                                or 0
+                            )
+                        agent._emit_status(
+                            PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE.format(
+                                tokens=_wire_tokens,
+                                budget=_safe_budget,
+                            )
+                        )
+                        logger.info(
+                            "provider-wire pressure triggered auto-compaction: "
+                            "estimated_input=%s safe_input=%s attempt=%d/%d "
+                            "provider=%s model=%s",
+                            _wire_tokens,
+                            _safe_budget,
+                            compression_attempts,
+                            max_compression_attempts,
+                            agent.provider,
+                            agent.model,
+                        )
+                        _wire_pressure_input = messages
+                        messages, active_system_prompt = agent._compress_context(
+                            messages,
+                            system_message,
+                            approx_tokens=max(request_pressure_tokens, _wire_tokens),
+                            task_id=effective_task_id,
+                            trigger="pre_send_fit_recovery",
+                        )
+                        if (
+                            messages is _wire_pressure_input
+                            and compression_skipped_due_to_lock(agent)
+                        ):
+                            # Join the existing manual/background compaction
+                            # instead of returning the 0.1s terminal error that
+                            # prompted this recovery path. Once its durable
+                            # commit lands, rebuild this same model request.
+                            joined_messages = wait_for_concurrent_compression(
+                                agent, messages
+                            )
+                            if joined_messages is None:
+                                compression_attempts -= 1
+                                _refund_unattempted_provider_call()
+                                agent._persist_session(
+                                    messages, conversation_history
+                                )
+                                return _compression_deferred_result(
+                                    agent, messages, api_call_count
+                                )
+                            messages = joined_messages
+                            active_system_prompt = (
+                                getattr(agent, "_cached_system_prompt", None)
+                                or active_system_prompt
+                            )
+                            # The lock winner, not this turn, consumed the
+                            # compaction attempt. Keep the local backstop for
+                            # genuine post-join pressure.
+                            compression_attempts -= 1
+
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages, conversation_history
+                        )
+                        agent._empty_content_retries = 0
+                        agent._thinking_prefill_retries = 0
+                        agent._last_content_with_tools = None
+                        agent._last_content_tools_all_housekeeping = False
+                        agent._mute_post_response = False
+                        _preflight_compression_blocked = False
+                        _retry.restart_with_compressed_messages = True
+                        break
+
+                    # A bounded no-progress backstop remains necessary for an
+                    # irreducible system/tool/user floor. This is no longer a
+                    # provider error and no provider call was attempted.
+                    agent._flush_status_buffer()
+                    logger.error(
+                        "provider-wire auto-compaction made no fit progress "
+                        "after %d attempts: %s",
+                        max_compression_attempts,
+                        _unfit_summary,
                     )
+                    _refund_unattempted_provider_call()
                     agent._persist_session(messages, conversation_history)
                     return {
                         "final_response": _unfit_summary,
                         "messages": messages,
                         "completed": False,
                         "failed": True,
+                        "compression_exhausted": True,
                         "error_type": type(api_error).__name__,
                         "error": str(api_error),
-                        # The fit gate increments the attempt counter before
-                        # invoking transport; no provider call occurred.
-                        "api_calls": max(0, api_call_count - 1),
+                        "api_calls": api_call_count,
                     }
 
                 # -----------------------------------------------------------
@@ -5767,10 +5890,24 @@ def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
-                        agent._persist_session(messages, conversation_history)
-                        return _compression_deferred_result(
-                            agent, messages, api_call_count
+                        joined_messages = wait_for_concurrent_compression(
+                            agent, messages
                         )
+                        if joined_messages is None:
+                            agent._persist_session(messages, conversation_history)
+                            return _compression_deferred_result(
+                                agent, messages, api_call_count
+                            )
+                        messages = joined_messages
+                        active_system_prompt = (
+                            getattr(agent, "_cached_system_prompt", None)
+                            or active_system_prompt
+                        )
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages, conversation_history
+                        )
+                        _retry.restart_with_compressed_messages = True
+                        break
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -5914,10 +6051,24 @@ def run_conversation(
                             )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
-                                agent._persist_session(messages, conversation_history)
-                                return _compression_deferred_result(
-                                    agent, messages, api_call_count
+                                joined_messages = wait_for_concurrent_compression(
+                                    agent, messages
                                 )
+                                if joined_messages is None:
+                                    agent._persist_session(messages, conversation_history)
+                                    return _compression_deferred_result(
+                                        agent, messages, api_call_count
+                                    )
+                                messages = joined_messages
+                                active_system_prompt = (
+                                    getattr(agent, "_cached_system_prompt", None)
+                                    or active_system_prompt
+                                )
+                                conversation_history = conversation_history_after_compression(
+                                    agent, messages, conversation_history
+                                )
+                                _retry.restart_with_compressed_messages = True
+                                break
                             conversation_history = conversation_history_after_compression(
                                 agent, messages, conversation_history
                             )
@@ -6075,10 +6226,24 @@ def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
-                        agent._persist_session(messages, conversation_history)
-                        return _compression_deferred_result(
-                            agent, messages, api_call_count
+                        joined_messages = wait_for_concurrent_compression(
+                            agent, messages
                         )
+                        if joined_messages is None:
+                            agent._persist_session(messages, conversation_history)
+                            return _compression_deferred_result(
+                                agent, messages, api_call_count
+                            )
+                        messages = joined_messages
+                        active_system_prompt = (
+                            getattr(agent, "_cached_system_prompt", None)
+                            or active_system_prompt
+                        )
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages, conversation_history
+                        )
+                        _retry.restart_with_compressed_messages = True
+                        break
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )

@@ -80,8 +80,10 @@ def agent():
 from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
 
-def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkeypatch):
-    """An unchanged typed fit refusal is not retried by the production loop."""
+def test_context_projection_unfit_auto_compacts_and_retries_without_provider_error(
+    agent, monkeypatch
+):
+    """Final-wire pressure rebuilds the turn after automatic compaction."""
     gate_attempts = []
     result = CutResult(
         messages=[{"role": "system", "content": "policy"}],
@@ -92,13 +94,88 @@ def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkey
 
     def refuse_once(*_args, **_kwargs):
         gate_attempts.append(True)
-        raise ContextProjectionUnfit(result)
+        if len(gate_attempts) == 1:
+            raise ContextProjectionUnfit(result)
+        return _mock_response(content="recovered")
 
     agent._interruptible_api_call = refuse_once
-    agent.client.chat.completions.create = MagicMock(
-        side_effect=AssertionError("provider must not be called")
-    )
+    compacted = [{"role": "user", "content": "irreducible task"}]
+    compress = MagicMock(return_value=(compacted, "compressed policy"))
     monkeypatch.setattr(run_agent.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("retry sleep")))
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_compress_context", compress),
+    ):
+        outcome = agent.run_conversation("irreducible task")
+
+    assert len(gate_attempts) == 2
+    compress.assert_called_once()
+    assert compress.call_args.kwargs["trigger"] == "pre_send_fit_recovery"
+    assert outcome["completed"] is True
+    assert outcome["final_response"] == "recovered"
+    assert outcome["api_calls"] == 1
+    assert agent.iteration_budget.used == 1
+
+
+def test_context_projection_unfit_joins_running_compaction_before_retry(agent):
+    """A prompt submitted during /compress waits for its durable result."""
+    refusal = ContextProjectionUnfit(CutResult(
+        messages=[],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="final provider wire payload exceeds safe context budget",
+    ))
+    attempts = 0
+
+    def refuse_then_succeed(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise refusal
+        return _mock_response(content="continued after compact")
+
+    def lose_compression_lock(messages, system_message, **_kwargs):
+        agent._compression_skipped_due_to_lock = "manual-compress-holder"
+        return messages, system_message
+
+    compacted = [{"role": "user", "content": "current task"}]
+    agent._interruptible_api_call = refuse_then_succeed
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(
+            agent, "_compress_context", side_effect=lose_compression_lock
+        ),
+        patch(
+            "agent.conversation_loop.wait_for_concurrent_compression",
+            return_value=compacted,
+        ) as join,
+    ):
+        outcome = agent.run_conversation("current task")
+
+    join.assert_called_once()
+    assert attempts == 2
+    assert outcome["completed"] is True
+    assert outcome["final_response"] == "continued after compact"
+    assert not outcome.get("compression_deferred")
+
+
+@pytest.mark.parametrize("compression_enabled,max_attempts", [(False, 3), (True, 0)])
+def test_context_projection_terminal_backstop_refunds_pretransport_iteration(
+    agent, compression_enabled, max_attempts
+):
+    refusal = ContextProjectionUnfit(CutResult(
+        messages=[],
+        outcome="context_projection_unfit",
+        provider_call_allowed=False,
+        reason="irreducible request floor",
+    ))
+    agent.compression_enabled = compression_enabled
+    agent.max_compression_attempts = max_attempts
+    agent._interruptible_api_call = MagicMock(side_effect=refusal)
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
@@ -106,13 +183,11 @@ def test_context_projection_unfit_is_terminal_in_conversation_loop(agent, monkey
     ):
         outcome = agent.run_conversation("irreducible task")
 
-    assert len(gate_attempts) == 1
-    assert agent.client.chat.completions.create.call_count == 0
-    assert outcome["completed"] is False
     assert outcome["failed"] is True
-    assert outcome["error_type"] == "ContextProjectionUnfit"
-    assert outcome["error"] == "irreducible request floor"
     assert outcome["api_calls"] == 0
+    assert agent._api_call_count == 0
+    assert agent.iteration_budget.used == 0
+    assert agent._interruptible_api_call.call_count == 1
 
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
@@ -2801,13 +2876,16 @@ class TestHandleMaxIterations:
         agent._config_context_length = 1
         agent._compression_safety_margin = 0
         agent.max_tokens = 1
+        agent.max_compression_attempts = 0
         calls = []
         agent._run_codex_stream = lambda request: calls.append(request)
 
-        with pytest.raises(ContextProjectionUnfit):
-            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "oversized task"}], 1
+        )
 
         assert calls == []
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_is_reapplied_to_codex_retry_before_responses_sdk(self, agent):
         agent.api_mode = "codex_responses"
@@ -2817,6 +2895,7 @@ class TestHandleMaxIterations:
         agent._base_url_hostname = "chatgpt.com"
         agent.model = "gpt-5.5"
         agent._cached_system_prompt = "policy"
+        agent.max_compression_attempts = 0
         provider_calls = []
         agent._run_codex_stream = lambda request: (provider_calls.append(request), SimpleNamespace(
             status="completed",
@@ -2836,8 +2915,9 @@ class TestHandleMaxIterations:
         try:
             with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
                 with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-                    with pytest.raises(ContextProjectionUnfit):
-                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    result = agent._handle_max_iterations(
+                        [{"role": "user", "content": "safe task"}], 1
+                    )
                     complete_logical.assert_called_once_with(
                         complete_logical.call_args.args[0], outcome="failed"
                     )
@@ -2846,6 +2926,7 @@ class TestHandleMaxIterations:
 
         assert len(provider_calls) == 1
         assert gate_calls == 3
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_blocks_irreducible_anthropic_request_before_messages_sdk(self, agent):
         agent.api_mode = "anthropic_messages"
@@ -2857,13 +2938,16 @@ class TestHandleMaxIterations:
         agent._config_context_length = 1
         agent._compression_safety_margin = 0
         agent.max_tokens = 1
+        agent.max_compression_attempts = 0
         calls = []
         agent._anthropic_messages_create = lambda request, **kwargs: calls.append(request)
 
-        with pytest.raises(ContextProjectionUnfit):
-            agent._handle_max_iterations([{"role": "user", "content": "oversized task"}], 1)
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "oversized task"}], 1
+        )
 
         assert calls == []
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_is_reapplied_to_anthropic_retry_before_messages_sdk(self, agent):
         agent.api_mode = "anthropic_messages"
@@ -2872,6 +2956,7 @@ class TestHandleMaxIterations:
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "claude-3-5-sonnet"
         agent._cached_system_prompt = "policy"
+        agent.max_compression_attempts = 0
         provider_calls = []
         agent._anthropic_messages_create = lambda request, **kwargs: (provider_calls.append(request), SimpleNamespace(content=[], stop_reason="end_turn", usage=None))[1]
         original_context = agent._config_context_length
@@ -2888,8 +2973,9 @@ class TestHandleMaxIterations:
         try:
             with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
                 with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-                    with pytest.raises(ContextProjectionUnfit):
-                        agent._handle_max_iterations([{"role": "user", "content": "safe task"}], 1)
+                    result = agent._handle_max_iterations(
+                        [{"role": "user", "content": "safe task"}], 1
+                    )
                     complete_logical.assert_called_once_with(
                         complete_logical.call_args.args[0], outcome="failed"
                     )
@@ -2898,26 +2984,29 @@ class TestHandleMaxIterations:
 
         assert len(provider_calls) == 1
         assert gate_calls == 3
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_blocks_irreducible_openai_request_before_sdk(self, agent):
         agent._cached_system_prompt = "policy"
         agent._config_context_length = 1
         agent._compression_safety_margin = 0
         agent.max_tokens = 1
+        agent.max_compression_attempts = 0
         agent.client.chat.completions.create = MagicMock(
             side_effect=AssertionError("provider must not be called")
         )
 
-        with pytest.raises(ContextProjectionUnfit):
-            agent._handle_max_iterations(
-                [{"role": "user", "content": "oversized task"}],
-                1,
-            )
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "oversized task"}],
+            1,
+        )
 
         assert agent.client.chat.completions.create.call_count == 0
+        assert "could not fit after automatic context compaction" in result
 
     def test_summary_gate_is_reapplied_to_retry_before_sdk(self, agent):
         agent._cached_system_prompt = "policy"
+        agent.max_compression_attempts = 0
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),
             AssertionError("retry provider must not be called"),
@@ -2935,15 +3024,191 @@ class TestHandleMaxIterations:
             return prepare_api_request(current_agent, request)
 
         with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
-            with pytest.raises(ContextProjectionUnfit):
-                agent._handle_max_iterations(
-                    [{"role": "user", "content": "safe first task"}],
-                    1,
-                )
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "safe first task"}],
+                1,
+            )
 
         agent._config_context_length = original_context
         assert gate_calls == 3
         assert agent.client.chat.completions.create.call_count == 1
+        assert "could not fit after automatic context compaction" in result
+
+    def test_summary_gate_auto_compacts_and_rebuilds_before_sdk(self, agent):
+        from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+
+        refusal = ContextProjectionUnfit(CutResult(
+            messages=[],
+            outcome="context_projection_unfit",
+            provider_call_allowed=False,
+            reason="final provider wire payload exceeds safe context budget",
+        ))
+        gate_calls = 0
+
+        def refuse_once(_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 1:
+                raise refusal
+            return dict(request)
+
+        compacted = [{"role": "user", "content": "compacted task"}]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Recovered summary"
+        )
+        with (
+            patch(
+                "agent.compression_v3.prepare_api_request",
+                side_effect=refuse_once,
+            ),
+            patch.object(
+                agent,
+                "_compress_context",
+                return_value=(compacted, "compressed policy"),
+            ) as compress,
+        ):
+            messages = [{"role": "user", "content": "oversized task"}]
+            result = agent._handle_max_iterations(messages, 1)
+
+        assert result == "Recovered summary"
+        assert gate_calls == 3
+        assert compress.call_args.kwargs["trigger"] == "pre_send_fit_recovery"
+        assert sum(
+            message.get("content") == MAX_ITERATIONS_SUMMARY_REQUEST
+            for message in messages
+        ) == 1
+        assert agent.client.chat.completions.create.call_count == 1
+
+    @pytest.mark.parametrize("in_place", [True, False])
+    def test_terminal_summary_compaction_rebases_real_session_db(
+        self, agent, monkeypatch, tmp_path, in_place
+    ):
+        from agent.compression_v3 import ContextProjectionUnfit
+        from agent.iteration_budget import IterationBudget
+        from agent.turn_finalizer import finalize_turn
+        from hermes_state import SessionDB
+
+        parent_id = f"terminal-summary-{'in-place' if in_place else 'rotation'}"
+        child_id = f"{parent_id}-child"
+        db = SessionDB(db_path=tmp_path / f"{parent_id}.db")
+        db.create_session(session_id=parent_id, source="test")
+        original = [
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "current task"},
+        ]
+        db.append_messages_batch(parent_id, original)
+        messages = db.get_messages_as_conversation(
+            parent_id, include_row_ids=True
+        )
+        conversation_history = list(messages)
+
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = parent_id
+        agent.max_iterations = 1
+        agent.iteration_budget = IterationBudget(1)
+        assert agent.iteration_budget.consume() is True
+        agent._last_flushed_db_idx = len(messages)
+        agent._flushed_db_message_session_id = parent_id
+        agent._flushed_db_message_ids = {
+            id(message) for message in messages
+        }
+        agent._cached_system_prompt = "policy"
+        agent._compression_safety_margin = 0
+        agent.max_tokens = 64
+        agent.save_trajectories = False
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Recovered summary"
+        )
+        monkeypatch.setattr(agent, "_save_session_log", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            agent, "_cleanup_task_resources", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook", lambda *_a, **_k: []
+        )
+
+        gate_calls = 0
+        refusal = ContextProjectionUnfit(CutResult(
+            messages=[],
+            outcome="context_projection_unfit",
+            provider_call_allowed=False,
+            reason="final provider wire payload exceeds safe context budget",
+        ))
+
+        def refuse_once(_agent, request):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 1:
+                raise refusal
+            return dict(request)
+
+        compacted = [
+            {"role": "user", "content": "compacted terminal task"}
+        ]
+
+        def commit_compaction(messages, _system_message, **_kwargs):
+            if in_place:
+                db.archive_and_compact(parent_id, compacted)
+                agent._last_flushed_db_idx = 0
+                agent._flushed_db_message_session_id = parent_id
+                agent._flushed_db_message_ids = set()
+            else:
+                db.publish_compression_child(
+                    parent_session_id=parent_id,
+                    child_session_id=child_id,
+                    source="test",
+                    messages=compacted,
+                    require_compression_lease=False,
+                )
+                agent.session_id = child_id
+                agent._last_flushed_db_idx = len(compacted)
+                agent._flushed_db_message_session_id = child_id
+                agent._flushed_db_message_ids = {
+                    id(message) for message in compacted
+                }
+            agent._last_compression_attempt_recorded = True
+            agent._last_compression_attempt_in_place = in_place
+            agent._last_compaction_in_place = in_place
+            return compacted, "compressed policy"
+
+        with (
+            patch(
+                "agent.compression_v3.prepare_api_request",
+                side_effect=refuse_once,
+            ),
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=commit_compaction,
+            ),
+        ):
+            result = finalize_turn(
+                agent,
+                final_response=None,
+                api_call_count=1,
+                interrupted=False,
+                failed=False,
+                messages=messages,
+                conversation_history=conversation_history,
+                effective_task_id="task",
+                turn_id="turn",
+                user_message="current task",
+                original_user_message="current task",
+                _should_review_memory=False,
+                _turn_exit_reason="budget_exhausted",
+            )
+
+        active_session_id = parent_id if in_place else child_id
+        active = db.get_messages(active_session_id)
+        contents = [message.get("content") for message in active]
+        assert result["final_response"].startswith("Recovered summary")
+        assert contents.count("compacted terminal task") == 1
+        assert contents.count("Recovered summary") == 1
+        assert len(active) == 3
+        assert agent._iteration_summary_compaction_recovered is False
+        db.close()
 
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
