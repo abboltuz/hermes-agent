@@ -67,6 +67,18 @@ def resolve_background_compression_config(
     return BackgroundCompressionConfig(enabled, start_ratio, deadline_seconds)
 
 
+def automatic_projection_lane_enabled(agent: Any) -> bool:
+    """Return whether automatic turns may defer semantic work off-path."""
+    policy = getattr(agent, "_compression_v3_background_config", None)
+    route = getattr(agent, "_compression_v3_route", None)
+    return bool(
+        getattr(agent, "compression_enabled", True)
+        and isinstance(policy, BackgroundCompressionConfig)
+        and policy.enabled
+        and compression_route_is_eligible(route)
+    )
+
+
 def _background_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Return one bounded process-wide pool instead of one thread per chat."""
     global _BACKGROUND_EXECUTOR
@@ -981,11 +993,17 @@ def _maybe_schedule_background_projection(
     policy = getattr(agent, "_compression_v3_background_config", None)
     route = getattr(agent, "_compression_v3_route", None)
     if (
-        not isinstance(policy, BackgroundCompressionConfig)
-        or not policy.enabled
-        or not compression_route_is_eligible(route)
-        or current_tokens < context_window * policy.start_ratio
+        not automatic_projection_lane_enabled(agent)
     ):
+        return None
+    compressor = getattr(agent, "context_compressor", None)
+    semantic_threshold = getattr(compressor, "threshold_tokens", None)
+    if isinstance(semantic_threshold, int) and semantic_threshold > 0:
+        threshold_ratio = semantic_threshold / context_window
+        start_ratio = min(policy.start_ratio, max(0.05, threshold_ratio - 0.10))
+    else:
+        start_ratio = policy.start_ratio
+    if current_tokens < context_window * start_ratio:
         return None
     coordinator = ensure_compression_coordinator(
         agent, trigger="background_pressure", urgency=1
@@ -1065,6 +1083,13 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
     budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
     wire_budget = provider_request_budget(agent, wire_request)
+    semantic_threshold = getattr(compressor, "threshold_tokens", None)
+    projection_pressure = bool(
+        automatic_projection_lane_enabled(agent)
+        and isinstance(semantic_threshold, int)
+        and semantic_threshold > 0
+        and wire_budget.estimated_input_tokens >= semantic_threshold
+    )
     schema_hash = (
         _projection_fingerprint(tools)
         if isinstance(tools, Sequence) and not isinstance(tools, (str, bytes))
@@ -1077,7 +1102,7 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         context_window=context_window,
         schema_hash=schema_hash,
     )
-    if budget.fits(messages) and wire_budget.fits:
+    if budget.fits(messages) and wire_budget.fits and not projection_pressure:
         return wire_request
     if coordinator is None:
         coordinator = ensure_compression_coordinator(
@@ -1103,6 +1128,13 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         and _candidate_wire_fits(background_messages)
     ):
         request["messages"] = background_messages
+        if coordinator.take_background_adoption_notice():
+            emit_status = getattr(agent, "_emit_status", None)
+            if callable(emit_status):
+                emit_status(
+                    "✓ Background context preparation completed; continuing "
+                    "with the compacted projection."
+                )
         return _strip_provider_private(request)
     result = emergency_context_cut(
         messages,
@@ -1110,9 +1142,20 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         session_id=str(getattr(agent, "session_id", "") or ""),
         generation=int(getattr(agent, "_compression_generation", 0) or 0),
         watermark=int(getattr(agent, "_session_watermark", 0) or 0),
-        min_reclaim_tokens=0,
+        min_reclaim_tokens=(
+            TOOL_PRESSURE_MIN_RECLAIM_TOKENS if projection_pressure else 0
+        ),
         wire_fit=_candidate_wire_fits,
     )
+    if (
+        projection_pressure
+        and wire_budget.fits
+        and result.outcome == "context_projection_min_reclaim_unmet"
+    ):
+        # Proactive pressure is an optimization, not a local terminal guard.
+        # If the truthful request already fits and there is too little optional
+        # history to reclaim, dispatch it unchanged.
+        return wire_request
     request["messages"] = result.messages
     wire_request = _strip_provider_private(request)
     if not result.provider_call_allowed or not budget.fits(result.messages) or not _wire_request_fits(
@@ -1298,6 +1341,8 @@ class CompressionCoordinator:
         self._background_snapshot: BackgroundCompressionSnapshot | None = None
         self._background_closed = False
         self._background_result: CompressionCandidate | None = None
+        self._background_terminal: str | None = None
+        self._background_notified_prefix: str | None = None
         self.telemetry: deque[str] = deque(maxlen=32)
 
     @property
@@ -1426,11 +1471,13 @@ class CompressionCoordinator:
                 and self._background_snapshot.generation == snapshot.generation
                 and self._background_snapshot.prefix_fingerprint
                 == snapshot.prefix_fingerprint
+                and self._background_snapshot.schema_hash == snapshot.schema_hash
             ):
                 self.telemetry.append("background_reused")
                 return existing
             self._background_snapshot = snapshot
             self._background_result = None
+            self._background_terminal = None
             self.telemetry.append("background_started")
             self._background_future = _background_executor().submit(worker, snapshot)
             return self._background_future
@@ -1444,17 +1491,22 @@ class CompressionCoordinator:
                 return None
             if self._background_result is not None:
                 return self._background_result
+            if self._background_terminal is not None:
+                return None
             if not future.done():
                 return None
             try:
                 result = future.result(timeout=0)
             except Exception:
+                self._background_terminal = "failed"
                 self.telemetry.append("background_failed")
                 return None
             if time.monotonic() > snapshot.deadline:
+                self._background_terminal = "expired"
                 self.telemetry.append("background_expired")
                 return None
             if not isinstance(result, CompressionCandidate):
+                self._background_terminal = "invalid"
                 self.telemetry.append("background_invalid")
                 return None
             self._background_result = result
@@ -1493,14 +1545,29 @@ class CompressionCoordinator:
             return None
         self.active_projection = combined
         self.outcome = "background_candidate_adopted"
-        self.telemetry.append("background_adopted")
+        if self._background_notified_prefix != candidate.prefix_hash:
+            self.telemetry.append("background_adopted")
         return [dict(message) for message in combined]
+
+    def take_background_adoption_notice(self) -> bool:
+        """Return true once for each newly adopted semantic prefix."""
+        with self._admission_lock:
+            candidate = self._background_result
+            if (
+                self.outcome != "background_candidate_adopted"
+                or candidate is None
+                or self._background_notified_prefix == candidate.prefix_hash
+            ):
+                return False
+            self._background_notified_prefix = candidate.prefix_hash
+            return True
 
     def close_background(self) -> None:
         """Fence late results; the shared executor remains process-owned."""
         with self._admission_lock:
             self._background_closed = True
             self._background_result = None
+            self._background_terminal = "closed"
             future = self._background_future
             if future is not None:
                 future.cancel()

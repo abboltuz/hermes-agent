@@ -81,6 +81,10 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
+  background:
+    enabled: true            # Prepare semantic projection off the turn path
+    start_ratio: 0.55        # Upper bound; starts 10 points before threshold when earlier
+    deadline_seconds: 120    # Candidate TTL/work deadline, never a foreground wait
   threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
   # model_thresholds:        # Per-model threshold overrides (substring match,
   #   "glm-5.2": 0.40        # longest key wins). See "Per-model threshold
@@ -109,6 +113,9 @@ auxiliary:
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `background.enabled` | `true` | bool | Prepare one semantic projection in a shared bounded worker pool. Automatic provider-bound turns never wait for it: they adopt a ready append-safe candidate or use deterministic projection immediately. Manual and maintenance compaction remain durable. |
+| `background.start_ratio` | `0.55` | 0.05-0.84 | Earliest fraction of the active model context at which speculation may start. Hermes automatically lowers it to ten percentage points before the live semantic threshold when necessary; this is ratio-based, not a provider/model table. |
+| `background.deadline_seconds` | `120` | 1-120 seconds | Worker deadline and candidate TTL. It is not added to foreground latency. |
 | `model_thresholds` | `{}` | map | Per-model overrides of `threshold`. Keys are substring-matched against the model name (longest match wins). The small-context floor still applies on top (see below) |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` (legacy mode only — `lean` uses its own clamp) |
 | `tail_mode` | `lean` | `lean`, `legacy` | Tail retention policy. `lean` keeps a clamped tail of `2.5% × context window` (10K floor, 25K cap) and carries continuity in one summary response: a detailed identifier-preserving log, a mechanically extracted anchor index (PR numbers, SHAs, paths, error strings — regex, never paraphrased), every real user message quoted verbatim (newest-first budget), and a `session_search` recovery pointer so the agent can re-access anything summarized away. `legacy` explicitly restores the older `target_ratio`-sized verbatim tail (~100K+ tokens on big-window models). Old tool results inside the lean tail are demoted to one-line stubs carrying a recovery pointer. |
@@ -122,6 +129,14 @@ auxiliary:
 | `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages only for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription (see below) |
 | `codex_responses_compact_threshold` | `200000` | ≥1 tokens | Server-side compaction trigger in input tokens. Clamped below the local compression threshold at request time so the server compacts first |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
+
+Automatic pressure uses a two-lane flow. The semantic lane starts early from
+an immutable complete prefix and may finish while the model continues. The
+foreground lane owns liveness: at the actual request boundary it either splices
+the new tail onto a matching semantic candidate or applies a deterministic
+projection without waiting. The final provider-wire budget still comes from the
+active model's resolved context capability and preserves request controls such
+as tools and output limits.
 
 ### In-place compaction (single stable session id)
 

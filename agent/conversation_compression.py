@@ -749,7 +749,7 @@ HARD_PRESSURE_COMPRESSION_MAX_SECONDS = 120.0
 _HARD_PRESSURE_COMPRESSION_TRIGGERS = frozenset({
     "preflight_auto", "pre_api_auto", "mid_loop_pressure",
     "payload_413_recovery", "context_overflow_recovery",
-    "pre_send_fit_recovery",
+    "pre_send_fit_recovery", "pre_send_fit_emergency",
 })
 
 

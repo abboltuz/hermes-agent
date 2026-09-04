@@ -8258,6 +8258,24 @@ class AIAgent:
                 HARD_PRESSURE_COMPRESSION_MAX_SECONDS,
                 is_hard_pressure_compression_trigger,
             )
+            from agent.compression_v3 import automatic_projection_lane_enabled
+
+            if (
+                is_hard_pressure_compression_trigger(trigger)
+                and automatic_projection_lane_enabled(self)
+            ):
+                # Semantic compression is already speculated by the final
+                # request gate below the ordinary threshold. Do not block the
+                # model turn here: a ready candidate is adopted append-safely,
+                # otherwise the same gate applies an immediate deterministic
+                # projection. Manual and maintenance compaction still use the
+                # durable synchronous path.
+                existing_prompt = (
+                    getattr(self, "_cached_system_prompt", None)
+                    or system_message
+                    or ""
+                )
+                return messages, existing_prompt
             if is_hard_pressure_compression_trigger(trigger):
                 # A disabled general timeout must not disable the safety
                 # wrapper on provider-bound automatic pressure paths.

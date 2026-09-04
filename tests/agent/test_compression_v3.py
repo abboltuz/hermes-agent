@@ -14,6 +14,7 @@ from agent.compression_v3 import (
     CompressionCoordinator,
     CompressionRequest,
     BackgroundCompressionConfig,
+    automatic_projection_lane_enabled,
     build_background_snapshot,
     build_policy_capsule,
     compression_route_is_eligible,
@@ -556,6 +557,21 @@ def test_background_policy_is_ratio_based_and_bounded():
     assert policy.deadline_seconds == 120
 
 
+def test_automatic_projection_lane_is_capability_gated():
+    agent = SimpleNamespace(
+        _compression_v3_background_config=BackgroundCompressionConfig(),
+        _compression_v3_route={
+            "resolution": "auxiliary_auto",
+            "certified_fast": True,
+            "reasoning": False,
+        },
+    )
+
+    assert automatic_projection_lane_enabled(agent) is True
+    agent._compression_v3_route["reasoning"] = True
+    assert automatic_projection_lane_enabled(agent) is False
+
+
 def test_background_snapshot_stops_before_incomplete_tool_round():
     messages = [
         {"role": "user", **HUMAN, "content": "first"},
@@ -659,6 +675,8 @@ def test_background_job_coalesces_and_adopts_append_only_tail():
     assert owner.project_background(
         live, generation=3, schema_hash="tools-v1"
     ) == projected
+    assert owner.take_background_adoption_notice() is True
+    assert owner.take_background_adoption_notice() is False
 
 
 def test_background_candidate_rejects_changed_prefix_or_schema():
@@ -733,6 +751,72 @@ def test_fit_request_starts_background_work_without_waiting(monkeypatch):
         assert agent._compression_coordinator.poll_background() is None
     finally:
         release.set()
+
+
+def test_background_start_precedes_lower_semantic_threshold(monkeypatch):
+    from agent import compression_v3
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    def worker(_snapshot):
+        entered.set()
+        release.wait(1)
+        raise RuntimeError("test worker complete")
+
+    monkeypatch.setattr(compression_v3, "run_background_compression_worker", worker)
+    agent = SimpleNamespace(
+        session_id="early-derived",
+        context_compressor=SimpleNamespace(threshold_tokens=500),
+        _config_context_length=1_000,
+        _compression_safety_margin=0,
+        _compression_generation=0,
+        _compression_v3_background_config=BackgroundCompressionConfig(
+            True, 0.55, 30
+        ),
+        _compression_v3_route={
+            "resolution": "auxiliary_auto",
+            "certified_fast": True,
+            "reasoning": False,
+        },
+    )
+    request = {
+        "messages": [{"role": "user", **HUMAN, "content": "x" * 1_200}],
+        "tools": [],
+        "max_tokens": 8,
+    }
+    try:
+        assert prepare_api_request(agent, request)["messages"] == request["messages"]
+        assert entered.wait(1)
+    finally:
+        release.set()
+
+
+def test_automatic_preflight_does_not_enter_synchronous_compressor(monkeypatch):
+    from run_agent import AIAgent
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.compress_context",
+        lambda *_args, **_kwargs: pytest.fail("synchronous compressor was entered"),
+    )
+    agent = SimpleNamespace(
+        session_id="projection-lane",
+        _conversation_root_id=lambda: "projection-lane",
+        _cached_system_prompt="cached",
+        _compression_v3_background_config=BackgroundCompressionConfig(),
+        _compression_v3_route={
+            "resolution": "auxiliary_auto",
+            "certified_fast": True,
+            "reasoning": False,
+        },
+    )
+    messages = [{"role": "user", **HUMAN, "content": "continue"}]
+
+    result = AIAgent._compress_context(
+        agent, messages, "system", trigger="preflight_auto"
+    )
+
+    assert result == (messages, "cached")
 
 
 def test_unfit_request_uses_deterministic_cut_while_background_is_pending(

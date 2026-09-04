@@ -822,6 +822,10 @@ All compression settings live in `config.yaml` (no environment variables).
 ```yaml
 compression:
   enabled: true                                     # Toggle compression on/off
+  background:
+    enabled: true                                   # Prepare semantic context concurrently; foreground never waits
+    start_ratio: 0.55                               # Upper bound; lowered automatically to stay ahead of threshold
+    deadline_seconds: 120                           # Worker deadline/candidate TTL, not foreground latency
   progress_notices: false                           # Opt-in: deliver routine compression progress notices to chat platforms — see below
   threshold: 0.50                                   # Compress at this % of context limit
   threshold_tokens: null                            # Absolute token cap (optional) — takes lower of ratio vs absolute
