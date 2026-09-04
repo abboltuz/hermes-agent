@@ -749,6 +749,7 @@ def _(rid, params: dict) -> dict:
             )
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
+            record["resume_model_only"] = omit_messages
             record["resume_message_count"] = int(found.get("message_count") or 0)
             record["resume_preparation"] = {
                 "attempt": 1,
@@ -758,7 +759,13 @@ def _(rid, params: dict) -> dict:
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
 
-            _schedule_resume_hydration(sid, target, db, close_db=owns_db)
+            _schedule_resume_hydration(
+                sid,
+                target,
+                db,
+                close_db=owns_db,
+                model_only=omit_messages,
+            )
             # The hydration worker now owns a profile-scoped handle and closes it
             # after the transcript read. The shared launch DB is process-owned.
             if owns_db:
@@ -1168,6 +1175,7 @@ def _(rid, params: dict) -> dict:
         db,
         close_db=owns_db,
         attempt=attempt,
+        model_only=bool(session.get("resume_model_only")),
     )
     return _ok(
         rid,

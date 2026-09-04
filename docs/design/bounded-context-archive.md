@@ -169,6 +169,14 @@ user requests an older page. This removes archive size from chat-open latency,
 but the older-page reader still needs the physical archive/index work in steps
 3–4 before its own latency is independent of total archive size.
 
+When Desktop requests `messages_omitted`, deferred agent preparation likewise
+loads only the model-facing tip/working snapshot. It does not rebuild the full
+display lineage or its ancestor prefix: visible history already belongs to the
+independent REST path. The safety guard follows the same scope, so a large
+legacy display lineage with a bounded continuation tip is not rejected or
+materialized as model input. Non-Desktop/eager clients retain the prior combined
+model-and-display contract.
+
 The preview is transient presentation state keyed by stored session and owner
 route. It is never persisted as a second conversation and never fabricated as a
 runtime id. Older-page reads reuse the existing bounded transcript window and

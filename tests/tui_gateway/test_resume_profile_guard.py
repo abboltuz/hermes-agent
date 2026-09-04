@@ -34,18 +34,24 @@ def test_resume_applies_owner_profile_guard(
     observed = []
     progress = []
     worker_closed = threading.Event()
-    real_guard = SessionDB.assert_resume_safe
+    real_resume_guard = SessionDB.assert_resume_safe
+    real_model_guard = SessionDB.assert_export_safe
     real_close = SessionDB.close
 
-    def guard(db, target, *args, **kwargs):
+    def resume_guard(db, target, *args, **kwargs):
         observed.append(get_hermes_home())
-        return real_guard(db, target, *args, **kwargs)
+        return real_resume_guard(db, target, *args, **kwargs)
+
+    def model_guard(db, target, *args, **kwargs):
+        observed.append(get_hermes_home())
+        return real_model_guard(db, target, *args, **kwargs)
 
     def close(db):
         real_close(db)
         worker_closed.set()
 
-    monkeypatch.setattr(SessionDB, "assert_resume_safe", guard)
+    monkeypatch.setattr(SessionDB, "assert_resume_safe", resume_guard)
+    monkeypatch.setattr(SessionDB, "assert_export_safe", model_guard)
     monkeypatch.setattr(SessionDB, "close", close)
     monkeypatch.setattr(server, "_hermes_home", launch)
     monkeypatch.setattr(server, "_profile_home", lambda _name: owner)
@@ -122,3 +128,35 @@ def test_launch_profile_guard_restores_foreign_caller_context(
             assert get_hermes_home() == foreign
         finally:
             reset_hermes_home_override(token)
+
+
+def test_model_only_resume_guard_counts_tip_not_display_lineage(tmp_path, monkeypatch):
+    home = tmp_path / "owner"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "sessions:\n  max_resume_messages: 2\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(server, "_hermes_home", home)
+
+    with SessionDB(home / "state.db") as db:
+        db.create_session("parent", "desktop")
+        db.append_message("parent", "user", "first")
+        db.append_message("parent", "assistant", "answer")
+        db.append_message("parent", "user", "second")
+        db.end_session("parent", "compression")
+        db.create_session(
+            "tip",
+            "desktop",
+            parent_session_id="parent",
+        )
+        db.append_message("tip", "user", "live tip")
+
+        with pytest.raises(SessionResumeTooLargeError):
+            server._assert_session_resume_safe(db, "tip", profile_home=home)
+
+        server._assert_session_resume_safe(
+            db,
+            "tip",
+            profile_home=home,
+            model_only=True,
+        )

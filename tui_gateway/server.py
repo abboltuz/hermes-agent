@@ -9752,21 +9752,37 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
 
 
 def _assert_session_resume_safe(
-    db, stored_id: str, message_count=None, *, profile_home=None
+    db, stored_id: str, message_count=None, *, profile_home=None, model_only=False
 ) -> None:
     """Apply the owning profile's policy, independent of caller/thread context."""
-    from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
+    from hermes_state import (
+        SessionExportTooLargeError,
+        SessionResumeTooLargeError,
+        resolved_max_resume_messages,
+    )
 
     home_token = set_hermes_home_override(profile_home or _hermes_home)
     try:
-        safety_check = getattr(db, "assert_resume_safe", None)
-        if callable(safety_check):
-            safety_check(stored_id)
-        else:
+        model_check = getattr(db, "assert_export_safe", None) if model_only else None
+        if callable(model_check):
             limit = resolved_max_resume_messages()
-            count = int(message_count or 0)
-            if limit and count > limit:
-                raise SessionResumeTooLargeError(count, limit)
+            try:
+                model_check(stored_id, max_messages=limit)
+            except SessionExportTooLargeError as exc:
+                raise SessionResumeTooLargeError(
+                    exc.message_count,
+                    limit,
+                    scope="in its model-facing working segment",
+                ) from exc
+        else:
+            safety_check = getattr(db, "assert_resume_safe", None)
+            if callable(safety_check):
+                safety_check(stored_id)
+            else:
+                limit = resolved_max_resume_messages()
+                count = int(message_count or 0)
+                if limit and count > limit:
+                    raise SessionResumeTooLargeError(count, limit)
     except SessionResumeTooLargeError:
         raise
     except Exception as exc:
@@ -9801,7 +9817,13 @@ def _resume_hydration_db(session: dict):
 
 
 def _schedule_resume_hydration(
-    sid: str, stored_id: str, db, *, close_db: bool = False, attempt: int = 1
+    sid: str,
+    stored_id: str,
+    db,
+    *,
+    close_db: bool = False,
+    attempt: int = 1,
+    model_only: bool = False,
 ) -> None:
     """Load a cold resume's transcript off the JSON-RPC response path."""
 
@@ -9828,10 +9850,25 @@ def _schedule_resume_hydration(
             _assert_session_resume_safe(
                 db, stored_id, session.get("resume_message_count"),
                 profile_home=session.get("profile_home"),
+                model_only=model_only,
             )
             db.reopen_session(stored_id)
-            raw_history, display_history = db.get_resume_conversations(stored_id)
-            prefix = db.get_ancestor_display_prefix(stored_id)
+            if model_only:
+                # Desktop owns display hydration through the independently
+                # paged REST archive. Preparing the model must therefore read
+                # only the tip's bounded working context; loading the full
+                # lineage here would make agent readiness scale with archive
+                # size a second time, despite messages_omitted=true.
+                raw_history = db.get_messages_as_conversation(
+                    stored_id,
+                    repair_alternation=True,
+                    include_row_ids=True,
+                )
+                display_history = raw_history
+                prefix = []
+            else:
+                raw_history, display_history = db.get_resume_conversations(stored_id)
+                prefix = db.get_ancestor_display_prefix(stored_id)
             history = sanitize_replay_history(raw_history)
 
             if (

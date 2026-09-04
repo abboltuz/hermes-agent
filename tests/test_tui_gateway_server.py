@@ -3653,10 +3653,17 @@ def test_deferred_resume_acknowledges_before_materialization_guard(monkeypatch, 
             reads.append(("reopen", target))
 
         def get_resume_conversations(self, target):
-            reads.append(("history", target))
-            return [], []
+            raise AssertionError("model-only hydration loaded display lineage")
 
         def get_ancestor_display_prefix(self, _target):
+            raise AssertionError("model-only hydration loaded ancestor prefix")
+
+        def get_messages_as_conversation(self, target, **kwargs):
+            assert kwargs == {
+                "repair_alternation": True,
+                "include_row_ids": True,
+            }
+            reads.append(("model", target))
             return []
 
     def emitted(event, _sid, payload):
@@ -3687,7 +3694,7 @@ def test_deferred_resume_acknowledges_before_materialization_guard(monkeypatch, 
         assert reads == []
         release_guard.set()
         assert finished.wait(timeout=1)
-        assert reads == ([] if oversized else [("reopen", "guarded-chat"), ("history", "guarded-chat")])
+        assert reads == ([] if oversized else [("reopen", "guarded-chat"), ("model", "guarded-chat")])
     finally:
         release_guard.set()
         caller.join(timeout=3)
@@ -3711,8 +3718,12 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
         def reopen_session(self, _target):
             pass
 
-        def get_resume_conversations(self, _target):
+        def get_messages_as_conversation(self, _target, **kwargs):
             nonlocal attempts
+            assert kwargs == {
+                "repair_alternation": True,
+                "include_row_ids": True,
+            }
             attempts += 1
             if attempts == 1:
                 first_released.set()
@@ -3720,7 +3731,10 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
             retry_started.set()
             assert release_retry.wait(timeout=2.0)
             loaded = [{"role": "user", "content": "retry loaded"}]
-            return loaded, loaded
+            return loaded
+
+        def get_resume_conversations(self, _target):
+            raise AssertionError("model-only retry loaded display lineage")
 
         def get_ancestor_display_prefix(self, _target):
             return []
@@ -3749,7 +3763,11 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     try:
         first = server._methods["session.resume"](
             "r1",
-            {"session_id": "retry-session", "defer_history": True},
+            {
+                "session_id": "retry-session",
+                "defer_history": True,
+                "omit_messages": True,
+            },
         )
         first_sid = first["result"]["session_id"]
         assert first_released.wait(timeout=1.0)
@@ -3772,7 +3790,11 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
 
         second = server._methods["session.resume"](
             "r2",
-            {"session_id": "retry-session", "defer_history": True},
+            {
+                "session_id": "retry-session",
+                "defer_history": True,
+                "omit_messages": True,
+            },
         )
         assert second["result"]["session_id"] == first_sid
         assert second["result"]["preparation"]["status"] == "preparation_failed"
