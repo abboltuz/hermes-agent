@@ -631,22 +631,25 @@ _ANTIGRAVITY_PICKER_MODEL_ID = re.compile(
     r"gemini-[1-9](?:\.\d)?-(?:pro|flash|ultra|nano|lite)(?:-(?:preview(?:-customtools)?|thinking|experimental|exp|latest))?"
     r"|claude-(?:(?:opus|sonnet|haiku)-[1-9](?:-[1-9])?(?:-(?:latest|thinking|beta|preview))?"
     r"|[1-9](?:-[1-9])?-(?:opus|sonnet|haiku)(?:-\d{8})?(?:-(?:latest|thinking|beta|preview))?)"
+    r"|gpt-oss-120b"
     r")$"
 )
 
 
 def _safe_antigravity_model_ids(model_ids: list[str]) -> list[str]:
-    """Keep only bounded Gemini/Claude model IDs for picker responses.
+    """Keep only bounded public Antigravity model IDs for picker responses.
 
     The bridge is an external process boundary. After the provider helper has
-    selected Gemini/Claude families, require their published ID grammar rather
+    selected public families, require their published ID grammar rather
     than accepting arbitrary family-prefixed text. This prevents bridge
     markers, URIs, and credential-shaped payloads from reaching GUI clients.
     """
     return [
         model_id
         for model_id in model_ids
-        if len(model_id) <= _MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH
+        if type(model_id) is str
+        and len(model_id) <= _MAX_ANTIGRAVITY_PICKER_MODEL_ID_LENGTH
+        and (not model_id.lower().startswith("gpt-oss-"))
         and _ANTIGRAVITY_PICKER_MODEL_ID.fullmatch(model_id.lower())
     ]
 
