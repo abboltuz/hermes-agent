@@ -7,7 +7,8 @@ providers retain their existing scopes.
 
 Each managed Python client starts its own lightweight bridge proxy with an
 ephemeral token. Only the child environment receives the installation root and
-the internal shared-service launch field; neither `os.environ` nor the active
+the internal shared-service launch field and exact Python interpreter path for
+the POSIX kernel-lock helper; neither `os.environ` nor the active
 profile context is changed. Auth and catalog probes that explicitly pass the
 managed executable follow the same route as inference clients. Custom explicit
 commands retain the private contract. Managed launches require the
@@ -20,7 +21,8 @@ installation account pool. Closing a client does not stop the shared owner.
 
 Desktop Accounts settings render Google Antigravity in the regular provider list.
 Its row expands inline to connect accounts, edit priorities, enable/disable and
-remove accounts. Closing the accordion preserves an active OAuth flow. Account
+remove accounts. Closing either disclosure or refreshing connection status
+preserves mounted account controls and an active OAuth flow. Account
 emails are displayed; opaque IDs remain mutation keys. Missing legacy emails use
 a numbered account label instead of a random identifier. The settings text makes
 the installation-wide scope explicit in every supported locale.

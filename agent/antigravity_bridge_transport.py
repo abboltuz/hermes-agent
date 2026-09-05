@@ -9,6 +9,7 @@ import queue
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -99,12 +100,14 @@ class AntigravityBridgeProcess:
         # that pass the resolved executable explicitly (auth/catalog probes).
         # Keep custom commands private and never mutate the parent environment.
         env.pop("HERMES_ANTIGRAVITY_SHARED_ROOT", None)
+        env.pop("HERMES_ANTIGRAVITY_PYTHON", None)
         shared = isinstance(self.command, str) and self.command == resolve_antigravity_bridge_command()
         if shared:
             from hermes_constants import get_default_hermes_root
             root = str(get_default_hermes_root().expanduser().resolve())
             env["HERMES_HOME"] = root
             env["HERMES_ANTIGRAVITY_SHARED_ROOT"] = root
+            env["HERMES_ANTIGRAVITY_PYTHON"] = sys.executable
         try:
             with self._stop_lock:
                 if self._stopped:

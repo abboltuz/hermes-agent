@@ -669,6 +669,7 @@ def test_antigravity_managed_launch_uses_installation_root(tmp_path, monkeypatch
         "import json, os\n"
         f"assert os.environ['HERMES_HOME'] == {str(root)!r}\n"
         f"assert os.environ['HERMES_ANTIGRAVITY_SHARED_ROOT'] == {str(root)!r}\n"
+        f"assert os.environ['HERMES_ANTIGRAVITY_PYTHON'] == {sys.executable!r}\n"
         f"print('antigravity-bridge ready ' + json.dumps({{'protocol': {protocol!r}, 'host': '127.0.0.1', 'port': 12345}}), flush=True)\n"
     )
     command.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(child_code)}\n")

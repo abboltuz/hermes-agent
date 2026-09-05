@@ -160,6 +160,47 @@ function OAuthPicker({
   const others = rest.filter(p => !p.status?.logged_in)
   const collapsible = others.length > 0
   const showOthers = !collapsible || showAll
+  // Keep provider keys under one stable parent. Disclosure/status changes must
+  // not unmount account controls and cancel an in-progress browser OAuth flow.
+  const rows: ReactNode[] = []
+
+  if (connected.length > 0) {
+    rows.push(<GroupLabel key="connected-label">{p.connected}</GroupLabel>)
+  }
+
+  for (const provider of [...connected, ...others]) {
+    if (provider === others[0] && connected.length > 0) {
+      rows.push(
+        <div hidden={!showOthers} key="others-label">
+          <GroupLabel>{p.otherProviders}</GroupLabel>
+        </div>
+      )
+    }
+
+    rows.push(
+      <div hidden={!provider.status?.logged_in && !showOthers} key={`provider:${provider.id}`}>
+        {provider.id === 'antigravity' ? (
+          <AntigravityProviderRow onConfigSaved={onConfigSaved} provider={provider} />
+        ) : provider.status?.logged_in ? (
+          <ConnectedProviderRow
+            disconnecting={disconnecting === provider.id}
+            onDisconnect={onDisconnect}
+            onSelect={select}
+            onTerminalDisconnect={onTerminalDisconnect}
+            provider={provider}
+          />
+        ) : (
+          <ProviderRow onSelect={select} provider={provider} />
+        )}
+      </div>
+    )
+  }
+
+  rows.push(
+    <div hidden={!showOthers} key="openrouter">
+      <OpenRouterProviderRow onClick={onWantApiKey} />
+    </div>
+  )
 
   return (
     <section className="mb-5 grid gap-2">
@@ -181,38 +222,7 @@ function OAuthPicker({
       {featured && <FeaturedProviderRow onSelect={select} provider={featured} />}
       {/* Slot #2 — always visible, matching onboarding / CANONICAL_PROVIDERS. */}
       <FireworksProviderRow onClick={onWantApiKey} />
-      {connected.length > 0 && (
-        <>
-          <GroupLabel>{p.connected}</GroupLabel>
-          {connected.map(p =>
-            p.id === 'antigravity' ? (
-              <AntigravityProviderRow key={p.id} onConfigSaved={onConfigSaved} provider={p} />
-            ) : (
-              <ConnectedProviderRow
-                disconnecting={disconnecting === p.id}
-                key={p.id}
-                onDisconnect={onDisconnect}
-                onSelect={select}
-                onTerminalDisconnect={onTerminalDisconnect}
-                provider={p}
-              />
-            )
-          )}
-        </>
-      )}
-      {showOthers && (
-        <>
-          {connected.length > 0 && <GroupLabel>{p.otherProviders}</GroupLabel>}
-          {others.map(p =>
-            p.id === 'antigravity' ? (
-              <AntigravityProviderRow key={p.id} onConfigSaved={onConfigSaved} provider={p} />
-            ) : (
-              <ProviderRow key={p.id} onSelect={select} provider={p} />
-            )
-          )}
-          <OpenRouterProviderRow onClick={onWantApiKey} />
-        </>
-      )}
+      <div className="grid gap-2">{rows}</div>
       {collapsible && (
         <Button
           className="py-1 text-[length:var(--conversation-caption-font-size)]"
@@ -234,6 +244,7 @@ function AntigravityProviderRow({ provider, onConfigSaved }: { provider: OAuthPr
   const panelId = useId()
   const [open, setOpen] = useState(false)
   const [visited, setVisited] = useState(false)
+
   return (
     <div className="grid gap-2">
       <RowButton
@@ -399,6 +410,11 @@ export function ProvidersSettings({
     setOauthProviders(providers)
   }, [])
 
+  const onAccountsChanged = useCallback(() => {
+    onConfigSaved?.()
+    void refreshOAuthProviders().catch(() => undefined)
+  }, [onConfigSaved, refreshOAuthProviders])
+
   useEffect(() => {
     let cancelled = false
 
@@ -553,10 +569,10 @@ export function ProvidersSettings({
     <SettingsContent>
       <OAuthPicker
         disconnecting={disconnecting}
+        onConfigSaved={onAccountsChanged}
         onDisconnect={provider => void handleDisconnect(provider)}
         onTerminalDisconnect={provider => void handleTerminalDisconnect(provider)}
         onWantApiKey={() => onViewChange('keys')}
-        onConfigSaved={onConfigSaved}
         providers={oauthProviders}
       />
     </SettingsContent>
