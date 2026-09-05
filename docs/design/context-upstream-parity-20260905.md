@@ -157,3 +157,22 @@ micro-compaction policy files have not changed in that range. A newer oversized
 `@file` ingress-pointer feature in `agent/context_references.py` is outside this
 pinned restoration; this report does not claim every newer context-related
 feature is included.
+
+The second exact candidate, `8bc749884e`, resolved the image and routing findings
+but received CHANGES_REQUESTED for one remaining continuation consumer:
+`reference_handoff_would_drive_next_model_call` still treated standalone typed
+task replay as reference-only. It now uses the same trusted in-flight predicate.
+The repeated-handoff regression exercises the actual
+`_should_skip_model_call_for_reference_handoff` boundary and asserts no appended
+row, no restoration of an older turn-start instruction, and an unchanged
+transcript. Untrusted plugin/webhook events still do not drive continuation.
+
+Final correction verification:
+
+```sh
+scripts/run_tests.sh tests/agent/test_compression_typed_inflight_task.py tests/agent/test_reference_handoff_active_turn.py tests/agent/test_context_compressor_zero_user_provenance.py tests/agent/test_compressor_actionable_tail_anchor.py tests/run_agent/test_run_agent.py -q -j 3
+```
+
+Exit 0: **5 files, 345 passed, 0 failed**, 54.3 seconds. Diff-check and Ruff
+F821/F822/F823 on the final correction files pass. This is a rerun of affected
+tests within the 1,880-test set, not 345 additional distinct tests.

@@ -60,6 +60,13 @@ def test_typed_task_survives_repeated_handoffs(platform, source, merge_on_carrie
         from agent.conversation_compression import _ensure_compressed_has_user_turn
         assert _ensure_compressed_has_user_turn(transcript, compressed) == "already_present"
         assert compressed == before
+        from agent.conversation_loop import _should_skip_model_call_for_reference_handoff
+        assert _should_skip_model_call_for_reference_handoff(
+            compressed, "Older turn-start instruction", {
+                key: original[key] for key in SEMANTIC_FIELDS if key in original
+            },
+        ) is False
+        assert compressed == before
         transcript = [*compressed, *_pending()]
     assert task == original
 
@@ -76,3 +83,11 @@ def test_completed_trusted_task_is_not_reanimated(platform, source):
 @pytest.mark.parametrize("source", ["external_webhook", "plugin"])
 def test_untrusted_event_is_not_promoted_to_live_task(source):
     assert ContextCompressor._find_inflight_user_task([_task("cron", source), *_pending()]) is None
+    from agent.conversation_loop import _should_skip_model_call_for_reference_handoff
+    transcript = [
+        {"role": "user", "content": SUMMARY_PREFIX + "\nNotes\n" + _SUMMARY_END_MARKER},
+        _task("cron", source),
+    ]
+    original = deepcopy(transcript)
+    assert _should_skip_model_call_for_reference_handoff(transcript, None) is True
+    assert transcript == original

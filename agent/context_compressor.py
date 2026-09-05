@@ -4922,10 +4922,7 @@ def reference_handoff_would_drive_next_model_call(messages: Optional[List[Dict[s
         role = message.get("role")
         if (
             role == "tool" or (role == "assistant" and message.get("tool_calls"))
-            or (
-                ContextCompressor._is_actionable_user_turn(message)
-                and not ContextCompressor._is_synthetic_compression_user_turn(message)
-            )
+            or ContextCompressor._is_inflight_task_turn(message)
             or (is_compaction_summary_message(message) and _handoff_carries_live_user_content(message))
         ):
             return False
