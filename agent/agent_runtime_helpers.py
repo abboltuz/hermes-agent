@@ -1,5 +1,6 @@
 """Assorted AIAgent runtime helpers — moved out of run_agent.py for clarity.
 
+
 Each function takes the parent ``AIAgent`` as its first argument
 (``agent``) except for the static helpers (``sanitize_tool_call_arguments``,
 ``drop_thinking_only_and_merge_users``) which are stateless.  AIAgent
@@ -52,6 +53,32 @@ from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+
+def _classify_tool_call_orphans(messages: List[Dict[str, Any]]):
+    """Classify orphaned tool-call / tool-result pairs; single source of truth for GLOBAL orphan
+    detection. Returns ``(surviving_call_ids, result_call_ids, orphaned_results, missing_tool_calls)``;
+    every id variant of a tool_call is registered so a result matching any alias survives, and
+    ``orphaned_results`` are the actual dicts (filter by ``id(msg)``). ``sanitize_api_messages``
+    pairs positionally instead but shares the ``*_id_variants`` alias policy."""
+    assistant_call_variants = [
+        (tc, variants)
+        for msg in messages if msg.get("role") == "assistant"
+        for tc in msg.get("tool_calls") or []
+        if (variants := tool_call_id_variants(tc))
+    ]
+    surviving_call_ids: set[str] = set().union(*(v for _, v in assistant_call_variants))
+    result_entries = [
+        (msg, tool_result_id_variants(msg.get("tool_call_id"))) for msg in messages if msg.get("role") == "tool"
+    ]
+    result_call_ids: set[str] = set().union(*(v for _, v in result_entries))
+    orphaned_results = [msg for msg, v in result_entries if v and not (v & surviving_call_ids)]
+    orphaned_ids = {id(msg) for msg in orphaned_results}
+    surviving_result_variants = [v for msg, v in result_entries if v and id(msg) not in orphaned_ids]
+    missing_tool_calls = [
+        tc for tc, v in assistant_call_variants if not any(v & rv for rv in surviving_result_variants)
+    ]
+    return surviving_call_ids, result_call_ids, orphaned_results, missing_tool_calls
 
 
 # Max consecutive successful credential-pool token refreshes of the SAME entry
@@ -683,19 +710,46 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             # blocks — fall back to keeping the existing content.
             prev_content = prev.get("content")
             new_content = msg.get("content")
+            content_rewritten = False
             if isinstance(prev_content, str) and isinstance(new_content, str):
                 joined = "\n".join(
                     p for p in (prev_content.strip(), new_content.strip()) if p
                 )
                 prev["content"] = joined
+                # A falsy ``new_content`` (e.g. "") strips to nothing and
+                # ``joined`` collapses back to ``prev_content`` unchanged --
+                # that must NOT count as a rewrite (wz-heng, #78063 review).
+                content_rewritten = joined != prev_content
             elif not prev_content and new_content is not None:
                 prev["content"] = new_content
+                content_rewritten = new_content != prev_content
             # Carry reasoning_content from the later turn only if the
             # earlier turn lacks it (strict thinking providers require a
             # reasoning_content on the merged tool-call turn; the first
             # non-empty one suffices).
             if not prev.get("reasoning_content") and msg.get("reasoning_content"):
                 prev["reasoning_content"] = msg["reasoning_content"]
+            # ``prev`` may carry an ``api_content`` sidecar (the exact bytes
+            # previously sent to the API, e.g. a sanitize-divergence stamp —
+            # see ``_flush_messages_to_session_db``) from BEFORE this merge.
+            # The sidecar takes priority over ``content`` at API-build time
+            # (``conversation_loop``'s ``api_messages`` build substitutes it
+            # back in for role ``assistant``), so leaving it in place while
+            # ``prev["content"]`` changes would silently replay the pre-merge
+            # bytes and discard everything this merge just concatenated on —
+            # the same stale-field-survives-the-merge shape as the
+            # ``tool_calls`` gap above, just for a different field. Only drop
+            # it when the merge actually changed the resulting value (e.g.
+            # the later turn's content is ``None``, or either side is
+            # multimodal/list — both branches skip the reassignment and
+            # ``prev["content"]`` is untouched; a falsy ``new_content`` that
+            # strips to nothing also leaves ``joined`` equal to the original
+            # ``prev_content``): in those cases the sidecar is still the
+            # exact bytes previously sent for the UNCHANGED content, and
+            # dropping it would break the prompt-cache replay invariant for
+            # no reason (wz-heng, #78063 review).
+            if content_rewritten:
+                drop_stale_api_content(prev)
             repairs += 1
             continue
         collapsed.append(msg)
@@ -1365,6 +1419,8 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        if isinstance(rt.get("runtime_capabilities"), dict):
+            agent.runtime_capabilities = dict(rt["runtime_capabilities"])
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
 
         if agent.api_mode == "anthropic_messages":
@@ -2730,7 +2786,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2745,6 +2801,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     turn-scoped).
     """
     from hermes_cli.providers import determine_api_mode
+    from agent.native_compaction import resolve_native_compaction_capabilities
+
+    old_model = agent.model
+    old_provider = agent.provider
 
     # ── Determine api_mode if not provided ──
     # Pass model so dual-wire providers (Nous Portal anthropic/* → Messages)
@@ -2752,6 +2812,27 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # openai_chat overlay default.
     if not api_mode:
         api_mode = determine_api_mode(new_provider, base_url, model=new_model)
+
+    # Same-provider switches may omit base_url intentionally (for example, a
+    # direct caller refreshing credentials). Resolve capabilities from the
+    # endpoint that the normalization below will retain, not from the empty
+    # raw argument.
+    effective_base_url = base_url
+    if not effective_base_url and (old_provider or "").strip().lower() == (
+        new_provider or ""
+    ).strip().lower():
+        effective_base_url = getattr(agent, "base_url", "")
+
+    destination_capabilities = (
+        dict(capabilities)
+        if isinstance(capabilities, dict)
+        else resolve_native_compaction_capabilities(
+            model=new_model,
+            base_url=effective_base_url,
+            provider=new_provider,
+            is_codex_backend=(new_provider or '').strip().lower() == 'openai-codex',
+        )
+    )
 
     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
     # /v1 into the anthropic_messages client, which would cause the SDK to
@@ -2767,9 +2848,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         and base_url
     ):
         base_url = re.sub(r"/v1/?$", "", base_url)
-
-    old_model = agent.model
-    old_provider = agent.provider
 
     # ── Snapshot all fields the swap+rebuild can mutate ──
     # If the rebuild raises (bad API key, network error, build_anthropic_client
@@ -2799,6 +2877,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_is_anthropic_oauth",
             "_config_context_length",
             "_reasoning_echo_flag",
+            "runtime_capabilities",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -3099,6 +3178,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
 
+    # Publish the destination capability map only after every runtime setup
+    # above has succeeded. Failed switches must leave the old map intact.
+    agent.runtime_capabilities = destination_capabilities
+
     # ── Reset the cross-turn stale-call circuit breaker (#58962) ──
     # The breaker's error text tells the user to "switch models ... then
     # retry"; without this reset the streak stays latched and the freshly
@@ -3121,6 +3204,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",

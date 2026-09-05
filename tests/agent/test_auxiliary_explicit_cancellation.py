@@ -316,8 +316,13 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
 
         # Let the orphan's real adapter timer fire. It may close the attempt's
         # event stream to wake that worker, but never the process-shared client.
-        timers[0].fired = True
-        timers[0].function()
+        # Upstream's progress-aware watchdog checks the deadline when called;
+        # firing a manual timer must advance its clock as well.
+        with monkeypatch.context() as deadline_clock:
+            fired_at = time.monotonic() + timers[0].interval + 0.01
+            deadline_clock.setattr(aux.time, "monotonic", lambda: fired_at)
+            timers[0].fired = True
+            timers[0].function()
         assert owner_stream.closed.is_set()
         assert not real_client.closed.is_set()
         with aux._client_cache_lock:

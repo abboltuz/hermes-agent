@@ -705,7 +705,10 @@ class TestNonStringContent:
         mock_response.choices[0].message = "plain summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True)
+            # Pin legacy: this test asserts the raw coerced string terminates
+            # the summary, which lean mode's verbatim-user-quote appendix
+            # intentionally follows. Coercion is mode-independent.
+            c = ContextCompressor(model="test", quiet_mode=True, tail_mode="legacy")
 
         messages = [
             {"role": "user", **_HUMAN, "content": "do something"},
@@ -2051,7 +2054,9 @@ class TestUpdateModelBudgets:
         """tail_token_budget must change after switching to a different context length."""
         from unittest.mock import patch
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
-            comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
+            comp = ContextCompressor(
+                "model-a", threshold_percent=0.50, quiet_mode=True, tail_mode="legacy",
+            )
         old_tail = comp.tail_token_budget
         old_max_summary = comp.max_summary_tokens
 
@@ -2064,7 +2069,9 @@ class TestUpdateModelBudgets:
         """Budgets should be proportional to context_length after update."""
         from unittest.mock import patch
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
+            comp = ContextCompressor(
+                "model-a", threshold_percent=0.50, quiet_mode=True, tail_mode="legacy",
+            )
         comp.update_model("model-b", context_length=10_000)
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
         assert comp.max_summary_tokens == min(int(10_000 * 0.05), 4000)
@@ -3469,7 +3476,15 @@ class TestPreLlmFeasibilityCheck:
         """The target scenario from #60451: a tool-heavy transcript whose
         protected tail already holds most of the tokens, leaving a tiny
         middle window. The skip must fire and _generate_summary must not
-        be called."""
+        be called.
+
+        Pinned to legacy tail sizing: the scenario REQUIRES the big
+        payloads to sit inside the protected tail (legacy budget ≈ 17K on
+        this fixture). Under the lean default (10K clamp) the same
+        payloads fall into the compressible middle, so compression
+        correctly proceeds — that is desired behavior, not a skip case.
+        """
+        compressor.tail_mode = "legacy"
         compressor._ineffective_compression_count = 1
         msgs = [{"role": "system", "content": "system prompt"}]
         # Small middle: a few lightweight early exchanges.

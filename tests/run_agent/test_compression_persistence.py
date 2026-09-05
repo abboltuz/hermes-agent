@@ -299,11 +299,14 @@ class TestFlushAfterCompression:
             # The transcript must also be large enough that the provider-less
             # static fallback net-shrinks it (middle drops must outweigh the
             # fixed compaction marker overhead), or the no-growth commit guard
-            # correctly refuses the rotation this test exercises.
+            # correctly refuses the rotation this test exercises. Sized for
+            # the lean tail default: the 10K-token tail floor must leave a
+            # substantial compressible middle (~2K chars/message × 40 ≈ 20K
+            # estimated tokens total).
             messages = [
                 {
                     "role": "user" if i % 2 == 0 else "assistant",
-                    "content": f"message {i} " + "x" * 200,
+                    "content": f"message {i} " + "x" * 2000,
                     "_db_persisted": True,
                 }
                 for i in range(40)
@@ -529,75 +532,6 @@ class TestStoredPromptCwdDrift:
                 "Built prompt missing 'Platform: cli' — drift detection cannot read it"
             )
 
-    def test_projection_rows_do_not_shift_duplicate_active_row_ids(self):
-        """Backfill matches transcript identity, not projection-row position."""
-        from agent.compression_v3 import _bind_recovery_identity
-        from hermes_state import SessionDB
-        from run_agent import AIAgent
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
-            session_id = "alignment-test"
-            db.create_session(session_id=session_id, source="test")
-            db.append_messages_batch(session_id, [
-                {"role": "system", "content": "policy"},
-                {"role": "system", "content": "[POLICY CAPSULE] constraints"},
-                {"role": "assistant", "content": "duplicate", "reasoning": "current",
-                 "provenance_metadata": {"source": "current"}},
-                {"role": "tool", "content": "current result", "tool_call_id": "current"},
-                {"role": "system", "content": "[COMPACTION RECOVERY] capsule"},
-                {"role": "assistant", "content": "duplicate", "reasoning": "archived",
-                 "provenance_metadata": {"source": "archived"}},
-                {"role": "tool", "content": "archived result", "tool_call_id": "archived"},
-            ])
-            durable = db.get_messages_as_conversation(session_id, include_row_ids=True)
-            by_content = {
-                (row.get("role"), row.get("content"), row.get("reasoning")): row["_row_id"]
-                for row in durable
-            }
-            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
-                agent = AIAgent(
-                    api_key="test-key", base_url="https://openrouter.ai/api/v1",
-                    model="test/model", provider="openrouter", quiet_mode=True,
-                    session_db=db, session_id=session_id,
-                    skip_context_files=True, skip_memory=True,
-                )
-            agent._session_db_created = True
-            by_identity = {(row.get("role"), row.get("content"), row.get("reasoning")): row for row in durable}
-            # The live projection moves projection-only capsules: one leads the
-            # transcript and another is interleaved, unlike the durable sequence.
-            live_source = [
-                {"role": "system", "content": "[POLICY CAPSULE] projected leading"},
-                by_identity[("system", "policy", None)],
-                by_identity[("assistant", "duplicate", "current")],
-                by_identity[("tool", "current result", None)],
-                {"role": "system", "content": "[COMPACTION RECOVERY] projected middle"},
-                by_identity[("assistant", "duplicate", "archived")],
-                by_identity[("tool", "archived result", None)],
-            ]
-            live = [dict(row) for row in live_source]
-            for row in live:
-                row.pop("_row_id", None)
-            agent._flush_messages_to_session_db(live, live)
-
-            assert len(db.get_messages(session_id)) == len(durable)
-
-            current = next(row for row in live if row.get("reasoning") == "current")
-            archived = next(row for row in live if row.get("reasoning") == "archived")
-            assert current["_row_id"] == by_content[("assistant", "duplicate", "current")]
-            assert archived["_row_id"] == by_content[("assistant", "duplicate", "archived")]
-            assert current["_row_id"] != archived["_row_id"]
-
-            registered = {}
-            def register(_sid, ids, **_kwargs):
-                registered["ids"] = ids
-                return "canonical"
-            agent._session_db.register_compression_recovery = register
-            demoted = [current, next(row for row in live if row.get("tool_call_id") == "current")]
-            assert _bind_recovery_identity(agent, demoted, [], "anchor", 1, 7) == "canonical"
-            assert registered["ids"] == [current["_row_id"], demoted[1]["_row_id"]]
-            agent.close()
-            db.close()
 
     def test_ambiguous_duplicate_durable_identity_fails_closed(self):
         """Identical durable rows never receive an arbitrary recovery ID."""

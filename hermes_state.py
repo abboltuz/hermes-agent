@@ -62,7 +62,8 @@ from hermes_cli.sqlite_runtime import (
 )
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
-from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
+from hermes_state_common import (
+    is_automatic_end_reason,  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
@@ -6715,6 +6716,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        require_lease_refresh: bool = False,
+        lease_ttl_seconds: float = 300.0,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
     ) -> None:
@@ -6739,8 +6742,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        When *require_lease_refresh* is True and *compression_lock_holder* is
+        set, the lease is refreshed inside the same transaction before the
+        expiry check. This gives a refresher
+        that stopped due to transient DB failures one final chance to extend
+        the lease, preventing wasted compression work. The refresh uses the
+        same ``conn`` as the publication, so there is no TOCTOU window.
         """
         def _do(conn):
+            if require_lease_refresh and compression_lock_holder:
+                conn.execute(
+                    "UPDATE compression_locks SET expires_at = ? "
+                    "WHERE session_id = ? AND holder = ?",
+                    (time.time() + lease_ttl_seconds, parent_session_id,
+                     compression_lock_holder),
+                )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -6755,7 +6772,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -6764,7 +6781,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if parent is None:
                 raise RuntimeError(f"Compression parent not found: {parent_session_id}")
             if parent["ended_at"] is not None:
-                raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
+                # A parent stamped ended by AUTOMATIC cleanup (tui_shutdown,
+                # ws_disconnect, orphan reap, idle/LRU evict) while a live
+                # agent is publishing its rotation is stale by construction —
+                # this writer holds the compression lease and is actively
+                # continuing the conversation the stamp claims is over.
+                # Left in place it wedges rotation forever: every attempt
+                # aborts here, nothing clears the stamp, and each attempt's
+                # pre-publish flush re-grows the parent until the provider
+                # rejects the request (#88197: 303 unique messages → 2,611
+                # rows → HTTP 400). Clear it in this same transaction and
+                # proceed; the closure UPDATE below re-stamps the parent with
+                # its true boundary (end_reason='compression'). Deliberate
+                # boundaries (compression, session_reset, explicit close)
+                # still fail closed — those mean another path owns lineage.
+                if is_automatic_end_reason(parent["end_reason"]):
+                    conn.execute(
+                        "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                        "WHERE id = ?",
+                        (parent_session_id,),
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Compression parent already ended: {parent_session_id}"
+                    )
             if not messages:
                 raise RuntimeError("Compression child handoff must not be empty")
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
@@ -7108,10 +7148,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # Merge-max with any longer live deadline so a later shorter
+            # write cannot reopen the thrash window (#96775). The error
+            # column always takes the latest diagnostic.
             conn.execute(
-                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "UPDATE sessions SET compression_failure_cooldown_until = CASE "
+                "WHEN compression_failure_cooldown_until IS NOT NULL "
+                " AND compression_failure_cooldown_until > ? "
+                "THEN compression_failure_cooldown_until ELSE ? END, "
                 "compression_failure_error = ? WHERE id = ?",
-                (cooldown_until, error, session_id),
+                (cooldown_until, cooldown_until, error, session_id),
             )
 
         try:
@@ -7380,6 +7426,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 "UPDATE sessions SET compression_ineffective_count = ? WHERE id = ?",
                 (normalized, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_compression_recovery_deadline(self, session_id: str) -> float:
+        """Return the persisted anti-thrash recovery deadline (wall-clock epoch).
+
+        ``0.0`` means "not armed". The deadline is the durable half of the
+        #14694 recovery clock: the gateway rebuilds the compressor on every
+        turn / cache eviction, so a process-local deadline restarted the
+        wait on each rebuild and a tripped session never earned its probe
+        (#100185).
+        """
+        if not session_id:
+            return 0.0
+        with self._read_ctx() as conn:
+            if conn is None:
+                return 0.0
+            row = conn.execute(
+                "SELECT compression_recovery_deadline FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return 0.0
+        value = (
+            row["compression_recovery_deadline"]
+            if isinstance(row, sqlite3.Row)
+            else row[0]
+        )
+        try:
+            return max(0.0, float(value or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def set_compression_recovery_deadline(self, session_id: str, deadline: float) -> None:
+        """Persist the anti-thrash recovery deadline; ``0`` / ``None`` disarms it."""
+        if not session_id:
+            return
+        try:
+            normalized = max(0.0, float(deadline or 0.0))
+        except (TypeError, ValueError):
+            normalized = 0.0
+        stored = normalized if normalized > 0.0 else None
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compression_recovery_deadline = ? WHERE id = ?",
+                (stored, session_id),
             )
 
         self._execute_write(_do)
@@ -11375,6 +11469,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        tail_count: int = 0,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -11413,6 +11508,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         held by that holder and unexpired — a compression whose lease was
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
+
+        *tail_count* (default 0) names how many of the LAST rows of
+        *compacted_messages* are the verbatim carried-forward tail the
+        compressor protected rather than summarized (#86366). Those rows'
+        ORIGINALS — which this call archives as a side effect of the blanket
+        soft-archive — are superseded byte-identical duplicates, not
+        "summarized away" content, so they are stamped rewind-style
+        (``active=0, compacted=0``, hidden from search_messages) instead of
+        ``compacted=1``. Without this the tail originals satisfy the recall
+        filter alongside their live clones and session_search returns every
+        carried-forward message once per compaction. Callers that cannot know
+        their tail shape keep the historical archive-everything behavior.
 
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
@@ -11473,13 +11580,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # rewind/undo's active=0+compacted=0, which means "user took it
             # back"). search_messages includes compacted=1 rows by default so
             # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them. Tail originals are
-            # archived too — their clones (below) carry the live copy.
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
-            )
+            # loads (active=1 only) still exclude them. Tail originals whose
+            # verbatim clones ride inside *compacted_messages* (tail_count)
+            # are superseded duplicates instead (#86366): they get the
+            # rewind-style flags so they stop matching the recall filter.
+            # Rewind-target ids: the originals of the carried-forward tail
+            # rows (tail_count), captured BEFORE any flag flips. Named apart
+            # from the watermark `tail_ids` below on purpose — the two are
+            # different sets (#86366): rewind targets sit AT/BELOW the
+            # watermark (the compressor only saw rows up to it), while
+            # `tail_ids` are concurrent appends ABOVE it. Without the bound,
+            # a concurrent append would steal a LIMIT slot and leave a real
+            # carried-forward original stamped compacted=1.
+            rewind_tail_ids: Optional[list[int]] = None
+            if tail_count > 0:
+                if watermark is not None:
+                    tail_rows = conn.execute(
+                        "SELECT id FROM messages "
+                        "WHERE session_id = ? AND active = 1 AND id <= ? "
+                        "ORDER BY id DESC LIMIT ?",
+                        (session_id, int(watermark), int(tail_count)),
+                    ).fetchall()
+                else:
+                    tail_rows = conn.execute(
+                        "SELECT id FROM messages "
+                        "WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT ?",
+                        (session_id, int(tail_count)),
+                    ).fetchall()
+                rewind_tail_ids = [int(row["id"]) for row in tail_rows]
+
+            # The watermark clone below re-inserts `tail_ids` rows byte-exact
+            # as live rows — their originals are the SAME superseded-duplicate
+            # class as the carried-forward tail (#86366), so they take the
+            # rewind flags too instead of double-matching the recall filter.
+            rewind_ids = [*(rewind_tail_ids or []), *tail_ids]
+
+            if rewind_ids:
+                placeholders = ",".join("?" for _ in rewind_ids)
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 0 "
+                    f"WHERE session_id = ? AND id IN ({placeholders})",
+                    [session_id, *rewind_ids],
+                )
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE session_id = ? AND active = 1 "
+                    f"AND id NOT IN ({placeholders})",
+                    [session_id, *rewind_ids],
+                )
+            else:
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
             )

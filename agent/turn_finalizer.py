@@ -165,7 +165,6 @@ def finalize_turn(
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
-    iteration_limit_error = None
     if continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
@@ -195,37 +194,7 @@ def finalize_turn(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        try:
-            final_response = agent._handle_max_iterations(messages, api_call_count)
-            # The iteration-summary path can now compact and recursively
-            # rebuild its provider request. It cannot return a local variable,
-            # so consume the explicit boundary handoff it published before the
-            # final durable flush. For in-place mode this is the exact list of
-            # rows archive_and_compact already inserted; for rotation it is
-            # None so the child-session cursor owns deduplication.
-            if (
-                getattr(
-                    agent, "_iteration_summary_compaction_recovered", False
-                )
-                is True
-            ):
-                conversation_history = getattr(
-                    agent, "_iteration_summary_compression_history", None
-                )
-                agent._iteration_summary_compaction_recovered = False
-                agent._iteration_summary_compression_history = None
-        except Exception as summary_error:
-            # The summary provider gate is a terminal refusal for this exact
-            # wire. Keep the ownership boundary here so run_conversation
-            # returns a structured failed result instead of leaking an
-            # uncaught ContextProjectionUnfit exception.
-            from agent.compression_v3 import ContextProjectionUnfit
-
-            if not isinstance(summary_error, ContextProjectionUnfit):
-                raise
-            failed = True
-            iteration_limit_error = summary_error
-            final_response = agent._summarize_api_error(summary_error)
+        final_response = agent._handle_max_iterations(messages, api_call_count)
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -789,9 +758,6 @@ def finalize_turn(
     }
     if kanban_terminal_transition is not None:
         result["terminal_transition"] = kanban_terminal_transition.as_dict()
-    if iteration_limit_error is not None:
-        result["error_type"] = type(iteration_limit_error).__name__
-        result["error"] = str(iteration_limit_error)
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

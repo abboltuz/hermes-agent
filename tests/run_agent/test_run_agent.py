@@ -21,7 +21,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
-from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
 import run_agent
 from run_agent import AIAgent
@@ -54,10 +53,6 @@ def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
 
-
-
-
-
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -77,226 +72,7 @@ def agent():
         )
         a.client = MagicMock()
         return a
-from agent.compression_v3 import ContextProjectionUnfit, CutResult
 
-
-def test_context_projection_unfit_auto_compacts_and_retries_without_provider_error(
-    agent, monkeypatch
-):
-    """Final-wire pressure rebuilds the turn after automatic compaction."""
-    gate_attempts = []
-    result = CutResult(
-        messages=[{"role": "system", "content": "policy"}],
-        outcome="context_projection_unfit",
-        provider_call_allowed=False,
-        reason="irreducible request floor",
-    )
-
-    def refuse_once(*_args, **_kwargs):
-        gate_attempts.append(True)
-        if len(gate_attempts) == 1:
-            raise ContextProjectionUnfit(result)
-        return _mock_response(content="recovered")
-
-    agent._interruptible_api_call = refuse_once
-    compacted = [{"role": "user", "content": "irreducible task"}]
-    compress = MagicMock(return_value=(compacted, "compressed policy"))
-    monkeypatch.setattr(run_agent.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("retry sleep")))
-    with (
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch.object(agent, "_compress_context", compress),
-    ):
-        outcome = agent.run_conversation("irreducible task")
-
-    assert len(gate_attempts) == 2
-    compress.assert_called_once()
-    assert compress.call_args.kwargs["trigger"] == "pre_send_fit_recovery"
-    assert outcome["completed"] is True
-    assert outcome["final_response"] == "recovered"
-    assert outcome["api_calls"] == 1
-    assert agent.iteration_budget.used == 1
-
-
-def test_context_projection_unfit_joins_running_compaction_before_retry(agent):
-    """A prompt submitted during /compress waits for its durable result."""
-    refusal = ContextProjectionUnfit(CutResult(
-        messages=[],
-        outcome="context_projection_unfit",
-        provider_call_allowed=False,
-        reason="final provider wire payload exceeds safe context budget",
-    ))
-    attempts = 0
-
-    def refuse_then_succeed(*_args, **_kwargs):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise refusal
-        return _mock_response(content="continued after compact")
-
-    def lose_compression_lock(messages, system_message, **_kwargs):
-        agent._compression_skipped_due_to_lock = "manual-compress-holder"
-        return messages, system_message
-
-    compacted = [{"role": "user", "content": "current task"}]
-    agent._interruptible_api_call = refuse_then_succeed
-    with (
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch.object(
-            agent, "_compress_context", side_effect=lose_compression_lock
-        ),
-        patch(
-            "agent.conversation_loop.wait_for_concurrent_compression",
-            return_value=compacted,
-        ) as join,
-    ):
-        outcome = agent.run_conversation("current task")
-
-    join.assert_called_once()
-    assert attempts == 2
-    assert outcome["completed"] is True
-    assert outcome["final_response"] == "continued after compact"
-    assert not outcome.get("compression_deferred")
-
-
-def test_context_projection_attempt_budget_rearms_after_provider_success(
-    agent,
-):
-    """A long tool turn gets a fresh wire-pressure episode after each call."""
-    refusal = ContextProjectionUnfit(CutResult(
-        messages=[],
-        outcome="context_projection_unfit",
-        provider_call_allowed=False,
-        reason="final provider wire payload exceeds safe context budget",
-    ))
-    tool_call = _mock_tool_call(
-        name="web_search",
-        arguments="{}",
-        call_id="pressure-episode-1",
-    )
-    usage = {
-        "prompt_tokens": 1_000,
-        "completion_tokens": 20,
-        "total_tokens": 1_020,
-    }
-    responses = iter([
-        refusal,
-        _mock_response(
-            content="",
-            finish_reason="tool_calls",
-            tool_calls=[tool_call],
-            usage=usage,
-        ),
-        refusal,
-        _mock_response(content="continued", usage=usage),
-    ])
-
-    def pressure_then_provider(*_args, **_kwargs):
-        result = next(responses)
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    agent.compression_enabled = True
-    agent.max_compression_attempts = 1
-    agent._cached_system_prompt = "You are helpful."
-    agent._use_prompt_caching = False
-    agent._interruptible_api_call = pressure_then_provider
-    agent.save_trajectories = False
-
-    def compact(current_messages, _system_message, **_kwargs):
-        return [dict(message) for message in current_messages], "compressed policy"
-
-    with (
-        patch("run_agent.handle_function_call", return_value="search result"),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch.object(agent, "_compress_context", side_effect=compact) as compress,
-    ):
-        outcome = agent.run_conversation("research and continue")
-
-    assert outcome["completed"] is True
-    assert outcome["final_response"] == "continued"
-    assert outcome["api_calls"] == 2
-    assert compress.call_count == 2
-    assert all(
-        call.kwargs["trigger"] == "pre_send_fit_recovery"
-        for call in compress.call_args_list
-    )
-
-
-def test_context_projection_exhaustion_escalates_to_forced_recovery(agent):
-    """The regular episode cap changes strategy instead of ending the turn."""
-    refusal = ContextProjectionUnfit(CutResult(
-        messages=[],
-        outcome="context_projection_unfit",
-        provider_call_allowed=False,
-        reason="final provider wire payload exceeds safe context budget",
-    ))
-    responses = iter([refusal, refusal, _mock_response(content="continued")])
-
-    def refuse_twice(*_args, **_kwargs):
-        result = next(responses)
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    agent.compression_enabled = True
-    agent.max_compression_attempts = 1
-    agent._interruptible_api_call = refuse_twice
-
-    def compact(current_messages, _system_message, **_kwargs):
-        return [dict(message) for message in current_messages], "compressed policy"
-
-    with (
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch.object(agent, "_compress_context", side_effect=compact) as compress,
-    ):
-        outcome = agent.run_conversation("continue automatically")
-
-    assert outcome["completed"] is True
-    assert outcome["final_response"] == "continued"
-    assert outcome["api_calls"] == 1
-    assert [call.kwargs.get("force", False) for call in compress.call_args_list] == [
-        False,
-        True,
-    ]
-    assert [call.kwargs["trigger"] for call in compress.call_args_list] == [
-        "pre_send_fit_recovery",
-        "pre_send_fit_emergency",
-    ]
-
-
-def test_context_projection_disabled_refunds_pretransport_iteration(agent):
-    refusal = ContextProjectionUnfit(CutResult(
-        messages=[],
-        outcome="context_projection_unfit",
-        provider_call_allowed=False,
-        reason="irreducible request floor",
-    ))
-    agent.compression_enabled = False
-    agent._interruptible_api_call = MagicMock(side_effect=refusal)
-    with (
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-    ):
-        outcome = agent.run_conversation("irreducible task")
-
-    assert outcome["failed"] is True
-    assert outcome["failure_reason"] == "context_projection_compaction_disabled"
-    assert outcome["failure_retryable"] is False
-    assert outcome["api_calls"] == 0
-    assert agent._api_call_count == 0
-    assert agent.iteration_budget.used == 0
-    assert agent._interruptible_api_call.call_count == 1
 
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
@@ -306,10 +82,6 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
     agent._apply_persist_user_message_override(messages)
 
     assert messages == [{"role": "user", "content": "hello"}]
-
-
-
-
 
 
 def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
@@ -366,6 +138,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
             for m in messages:
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
+
+        def flush_token_counts(self):
+            pass
 
     db = _BarrierDB()
     agent._session_db = db
@@ -599,10 +374,6 @@ class TestHasContentAfterThinkBlock:
         assert agent._has_content_after_think_block(None) is False
 
 
-
-
-
-
 class TestStripThinkBlocks:
     def test_none_returns_empty(self, agent):
         assert agent._strip_think_blocks(None) == ""
@@ -627,19 +398,10 @@ class TestStripThinkBlocks:
         assert "internal reasoning" not in result
 
 
-
-
-
     def test_single_block_removed(self, agent):
         result = agent._strip_think_blocks("<think>reasoning</think> answer")
         assert "reasoning" not in result
         assert "answer" in result
-
-
-
-
-
-
 
 
     # ─── Unterminated-block coverage (#8878, #9568, #10408) ──────────────
@@ -647,10 +409,6 @@ class TestStripThinkBlocks:
     # closing tag, leaking raw reasoning into assistant content. The open
     # tag appears at a block boundary (start of text or after a newline);
     # everything from that tag to end-of-string is stripped.
-
-
-
-
 
 
     def test_mixed_case_closed_pair_stripped(self, agent):
@@ -669,15 +427,6 @@ class TestStripThinkBlocks:
     # standalone tool-call XML inside assistant content instead of via the
     # structured `tool_calls` field. Left unstripped, raw XML leaks to
     # gateway users (Discord/Telegram/Matrix) and the CLI.
-
-
-
-
-
-
-
-
-
 
 
     @pytest.mark.parametrize(
@@ -703,15 +452,6 @@ class TestExtractReasoning:
     def test_reasoning_field(self, agent):
         msg = _mock_assistant_msg(reasoning="thinking hard")
         assert agent._extract_reasoning(msg) == "thinking hard"
-
-
-
-
-
-
-
-
-
 
 
 class TestSessionJsonSnapshotOptIn:
@@ -867,9 +607,6 @@ class TestGetMessagesUpToLastAssistant:
         result = agent._get_messages_up_to_last_assistant(msgs)
         assert result == msgs
         assert result is not msgs  # should be a copy
-
-
-
 
 
 class TestMaskApiKey:
@@ -1087,17 +824,11 @@ class TestInit:
         assert a.max_tokens == 8192
 
 
-
-
-
 class TestInterrupt:
     def test_interrupt_sets_flag(self, agent):
         with patch("run_agent._set_interrupt"):
             agent.interrupt()
             assert agent._interrupt_requested is True
-
-
-
 
 
 class TestHydrateTodoStore:
@@ -1123,13 +854,6 @@ class TestHydrateTodoStore:
         with patch("run_agent._set_interrupt"):
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
-
-
-
-
-
-
-
 
 
 class TestBuildSystemPrompt:
@@ -1331,21 +1055,6 @@ class TestToolUseEnforcementConfig:
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     def test_no_tools_never_injects(self):
         """Even with enforcement=true, no injection when agent has no tools."""
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
@@ -1485,8 +1194,6 @@ class TestTaskCompletionGuidance:
         agent = self._make_agent(model="anthropic/claude-opus-4.8")
         prompt = agent._build_system_prompt()
         assert TASK_COMPLETION_GUIDANCE in prompt
-
-
 
 
     def test_no_tools_no_injection(self):
@@ -1669,10 +1376,6 @@ class TestBuildApiKwargs:
         assert "temperature" not in kwargs
 
 
-
-
-
-
     def test_kimi_coding_endpoint_disables_thinking(self, agent):
         """When reasoning_config.enabled=False, thinking should be disabled
         and reasoning_effort should be omitted entirely — mirroring Kimi
@@ -1751,8 +1454,6 @@ class TestBuildApiKwargs:
         assert agent._github_models_reasoning_extra_body() == {"effort": "xhigh"}
 
 
-
-
     def test_qwen_portal_formats_messages_and_metadata(self, agent):
         agent.provider = "qwen-oauth"
         agent.base_url = "https://portal.qwen.ai/v1"
@@ -1784,11 +1485,6 @@ class TestBuildApiKwargs:
         assert user_content[1] == {"type": "text", "text": "world"}
 
 
-
-
-
-
-
     def test_non_custom_provider_unaffected(self, agent):
         """OpenRouter provider with effort=none should NOT inject think=false."""
         agent.provider = "openrouter"
@@ -1809,13 +1505,6 @@ class TestBuildAssistantMessage:
         assert result["finish_reason"] == "stop"
 
 
-
-
-
-
-
-
-
     def test_tool_call_extra_content_preserved(self, agent):
         """Gemini thinking models attach extra_content with thought_signature
         to tool calls. This must be preserved so subsequent API calls include it."""
@@ -1828,11 +1517,6 @@ class TestBuildAssistantMessage:
         assert result["tool_calls"][0]["extra_content"] == {
             "google": {"thought_signature": "abc123"}
         }
-
-
-
-
-
 
 
 class TestFormatToolsForSystemMessage:
@@ -2189,15 +1873,6 @@ class TestConcurrentToolExecution:
                 mock_con.assert_not_called()
 
 
-
-
-
-
-
-
-
-
-
     def test_concurrent_executes_all_tools(self, agent):
         """Concurrent path should execute all tools and append results in order."""
         tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="c1")
@@ -2305,10 +1980,6 @@ class TestConcurrentToolExecution:
         assert messages[0]["tool_call_id"] == "c1"
         assert messages[1]["tool_call_id"] == "c2"
         assert all("Python interpreter is shutting down" in m["content"] for m in messages)
-
-
-
-
 
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
@@ -2429,8 +2100,6 @@ class TestConcurrentToolExecution:
         assert "ok" in result
 
 
-
-
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
         tool_call = _mock_tool_call(name="write_file",
@@ -2459,8 +2128,6 @@ class TestConcurrentToolExecution:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
-
-
 
 
     @pytest.mark.parametrize("concurrent", [False, True])
@@ -2540,11 +2207,6 @@ class TestConcurrentToolExecution:
 
         assert json.loads(result) == {"error": "Blocked"}
         assert agent._turns_since_memory == 5
-
-
-
-
-
 
 
     def test_managed_tool_pipeline_rejects_second_dispatch(self, agent, monkeypatch):
@@ -2785,12 +2447,6 @@ class TestPathsOverlap:
         assert _paths_overlap(Path("src/a.py"), Path("src/a.py"))
 
 
-
-
-
-
-
-
 class TestParallelScopePathNormalization:
     def test_extract_parallel_scope_path_normalizes_relative_to_cwd(self, tmp_path, monkeypatch):
         from run_agent import _extract_parallel_scope_path
@@ -2852,109 +2508,7 @@ class TestMcpParallelToolBatch:
                 _mcp_tool_server_names.pop("mcp__github__search_code", None)
 
 
-
-
 class TestHandleMaxIterations:
-    def test_reducible_summary_preserves_durable_recovery_rows(self, agent, tmp_path):
-        """A reducible iteration summary binds demoted rows before one SDK call."""
-        from hermes_state import SessionDB
-
-        db = SessionDB(db_path=tmp_path / "recovery.db")
-        session_id = "iteration-recovery-e2e"
-        db.create_session(session_id=session_id, source="test")
-        durable = []
-        for index in range(8):
-            durable.extend([
-                {
-                    "role": "user",
-                    "content": f"semantic round {index}",
-                    "origin_kind": "human_user",
-                    "turn_kind": "prompt",
-                    "trust_kind": "user_authorized",
-                },
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": f"call-{index}",
-                        "type": "function",
-                        "function": {"name": "inspect", "arguments": "{}"},
-                    }],
-                    "reasoning": f"reasoning-{index}",
-                    "provenance_metadata": {"event_kind": "tool_call"},
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": f"call-{index}",
-                    "content": f"tool body {index} " + ("x" * 1200),
-                },
-            ])
-        durable.append({
-            "role": "user",
-            "content": "latest human task: preserve this exact task",
-            "origin_kind": "human_user",
-            "turn_kind": "prompt",
-            "trust_kind": "user_authorized",
-        })
-        db.append_messages_batch(session_id, durable)
-        source = db.get_messages_as_conversation(session_id, include_row_ids=True)
-        source_before = [dict(message) for message in source]
-        durable_snapshot = db.get_messages_as_conversation(session_id, include_row_ids=True)
-        latest_task = source[-1]["content"]
-        for message in source:
-            message["_db_persisted"] = True
-
-        original_register = db.register_compression_recovery
-        registered = {}
-
-        def register(*args, **kwargs):
-            result = original_register(*args, **kwargs)
-            registered["identity"] = result
-            registered["ids"] = list(args[1])
-            return result
-
-        db.register_compression_recovery = register
-        agent._session_db = db
-        agent._session_db_created = True
-        agent.session_id = session_id
-        # Keep this fixture below the token-domain wire threshold; the former
-        # 8K budget no longer forces a recovery cut after bytes become tokens.
-        agent._config_context_length = 3_000
-        agent._compression_safety_margin = 0
-        agent.max_tokens = 64
-        agent._cached_system_prompt = ""
-        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
-
-        result = agent._handle_max_iterations(source, 1)
-
-        assert result == "Summary"
-        assert agent.client.chat.completions.create.call_count == 1
-        request = agent.client.chat.completions.create.call_args.kwargs
-        assert all(
-            not (isinstance(key, str) and (key.startswith("_") or key == "provenance_metadata"))
-            for message in request["messages"]
-            for key in message
-        )
-        assert latest_task == "latest human task: preserve this exact task"
-        retained_tool_calls = sum(
-            message.get("role") == "assistant"
-            and message.get("tool_calls") is not None
-            for message in request["messages"]
-        )
-        assert 0 < retained_tool_calls < 8
-
-        from agent.compression_v3 import _provider_wire_token_bound
-        assert _provider_wire_token_bound(request) + agent.max_tokens + agent._compression_safety_margin <= agent._config_context_length
-        assert db.get_messages_as_conversation(session_id, include_row_ids=True) == durable_snapshot
-        durable_ids = {message["_row_id"] for message in source_before}
-        assert registered["ids"]
-        assert set(registered["ids"]).issubset(durable_ids)
-        assert set(registered["ids"]) >= {source_before[0]["_row_id"], source_before[1]["_row_id"]}
-        recovery = db.get_compression_recovery(registered["identity"], session_id)
-        assert recovery is not None
-        assert recovery["message_ids"] == registered["ids"]
-        assert len(db.get_messages(session_id)) == len(durable)
-        db.close()
 
     def test_summary_notice_uses_safe_print(self, agent):
         agent._print_fn = lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("closed"))
@@ -2974,350 +2528,6 @@ class TestHandleMaxIterations:
         assert "summary" in result.lower()
         assert agent.client.chat.completions.create.call_count == 1
 
-    def test_summary_gate_blocks_irreducible_codex_request_before_responses_sdk(self, agent):
-        agent.api_mode = "codex_responses"
-        agent.provider = "openai-codex"
-        agent.base_url = "https://chatgpt.com/backend-api/codex"
-        agent._base_url_lower = agent.base_url.lower()
-        agent._base_url_hostname = "chatgpt.com"
-        agent.model = "gpt-5.5"
-        agent._cached_system_prompt = "policy"
-        agent._config_context_length = 1
-        agent._compression_safety_margin = 0
-        agent.max_tokens = 1
-        agent.max_compression_attempts = 0
-        calls = []
-        agent._run_codex_stream = lambda request: calls.append(request)
-
-        result = agent._handle_max_iterations(
-            [{"role": "user", "content": "oversized task"}], 1
-        )
-
-        assert calls == []
-        assert "could not fit after automatic context compaction" in result
-
-    def test_summary_gate_is_reapplied_to_codex_retry_before_responses_sdk(self, agent):
-        agent.api_mode = "codex_responses"
-        agent.provider = "openai-codex"
-        agent.base_url = "https://chatgpt.com/backend-api/codex"
-        agent._base_url_lower = agent.base_url.lower()
-        agent._base_url_hostname = "chatgpt.com"
-        agent.model = "gpt-5.5"
-        agent._cached_system_prompt = "policy"
-        agent.max_compression_attempts = 0
-        provider_calls = []
-        agent._run_codex_stream = lambda request: (provider_calls.append(request), SimpleNamespace(
-            status="completed",
-            output=[SimpleNamespace(type="message", status="completed", content=[SimpleNamespace(type="output_text", text="")])],
-        ))[1]
-        original_context = agent._config_context_length
-        gate_calls = 0
-        from agent.compression_v3 import prepare_api_request
-
-        def gate_then_shrink(current_agent, request):
-            nonlocal gate_calls
-            gate_calls += 1
-            if gate_calls == 3:
-                current_agent._config_context_length = 1
-            return prepare_api_request(current_agent, request)
-
-        try:
-            with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
-                with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-                    result = agent._handle_max_iterations(
-                        [{"role": "user", "content": "safe task"}], 1
-                    )
-                    complete_logical.assert_called_once_with(
-                        complete_logical.call_args.args[0], outcome="failed"
-                    )
-        finally:
-            agent._config_context_length = original_context
-
-        assert len(provider_calls) == 1
-        assert gate_calls == 3
-        assert "could not fit after automatic context compaction" in result
-
-    def test_summary_gate_blocks_irreducible_anthropic_request_before_messages_sdk(self, agent):
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "anthropic"
-        agent.base_url = "https://api.anthropic.com"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.model = "claude-3-5-sonnet"
-        agent._cached_system_prompt = "policy"
-        agent._config_context_length = 1
-        agent._compression_safety_margin = 0
-        agent.max_tokens = 1
-        agent.max_compression_attempts = 0
-        calls = []
-        agent._anthropic_messages_create = lambda request, **kwargs: calls.append(request)
-
-        result = agent._handle_max_iterations(
-            [{"role": "user", "content": "oversized task"}], 1
-        )
-
-        assert calls == []
-        assert "could not fit after automatic context compaction" in result
-
-    def test_summary_gate_is_reapplied_to_anthropic_retry_before_messages_sdk(self, agent):
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "anthropic"
-        agent.base_url = "https://api.anthropic.com"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.model = "claude-3-5-sonnet"
-        agent._cached_system_prompt = "policy"
-        agent.max_compression_attempts = 0
-        provider_calls = []
-        agent._anthropic_messages_create = lambda request, **kwargs: (provider_calls.append(request), SimpleNamespace(content=[], stop_reason="end_turn", usage=None))[1]
-        original_context = agent._config_context_length
-        gate_calls = 0
-        from agent.compression_v3 import prepare_api_request
-
-        def gate_then_shrink(current_agent, request):
-            nonlocal gate_calls
-            gate_calls += 1
-            if gate_calls == 3:
-                current_agent._config_context_length = 1
-            return prepare_api_request(current_agent, request)
-
-        try:
-            with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
-                with patch("agent.relay_llm.complete_logical_call") as complete_logical:
-                    result = agent._handle_max_iterations(
-                        [{"role": "user", "content": "safe task"}], 1
-                    )
-                    complete_logical.assert_called_once_with(
-                        complete_logical.call_args.args[0], outcome="failed"
-                    )
-        finally:
-            agent._config_context_length = original_context
-
-        assert len(provider_calls) == 1
-        assert gate_calls == 3
-        assert "could not fit after automatic context compaction" in result
-
-    def test_summary_gate_blocks_irreducible_openai_request_before_sdk(self, agent):
-        agent._cached_system_prompt = "policy"
-        agent._config_context_length = 1
-        agent._compression_safety_margin = 0
-        agent.max_tokens = 1
-        agent.max_compression_attempts = 0
-        agent.client.chat.completions.create = MagicMock(
-            side_effect=AssertionError("provider must not be called")
-        )
-
-        result = agent._handle_max_iterations(
-            [{"role": "user", "content": "oversized task"}],
-            1,
-        )
-
-        assert agent.client.chat.completions.create.call_count == 0
-        assert "could not fit after automatic context compaction" in result
-
-    def test_summary_gate_is_reapplied_to_retry_before_sdk(self, agent):
-        agent._cached_system_prompt = "policy"
-        agent.max_compression_attempts = 0
-        agent.client.chat.completions.create.side_effect = [
-            _mock_response(content=""),
-            AssertionError("retry provider must not be called"),
-        ]
-        original_context = agent._config_context_length
-        gate_calls = 0
-
-        from agent.compression_v3 import prepare_api_request
-
-        def gate_then_shrink(current_agent, request):
-            nonlocal gate_calls
-            gate_calls += 1
-            if gate_calls == 3:
-                current_agent._config_context_length = 1
-            return prepare_api_request(current_agent, request)
-
-        with patch("agent.compression_v3.prepare_api_request", side_effect=gate_then_shrink):
-            result = agent._handle_max_iterations(
-                [{"role": "user", "content": "safe first task"}],
-                1,
-            )
-
-        agent._config_context_length = original_context
-        assert gate_calls == 3
-        assert agent.client.chat.completions.create.call_count == 1
-        assert "could not fit after automatic context compaction" in result
-
-    def test_summary_gate_auto_compacts_and_rebuilds_before_sdk(self, agent):
-        from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
-
-        refusal = ContextProjectionUnfit(CutResult(
-            messages=[],
-            outcome="context_projection_unfit",
-            provider_call_allowed=False,
-            reason="final provider wire payload exceeds safe context budget",
-        ))
-        gate_calls = 0
-
-        def refuse_once(_agent, request):
-            nonlocal gate_calls
-            gate_calls += 1
-            if gate_calls == 1:
-                raise refusal
-            return dict(request)
-
-        compacted = [{"role": "user", "content": "compacted task"}]
-        agent.client.chat.completions.create.return_value = _mock_response(
-            content="Recovered summary"
-        )
-        with (
-            patch(
-                "agent.compression_v3.prepare_api_request",
-                side_effect=refuse_once,
-            ),
-            patch.object(
-                agent,
-                "_compress_context",
-                return_value=(compacted, "compressed policy"),
-            ) as compress,
-        ):
-            messages = [{"role": "user", "content": "oversized task"}]
-            result = agent._handle_max_iterations(messages, 1)
-
-        assert result == "Recovered summary"
-        assert gate_calls == 3
-        assert compress.call_args.kwargs["trigger"] == "pre_send_fit_recovery"
-        assert sum(
-            message.get("content") == MAX_ITERATIONS_SUMMARY_REQUEST
-            for message in messages
-        ) == 1
-        assert agent.client.chat.completions.create.call_count == 1
-
-    @pytest.mark.parametrize("in_place", [True, False])
-    def test_terminal_summary_compaction_rebases_real_session_db(
-        self, agent, monkeypatch, tmp_path, in_place
-    ):
-        from agent.compression_v3 import ContextProjectionUnfit
-        from agent.iteration_budget import IterationBudget
-        from agent.turn_finalizer import finalize_turn
-        from hermes_state import SessionDB
-
-        parent_id = f"terminal-summary-{'in-place' if in_place else 'rotation'}"
-        child_id = f"{parent_id}-child"
-        db = SessionDB(db_path=tmp_path / f"{parent_id}.db")
-        db.create_session(session_id=parent_id, source="test")
-        original = [
-            {"role": "user", "content": "old task"},
-            {"role": "assistant", "content": "old answer"},
-            {"role": "user", "content": "current task"},
-        ]
-        db.append_messages_batch(parent_id, original)
-        messages = db.get_messages_as_conversation(
-            parent_id, include_row_ids=True
-        )
-        conversation_history = list(messages)
-
-        agent._session_db = db
-        agent._session_db_created = True
-        agent.session_id = parent_id
-        agent.max_iterations = 1
-        agent.iteration_budget = IterationBudget(1)
-        assert agent.iteration_budget.consume() is True
-        agent._last_flushed_db_idx = len(messages)
-        agent._flushed_db_message_session_id = parent_id
-        agent._flushed_db_message_ids = {
-            id(message) for message in messages
-        }
-        agent._cached_system_prompt = "policy"
-        agent._compression_safety_margin = 0
-        agent.max_tokens = 64
-        agent.save_trajectories = False
-        agent.client.chat.completions.create.return_value = _mock_response(
-            content="Recovered summary"
-        )
-        monkeypatch.setattr(agent, "_save_session_log", lambda *_a, **_k: None)
-        monkeypatch.setattr(
-            agent, "_cleanup_task_resources", lambda *_a, **_k: None
-        )
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook", lambda *_a, **_k: []
-        )
-
-        gate_calls = 0
-        refusal = ContextProjectionUnfit(CutResult(
-            messages=[],
-            outcome="context_projection_unfit",
-            provider_call_allowed=False,
-            reason="final provider wire payload exceeds safe context budget",
-        ))
-
-        def refuse_once(_agent, request):
-            nonlocal gate_calls
-            gate_calls += 1
-            if gate_calls == 1:
-                raise refusal
-            return dict(request)
-
-        compacted = [
-            {"role": "user", "content": "compacted terminal task"}
-        ]
-
-        def commit_compaction(messages, _system_message, **_kwargs):
-            if in_place:
-                db.archive_and_compact(parent_id, compacted)
-                agent._last_flushed_db_idx = 0
-                agent._flushed_db_message_session_id = parent_id
-                agent._flushed_db_message_ids = set()
-            else:
-                db.publish_compression_child(
-                    parent_session_id=parent_id,
-                    child_session_id=child_id,
-                    source="test",
-                    messages=compacted,
-                    require_compression_lease=False,
-                )
-                agent.session_id = child_id
-                agent._last_flushed_db_idx = len(compacted)
-                agent._flushed_db_message_session_id = child_id
-                agent._flushed_db_message_ids = {
-                    id(message) for message in compacted
-                }
-            agent._last_compression_attempt_recorded = True
-            agent._last_compression_attempt_in_place = in_place
-            agent._last_compaction_in_place = in_place
-            return compacted, "compressed policy"
-
-        with (
-            patch(
-                "agent.compression_v3.prepare_api_request",
-                side_effect=refuse_once,
-            ),
-            patch.object(
-                agent,
-                "_compress_context",
-                side_effect=commit_compaction,
-            ),
-        ):
-            result = finalize_turn(
-                agent,
-                final_response=None,
-                api_call_count=1,
-                interrupted=False,
-                failed=False,
-                messages=messages,
-                conversation_history=conversation_history,
-                effective_task_id="task",
-                turn_id="turn",
-                user_message="current task",
-                original_user_message="current task",
-                _should_review_memory=False,
-                _turn_exit_reason="budget_exhausted",
-            )
-
-        active_session_id = parent_id if in_place else child_id
-        active = db.get_messages(active_session_id)
-        contents = [message.get("content") for message in active]
-        assert result["final_response"].startswith("Recovered summary")
-        assert contents.count("compacted terminal task") == 1
-        assert contents.count("Recovered summary") == 1
-        assert len(active) == 3
-        assert agent._iteration_summary_compaction_recovered is False
-        db.close()
 
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
@@ -3475,10 +2685,6 @@ class TestHandleMaxIterations:
         # Internal history is untouched — the path copies each message.
         assert messages[2]["tool_name"] == "execute_code"
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
-
-
-
-
 
 
     def test_codex_summary_sanitizes_orphan_tool_results(self, agent):
@@ -5004,11 +4210,6 @@ class TestRunConversation:
         assert "truncated by the output length limit" in third_call_messages[-1]["content"]
 
 
-
-
-
-
-
     def test_length_thinking_exhausted_skips_continuation(self, agent):
         """When finish_reason='length' but content is only thinking, skip retries."""
         self._setup_agent(agent)
@@ -5646,9 +4847,6 @@ class TestRunConversation:
         assert agent.client.chat.completions.create.call_count <= 6
 
 
-
-
-
 class TestHookPayloadSanitizesSimpleNamespace:
     """Regression: ``_hook_jsonable`` referenced ``SimpleNamespace`` without
     importing it, so sanitizing any hook payload that contained one raised
@@ -6110,11 +5308,6 @@ class TestCredentialPoolRecovery:
         agent._swap_credential.assert_called_once_with(next_entry)
 
 
-
-
-
-
-
     def test_extract_api_error_context_uses_reset_timestamp_and_reason(self, agent):
         response = SimpleNamespace(headers={})
         error = SimpleNamespace(
@@ -6151,8 +5344,6 @@ class TestCredentialPoolRecovery:
         assert context["message"] == "The usage limit has been reached"
 
 
-
-
 class TestMaxTokensParam:
     """Verify _max_tokens_param returns the correct key for each provider."""
 
@@ -6162,18 +5353,7 @@ class TestMaxTokensParam:
         assert result == {"max_completion_tokens": 4096}
 
 
-
-
-
-
-
     # ── Model-name fallback for non-openai.com endpoints serving newer families ──
-
-
-
-
-
-
 
 
 class TestGpt5ApiModeRouting:
@@ -6322,8 +5502,6 @@ class TestSafeWriter:
         assert inner.getvalue() == "hello"
 
 
-
-
     def test_installed_in_run_conversation(self, agent):
         """run_conversation installs _SafeWriter on stdio."""
         import sys
@@ -6347,9 +5525,6 @@ class TestSafeWriter:
 
     # test_installed_before_init_time_honcho_error_prints removed —
     # Honcho integration extracted to plugin (PR #4154).
-
-
-
 
 
 # ===================================================================
@@ -6524,10 +5699,6 @@ def test_quiet_spinner_allowed_with_explicit_print_fn(agent):
         assert agent._should_start_quiet_spinner() is True
 
 
-
-
-
-
 def test_is_openai_client_closed_honors_custom_client_flag():
     assert AIAgent._is_openai_client_closed(SimpleNamespace(is_closed=True)) is True
     assert AIAgent._is_openai_client_closed(SimpleNamespace(is_closed=False)) is False
@@ -6558,8 +5729,6 @@ def test_is_openai_client_closed_handles_method_form():
     # Method returning True - client is closed
     closed_client = MethodFormClient(closed=True)
     assert AIAgent._is_openai_client_closed(closed_client) is True
-
-
 
 
 class TestAnthropicBaseUrlPassthrough:
@@ -6681,9 +5850,6 @@ class TestAnthropicCredentialRefresh:
         agent._anthropic_client.messages.stream.assert_called_once_with(model="claude-sonnet-4-20250514")
         agent._anthropic_client.messages.create.assert_called_once_with(model="claude-sonnet-4-20250514")
         assert result is response
-
-
-
 
 
 # ===================================================================
@@ -7206,13 +6372,9 @@ class TestStreamingApiCall:
                 agent._interruptible_streaming_api_call({"messages": []})
 
 
-
-
 # ===================================================================
 # Interrupt _vprint force=True verification
 # ===================================================================
-
-
 
 
 # ===================================================================
@@ -7421,6 +6583,43 @@ class TestReasoningReplayForStrictProviders:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    @pytest.mark.parametrize("summary_path", [False, True])
+    def test_outbound_image_eviction_keeps_durable_history(self, agent, summary_path):
+        from copy import deepcopy
+        from agent.context_compressor import _MAX_KEEP_TOOL_IMAGES, _tool_content_has_images
+
+        self._setup_agent(agent)
+        history = [{"role": "user", "content": "Inspect the screenshots"}]
+        for i in range(_MAX_KEEP_TOOL_IMAGES + 2):
+            history.extend([
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": f"shot{i}", "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": f"shot{i}", "content": [
+                    {"type": "text", "text": f"Screenshot {i}"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZAAAAABJRU5ErkJggg=="}},
+                ]},
+            ])
+        original = deepcopy(history)
+        agent.client.chat.completions.create.return_value = _mock_response(content="done", finish_reason="stop")
+        with (
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_provider_supports_vision_tool_messages", return_value=True),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            if summary_path:
+                assert agent._handle_max_iterations(history, 5) == "done"
+            else:
+                assert agent.run_conversation("Continue", conversation_history=history)["completed"]
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        images = [m for m in sent if m.get("role") == "tool" and _tool_content_has_images(m.get("content"))]
+        assert [m["tool_call_id"] for m in images] == [f"shot{i}" for i in range(2, _MAX_KEEP_TOOL_IMAGES + 2)]
+        # Summary adds its request, but all original transcript rows stay exact.
+        assert history[:len(original)] == original
+
     def test_kimi_tool_replay_includes_space_reasoning_content(self, agent):
         self._setup_agent(agent)
         agent.base_url = "https://api.kimi.com/coding/v1"
@@ -7517,8 +6716,6 @@ class TestVprintForceOnErrors:
         with patch("builtins.print", side_effect=lambda *a, **kw: printed.append(a)):
             agent._vprint("error msg", force=True)
         assert len(printed) == 1
-
-
 
 
 class TestNormalizeCodexDictArguments:
@@ -7677,9 +6874,6 @@ class TestMemoryNudgeCounterPersistence:
         assert hasattr(a, "_iters_since_skill")
         assert a._turns_since_memory == 0
         assert a._iters_since_skill == 0
-
-
-
 
 
 class TestSupportsReasoningExtraBody:

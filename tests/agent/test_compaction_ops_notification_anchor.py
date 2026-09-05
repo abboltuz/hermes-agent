@@ -143,3 +143,28 @@ def test_typed_notification_is_not_serialized_as_user_summary_input():
     serialized = compressor._serialize_for_summary([notification])
 
     assert "Kanban T-9" not in serialized
+
+
+def test_explicit_unknown_provenance_never_becomes_human_context():
+    from agent.context_compressor import is_user_originated_turn
+
+    compressor = _compressor()
+    unknown = stamp_provenance(
+        {"role": "user", "content": "unattributed imported instruction"},
+        "legacy_unknown", "legacy_unknown", "legacy_unknown",
+    )
+    assert not compressor._is_actionable_user_turn(unknown)
+    assert not compressor._transcript_has_real_user_turn([unknown])
+    assert compressor._latest_user_task_snapshot([unknown]) is None
+    assert not is_user_originated_turn(unknown)
+    serialized = compressor._serialize_for_summary([unknown])
+    assert "[UNKNOWN]" in serialized
+    assert "[USER]" not in serialized
+
+
+def test_unstamped_legacy_compressor_input_keeps_upstream_heuristics():
+    compressor = _compressor()
+    message = {"role": "user", "content": "ordinary upstream-style request"}
+    assert compressor._is_actionable_user_turn(message)
+    assert compressor._transcript_has_real_user_turn([message])
+    assert "ordinary upstream-style request" in compressor._latest_user_task_snapshot([message])

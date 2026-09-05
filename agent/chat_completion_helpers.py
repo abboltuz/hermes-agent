@@ -939,9 +939,6 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
-    from agent.compression_v3 import prepare_api_request
-
-    api_kwargs = prepare_api_request(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -2881,6 +2878,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        from agent.native_compaction import resolve_native_compaction_capabilities
+        agent.runtime_capabilities = resolve_native_compaction_capabilities(
+            model=agent.model,
+            base_url=agent.base_url,
+            provider=fb_provider,
+            is_codex_backend=fb_provider == "openai-codex",
+        )
         return True
     except Exception as e:
         if fb_provider == "nous":
@@ -2890,19 +2894,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(
-    agent,
-    messages: list,
-    api_call_count: int,
-    *,
-    _fit_recovery_attempt: int = 0,
-) -> str:
+def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    if _fit_recovery_attempt == 0:
-        # Per-invocation handoff consumed by turn_finalizer. Strictly reset it
-        # so a cached gateway agent can never reuse a prior turn's baseline.
-        agent._iteration_summary_compaction_recovered = False
-        agent._iteration_summary_compression_history = None
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (hermes chat -Q, oneshot, background
@@ -2924,17 +2917,10 @@ def handle_max_iterations(
     summary_call_outcome = "failed"
 
     def _managed_summary_call(request, callback, *, retry_count: int):
-        """Gate the final provider-shaped summary wire before dispatch."""
         from agent import relay_llm
-        from agent.compression_v3 import prepare_api_request
 
-        # This is deliberately inside the managed callback boundary: provider
-        # adapters may have added route-specific fields (Responses input,
-        # Anthropic system blocks, or nested Bedrock controls) since the
-        # canonical projection was prepared.
-        prepared_request = prepare_api_request(agent, request)
         return relay_llm.execute_current(
-            prepared_request,
+            request,
             callback,
             name=str(getattr(agent, "provider", "") or "provider"),
             model_name=str(getattr(agent, "model", "") or ""),
@@ -3029,39 +3015,23 @@ def handle_max_iterations(
         # "No tool call found for function call output".
         api_messages = agent._sanitize_api_messages(api_messages)
 
+        # Same send-path vision eviction as the main loop (#89296).
+        from agent.context_compressor import evict_stale_outbound_tool_images
+        evict_stale_outbound_tool_images(api_messages)
+
         # Same safety net as the main loop: drop thinking-only assistant
         # turns so Anthropic-family providers don't 400 the summary call.
         # _thinking_prefill must survive until here so the drop pass can
         # recognize stubs after reasoning fields are stripped.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
-        # Remove legacy schema-foreign scaffolding, but retain the v3 sidecars
-        # that the canonical fit gate needs for durable recovery binding.
+        # Strip all remaining underscore-prefixed scaffolding keys before the
+        # wire. The summary path calls chat.completions.create() directly,
+        # bypassing the transport's universal underscore-key sweeper.
         for api_msg in api_messages:
-            if not isinstance(api_msg, dict):
-                continue
-            for internal_key in [
-                key for key in api_msg
-                if isinstance(key, str)
-                and key.startswith("_")
-                and key not in {"_row_id", "_db_persisted"}
-                and not key.startswith(("_compression", "_micro_compact"))
-            ]:
-                api_msg.pop(internal_key, None)
-
-        # Keep recovery sidecars in this in-process canonical projection until
-        # prepare_api_request performs the deterministic cut and binds durable
-        # row identity. That function returns a provider-safe copy, so source
-        # transcript rows remain lossless while no private fields reach a SDK.
-        def _prepare_canonical_summary_messages() -> list:
-            """Fit the canonical Chat history before route transformation."""
-            from agent.compression_v3 import prepare_api_request
-
-            canonical_request = {"messages": api_messages}
-            if agent.max_tokens is not None:
-                canonical_request.update(agent._max_tokens_param(agent.max_tokens))
-            prepared = prepare_api_request(agent, canonical_request)
-            return prepared["messages"]
+            if isinstance(api_msg, dict):
+                for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
+                    api_msg.pop(internal_key, None)
 
         summary_extra_body = {}
         try:
@@ -3102,14 +3072,9 @@ def handle_max_iterations(
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            summary_messages = _prepare_canonical_summary_messages()
-            codex_kwargs = agent._build_api_kwargs(summary_messages)
+            codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = _managed_summary_call(
-                codex_kwargs,
-                lambda request: agent._run_codex_stream(request),
-                retry_count=0,
-            )
+            summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -3177,11 +3142,10 @@ def handle_max_iterations(
                 summary_kwargs["extra_body"] = summary_extra_body
 
             if agent.api_mode == "anthropic_messages":
-                summary_messages = _prepare_canonical_summary_messages()
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(
                     model=agent.model,
-                    messages=summary_messages,
+                    messages=api_messages,
                     tools=None,
                     max_tokens=agent.max_tokens,
                     reasoning_config=agent.reasoning_config,
@@ -3198,8 +3162,6 @@ def handle_max_iterations(
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
-                summary_messages = _prepare_canonical_summary_messages()
-                summary_kwargs["messages"] = summary_messages
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
@@ -3225,23 +3187,17 @@ def handle_max_iterations(
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                summary_messages = _prepare_canonical_summary_messages()
-                codex_kwargs = agent._build_api_kwargs(summary_messages)
+                codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = _managed_summary_call(
-                    codex_kwargs,
-                    lambda request: agent._run_codex_stream(request),
-                    retry_count=1,
-                )
+                retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()
             elif agent.api_mode == "anthropic_messages":
-                summary_messages = _prepare_canonical_summary_messages()
                 _tretry = agent._get_transport()
                 _ant_kw2 = _tretry.build_kwargs(
                     model=agent.model,
-                    messages=summary_messages,
+                    messages=api_messages,
                     tools=None,
                     is_oauth=agent._is_anthropic_oauth,
                     max_tokens=agent.max_tokens,
@@ -3258,10 +3214,9 @@ def handle_max_iterations(
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
             else:
-                summary_messages = _prepare_canonical_summary_messages()
                 summary_kwargs = {
                     "model": agent.model,
-                    "messages": summary_messages,
+                    "messages": api_messages,
                 }
                 if _summary_temperature is not None:
                     summary_kwargs["temperature"] = _summary_temperature
@@ -3298,115 +3253,6 @@ def handle_max_iterations(
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        from agent.compression_v3 import ContextProjectionUnfit
-
-        if isinstance(e, ContextProjectionUnfit):
-            from agent.conversation_compression import (
-                PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE,
-                compression_skipped_due_to_lock,
-                conversation_history_after_compression,
-                wait_for_concurrent_compression,
-            )
-
-            max_attempts = int(
-                getattr(agent, "max_compression_attempts", 3) or 0
-            )
-            if (
-                getattr(agent, "compression_enabled", True)
-                and _fit_recovery_attempt < max_attempts
-            ):
-                wire_tokens = getattr(e, "estimated_input_tokens", None)
-                if not isinstance(wire_tokens, int) or wire_tokens <= 0:
-                    wire_tokens = estimate_request_context_tokens(
-                        {"messages": api_messages}
-                    )
-                safe_budget = getattr(e, "safe_input_budget", None)
-                if not isinstance(safe_budget, int) or safe_budget < 0:
-                    safe_budget = int(
-                        getattr(
-                            getattr(agent, "context_compressor", None),
-                            "threshold_tokens",
-                            0,
-                        )
-                        or 0
-                    )
-                emit_status = getattr(agent, "_emit_status", None)
-                if callable(emit_status):
-                    emit_status(
-                        PROVIDER_WIRE_COMPRESSION_STATUS_TEMPLATE.format(
-                            tokens=wire_tokens,
-                            budget=safe_budget,
-                        )
-                    )
-                logger.info(
-                    "iteration-summary wire pressure triggered auto-compaction: "
-                    "estimated_input=%s safe_input=%s attempt=%d/%d",
-                    wire_tokens,
-                    safe_budget,
-                    _fit_recovery_attempt + 1,
-                    max_attempts,
-                )
-
-                # The summary nudge is runtime-only and this invocation will
-                # append it again after recovery. Remove it before compacting
-                # so retries never accumulate duplicate synthetic user turns.
-                if (
-                    messages
-                    and isinstance(messages[-1], dict)
-                    and messages[-1].get("content") == MAX_ITERATIONS_SUMMARY_REQUEST
-                    and messages[-1].get("display_kind") == "hidden"
-                ):
-                    messages.pop()
-                pressure_input = messages
-                recovered, _active_system_prompt = agent._compress_context(
-                    messages,
-                    None,
-                    approx_tokens=wire_tokens,
-                    trigger="pre_send_fit_recovery",
-                )
-                if (
-                    recovered is pressure_input
-                    and compression_skipped_due_to_lock(agent)
-                ):
-                    recovered = wait_for_concurrent_compression(agent, messages)
-                    if recovered is None:
-                        return (
-                            "I reached the iteration limit while context "
-                            "compaction was still completing. The conversation "
-                            "was preserved, but no final summary was generated."
-                        )
-                # Keep the caller-owned transcript object authoritative even
-                # when compaction returns a replacement projection.
-                messages[:] = list(recovered)
-                previous_history = getattr(
-                    agent, "_iteration_summary_compression_history", None
-                )
-                agent._iteration_summary_compression_history = (
-                    conversation_history_after_compression(
-                        agent,
-                        messages,
-                        previous_history,
-                    )
-                )
-                agent._iteration_summary_compaction_recovered = True
-                return handle_max_iterations(
-                    agent,
-                    messages,
-                    api_call_count,
-                    _fit_recovery_attempt=_fit_recovery_attempt + 1,
-                )
-
-            logger.error(
-                "iteration-summary request remained unfit after %d automatic "
-                "compaction attempts: %s",
-                _fit_recovery_attempt,
-                e,
-            )
-            return (
-                "I reached the iteration limit, but the final summary request "
-                "could not fit after automatic context compaction. The "
-                "conversation was preserved."
-            )
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
@@ -3519,10 +3365,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     """
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
-
-    from agent.compression_v3 import prepare_api_request
-
-    api_kwargs = prepare_api_request(agent, api_kwargs)
 
     def _stream_final_text(response) -> str:
         try:
