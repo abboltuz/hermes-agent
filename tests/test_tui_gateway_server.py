@@ -3574,11 +3574,6 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         )
 
         assert first["result"]["hydrating"] is True
-        assert first["result"]["preparation"] == {
-            "attempt": 1,
-            "phase": "history",
-            "status": "preparing",
-        }
         assert first["result"]["messages"] == []
         assert first["result"]["message_count"] == 1200
         assert history_started.wait(timeout=1.0)
@@ -3602,12 +3597,6 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         assert server._sessions[sid]["history"] == [loaded]
         assert server._sessions[sid]["display_history_prefix"] == [ancestor]
         assert server._sessions[sid]["resume_message_count"] == 2
-        assert server._sessions[sid]["resume_preparation"] == {
-            "attempt": 1,
-            "message_count": 2,
-            "phase": "history",
-            "status": "ready",
-        }
         assert auto_continue_calls == [(sid, server._sessions[sid], "large-session")]
     finally:
         release_history.set()
@@ -3619,260 +3608,9 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
                 server._sessions.pop(sid, None)
 
 
-@pytest.mark.parametrize("oversized", [False, True])
-def test_deferred_resume_acknowledges_before_materialization_guard(monkeypatch, oversized):
-    from hermes_state import SessionResumeTooLargeError
-
-    guard_started = threading.Event()
-    release_guard = threading.Event()
-    response_ready = threading.Event()
-    finished = threading.Event()
-    reads = []
-    response = {}
-
-    class GuardedDB:
-        def get_session_for_resume(self, target):
-            return {"id": target, "message_count": 100000 if oversized else 2}
-
-        def get_session(self, target):
-            # Teardown may inspect lifecycle metadata after the worker exits;
-            # forbid the heavy read specifically during acknowledgement.
-            assert release_guard.is_set(), "acknowledgement read full metadata"
-            return self.get_session_for_resume(target)
-
-        def resolve_resume_session_id(self, target):
-            return target
-
-        def assert_resume_safe(self, _target):
-            guard_started.set()
-            assert release_guard.wait(timeout=3)
-            if oversized:
-                raise SessionResumeTooLargeError(100000, 20000)
-
-        def reopen_session(self, target):
-            reads.append(("reopen", target))
-
-        def get_resume_conversations(self, target):
-            raise AssertionError("model-only hydration loaded display lineage")
-
-        def get_ancestor_display_prefix(self, _target):
-            raise AssertionError("model-only hydration loaded ancestor prefix")
-
-        def get_model_resume_conversation(self, target):
-            reads.append(("model", target))
-            return []
-
-    def emitted(event, _sid, payload):
-        if event == "session.resume_progress" and payload.get("status") in {"complete", "failed"}:
-            finished.set()
-
-    monkeypatch.setattr(server, "_get_db", lambda: GuardedDB())
-    monkeypatch.setattr(server, "_emit", emitted)
-    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_lazy_resume_info", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
-    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
-
-    def request():
-        response.update(server._methods["session.resume"]("open", {
-            "session_id": "guarded-chat", "source": "desktop",
-            "defer_history": True, "omit_messages": True,
-        }))
-        response_ready.set()
-
-    caller = threading.Thread(target=request)
-    caller.start()
-    try:
-        assert guard_started.wait(timeout=1)
-        assert response_ready.wait(timeout=1), "opening waited for the history guard"
-        assert response["result"]["hydrating"] is True
-        assert reads == []
-        release_guard.set()
-        assert finished.wait(timeout=1)
-        assert reads == ([] if oversized else [("reopen", "guarded-chat"), ("model", "guarded-chat")])
-    finally:
-        release_guard.set()
-        caller.join(timeout=3)
-
-
-def test_model_only_deferred_resume_preserves_compacted_summary_marker(
-    monkeypatch, tmp_path
-):
-    """The Desktop fast path must hydrate the exact model-facing projection."""
-    from hermes_state import SessionDB
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("compacted-chat", source="tui")
-    db.append_message("compacted-chat", "user", "old question")
-    db.append_message("compacted-chat", "assistant", "old answer")
-    db.archive_and_compact(
-        "compacted-chat",
-        [
-            {
-                "role": "user",
-                "content": "durable summary",
-                "_compressed_summary": True,
-            }
-        ],
-    )
-
-    sid = "live-compacted-chat"
-    ready = threading.Event()
-    session = _session(
-        session_key="compacted-chat",
-        resume_hydrating=True,
-        resume_history_ready=ready,
-        agent_ready=threading.Event(),
-        resume_message_count=1,
-        resume_preparation={
-            "attempt": 1,
-            "phase": "history",
-            "status": "preparing",
-        },
-    )
-    server._sessions[sid] = session
-    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
-
-    try:
-        server._schedule_resume_hydration(
-            sid, "compacted-chat", db, model_only=True
-        )
-        assert ready.wait(timeout=2.0)
-        assert session["resume_preparation"]["status"] == "ready"
-        assert session["history"][0]["content"] == "durable summary"
-        assert session["history"][0]["_compressed_summary"] is True
-        assert session["display_history_prefix"] == []
-    finally:
-        server._sessions.pop(sid, None)
-        db.close()
-
-
-def test_model_only_deferred_resume_hard_compacts_oversized_tip(
-    monkeypatch, tmp_path
-):
-    from hermes_state import (
-        SessionDB,
-        SessionExportTooLargeError,
-        SessionResumeTooLargeError,
-    )
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("oversized-chat", source="tui")
-    db.append_messages_batch(
-        "oversized-chat",
-        [
-            {
-                "role": "user" if index % 2 == 0 else "assistant",
-                "content": f"turn-{index}",
-                **(HUMAN_PROVENANCE if index % 2 == 0 else {}),
-            }
-            for index in range(30)
-        ],
-    )
-
-    def ten_row_guard(db_handle, stored_id, *_args, **_kwargs):
-        try:
-            db_handle.assert_export_safe(stored_id, max_messages=10)
-        except SessionExportTooLargeError as exc:
-            raise SessionResumeTooLargeError(
-                exc.message_count,
-                10,
-                scope="in its model-facing working segment",
-            ) from exc
-
-    monkeypatch.setattr(server, "_assert_session_resume_safe", ten_row_guard)
-    monkeypatch.setattr(
-        server,
-        "_resume_hard_summary_callback",
-        lambda _session: (lambda _batch, _previous: "rolling bounded summary"),
-    )
-    emitted = []
-    monkeypatch.setattr(
-        server, "_emit", lambda event, _sid, payload: emitted.append((event, payload))
-    )
-    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_args: None)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
-
-    sid = "live-oversized-chat"
-    ready = threading.Event()
-    session = _session(
-        session_key="oversized-chat",
-        resume_hydrating=True,
-        resume_history_ready=ready,
-        agent_ready=threading.Event(),
-        resume_message_count=30,
-        resume_preparation={
-            "attempt": 1,
-            "phase": "history",
-            "status": "preparing",
-        },
-    )
-    server._sessions[sid] = session
-    try:
-        server._schedule_resume_hydration(
-            sid, "oversized-chat", db, model_only=True
-        )
-        assert ready.wait(timeout=3.0)
-        assert session["resume_preparation"]["status"] == "ready"
-        assert len(session["history"]) <= 5
-        assert session["history"][0]["_compressed_summary"] is True
-        assert any(
-            event == "session.resume_progress"
-            and payload.get("phase") == "compaction"
-            for event, payload in emitted
-        )
-        raw = db.get_messages("oversized-chat", include_inactive=True)
-        assert sum(row["compacted"] == 1 for row in raw) >= 30
-    finally:
-        server._sessions.pop(sid, None)
-        db.close()
-
-
-def test_model_only_hard_compaction_honors_required_checkpoint(
-    monkeypatch, tmp_path
-):
-    from hermes_state import SessionDB, SessionResumeTooLargeError
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("checkpoint-chat", source="tui")
-    db.append_message("checkpoint-chat", "user", "must remain", **HUMAN_PROVENANCE)
-    monkeypatch.setattr(
-        server,
-        "_load_cfg",
-        lambda: {"compression": {"checkpoint_required": True}},
-    )
-
-    sid = "live-checkpoint-chat"
-    session = _session(
-        session_key="checkpoint-chat",
-        resume_preparation={"attempt": 1, "phase": "history", "status": "preparing"},
-    )
-    server._sessions[sid] = session
-    try:
-        with pytest.raises(RuntimeError, match="BLOCKED_MISSING_PREREQUISITE"):
-            server._recover_oversized_model_resume(
-                sid,
-                session,
-                "checkpoint-chat",
-                db,
-                SessionResumeTooLargeError(11, 10),
-                attempt=1,
-            )
-        assert db.get_messages("checkpoint-chat")[0]["content"] == "must remain"
-    finally:
-        server._sessions.pop(sid, None)
-        db.close()
-
-
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     first_released = threading.Event()
-    retry_started = threading.Event()
-    release_retry = threading.Event()
     build_started = threading.Event()
-    emitted = []
     attempts = 0
 
     class FakeDB:
@@ -3885,19 +3623,14 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
         def reopen_session(self, _target):
             pass
 
-        def get_model_resume_conversation(self, _target):
+        def get_resume_conversations(self, _target):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
                 first_released.set()
                 raise RuntimeError("sqlite read failed")
-            retry_started.set()
-            assert release_retry.wait(timeout=2.0)
             loaded = [{"role": "user", "content": "retry loaded"}]
-            return loaded
-
-        def get_resume_conversations(self, _target):
-            raise AssertionError("model-only retry loaded display lineage")
+            return loaded, loaded
 
         def get_ancestor_display_prefix(self, _target):
             return []
@@ -3911,11 +3644,6 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
         ),
     )
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(
-        server,
-        "_emit",
-        lambda event, sid, payload: emitted.append((event, sid, payload)),
-    )
     monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
     monkeypatch.setattr(
         server,
@@ -3926,296 +3654,27 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     try:
         first = server._methods["session.resume"](
             "r1",
-            {
-                "session_id": "retry-session",
-                "defer_history": True,
-                "omit_messages": True,
-            },
+            {"session_id": "retry-session", "defer_history": True},
         )
         first_sid = first["result"]["session_id"]
         assert first_released.wait(timeout=1.0)
-        first_session = server._sessions[first_sid]
-        assert first_session["resume_history_ready"].wait(timeout=1.0)
-        assert first_session["resume_preparation"] == {
-            "attempt": 1,
-            "message": "resume failed: sqlite read failed",
-            "phase": "history",
-            "status": "preparation_failed",
-        }
-        assert (
-            "error",
-            first_sid,
-            {
-                "kind": "session_preparation",
-                "message": "resume failed: sqlite read failed",
-            },
-        ) in emitted
+        assert first_sid not in server._sessions
 
         second = server._methods["session.resume"](
             "r2",
-            {
-                "session_id": "retry-session",
-                "defer_history": True,
-                "omit_messages": True,
-            },
+            {"session_id": "retry-session", "defer_history": True},
         )
-        assert second["result"]["session_id"] == first_sid
-        assert second["result"]["preparation"]["status"] == "preparation_failed"
-        assert second["result"]["status"] == "preparation_failed"
-        assert second["result"]["hydrating"] is False
-
-        retry = server._methods["session.resume.retry"](
-            "r3", {"session_id": first_sid}
-        )
-        assert retry["result"] == {
-            "session_id": first_sid,
-            "preparation": {
-                "attempt": 2,
-                "phase": "history",
-                "status": "preparing",
-            },
-        }
-        assert retry_started.wait(timeout=1.0)
-
-        duplicate_retry = server._methods["session.resume.retry"](
-            "r4", {"session_id": first_sid}
-        )
-        assert duplicate_retry["result"]["preparation"]["attempt"] == 2
-        assert attempts == 2
-
-        release_retry.set()
-        assert first_session["resume_history_ready"].wait(timeout=1.0)
+        second_sid = second["result"]["session_id"]
+        assert second_sid != first_sid
+        assert server._sessions[second_sid]["resume_history_ready"].wait(timeout=1.0)
         assert build_started.wait(timeout=1.0)
-        assert first_session["resume_preparation"] == {
-            "attempt": 2,
-            "message_count": 1,
-            "phase": "history",
-            "status": "ready",
-        }
     finally:
-        release_retry.set()
         for sid, session in list(server._sessions.items()):
             if session.get("session_key") == "retry-session":
                 lease = session.get("active_session_lease")
                 if lease is not None:
                     lease.release()
                 server._sessions.pop(sid, None)
-
-
-def test_stale_agent_build_waiter_cannot_poison_retry_generation():
-    old_history_ready = threading.Event()
-    old_agent_ready = threading.Event()
-    sid = "retry-build-generation"
-    session = {
-        "agent_build_generation": 0,
-        "agent_ready": old_agent_ready,
-        "history_lock": threading.Lock(),
-        "resume_history_ready": old_history_ready,
-        "session_key": "retry-build-generation-stored",
-    }
-    server._sessions[sid] = session
-
-    try:
-        server._start_agent_build(sid, session)
-        assert session["agent_build_started"] is True
-
-        # Mirror session.resume.retry installing a new generation before the
-        # old preparation waiter unwinds with its failure.
-        session["agent_build_generation"] = 1
-        session["agent_build_started"] = False
-        session["agent_ready"] = threading.Event()
-        session["resume_history_error"] = "old preparation failed"
-        old_history_ready.set()
-
-        assert old_agent_ready.wait(timeout=1.0)
-        assert session.get("agent_error") is None
-        assert session["agent_ready"].is_set() is False
-    finally:
-        old_history_ready.set()
-        server._sessions.pop(sid, None)
-
-
-def test_prompt_waiter_never_treats_replaced_ready_event_as_agent_success():
-    new_ready = threading.Event()
-    new_ready.set()
-    sid = "retry-prompt-wait-generation"
-    session = {
-        "agent": None,
-        "agent_build_generation": 0,
-        "agent_error": "old preparation failed",
-        "history_lock": threading.Lock(),
-        "running": True,
-    }
-
-    class _OldReady:
-        def wait(self, timeout=None):
-            # Exact race: the failed generation wakes this waiter, then retry
-            # replaces the Event and clears its error before the waiter can
-            # inspect the result.
-            with session["history_lock"]:
-                session["agent_build_generation"] = 1
-                session["agent_ready"] = new_ready
-                session["agent_error"] = None
-            return True
-
-        def is_set(self):
-            return True
-
-    session["agent_ready"] = _OldReady()
-
-    err = server._wait_agent_for_prompt(session, "rid", sid)
-
-    assert err is not None
-    assert "without an agent" in err["error"]["message"]
-
-
-def test_superseded_agent_build_closes_exact_agent_and_profile_db(monkeypatch, tmp_path):
-    sid = "superseded-agent-build"
-    ready = threading.Event()
-    history_ready = threading.Event()
-    history_ready.set()
-    closed = {"agent": 0, "db": 0}
-    created = {}
-
-    class _DB:
-        def __init__(self, db_path=None):
-            self.db_path = db_path
-
-        def close(self):
-            closed["db"] += 1
-
-    class _Agent:
-        def __init__(self, db):
-            self._session_db = db
-
-        def close(self):
-            closed["agent"] += 1
-            if getattr(self, "_owns_session_db", False):
-                self._session_db.close()
-
-    session = {
-        "agent": None,
-        "agent_build_generation": 0,
-        "agent_error": None,
-        "agent_ready": ready,
-        "history": [],
-        "history_lock": threading.Lock(),
-        "resume_history_ready": history_ready,
-        "session_key": "superseded-stored",
-        "profile_home": str(tmp_path),
-        "source": "desktop",
-    }
-    server._sessions[sid] = session
-
-    def _make_agent(_sid, _key, **kwargs):
-        agent = _Agent(kwargs["session_db"])
-        created["agent"] = agent
-        with session["history_lock"]:
-            session["agent_build_generation"] = 1
-        return agent
-
-    monkeypatch.setattr("hermes_state.SessionDB", _DB)
-    monkeypatch.setattr(server, "_make_agent", _make_agent)
-    monkeypatch.setattr(server, "_set_session_context", lambda _key: None)
-    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
-    monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: None)
-    monkeypatch.setattr(server, "reset_hermes_home_override", lambda _token: None)
-    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
-
-    try:
-        server._start_agent_build(sid, session)
-        assert ready.wait(timeout=1.0)
-
-        assert created["agent"] is not None
-        assert session["agent"] is None
-        assert closed == {"agent": 1, "db": 1}
-    finally:
-        server._sessions.pop(sid, None)
-
-
-def test_published_agent_owns_profile_db_before_concurrent_close(monkeypatch, tmp_path):
-    sid = "published-agent-close-race"
-    ready = threading.Event()
-    published = threading.Event()
-    release_build = threading.Event()
-    closed = {"agent": 0}
-    dbs = []
-
-    class _DB:
-        def __init__(self, db_path=None):
-            self.db_path = db_path
-            self.closed = 0
-            dbs.append(self)
-
-        def close(self):
-            self.closed += 1
-
-    class _Agent:
-        model = "test"
-
-        def __init__(self, db):
-            self._session_db = db
-
-        def close(self):
-            closed["agent"] += 1
-            if getattr(self, "_owns_session_db", False):
-                self._session_db.close()
-
-    session = {
-        "agent": None,
-        "agent_build_generation": 0,
-        "agent_error": None,
-        "agent_ready": ready,
-        "history": [],
-        "history_lock": threading.Lock(),
-        "session_key": "published-stored",
-        "profile_home": str(tmp_path),
-        "source": "desktop",
-    }
-    server._sessions[sid] = session
-
-    monkeypatch.setattr("hermes_state.SessionDB", _DB)
-    monkeypatch.setattr(
-        server,
-        "_make_agent",
-        lambda _sid, _key, **kwargs: _Agent(kwargs["session_db"]),
-    )
-    monkeypatch.setattr(server, "_set_session_context", lambda _key: None)
-    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
-    monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: None)
-    monkeypatch.setattr(server, "reset_hermes_home_override", lambda _token: None)
-    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
-    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
-    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
-    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
-    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
-    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
-    monkeypatch.setattr(server, "_emit", lambda *_args: None)
-
-    def _after_publish():
-        assert session["agent"] is not None
-        assert getattr(session["agent"], "_owns_session_db", False) is True
-        published.set()
-        assert release_build.wait(timeout=2.0)
-        return ("", "")
-
-    monkeypatch.setattr(server, "_config_model_target", _after_publish)
-
-    try:
-        server._start_agent_build(sid, session)
-        assert published.wait(timeout=1.0)
-
-        assert server._close_session_by_id(sid) is True
-        assert closed == {"agent": 1}
-        assert dbs[0].closed == 1
-
-        release_build.set()
-        assert ready.wait(timeout=1.0)
-        assert closed == {"agent": 1}
-        assert dbs[0].closed == 1
-    finally:
-        release_build.set()
-        server._sessions.pop(sid, None)
 
 
 def test_session_resume_deferred_history_close_cancels_build(monkeypatch):

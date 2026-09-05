@@ -2499,46 +2499,6 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect($messages.get()).toHaveLength(500)
   })
 
-  it('does not regress an event-ready primary session when the resume acknowledgement arrives later', async () => {
-    setSessions([storedSession({ id: 'stored-race', message_count: 42 })])
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-race' } as never)
-    const response = deferred<SessionResumeResponse>()
-
-    const requestGateway = <T,>(method: string): Promise<T> =>
-      (method === 'session.resume' ? response.promise : Promise.resolve({})) as Promise<T>
-
-    const states: MutableRefObject<Map<string, ClientSessionState>> = { current: new Map() }
-    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
-
-    render(
-      <ResumeHarness
-        onReady={value => (resume = value)}
-        requestGateway={requestGateway}
-        sessionStateByRuntimeIdRef={states}
-      />
-    )
-
-    await waitFor(() => expect(resume).not.toBeNull())
-    const opening = resume!('stored-race', true)
-
-    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalled())
-    states.current.set('live-race', {
-      ...createClientSessionState('stored-race'),
-      preparation: { attempt: 1, message_count: 42, phase: 'history', status: 'ready' }
-    })
-    response.resolve({
-      session_id: 'live-race',
-      resumed: 'stored-race',
-      message_count: 42,
-      messages: [],
-      preparation: { attempt: 1, phase: 'history', status: 'preparing' },
-      info: {}
-    })
-
-    await opening
-    expect(states.current.get('live-race')?.preparation?.status).toBe('ready')
-  })
-
   it('keeps REST history after resume rejection and grafts a later runtime projection', async () => {
     const persisted = Array.from({ length: 3 }, (_, index) => ({
       content: `persisted-${index}`,

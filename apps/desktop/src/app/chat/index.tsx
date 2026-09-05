@@ -15,8 +15,7 @@ import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { $sessionTileDragging, $sessionTileEdgeHover } from '@/components/pane-shell/tree/store'
 import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
-import { ErrorBanner, ErrorState } from '@/components/ui/error-state'
-import { Loader } from '@/components/ui/loader'
+import { ErrorState } from '@/components/ui/error-state'
 import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import { type HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -30,7 +29,6 @@ import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
-import { notifyError } from '@/store/notifications'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
@@ -105,7 +103,6 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onRestoreToMessage?: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
-  onRetryPreparation: (runtimeSessionId: string) => Promise<void> | void
   onRetryResume: (sessionId: string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   onDismissError?: (messageId: string) => void
@@ -456,7 +453,6 @@ const ChatViewContent = memo(function ChatViewContent({
   onEdit,
   onReload,
   onRestoreToMessage,
-  onRetryPreparation,
   onRetryResume,
   onTranscribeAudio,
   onDismissError
@@ -483,7 +479,6 @@ const ChatViewContent = memo(function ChatViewContent({
   const sessionAnchor = isPrimary ? 'workspace' : `session-tile:${storedId ?? ''}`
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
-  const preparation = useStore(view.$preparation)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
@@ -592,11 +587,6 @@ const ChatViewContent = memo(function ChatViewContent({
   // session can't blank the current one.
   const resumeExhausted = isPrimary && isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
 
-  const preparationBlocked =
-    Boolean(activeSessionId) && Boolean(preparation) && preparation?.status !== 'ready'
-
-  const preparationFailed = preparation?.status === 'preparation_failed'
-
   const loadingSession =
     !resumeExhausted && isRoutedSessionView && (routeSessionMismatch || (messagesEmpty && !activeSessionId))
 
@@ -604,7 +594,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // Hide the composer in the exhausted error state too: there's no live runtime
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
-  const showChatBar = !loadingSession && !resumeExhausted && !preparationBlocked && !isWatchWindow()
+  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
@@ -687,16 +677,6 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const overlayKind: DragKind = dragKind === 'files' ? 'files' : sessionDragging && !sessionEdgeHover ? 'session' : null
 
-  const retryPreparation = useCallback(() => {
-    if (!activeSessionId) {
-      return
-    }
-
-    void Promise.resolve(onRetryPreparation(activeSessionId)).catch(error => {
-      notifyError(error, t.desktop.resumeStrandedTitle)
-    })
-  }, [activeSessionId, onRetryPreparation, t.desktop.resumeStrandedTitle])
-
   return (
     <div
       className={cn(
@@ -750,7 +730,6 @@ const ChatViewContent = memo(function ChatViewContent({
             onCancel={haltRun}
             onDismissError={onDismissError}
             onRestoreToMessage={onRestoreToMessage}
-            readOnly={preparationBlocked}
             sessionId={activeSessionId}
             sessionKey={threadKey}
           />
@@ -787,22 +766,6 @@ const ChatViewContent = memo(function ChatViewContent({
           <ChatDropOverlay kind={overlayKind} />
           <ChatSwapOverlay profile={gatewaySwapTarget} />
         </div>
-        {preparationBlocked && (
-          <div className="shrink-0 space-y-2 border-t border-(--ui-border-subtle) px-4 py-3" role="status">
-            {preparationFailed ? (
-              <>
-                <ErrorBanner>
-                  {t.desktop.historyReadOnly} {preparation?.message}
-                </ErrorBanner>
-                <Button onClick={retryPreparation} size="sm" variant="outline">
-                  {t.desktop.resumeRetry}
-                </Button>
-              </>
-            ) : (
-              <Loader label={t.desktop.historyConnecting} />
-            )}
-          </div>
-        )}
         {/* Composer renders OUTSIDE the contain:[layout paint] wrapper above:
             that wrapper is a containing block for — and clips — position:fixed
             descendants, so the popped-out (fixed) composer would anchor to the
