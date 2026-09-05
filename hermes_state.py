@@ -101,8 +101,6 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
-from hermes_state_context import SessionContextMixin
-from hermes_state_snapshots import SessionSnapshotMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -166,10 +164,6 @@ class SessionResumeTooLargeError(ValueError):
             f"safe resume limit is {limit}. Export the session instead, or set "
             "sessions.max_resume_messages: 0 in config.yaml to disable the guard."
         )
-
-
-class SessionCompactionSourceChangedError(RuntimeError):
-    """A durable source row changed while a compaction was being built."""
 
 
 class SessionExportTooLargeError(ValueError):
@@ -4053,7 +4047,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -9027,20 +9021,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
 
         return self._execute_write(_do) or []
 
-    def get_session_for_resume(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Read navigation/runtime metadata without draining usage writes.
-
-        Opening a chat does not require exact billing counters or its complete
-        system prompt. Keep both the token flush and prompt join off this read
-        path; agent preparation still loads its authoritative runtime state.
-        """
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                f"SELECT {self._compact_session_cols()} FROM sessions s WHERE s.id = ?",
-                (session_id,),
-            ).fetchone()
-        return self._session_row_dict(row) if row else None
-
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         # Cost/usage readers (/status, /usage, gateway endpoints) reach the
@@ -11315,18 +11295,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
             ).fetchone()
         return int(row[0]) if row else 0
 
-    def get_message_mutation_revision(self, session_id: str) -> int:
-        """Return the durable update/delete CAS revision for a transcript."""
-        if not session_id:
-            return 0
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT revision FROM message_mutation_revisions "
-                "WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        return int(row[0]) if row else 0
-
     def register_compression_recovery(
         self, session_id: str, message_ids: List[int], *, generation: int = 0,
         watermark: int = 0, projection_fingerprint: str = "",
@@ -11407,7 +11375,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
-        source_mutation_revision: Optional[int] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -11447,11 +11414,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
 
-        Source-CAS safety: when *source_mutation_revision* is provided, the
-        commit also verifies that no existing message row was updated or
-        deleted while the candidate was being built. Appends remain governed
-        by the watermark and are cloned into the live tail as before.
-
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
         session's JSON config in the same transaction; a ``None`` value
@@ -11475,19 +11437,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                         "commit; refusing to publish a stale compaction"
                     )
 
-            if source_mutation_revision is not None:
-                revision_row = conn.execute(
-                    "SELECT revision FROM message_mutation_revisions "
-                    "WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                current_revision = int(revision_row[0]) if revision_row else 0
-                if current_revision != int(source_mutation_revision):
-                    raise SessionCompactionSourceChangedError(
-                        f"Session {session_id!r} changed while compaction was "
-                        "building; refusing to publish a stale projection"
-                    )
-
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
@@ -11499,38 +11448,25 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                 )
 
             # Concurrent tail: active rows that arrived after the watermark.
-            # Snapshot ids without materializing payloads; the clone below
-            # needs a stable id list, and SQL computes the tool-call count.
+            # Snapshot their ids and tool_calls now — the clone below needs a
+            # stable id list, and the tool-call count keeps sessions.* honest.
             tail_ids: list[int] = []
             tail_tool_calls = 0
             if watermark is not None:
-                tail_rows = conn.execute(
-                    "SELECT id, role FROM messages "
+                for row in conn.execute(
+                    "SELECT id, tool_calls FROM messages "
                     "WHERE session_id = ? AND active = 1 AND id > ? "
                     "ORDER BY id",
                     (session_id, int(watermark)),
-                ).fetchall()
-                if (
-                    source_mutation_revision is not None
-                    and tail_rows
-                    and tail_rows[0]["role"] == "tool"
-                ):
-                    raise SessionCompactionSourceChangedError(
-                        f"Session {session_id!r} appended a tool result across "
-                        "the compaction watermark; retrying the complete turn"
-                    )
-                tail_ids = [int(row["id"]) for row in tail_rows]
-                if tail_ids:
-                    tail_tool_calls = int(
-                        conn.execute(
-                            "SELECT COALESCE(SUM(CASE "
-                            "WHEN json_valid(tool_calls) "
-                            "THEN json_array_length(tool_calls) ELSE 0 END), 0) "
-                            "FROM messages WHERE session_id = ? AND active = 1 "
-                            "AND id > ?",
-                            (session_id, int(watermark)),
-                        ).fetchone()[0]
-                    )
+                ).fetchall():
+                    tail_ids.append(int(row["id"]))
+                    raw = row["tool_calls"]
+                    if raw:
+                        try:
+                            parsed = json.loads(raw) if isinstance(raw, str) else raw
+                            tail_tool_calls += len(parsed) if isinstance(parsed, list) else 0
+                        except (TypeError, ValueError):
+                            pass
 
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
@@ -11580,7 +11516,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
                     "model_config = ? WHERE id = ?",
                     (inserted, tool_calls_total, patched_model_config, session_id),
                 )
-            self._publish_working_context_snapshot(conn, session_id)
             return inserted
 
         return self._execute_write(_do)
@@ -11625,177 +11560,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
             return cursor.rowcount
 
         return self._execute_write(_do)
-
-    def get_compaction_source_page(
-        self,
-        session_id: str,
-        *,
-        after_id: int,
-        through_id: int,
-        limit: int,
-        max_field_chars: int,
-    ) -> List[Dict[str, Any]]:
-        """Read one active keyset page without materializing unbounded fields.
-
-        Cold recovery may be invoked precisely because a legacy row contains a
-        multi-megabyte payload. ``get_messages()`` intentionally returns exact
-        bodies, so using it here would allocate those bodies before recovery's
-        caps could run. This projection clips payload columns in SQLite and
-        leaves the authoritative rows untouched. The returned content carries
-        its durable row id whenever any sidecar was clipped.
-        """
-        if not session_id:
-            return []
-        page_limit = max(1, int(limit))
-        cap = max(1_000, int(max_field_chars))
-        # Leave room for the archive marker itself so the SQL projection — not
-        # only a later Python cleanup pass — obeys ``max_field_chars``.
-        text_payload_cap = max(2, cap - 128)
-        head = max(1, text_payload_cap * 3 // 4)
-        tail = max(1, text_payload_cap - head)
-        reference = (
-            "'[Full durable payload archived at message row ' || id || '.]'"
-        )
-        heavy_sidecars = (
-            "tool_calls",
-            "reasoning",
-            "reasoning_content",
-            "reasoning_details",
-            "codex_reasoning_items",
-            "codex_message_items",
-            "api_content",
-            "display_metadata",
-            "provenance_metadata",
-        )
-        scalar_limits = {
-            "session_id": 512,
-            "role": 64,
-            "tool_call_id": 256,
-            "tool_name": 256,
-            "effect_disposition": 128,
-            "timestamp": 128,
-            "finish_reason": 128,
-            "platform_message_id": 512,
-            "display_kind": 128,
-            "origin_kind": 128,
-            "turn_kind": 128,
-            "trust_kind": 128,
-        }
-        # Hermes encodes structured content as NUL-prefixed TEXT. SQLite's
-        # length(TEXT) stops at the first U+0000, so every admission bound must
-        # measure the stored bytes rather than text characters.
-        def byte_length(column: str) -> str:
-            return f"length(CAST({column} AS BLOB))"
-
-        sidecar_overflow = " OR ".join(
-            f"{byte_length(column)} > {cap}" for column in heavy_sidecars
-        )
-        scalar_overflow = " OR ".join(
-            f"{byte_length(column)} > {limit}"
-            for column, limit in scalar_limits.items()
-        )
-        payload_overflow = f"({sidecar_overflow}) OR ({scalar_overflow})"
-        source_payload_bytes = " + ".join(
-            f"COALESCE({byte_length(column)}, 0)"
-            for column in ("content", *heavy_sidecars, *scalar_limits)
-        )
-        content_expr = (
-            "CASE "
-            f"WHEN {byte_length('content')} > {cap} "
-            "AND substr(CAST(content AS BLOB), 1, 6) = X'006A736F6E3A' "
-            f"THEN {reference} "
-            f"WHEN typeof(content) = 'blob' AND {byte_length('content')} > {cap} "
-            f"THEN {reference} "
-            f"WHEN {byte_length('content')} > {cap} "
-            f"THEN substr(content, 1, {head}) || char(10) || '... ' || "
-            f"{reference} || char(10) || substr(content, -{tail}) "
-            f"WHEN {payload_overflow} "
-            f"THEN substr(COALESCE(content, ''), 1, "
-            f"max(0, {cap} - length({reference}) - 1)) || char(10) || {reference} "
-            "ELSE content END AS content"
-        )
-
-        def bounded(column: str) -> str:
-            return (
-                f"CASE WHEN {byte_length(column)} > {cap} "
-                f"THEN NULL ELSE {column} END AS {column}"
-            )
-
-        def bounded_scalar(column: str) -> str:
-            limit = scalar_limits[column]
-            return (
-                f"CASE WHEN {byte_length(column)} > {limit} "
-                f"THEN substr({column}, 1, {limit}) "
-                f"ELSE {column} END AS {column}"
-            )
-
-        bounded_tool_calls = f"""
-            CASE
-              WHEN {byte_length('tool_calls')} > {cap} THEN NULL
-              ELSE tool_calls
-            END AS tool_calls
-        """
-
-        sql = f"""
-            SELECT id, {bounded_scalar('session_id')}, {bounded_scalar('role')},
-                   {content_expr}, {bounded_scalar('tool_call_id')},
-                   {bounded_tool_calls}, {bounded_scalar('tool_name')},
-                   {bounded_scalar('effect_disposition')},
-                   {bounded_scalar('timestamp')},
-                   CASE WHEN typeof(token_count) IN ('integer', 'real')
-                        THEN token_count ELSE NULL END AS token_count,
-                   {bounded_scalar('finish_reason')},
-                   {bounded('reasoning')}, {bounded('reasoning_content')},
-                   {bounded('reasoning_details')},
-                   {bounded('codex_reasoning_items')},
-                   {bounded('codex_message_items')},
-                   {bounded_scalar('platform_message_id')},
-                   CASE WHEN observed = 1 THEN 1 ELSE 0 END AS observed,
-                   CASE WHEN _compressed_summary = 1 THEN 1 ELSE 0
-                        END AS _compressed_summary,
-                   1 AS active,
-                   CASE WHEN compacted = 1 THEN 1 ELSE 0 END AS compacted,
-                   {bounded('api_content')}, {bounded_scalar('display_kind')},
-                   {bounded('display_metadata')}, {bounded_scalar('origin_kind')},
-                   {bounded_scalar('turn_kind')}, {bounded_scalar('trust_kind')},
-                   {bounded('provenance_metadata')},
-                   CASE WHEN {byte_length('content')} > {cap} OR {payload_overflow}
-                        THEN 1 ELSE 0 END AS _resume_payload_clipped,
-                   CASE WHEN {byte_length('tool_calls')} > {cap}
-                        THEN 1 ELSE 0 END AS _resume_tool_calls_clipped,
-                   ({source_payload_bytes}) AS _resume_source_payload_bytes
-              FROM messages
-             WHERE session_id = ? AND active = 1 AND id > ? AND id <= ?
-             ORDER BY id ASC
-             LIMIT ?
-        """
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                sql,
-                (session_id, int(after_id), int(through_id), page_limit),
-            ).fetchall()
-
-        result: List[Dict[str, Any]] = []
-        for row in rows:
-            msg = dict(row)
-            if msg.pop("_compressed_summary", 0):
-                msg["_compressed_summary"] = True
-            msg["content"] = self._decode_content(msg.get("content"))
-            if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    msg["tool_calls"] = []
-            if msg.get("display_metadata") is not None:
-                msg["display_metadata"] = self._decode_display_metadata(
-                    msg["display_metadata"]
-                )
-            if msg.get("provenance_metadata") is not None:
-                msg["provenance_metadata"] = self._decode_provenance_metadata(
-                    msg["provenance_metadata"]
-                )
-            result.append(normalize_message_for_durable_write(msg))
-        return result
 
     def get_messages(
         self,
@@ -12182,13 +11946,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
         verbatim.
         """
         session_ids = [session_id]
-        if not include_ancestors and not include_inactive:
-            snapshot_rows = self._read_working_context_rows(session_id)
-            if snapshot_rows is not None:
-                return self._rows_to_conversation(
-                    snapshot_rows, session_id=session_id, include_ancestors=False,
-                    repair_alternation=repair_alternation, include_row_ids=include_row_ids,
-                )
         if include_ancestors and not self._is_explicit_branch_session(session_id):
             session_ids = self._session_lineage_root_to_tip(session_id)
 
@@ -12460,19 +12217,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
             if self._is_explicit_branch_session(session_id)
             else self._session_lineage_root_to_tip(session_id)
         )
-        if session_ids == [session_id]:
-            snapshot_rows = self._read_working_context_rows(session_id)
-            if snapshot_rows is not None:
-                return (
-                    self._rows_to_conversation(
-                        snapshot_rows, session_id=session_id, include_ancestors=False,
-                        repair_alternation=True, include_row_ids=True, include_summary_markers=True,
-                    ),
-                    self._rows_to_conversation(
-                        snapshot_rows, session_id=session_id, include_ancestors=True,
-                        repair_alternation=False, include_row_ids=True,
-                    ),
-                )
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
@@ -12507,37 +12251,6 @@ class SessionDB(SessionSnapshotMixin, SessionContextMixin, SessionSearchMixin, S
             include_row_ids=True,
         )
         return model_history, display_history
-
-    def get_model_resume_conversation(
-        self, session_id: str
-    ) -> List[Dict[str, Any]]:
-        """Return only the tip's model-facing history for live replay.
-
-        Unlike :meth:`get_messages_as_conversation`, this projection preserves
-        the durable ``_compressed_summary`` marker required by pre-compress
-        checkpoint providers.  Unlike :meth:`get_resume_conversations`, it
-        never materializes ancestor/display lineage.  Callers must apply the
-        model-facing resume admission guard before invoking this method.
-        """
-        snapshot_rows = self._read_working_context_rows(session_id)
-        if snapshot_rows is not None:
-            rows = snapshot_rows
-        else:
-            with self._read_ctx() as conn:
-                rows = conn.execute(
-                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
-                    "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
-                    (session_id,),
-                ).fetchall()
-
-        return self._rows_to_conversation(
-            rows,
-            session_id=session_id,
-            include_ancestors=False,
-            repair_alternation=True,
-            include_row_ids=True,
-            include_summary_markers=True,
-        )
 
     def get_resume_message_count(self, session_id: str) -> int:
         """Count active rows that a full resume would materialize."""

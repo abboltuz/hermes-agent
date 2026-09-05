@@ -383,11 +383,6 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
     defer_history = is_truthy_value(params.get("defer_history", False))
-    background_history = (
-        defer_history
-        and not is_truthy_value(params.get("eager_build", False))
-        and not is_truthy_value(params.get("lazy", False))
-    )
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
@@ -409,16 +404,7 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _db_unavailable_error(rid, code=5000)
 
-        # Older adapters retain their existing contract. Real deferred resumes
-        # do not drain pending usage writes or fetch the stored system prompt.
-        metadata_reader = getattr(type(db), "get_session_for_resume", None)
-
-        def _resume_metadata(session_id):
-            if background_history and callable(metadata_reader):
-                return metadata_reader(db, session_id)
-            return db.get_session(session_id)
-
-        found = _resume_metadata(target)
+        found = db.get_session(target)
         if not found:
             found = db.get_session_by_title(target)
             if found:
@@ -572,20 +558,38 @@ def _(rid, params: dict) -> dict:
                 tip = target
             if tip and tip != target:
                 target = tip
-                found = _resume_metadata(target) or found
+                found = db.get_session(target) or found
 
-        # Keep the safety gate before materialization, but off the acknowledgement
-        # path when a worker owns history loading. Merely hiding the returned
-        # messages is not deferred loading (older clients keep that distinction).
-        if not background_history:
-            from hermes_state import SessionResumeTooLargeError
+        # Every interactive resume path materializes the model history, even when
+        # omit_messages suppresses the response copy. Count the complete lineage
+        # before any reopen/history read so a runaway transcript cannot exhaust
+        # the dashboard. The metadata fallback keeps lightweight test/adaptor DBs
+        # that predate the shared SessionDB guard compatible. The limit resolves
+        # from config (sessions.max_resume_messages, 0 disables).
+        from hermes_state import (
+            SessionResumeTooLargeError,
+            resolved_max_resume_messages,
+        )
 
-            try:
-                _assert_session_resume_safe(
-                    db, target, found.get("message_count"), profile_home=profile_home
-                )
-            except SessionResumeTooLargeError as exc:
-                return _err(rid, 4130, str(exc))
+        safety_check = getattr(db, "assert_resume_safe", None)
+        try:
+            if callable(safety_check):
+                safety_check(target)
+            else:
+                resume_limit = resolved_max_resume_messages()
+                stored_message_count = int(found.get("message_count") or 0)
+                if resume_limit and stored_message_count > resume_limit:
+                    raise SessionResumeTooLargeError(stored_message_count, resume_limit)
+        except SessionResumeTooLargeError as exc:
+            return _err(rid, 4130, str(exc))
+        except Exception as exc:
+            # Fail OPEN: a transient guard failure (locked DB, schema skew on
+            # an adaptor store) must not turn the safety check into a new way
+            # to lose access to a session. Only a genuine over-limit blocks.
+            logger.warning(
+                "resume safety check failed for %s (proceeding without guard): %s",
+                target, exc,
+            )
 
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
@@ -607,8 +611,6 @@ def _(rid, params: dict) -> dict:
                     session.get("resume_message_count") or payload["message_count"]
                 )
                 payload["hydrating"] = bool(session.get("resume_hydrating"))
-                if preparation := _resume_preparation_payload(session):
-                    payload["preparation"] = preparation
             # A lazy watch session never owns a run loop, so its payload's running
             # flag is always False — overlay the child-run registry so a reconnecting
             # watch window keeps its busy indicator while the child is still mid-run.
@@ -727,7 +729,7 @@ def _(rid, params: dict) -> dict:
         # omit_messages read below (cold resume default) is skipped entirely, so
         # the transcript is never loaded twice for one resume. omit_messages only
         # governs the response shape of the non-deferred paths.
-        if background_history:
+        if defer_history and not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
             source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
@@ -749,23 +751,11 @@ def _(rid, params: dict) -> dict:
             )
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
-            record["resume_model_only"] = omit_messages
             record["resume_message_count"] = int(found.get("message_count") or 0)
-            record["resume_preparation"] = {
-                "attempt": 1,
-                "phase": "history",
-                "status": "preparing",
-            }
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
 
-            _schedule_resume_hydration(
-                sid,
-                target,
-                db,
-                close_db=owns_db,
-                model_only=omit_messages,
-            )
+            _schedule_resume_hydration(sid, target, db, close_db=owns_db)
             # The hydration worker now owns a profile-scoped handle and closes it
             # after the transcript read. The shared launch DB is process-owned.
             if owns_db:
@@ -779,7 +769,6 @@ def _(rid, params: dict) -> dict:
                     "message_count": record["resume_message_count"],
                     "messages": [],
                     "hydrating": True,
-                    "preparation": _resume_preparation_payload(record),
                     "info": _lazy_resume_info(
                         cwd,
                         model=model_override.get("model") or "",
@@ -1087,100 +1076,6 @@ def _(rid, params: dict) -> dict:
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
     return _ok(rid, payload)
-
-
-@method("session.resume.retry")
-def _(rid, params: dict) -> dict:
-    """Retry one failed deferred-history preparation on its retained runtime.
-
-    This starts at most one worker and never loops internally. Calls while a
-    worker is active are idempotent; each explicit call after a failure creates
-    one new fenced attempt on the same browse handle.
-    """
-    sid = str(params.get("session_id") or "").strip()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-
-    with _sessions_lock:
-        if _sessions.get(sid) is not session:
-            return _err(rid, 4001, "session not found")
-        with session["history_lock"]:
-            preparation = session.get("resume_preparation")
-            if not isinstance(preparation, dict):
-                return _err(rid, 4018, "session has no deferred preparation")
-
-            status = preparation.get("status")
-            if status in {"preparing", "ready"}:
-                return _ok(
-                    rid,
-                    {"session_id": sid, "preparation": _resume_preparation_payload(session)},
-                )
-            if status != "preparation_failed":
-                return _err(rid, 4019, f"preparation is not retryable: {status or 'unknown'}")
-
-            attempt = int(preparation.get("attempt") or 0) + 1
-            session["agent_build_generation"] = int(
-                session.get("agent_build_generation") or 0
-            ) + 1
-            session["agent_build_started"] = False
-            session.pop("_agent_build_thread", None)
-            session["resume_history_ready"] = threading.Event()
-            session["agent_ready"] = threading.Event()
-            session["resume_hydrating"] = True
-            session.pop("resume_history_error", None)
-            session["agent_error"] = None
-            session["resume_preparation"] = {
-                "attempt": attempt,
-                "phase": "history",
-                "status": "preparing",
-            }
-
-    db, owns_db = _resume_hydration_db(session)
-    if db is None:
-        message = "resume failed: state.db unavailable"
-        with session["history_lock"]:
-            session["resume_hydrating"] = False
-            session["resume_history_error"] = message
-            session["agent_error"] = message
-            session["resume_preparation"] = {
-                "attempt": attempt,
-                "message": message,
-                "phase": "history",
-                "status": "preparation_failed",
-            }
-            session["resume_history_ready"].set()
-            session["agent_ready"].set()
-        preparation_payload = _resume_preparation_payload(session)
-        _emit(
-            "session.resume_progress",
-            sid,
-            {
-                "message": message,
-                "phase": "history",
-                "status": "failed",
-                "preparation": preparation_payload,
-            },
-        )
-        _emit(
-            "error",
-            sid,
-            {"kind": "session_preparation", "message": message},
-        )
-        return _err(rid, 5000, message)
-
-    _schedule_resume_hydration(
-        sid,
-        str(session.get("resume_session_id") or session.get("session_key") or ""),
-        db,
-        close_db=owns_db,
-        attempt=attempt,
-        model_only=bool(session.get("resume_model_only")),
-    )
-    return _ok(
-        rid,
-        {"session_id": sid, "preparation": _resume_preparation_payload(session)},
-    )
 
 
 @method("session.cwd.set")

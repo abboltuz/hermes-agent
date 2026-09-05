@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
-import { createClientSessionState } from '@/lib/chat-runtime'
 import { setSessionOwnerHint, setSessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import { deferred } from '@/test/deferred'
@@ -120,8 +119,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     vi.mocked(getLatestSessionMessages).mockReturnValueOnce(history.promise)
     vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({
       session_id: 'live-ready',
-      messages: [{ row_id: 9, role: 'assistant', content: 'resume tail' }],
-      preparation: { attempt: 1, phase: 'history', status: 'preparing' }
+      messages: [{ row_id: 9, role: 'assistant', content: 'resume tail' }]
     } as never)
     const updateSessionState = vi.fn()
     const runtimeIdByStoredSessionIdRef = { current: new Map<string, string>() }
@@ -143,7 +141,6 @@ describe('useSessionTileDelegate resumeTile', () => {
     const initialUpdate = updateSessionState.mock.calls[0][1]
     let state = initialUpdate({ messages: [] })
     expect(state.messages.map((message: ChatMessage) => message.rowId)).toEqual([9])
-    expect(state.preparation).toEqual({ attempt: 1, phase: 'history', status: 'preparing' })
 
     history.resolve({
       session_id: 'runtime-ready',
@@ -158,55 +155,6 @@ describe('useSessionTileDelegate resumeTile', () => {
 
     expect(publish).toHaveBeenCalledOnce()
     expect(state.messages.map((message: ChatMessage) => message.rowId)).toEqual([7, 8, 9])
-  })
-
-  it('does not regress an event-ready tile when the resume acknowledgement arrives later', async () => {
-    setSessions([row({ id: 'runtime-race', profile: 'owner' })])
-    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({ messages: [], session_id: 'runtime-race' } as never)
-    const runtime = deferred<Awaited<ReturnType<typeof requestGatewayForProfile>>>()
-    vi.mocked(requestGatewayForProfile).mockReturnValueOnce(runtime.promise)
-    const states = new Map<string, ReturnType<typeof createClientSessionState>>()
-
-    const updateSessionState = vi.fn(
-      (
-        runtimeId: string,
-        updater: (
-          state: ReturnType<typeof createClientSessionState>
-        ) => ReturnType<typeof createClientSessionState>
-      ) => {
-        const current = states.get(runtimeId) ?? createClientSessionState('runtime-race')
-        const next = updater(current)
-
-        states.set(runtimeId, next)
-
-        return next
-      }
-    )
-
-    renderTile(vi.fn(), {
-      sessionStateByRuntimeIdRef: { current: states as Map<string, unknown> },
-      updateSessionState
-    })
-
-    const opening = sessionTileDelegate()!.resumeTile('runtime-race', {
-      publish: vi.fn(),
-      current: () => null,
-      isCurrent: () => true
-    })
-
-    await waitFor(() => expect(requestGatewayForProfile).toHaveBeenCalled())
-    states.set('live-race', {
-      ...createClientSessionState('runtime-race'),
-      preparation: { attempt: 1, message_count: 42, phase: 'history', status: 'ready' }
-    })
-    runtime.resolve({
-      session_id: 'live-race',
-      messages: [],
-      preparation: { attempt: 1, phase: 'history', status: 'preparing' }
-    } as never)
-
-    await expect(opening).resolves.toBe('live-race')
-    expect(states.get('live-race')?.preparation?.status).toBe('ready')
   })
 
   it('drops a late archive tail after the stored session is rebound elsewhere', async () => {

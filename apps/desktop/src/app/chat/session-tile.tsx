@@ -23,7 +23,6 @@ import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useModelControls } from '@/app/session/hooks/use-model-controls'
 import { blobToDataUrl } from '@/app/session/hooks/use-prompt-actions/utils'
 import { resolveStoredSession } from '@/app/session/hooks/use-session-actions/utils'
-import { retryRetainedSessionPreparation } from '@/app/session/retry-preparation'
 import { ModelMenuPanel } from '@/app/shell/model-menu-panel'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
@@ -125,7 +124,6 @@ function buildTileView(storedSessionId: string, $preview: ReadableAtom<ChatMessa
     $messages,
     $messagesEmpty: computed($messages, messages => messages.length === 0),
     $model: computed($state, state => state?.model ?? ''),
-    $preparation: computed($state, state => state?.preparation),
     $provider: computed($state, state => state?.provider ?? ''),
     $reasoningEffort: computed($state, state => state?.reasoningEffort ?? ''),
     $runtimeId,
@@ -232,19 +230,6 @@ function TileChat({
   const onRemoveAttachment = useCallback((id: string) => void removeAttachment(id), [removeAttachment])
   const onRetryResume = useCallback(() => patchSessionTile(storedSessionId, { error: undefined }), [storedSessionId])
 
-  const onRetryPreparation = useCallback(
-    async (targetRuntimeId: string) => {
-      const delegate = sessionTileDelegate()
-
-      if (!delegate) {
-        throw new Error('Session controls are unavailable')
-      }
-
-      await retryRetainedSessionPreparation(requestTileGateway, delegate.updateSession, targetRuntimeId)
-    },
-    [requestTileGateway]
-  )
-
   // Per-tile model menu — rendered under this tile's SessionView so the pill
   // + switch target THIS runtime, not the primary (which may be mid-turn).
   const modelMenuContent = useMemo(
@@ -281,7 +266,6 @@ function TileChat({
           onReload={actions.reloadFromMessage}
           onRemoveAttachment={onRemoveAttachment}
           onRestoreToMessage={actions.restoreToMessage}
-          onRetryPreparation={onRetryPreparation}
           onRetryResume={onRetryResume}
           onSteer={actions.steerPrompt}
           onSubmit={actions.submitText}

@@ -17,7 +17,6 @@ import {
   $turnStartedAt
 } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
-import type { SessionPreparation } from '@/types/hermes'
 
 import { lastVisibleMessageIsUser } from './thread-loading'
 
@@ -59,9 +58,6 @@ export interface SessionView {
   $provider: ReadableAtom<string>
   $fast: ReadableAtom<boolean>
   $reasoningEffort: ReadableAtom<string>
-  /** Model-facing history build. The display transcript remains independently
-   * readable while this is preparing or failed. */
-  $preparation: ReadableAtom<SessionPreparation | undefined>
 }
 
 /** The active session's own slice, or `undefined` while it's a draft. */
@@ -107,7 +103,6 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $messagesEmpty: computed($primaryMessages, messages => messages.length === 0),
   $model: primaryField<string>(state => state.model, $currentModel),
   $provider: primaryField<string>(state => state.provider, $currentProvider),
-  $preparation: computed($primaryState, state => state?.preparation),
   $reasoningEffort: primaryField<string>(state => state.reasoningEffort, $currentReasoningEffort),
   $runtimeId: $activeSessionId,
   $storedId: $selectedStoredSessionId,

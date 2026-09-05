@@ -371,28 +371,19 @@ def test_deferred_build_transfers_the_handle_on_success(
 def test_deferred_build_closes_the_handle_when_the_session_is_reaped_midbuild(
     build_env, registered, monkeypatch
 ):
-    """A build that loses publication closes its still-local agent exactly once."""
+    """A discarded agent is never torn down, so transferring to it would leak.
 
-    captured: dict = {}
-
-    class _FakeAgent:
-        def __init__(self, session_db):
-            self._session_db = session_db
-            self._owns_session_db = False
-            self.closed = 0
-
-        def close(self):
-            self.closed += 1
-            if self._owns_session_db:
-                self._owns_session_db = False
-                self._session_db.close()
+    ``_build`` already computes ``replaced`` for the approval-notifier cleanup.
+    When the session was swapped out from under the build, the agent it produced
+    is unreachable — ``_teardown_session`` will never call close() on it — so the
+    handle has to be closed right here instead of handed over.
+    """
 
     def _fake_make_agent(sid, key, session_db=None, **_kwargs):
         # Simulate a concurrent reap landing while the agent was being built.
         with server._sessions_lock:
             server._sessions[sid] = {"session_key": "someone-else"}
-        captured["agent"] = _FakeAgent(session_db)
-        return captured["agent"]
+        return types.SimpleNamespace(_session_db=session_db, _owns_session_db=False)
 
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
     sid, session = "sid-reaped", _session(build_env.profile_home)
@@ -401,11 +392,8 @@ def test_deferred_build_closes_the_handle_when_the_session_is_reaped_midbuild(
     _run_build(sid, session)
 
     db = build_env.opened[0]
-    agent = captured["agent"]
-    assert session.get("agent") is None
-    assert agent.closed == 1
-    assert agent._owns_session_db is False
     assert db.closed == 1
+    assert session["agent"]._owns_session_db is False
 
 
 def test_deferred_build_never_opens_or_closes_for_the_launch_profile(

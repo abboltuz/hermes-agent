@@ -1,7 +1,7 @@
 import type * as React from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
-import type { SessionMessage, SessionPreparation, UsageStats } from '@/types/hermes'
+import type { SessionMessage, UsageStats } from '@/types/hermes'
 
 export interface ContextSuggestion {
   text: string
@@ -182,10 +182,6 @@ export interface PersistedDisplayTranscriptProvenance {
 
 export interface ClientSessionState {
   storedSessionId: string | null
-  /** Model-history preparation is independent of the durable display
-   * transcript. A failed preparation leaves this session readable and keeps
-   * the runtime handle available for an explicit retry. */
-  preparation?: SessionPreparation
   transcriptAuthorityEpoch?: number
   transcriptProvenance?: PersistedDisplayTranscriptProvenance
   messages: ChatMessage[]

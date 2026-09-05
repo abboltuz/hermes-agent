@@ -257,55 +257,6 @@ def test_resume_hands_profile_db_to_deferred_history_worker(profile_dbs, monkeyp
         release_history.set()
 
 
-def test_resume_retry_reopens_and_closes_the_same_profile_store(
-    profile_dbs, monkeypatch
-):
-    """A retained-runtime retry must not fall back to the launch DB or leak."""
-    completed = threading.Event()
-    retry_closed = threading.Event()
-
-    class _RetryDB(_RecordingDB):
-        def close(self):
-            super().close()
-            if len(profile_dbs) >= 2:
-                retry_closed.set()
-
-        def get_resume_conversations(self, _target):
-            if len(profile_dbs) == 1:
-                raise RuntimeError("first read failed")
-            completed.set()
-            return ([], [])
-
-    def _factory(db_path=None, **kwargs):
-        db = _RetryDB(db_path=db_path, **kwargs)
-        db.rows["s1"] = {"id": "s1", "cwd": "", "message_count": 0}
-        profile_dbs.append(db)
-        return db
-
-    monkeypatch.setattr("hermes_state.SessionDB", _factory)
-    monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _found: {})
-    monkeypatch.setattr(server, "_start_agent_build", lambda *_args, **_kwargs: None)
-
-    first = _resume(session_id="s1", profile="work", defer_history=True)
-    sid = first["result"]["session_id"]
-    session = server._sessions[sid]
-    assert session["resume_history_ready"].wait(timeout=1.0)
-    assert session["resume_preparation"]["status"] == "preparation_failed"
-    assert profile_dbs[0].closed == 1
-
-    retried = server.handle_request(
-        {"id": "retry", "method": "session.resume.retry", "params": {"session_id": sid}}
-    )
-    assert retried["result"]["preparation"]["attempt"] == 2
-    assert completed.wait(timeout=1.0)
-    assert session["resume_history_ready"].wait(timeout=1.0)
-    assert session["resume_preparation"]["status"] == "ready"
-    assert len(profile_dbs) == 2
-    assert profile_dbs[1].db_path == profile_dbs[0].db_path
-    assert retry_closed.wait(timeout=1.0)
-    assert profile_dbs[1].closed == 1
-
-
 def test_resume_keeps_profile_db_open_after_ownership_transfer(profile_dbs, monkeypatch):
     """A COMPLETED resume transfers the handle to the agent — do not close it.
 
