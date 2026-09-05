@@ -118,3 +118,42 @@ set, so upstream's lean default applies after activation.
 Promotion requires a clean committed candidate and exact-SHA approval. Runtime
 observation after promotion is separate from these offline checks; no claim of a
 successful live soak or repaired existing chat follows from unit tests alone.
+
+## Independent review corrections
+
+The first exact candidate, `49e3952d9a`, received CHANGES_REQUESTED. The correction
+keeps the same policy pin and addresses all three findings:
+
+- Preserve upstream in-flight task replay for typed trusted cron/delegation turns,
+  including repeated handoffs, carrier merges, and post-compression continuation
+  checks. Actor/trust fields survive; these tasks are never classified as human
+  intent. Untrusted plugin/webhook events and completed tasks are not replayed.
+- Restore upstream outbound stale tool-image eviction in both ordinary and
+  iteration-limit summary requests. Request-capture tests keep the newest three
+  image-bearing tool rows while asserting every original transcript row is exact.
+- Remove an imported endpoint-normalization change outside context scope.
+  Same-provider omitted-URL refresh retains custom routing and derives native
+  compression capability from that retained endpoint. Cross-provider unresolved
+  endpoints retain the original fail-without-mutation contract.
+
+After corrections, the core context command above plus
+`tests/run_agent/test_switch_model*.py` passes: **67 files, 692 passed, 0 failed**,
+82.3 seconds. The two request-capture regressions also pass in isolation. Their
+initial fixture failures (invalid image data, then an unspecified non-vision model)
+were corrected with a valid PNG and explicitly mocked vision capabilities; they
+were not product-code failures. Ruff F821/F822/F823 passes for all correction files.
+
+The complete preservation/affected command above was then rerun successfully:
+**53 files, 1,188 passed, 0 failed**, 75.9 seconds. Together, the two disjoint
+post-correction runs cover **120 files and 1,880 passing tests**.
+
+An additional pre-correction state run passed **289 tests across 6 files**:
+`test_hermes_state`, compression locks, busy retry, read-only preflight,
+`get_messages_include_compacted`, and `append_messages_batch`. These state files
+were not changed by the review corrections.
+
+Upstream advanced to `377118af86` during this work. The pinned compressor/facade/
+micro-compaction policy files have not changed in that range. A newer oversized
+`@file` ingress-pointer feature in `agent/context_references.py` is outside this
+pinned restoration; this report does not claim every newer context-related
+feature is included.

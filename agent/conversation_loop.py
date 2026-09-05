@@ -2771,6 +2771,11 @@ def run_conversation(
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
 
+        # Upstream send-path vision eviction (#89296): rewrite only the
+        # per-call projection; retain original screenshots in the transcript.
+        from agent.context_compressor import evict_stale_outbound_tool_images
+        evict_stale_outbound_tool_images(api_messages)
+
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
         # left behind. Prevents Anthropic 400s ("The final block in an

@@ -4005,6 +4005,24 @@ Write only the summary body. Do not include any preamble or prefix."""
         return adjusted
 
     @classmethod
+    def _is_inflight_task_turn(cls, message: Any) -> bool:
+        """Keep trusted scheduled/delegated work without calling it human input."""
+        from agent.conversation_compression import _is_real_user_message
+
+        if cls._is_actionable_user_turn(message) and _is_real_user_message(message):
+            return True
+        if (not isinstance(message, dict) or message.get("role") != "user"
+                or cls._is_context_summary_message(message)
+                or cls._is_blank_user_turn(message)):
+            return False
+        provenance = decode_message_provenance(message)
+        return bool(
+            provenance
+            and provenance.origin_kind in {OriginKind.AUTOMATION, OriginKind.AGENT}
+            and is_actionable_continuation(message)
+        )
+
+    @classmethod
     def _find_inflight_user_task(
         cls, messages: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
@@ -4021,30 +4039,16 @@ Write only the summary body. Do not include any preamble or prefix."""
         message that still has ``tool_calls`` outstanding means the run was
         interrupted mid-task and the instruction is still owed an answer.
 
-        Handoff carriers and synthetic scaffolding rows are excluded via the
-        same filter pair as ``_find_last_user_message_idx``, so an idle session
-        whose only user-role row is an inherited summary yields ``None`` and is
-        never re-animated (#80622).
+        Handoff carriers and synthetic scaffolding rows are excluded. Trusted
+        scheduled/delegated tasks are retained without human attribution. An
+        idle session containing only an inherited summary yields ``None`` and
+        is never re-animated (#80622).
         """
-        from agent.conversation_compression import _is_real_user_message
-
         last_user_idx = -1
-        # Find the newest user message that carries at least one image part. We anchor on image-bearing user
-        # messages (not all user messages) so a plain text follow-up after a big-image turn still strips the
-        # old image — matching the problem kilocode#9434 set out to solve.
-        # Newest tool message carrying an image. Tool-result images (``vision_analyze``,
-        # screenshot-returning tools) accumulate on their own timeline and the user anchor never protects
-        # the stale ones: a session whose only image-bearing user message is the FIRST one leaves ``anchor
-        # <= 0`` and strips nothing at all, so twenty tool results keep multi-MB of base64 in every request
-        # body until the provider answers 413 -- and the 413 handler's recovery compaction lands right back
-        # here and frees nothing, which is the wedge in #89938. Keep the newest tool image, since that is
-        # the one the model is reasoning about, and drop every older one wherever it sits.
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
-            # _is_real_user_message also rejects metadata-flagged scaffolding
-            # (_todo_snapshot_synthetic, recovery nudges, ...) that
-            # _is_actionable_user_turn cannot see.
-            if cls._is_actionable_user_turn(msg) and _is_real_user_message(msg):
+            # Preserve real requests and trusted automation, not scaffolding.
+            if cls._is_inflight_task_turn(msg):
                 last_user_idx = i
                 break
             if isinstance(msg, dict) and msg.get(_INFLIGHT_REPLAY_MERGED_KEY):
@@ -4101,9 +4105,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             return compressed
 
         for msg in compressed[carrier_idx + 1:]:
-            if self._is_actionable_user_turn(
-                msg
-            ) and not self._is_synthetic_compression_user_turn(msg):
+            if self._is_inflight_task_turn(msg):
                 # A real request already follows the summary.
                 return compressed
 
@@ -4137,6 +4139,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             # Never copy a summary carrier (metadata would mark the replay
             # synthetic): restate as a plain user row.
             replay = {"role": "user", "content": task_text}
+            replay.update({key: inflight[key] for key in SEMANTIC_FIELDS if key in inflight})
         else:
             replay = _fresh_compaction_message_copy(inflight)
         replay.pop(_COMPACTION_TAIL_MARKER, None)
@@ -4166,6 +4169,12 @@ Write only the summary body. Do not include any preamble or prefix."""
                 "\n\n" + _INFLIGHT_TASK_REPLAY_HEADER + "\n" + task_text,
             )
             carrier[_INFLIGHT_REPLAY_MERGED_KEY] = True
+            # The handoff still has its summary marker; the appended live task
+            # retains its actor/trust identity across subsequent compactions.
+            for key in SEMANTIC_FIELDS:
+                carrier.pop(key, None)
+                if key in inflight:
+                    carrier[key] = inflight[key]
             drop_stale_api_content(carrier)
             return compressed
 

@@ -6583,6 +6583,43 @@ class TestReasoningReplayForStrictProviders:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    @pytest.mark.parametrize("summary_path", [False, True])
+    def test_outbound_image_eviction_keeps_durable_history(self, agent, summary_path):
+        from copy import deepcopy
+        from agent.context_compressor import _MAX_KEEP_TOOL_IMAGES, _tool_content_has_images
+
+        self._setup_agent(agent)
+        history = [{"role": "user", "content": "Inspect the screenshots"}]
+        for i in range(_MAX_KEEP_TOOL_IMAGES + 2):
+            history.extend([
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": f"shot{i}", "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": f"shot{i}", "content": [
+                    {"type": "text", "text": f"Screenshot {i}"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZAAAAABJRU5ErkJggg=="}},
+                ]},
+            ])
+        original = deepcopy(history)
+        agent.client.chat.completions.create.return_value = _mock_response(content="done", finish_reason="stop")
+        with (
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_provider_supports_vision_tool_messages", return_value=True),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            if summary_path:
+                assert agent._handle_max_iterations(history, 5) == "done"
+            else:
+                assert agent.run_conversation("Continue", conversation_history=history)["completed"]
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        images = [m for m in sent if m.get("role") == "tool" and _tool_content_has_images(m.get("content"))]
+        assert [m["tool_call_id"] for m in images] == [f"shot{i}" for i in range(2, _MAX_KEEP_TOOL_IMAGES + 2)]
+        # Summary adds its request, but all original transcript rows stay exact.
+        assert history[:len(original)] == original
+
     def test_kimi_tool_replay_includes_space_reasoning_content(self, agent):
         self._setup_agent(agent)
         agent.base_url = "https://api.kimi.com/coding/v1"

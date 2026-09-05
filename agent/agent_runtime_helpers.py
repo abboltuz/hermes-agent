@@ -2813,11 +2813,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     if not api_mode:
         api_mode = determine_api_mode(new_provider, base_url, model=new_model)
 
-    normalized_new_provider = (new_provider or "").strip().lower()
-    if not base_url and normalized_new_provider == "openai":
-        # An omitted URL means the provider's canonical direct endpoint.
-        base_url = "https://api.openai.com/v1"
-
     # Same-provider switches may omit base_url intentionally (for example, a
     # direct caller refreshing credentials). Resolve capabilities from the
     # endpoint that the normalization below will retain, not from the empty

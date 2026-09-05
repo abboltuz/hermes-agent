@@ -133,6 +133,27 @@ def test_switch_model_without_config_context_length():
         assert call_kwargs.get("config_context_length") is None
 
 
+def test_same_provider_refresh_preserves_custom_endpoint_and_denies_native_compaction():
+    agent = _make_agent_with_compressor()
+    agent.provider = "openai"
+    agent.base_url = "https://proxy.example/v1"
+    with patch("run_agent.OpenAI") as client_factory:
+        agent.switch_model("gpt-5.6", "openai", api_key="fake-refresh", api_mode="chat_completions")
+    assert agent.base_url == "https://proxy.example/v1"
+    assert client_factory.call_args.kwargs["base_url"] == "https://proxy.example/v1"
+    assert agent.runtime_capabilities == {"native_compaction": False}
+
+
+def test_cross_provider_missing_endpoint_still_fails_without_runtime_mutation():
+    agent = _make_agent_with_compressor()
+    original = (agent.model, agent.provider, agent.base_url, agent.client)
+    with patch("run_agent.OpenAI") as client_factory:
+        with pytest.raises(ValueError, match="no base_url resolved"):
+            agent.switch_model("gpt-5.6", "openai", api_mode="chat_completions")
+    client_factory.assert_not_called()
+    assert (agent.model, agent.provider, agent.base_url, agent.client) == original
+
+
 def test_direct_start_model_override_does_not_inherit_profile_context_length():
     """A CLI ``--model`` startup override must not inherit another model's window."""
     cfg = {

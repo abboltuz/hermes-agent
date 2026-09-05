@@ -2109,6 +2109,13 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> CompressedUserTurn
 
 def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> CompressedUserTurnOutcome:
     """Preserve human intent, not merely a synthetic user-role placeholder."""
+    from agent.context_compressor import ContextCompressor
+
+    # Upstream's live-task replay can carry trusted scheduled/delegated work.
+    # It already satisfies continuation; do not append a placeholder or replay
+    # an older human request just because this task has a non-human actor.
+    if any(ContextCompressor._is_inflight_task_turn(message) for message in compressed):
+        return "already_present"
     if any(_is_real_user_message(message) for message in compressed) or _compressed_has_busy_steer(compressed):
         return "already_present"
     # Post-commit contract (#98450, mirrors _sync_micro_compact_to_db): archive_and_compact just durably
