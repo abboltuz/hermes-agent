@@ -388,7 +388,7 @@ class TestResponseCapture:
 
 
 class TestAgentInitConfig:
-    def test_defaults_off_and_threshold(self, monkeypatch):
+    def test_defaults_off_and_automatic_threshold(self, monkeypatch):
         from run_agent import AIAgent
 
         agent = AIAgent(
@@ -403,7 +403,7 @@ class TestAgentInitConfig:
             enabled_toolsets=[],
         )
         assert agent.codex_responses_native_compaction is False
-        assert agent.codex_responses_compact_threshold == 200_000
+        assert agent.codex_responses_compact_threshold is None
 
     def test_kwargs_have_no_context_management_by_default(self):
         from run_agent import AIAgent

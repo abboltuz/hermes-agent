@@ -10,7 +10,6 @@ traceback and lost the whole turn.
 
 import pytest
 
-from agent.compression_v3 import ContextProjectionUnfit, CutResult
 from agent.turn_finalizer import finalize_turn
 
 
@@ -163,20 +162,6 @@ def test_single_cleanup_step_raises_does_not_skip_others(step):
     assert len(result["cleanup_errors"]) == 1
 
 
-def test_iteration_summary_projection_refusal_returns_typed_failed_result():
-    error = ContextProjectionUnfit(CutResult(
-        messages=[],
-        outcome="context_projection_unfit",
-        provider_call_allowed=False,
-        reason="irreducible summary wire",
-    ))
-    result = _run(_StubAgent(raise_in={"summary"}, summary_error=error))
-
-    assert result["completed"] is False
-    assert result["failed"] is True
-    assert result["error_type"] == "ContextProjectionUnfit"
-    assert result["error"] == "irreducible summary wire"
-    assert result["final_response"] == "summary refused: irreducible summary wire"
 
 
 def test_clean_turn_has_no_cleanup_errors_key():
@@ -185,5 +170,4 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
-
 

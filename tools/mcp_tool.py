@@ -8085,6 +8085,8 @@ def refresh_agent_mcp_tools(
     enabled_override=None,
     disabled_override=None,
     quiet_mode: bool = True,
+    content_aware: bool = False,
+    preserve_prefix: bool = False,
 ) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry.
 
@@ -8112,6 +8114,22 @@ def refresh_agent_mcp_tools(
     surface.  The new ``(tools, valid_tool_names)`` pair is published together
     under ``_agent_tools_lock`` so a concurrent reader never sees a
     cross-attribute half-swap.
+
+    ``preserve_prefix`` is for the callers that rebuild inside a live
+    conversation (the between-turns prologue).  There the tool array is a
+    cached request prefix: every provider that renders ``tools`` ahead of the
+    messages re-prefills the entire history behind any byte that moves.  A
+    plain rebuild moves two kinds of bytes — it drops a tool whose ``check_fn``
+    merely flapped (a headless browser probe, an expired credential, a docker
+    blip), and it splices a late-landing tool into sorted position, which can
+    be index 0.  With ``preserve_prefix`` the live order is authoritative:
+    existing tools keep their slot (schemas still refresh), a tool that is
+    still *registered* but momentarily unavailable is carried forward, a tool
+    that genuinely left the registry is still dropped, and new tools are
+    appended at the tail so the prefix only ever grows.  Carrying an
+    unavailable tool forward changes nothing about dispatch — ``check_fn``
+    gates exposure at snapshot time, never invocation, and every handler
+    already owns its own unavailability error.
 
     Returns the set of newly-added tool names (empty when nothing changed), so
     callers can decide whether to notify the user / re-emit session info.  The
@@ -8168,6 +8186,18 @@ def refresh_agent_mcp_tools(
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
 
+    # Snapshot registry membership OUTSIDE ``_agent_tools_lock`` — it is the
+    # only input ``preserve_prefix`` needs beyond the two tool lists, and
+    # taking ``registry._lock`` under the tools lock would be the first place
+    # in the process to nest those two.
+    registered_names: set = set()
+    if preserve_prefix:
+        try:
+            registered_names = {entry.name for entry in registry.get_all_entries()}
+        except Exception:  # noqa: BLE001
+            # Fail open to the plain rebuild rather than pinning a stale list.
+            preserve_prefix = False
+
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.
@@ -8181,15 +8211,38 @@ def refresh_agent_mcp_tools(
         if snapshot_generation < published_gen:
             # A newer snapshot already won; our set is stale — drop it.
             return set()
-        current = {
-            t["function"]["name"]
-            for t in (getattr(agent, "tools", None) or [])
-        }
+        current_defs = list(getattr(agent, "tools", None) or [])
+        current = {t["function"]["name"] for t in current_defs}
+        if preserve_prefix:
+            new_defs, new_names = _merge_preserving_prefix(
+                current_defs, new_defs, registered_names,
+            )
         if new_names == current:
-            # No change → leave the live snapshot untouched (no churn), but
-            # record the generation so an in-flight older caller can't clobber.
-            agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-            return set()
+            # Same NAME set. For MCP-reload callers that is "no change" —
+            # leave the live snapshot untouched (no churn). Content-aware
+            # callers (the compaction boundary) also diff the serialized
+            # bytes: dynamic schemas (image_generate capabilities,
+            # delegate_task limits, execute_code stubs) change CONTENT
+            # under stable names when config changes between compactions.
+            content_changed = False
+            if content_aware:
+                try:
+                    _stable = json.dumps(
+                        (getattr(agent, "tools", None) or []),
+                        sort_keys=True, separators=(",", ":"), default=str,
+                    )
+                    _new = json.dumps(
+                        new_defs, sort_keys=True, separators=(",", ":"),
+                        default=str,
+                    )
+                    content_changed = _stable != _new
+                except Exception:  # noqa: BLE001
+                    content_changed = False
+            if not content_changed:
+                # Record the generation so an in-flight older caller can't
+                # clobber.
+                agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+                return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
         # Publish context-engine routing names atomically with the snapshot.
@@ -8198,7 +8251,117 @@ def refresh_agent_mcp_tools(
             engine_names.clear()
             engine_names.update(staged_engine_names)
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-        return new_names - current
+        added = new_names - current
+    # Every published snapshot re-pins the session's tool order so a later
+    # rebuild-for-existing-session (gateway agent-cache eviction) restores
+    # exactly these names — see ``restore_agent_tool_prefix``.
+    persist_agent_tool_names(agent)
+    return added
+
+
+def reprobe_tool_availability() -> None:
+    """Explicit ``/reload-mcp`` hatch out of the tools[] freeze.
+
+    Availability-gated tools (``check_fn``: Docker, HASS_TOKEN, OAuth…) are
+    frozen for the life of a session; a credential or daemon that appears
+    mid-session is only picked up when the user consciously asks. Drop the
+    ``check_fn`` verdict cache AND the ``get_tool_definitions`` memo (keyed on
+    registry generation, so it would otherwise replay the stale verdicts).
+    """
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+
+def persist_agent_tool_names(agent) -> None:
+    """Best-effort: write ``agent.tools`` names to the session row (freeze pin)."""
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not db or not session_id:
+        return
+    try:
+        db.update_session_tool_names(
+            session_id,
+            [t["function"]["name"] for t in (getattr(agent, "tools", None) or [])],
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("tool_names persist skipped", exc_info=True)
+
+
+def restore_agent_tool_prefix(agent, saved_names: list) -> bool:
+    """Fold a freshly built agent's ``tools`` onto the session's saved order.
+
+    Closes the second door on the tools[] freeze: the gateway rebuilds a NEW
+    ``AIAgent`` for an existing session after agent-cache eviction, and
+    ``agent_init`` re-derives ``agent.tools`` from live ``check_fn`` probes
+    with no predecessor to preserve. The saved name list stands in for that
+    predecessor: a saved tool that is still registered but failed its probe
+    this time is carried forward from the registry's schema, a deregistered
+    one is dropped, and genuinely new tools append at the tail — the same
+    ``_merge_preserving_prefix`` rule the between-turns refresh uses.
+    Returns True when the snapshot was changed.
+    """
+    if not saved_names:
+        return False
+    from tools.registry import registry
+
+    fresh_defs = list(getattr(agent, "tools", None) or [])
+    fresh = {t["function"]["name"]: t for t in fresh_defs}
+    saved_defs = []
+    for name in saved_names:
+        entry_def = fresh.get(name)
+        if entry_def is None:
+            entry = registry.get_entry(name)
+            if entry is None:
+                continue
+            entry_def = {"type": "function", "function": {**entry.schema, "name": entry.name}}
+        saved_defs.append(entry_def)
+    registered_names = {entry.name for entry in registry.get_all_entries()}
+    merged, merged_names = _merge_preserving_prefix(saved_defs, fresh_defs, registered_names)
+    with _agent_tools_lock:
+        if merged == fresh_defs:
+            return False
+        agent.tools = merged
+        agent.valid_tool_names = merged_names
+    if [t["function"]["name"] for t in merged] != list(saved_names):
+        persist_agent_tool_names(agent)
+    return True
+
+
+def _merge_preserving_prefix(
+    current_defs: list, new_defs: list, registered_names: set,
+) -> tuple[list, set]:
+    """Fold a fresh tool snapshot into a live one without moving existing bytes.
+
+    The live tool array is a cached request prefix, so the merge is ordered by
+    ``current_defs``, not by the fresh list:
+
+    * a name in both keeps its slot and takes the fresh schema (dynamic
+      overrides — delegate_task limits, execute_code stubs — still land);
+    * a name only in the live list is carried forward when it is still
+      registered (its ``check_fn`` flapped) and dropped when it is not (the
+      MCP server or plugin genuinely went away);
+    * a name only in the fresh list is appended at the tail, so a late-landing
+      MCP tool extends the prefix instead of splicing into sorted position.
+    """
+    fresh = {}
+    for entry in new_defs:
+        name = (entry.get("function") or {}).get("name", "")
+        if name:
+            fresh[name] = entry
+
+    merged = []
+    for entry in current_defs:
+        name = (entry.get("function") or {}).get("name", "")
+        replacement = fresh.pop(name, None)
+        if replacement is not None:
+            merged.append(replacement)
+        elif name and name in registered_names:
+            merged.append(entry)
+    merged.extend(fresh.values())
+    return merged, {(t.get("function") or {}).get("name", "") for t in merged}
 
 
 def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
