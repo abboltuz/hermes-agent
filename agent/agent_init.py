@@ -1313,6 +1313,8 @@ def init_agent(
             if agent.provider == "copilot-acp":
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
+            elif agent.provider == "antigravity" and agent.acp_command:
+                client_kwargs["bridge_command"] = agent.acp_command
             effective_base = base_url
             # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
             # "Ox Alpha"): the Zen relay serves these ANONYMOUSLY and 401s any

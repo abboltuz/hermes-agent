@@ -777,6 +777,22 @@ def test_antigravity_current_provider_uses_filtered_live_catalog_without_api_key
     assert "secret" not in str(row).lower()
 
 
+def test_antigravity_picker_keeps_current_namespaced_gpt_oss_catalog_row():
+    """A public GPT-OSS bridge row survives the real picker safety pipeline."""
+    current_gpt_oss = "antigravity-gpt-oss-120b"
+    ctx = _empty_ctx(provider="antigravity", model=current_gpt_oss)
+
+    with (
+        _list_auth_returning([]),
+        patch("hermes_cli.models.cached_provider_model_ids", return_value=[current_gpt_oss]),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+
+    row = next(row for row in payload["providers"] if row["slug"] == "antigravity")
+    assert row["models"] == [current_gpt_oss]
+    assert row["total_models"] == 1
+
+
 def test_antigravity_configured_provider_preserves_fallback_and_unconfigured_semantics():
     """Configured Antigravity gets its curated fallback; a setup skeleton does not."""
     from agent.antigravity_bridge_client import CURATED_FALLBACK_MODELS
@@ -976,7 +992,6 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
 
 
 
