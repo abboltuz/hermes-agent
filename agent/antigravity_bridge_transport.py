@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 READY_PREFIXES = ("antigravity-bridge ready ", "antigravity bridge ready ")
 PROTOCOL = "antigravity-openai-v1"
+SHARED_PROTOCOL = "antigravity-openai-shared-v1"
 TOKEN_ENV = "HERMES_ANTIGRAVITY_BRIDGE_TOKEN"
 STARTUP_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -60,14 +61,14 @@ def parse_antigravity_ready(line: str) -> dict[str, Any] | None:
 
 
 def validate_antigravity_ready(payload: dict[str, Any]) -> dict[str, Any]:
-    if payload.get("protocol") != PROTOCOL:
+    if payload.get("protocol") not in (PROTOCOL, SHARED_PROTOCOL):
         raise AntigravityBridgeError("unsupported Antigravity bridge protocol")
     if payload.get("host") != "127.0.0.1":
         raise AntigravityBridgeError("Antigravity bridge must bind to 127.0.0.1")
     port = payload.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise AntigravityBridgeError("Antigravity bridge readiness has invalid port")
-    return {"protocol": PROTOCOL, "host": "127.0.0.1", "port": port}
+    return {"protocol": payload["protocol"], "host": "127.0.0.1", "port": port}
 
 
 @dataclass
@@ -94,6 +95,16 @@ class AntigravityBridgeProcess:
             raise AntigravityBridgeError("Antigravity bridge command is empty")
         env = dict(os.environ)
         env[TOKEN_ENV] = self.auth_token
+        # Managed clients share one installation-owned pool, including callers
+        # that pass the resolved executable explicitly (auth/catalog probes).
+        # Keep custom commands private and never mutate the parent environment.
+        env.pop("HERMES_ANTIGRAVITY_SHARED_ROOT", None)
+        shared = isinstance(self.command, str) and self.command == resolve_antigravity_bridge_command()
+        if shared:
+            from hermes_constants import get_default_hermes_root
+            root = str(get_default_hermes_root().expanduser().resolve())
+            env["HERMES_HOME"] = root
+            env["HERMES_ANTIGRAVITY_SHARED_ROOT"] = root
         try:
             with self._stop_lock:
                 if self._stopped:
@@ -148,6 +159,9 @@ class AntigravityBridgeProcess:
         if isinstance(result, Exception):
             self.stop()
             raise result
+        if shared and result["protocol"] != SHARED_PROTOCOL:
+            self.stop()
+            raise AntigravityBridgeError("Antigravity bridge update required for shared accounts")
         self.endpoint = AntigravityBridgeEndpoint(
             f"http://{result['host']}:{result['port']}", self.auth_token
         )
@@ -179,8 +193,8 @@ class AntigravityBridgeProcess:
 
 def resolve_antigravity_bridge_command() -> str | None:
     """Return only a Hermes-managed executable; never search PATH or download."""
-    from hermes_constants import get_hermes_home
-    candidate = get_hermes_home() / "antigravity-bridge" / "bin" / (
+    from hermes_constants import get_default_hermes_root
+    candidate = get_default_hermes_root().expanduser().resolve() / "antigravity-bridge" / "bin" / (
         "antigravity-bridge.exe" if os.name == "nt" else "antigravity-bridge"
     )
     return str(candidate) if candidate.is_file() else None

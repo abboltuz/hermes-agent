@@ -48,6 +48,15 @@ function requestStub(): AntigravityGatewayRequest {
 }
 
 describe('createAntigravityRpc', () => {
+  it('projects email but not private account fields', async () => {
+    const request: AntigravityGatewayRequest = vi.fn(async () => ({
+      accounts: { accounts: [{ ...snapshot.accounts[0], email: 'artem@example.test', refreshToken: 'private' }] }
+    }))
+    await expect(createAntigravityRpc(request, () => 'default').listAccounts()).resolves.toEqual({
+      accounts: [{ ...snapshot.accounts[0], email: 'artem@example.test' }]
+    })
+  })
+
   it('forwards each exact RPC method, active profile, signal, and typed result', async () => {
     const request = requestStub()
     const signal = new AbortController().signal
@@ -86,13 +95,7 @@ describe('createAntigravityRpc', () => {
       undefined,
       signal
     )
-    expect(request).toHaveBeenNthCalledWith(
-      5,
-      'antigravity.oauth.start',
-      { profile: 'alpha' },
-      undefined,
-      signal
-    )
+    expect(request).toHaveBeenNthCalledWith(5, 'antigravity.oauth.start', { profile: 'alpha' }, undefined, signal)
     expect(request).toHaveBeenNthCalledWith(
       6,
       'antigravity.oauth.poll',

@@ -998,7 +998,7 @@ export const zhHant = defineLocale({
       loading: '正在載入提供方...',
       antigravity: {
         title: 'Antigravity 帳號',
-        description: '管理 Antigravity 帳號，不會顯示帳號憑證。',
+        description: '此 Hermes 安裝中的所有代理與設定檔共用帳號及優先順序。',
         projectId: '專案 ID',
         connect: '連結帳號',
         connectFailed: '無法開始 Antigravity 登入',

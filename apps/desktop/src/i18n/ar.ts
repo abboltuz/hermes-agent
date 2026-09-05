@@ -928,7 +928,7 @@ export const ar = defineLocale({
       },
       loading: 'جار تحميل المزودين...',
       antigravity: {
-        title: 'حسابات Antigravity', description: 'إدارة حسابات Antigravity دون كشف بيانات الاعتماد.', projectId: 'معرّف المشروع', connect: 'ربط حساب', connectFailed: 'تعذر بدء تسجيل دخول Antigravity', loadFailed: 'تعذر تحميل حسابات Antigravity.', mutationFailed: 'تعذر تحديث حساب Antigravity.', emptyTitle: 'لا توجد حسابات Antigravity', empty: 'اربط حسابًا للبدء.', enabled: 'مفعّل', disabled: 'معطّل', priority: 'الأولوية', priorityFor: account => `أولوية حساب Antigravity ${account}`, priorityInvalid: 'يجب أن تكون الأولوية بين 1 و999999.', savePriority: 'حفظ الأولوية', enableAccount: account => `تمكين حساب Antigravity ${account}`, accountLabel: account => `حساب Antigravity ${account}`, removeAccount: account => `إزالة حساب Antigravity ${account}`, removeConfirm: 'إزالة حساب Antigravity هذا؟'
+        title: 'حسابات Antigravity', description: 'تتم مشاركة الحسابات والأولويات بين جميع الوكلاء والملفات الشخصية في تثبيت Hermes هذا.', projectId: 'معرّف المشروع', connect: 'ربط حساب', connectFailed: 'تعذر بدء تسجيل دخول Antigravity', loadFailed: 'تعذر تحميل حسابات Antigravity.', mutationFailed: 'تعذر تحديث حساب Antigravity.', emptyTitle: 'لا توجد حسابات Antigravity', empty: 'اربط حسابًا للبدء.', enabled: 'مفعّل', disabled: 'معطّل', priority: 'الأولوية', priorityFor: account => `أولوية حساب Antigravity ${account}`, priorityInvalid: 'يجب أن تكون الأولوية بين 1 و999999.', savePriority: 'حفظ الأولوية', enableAccount: account => `تمكين حساب Antigravity ${account}`, accountLabel: account => `حساب Antigravity ${account}`, removeAccount: account => `إزالة حساب Antigravity ${account}`, removeConfirm: 'إزالة حساب Antigravity هذا؟'
       }
     },
     sessions: {

@@ -18,7 +18,7 @@ import { confirm } from '@/store/confirm'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 
-import { EmptyState, ListRow, SettingsSection } from './primitives'
+import { EmptyState, ListRow } from './primitives'
 
 const MAX_PRIORITY = 999_999
 const COMPLETE_OAUTH_STATUSES = new Set(['approved', 'complete', 'completed', 'success', 'succeeded'])
@@ -35,25 +35,22 @@ interface OAuthFlow {
   timer: ReturnType<typeof setInterval>
 }
 
-function accountLabel(accountId: string): string {
-  return `${accountId.slice(0, 13)}…${accountId.slice(-4)}`
-}
-
 function isAbort(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
 interface AntigravityAccountsProps {
+  embedded?: boolean
   onConfigSaved?: () => void
 }
 
-export function AntigravityAccounts({ onConfigSaved }: AntigravityAccountsProps) {
+export function AntigravityAccounts({ embedded, onConfigSaved }: AntigravityAccountsProps) {
   const profile = useStore($activeGatewayProfile)
 
-  return <AntigravityAccountsForProfile key={profile} onConfigSaved={onConfigSaved} />
+  return <AntigravityAccountsForProfile embedded={embedded} key={profile} onConfigSaved={onConfigSaved} />
 }
 
-function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsProps) {
+function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityAccountsProps) {
   const { t } = useI18n()
   const copy = t.settings.providers.antigravity
   const { requestGateway } = useGatewayRequest()
@@ -69,34 +66,44 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
   const oauth = useRef<OAuthFlow | null>(null)
   const pendingOAuthStart = useRef<PendingOAuthStart | null>(null)
 
-  const applySnapshot = useCallback((snapshot: AntigravityAccountsSnapshot, expectedProfile: string, expectedGeneration: number) => {
-    if (expectedProfile !== $activeGatewayProfile.get() || expectedGeneration !== generation.current) {
-      return false
-    }
-
-    setAccounts(snapshot.accounts)
-    setPriorityDrafts(Object.fromEntries(snapshot.accounts.map(account => [account.id, String(account.priority)])))
-    setPriorityErrors({})
-    setError(false)
-
-    return true
-  }, [])
-
-  const refresh = useCallback(async (controller = new AbortController()) => {
-    const expectedProfile = $activeGatewayProfile.get()
-    const expectedGeneration = ++generation.current
-    setError(false)
-
-    try {
-      const snapshot = await rpc.listAccounts({ signal: controller.signal })
-      return applySnapshot(snapshot, expectedProfile, expectedGeneration)
-    } catch (reason) {
-      if (!isAbort(reason) && expectedProfile === $activeGatewayProfile.get() && expectedGeneration === generation.current) {
-        setError(true)
+  const applySnapshot = useCallback(
+    (snapshot: AntigravityAccountsSnapshot, expectedProfile: string, expectedGeneration: number) => {
+      if (expectedProfile !== $activeGatewayProfile.get() || expectedGeneration !== generation.current) {
+        return false
       }
-      return false
-    }
-  }, [applySnapshot, rpc])
+
+      setAccounts(snapshot.accounts)
+      setPriorityDrafts(Object.fromEntries(snapshot.accounts.map(account => [account.id, String(account.priority)])))
+      setPriorityErrors({})
+      setError(false)
+
+      return true
+    },
+    []
+  )
+
+  const refresh = useCallback(
+    async (controller = new AbortController()) => {
+      const expectedProfile = $activeGatewayProfile.get()
+      const expectedGeneration = ++generation.current
+      setError(false)
+
+      try {
+        const snapshot = await rpc.listAccounts({ signal: controller.signal })
+        return applySnapshot(snapshot, expectedProfile, expectedGeneration)
+      } catch (reason) {
+        if (
+          !isAbort(reason) &&
+          expectedProfile === $activeGatewayProfile.get() &&
+          expectedGeneration === generation.current
+        ) {
+          setError(true)
+        }
+        return false
+      }
+    },
+    [applySnapshot, rpc]
+  )
 
   const cancelOAuth = useCallback(
     (flow = oauth.current, updateState = true) => {
@@ -186,11 +193,16 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
       const { [account.id]: _, ...rest } = current
       return rest
     })
-    void runMutation(`priority:${account.id}`, (client, signal) => client.setAccountPriority(account.id, value, { signal }))
+    void runMutation(`priority:${account.id}`, (client, signal) =>
+      client.setAccountPriority(account.id, value, { signal })
+    )
   }
 
   const remove = async (account: AntigravityAccount) => {
-    if (busy !== null || !(await confirm({ confirmLabel: t.common.remove, destructive: true, title: copy.removeConfirm }))) {
+    if (
+      busy !== null ||
+      !(await confirm({ confirmLabel: t.common.remove, destructive: true, title: copy.removeConfirm }))
+    ) {
       return
     }
 
@@ -268,21 +280,25 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
   }
 
   return (
-    <SettingsSection
-      aside={
-        <Button disabled={accounts === null || busy !== null || connecting} onClick={() => void refresh()} size="sm" type="button" variant="ghost">
+    <div className="grid gap-3">
+      <div className="flex items-center justify-between gap-2">
+        {!embedded && <h3>{copy.title}</h3>}
+        <Button
+          disabled={accounts === null || busy !== null || connecting}
+          onClick={() => void refresh()}
+          size="sm"
+          type="button"
+          variant="ghost"
+        >
           <RefreshCw className="size-3.5" />
           {t.common.refresh}
         </Button>
-      }
-      icon={Plus}
-      title={copy.title}
-    >
+      </div>
       <div className="grid gap-3">
         <p className="text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
           {copy.description}
         </p>
-        <div className="flex flex-wrap items-end gap-2 rounded-md border border-border/50 p-3">
+        <div className="flex flex-wrap items-end gap-2">
           {connecting ? (
             <Button onClick={() => cancelOAuth()} type="button" variant="outline">
               {t.common.cancel}
@@ -309,9 +325,10 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
         ) : accounts.length === 0 ? (
           <EmptyState description={copy.empty} title={copy.emptyTitle} />
         ) : (
-          <div className="divide-y divide-border/50">
-            {accounts.map(account => {
-              const label = accountLabel(account.id)
+          <div className="grid gap-2">
+            {accounts.map((account, index) => {
+              const label = account.email || copy.accountLabel(String(index + 1))
+              const accessibleName = account.email || String(index + 1)
               const isBusy = busy?.endsWith(account.id) ?? false
 
               return (
@@ -319,7 +336,7 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
                   action={
                     <div className="flex flex-wrap items-center justify-end gap-2">
                       <Switch
-                        aria-label={copy.enableAccount(label)}
+                        aria-label={copy.enableAccount(accessibleName)}
                         checked={account.enabled}
                         disabled={isBusy}
                         onCheckedChange={enabled => void changeEnabled(account, enabled)}
@@ -328,7 +345,7 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
                         {copy.priority}
                         <Input
                           aria-describedby={priorityErrors[account.id] ? `priority-error-${account.id}` : undefined}
-                          aria-label={copy.priorityFor(label)}
+                          aria-label={copy.priorityFor(accessibleName)}
                           disabled={isBusy}
                           inputMode="numeric"
                           max={MAX_PRIORITY}
@@ -340,18 +357,28 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
                           value={priorityDrafts[account.id] ?? String(account.priority)}
                         />
                       </label>
-                      <Button disabled={isBusy} onClick={() => savePriority(account)} size="sm" type="button" variant="outline">
+                      <Button
+                        disabled={isBusy}
+                        onClick={() => savePriority(account)}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
                         {copy.savePriority}
                       </Button>
                       <Button
-                        aria-label={copy.removeAccount(label)}
+                        aria-label={copy.removeAccount(accessibleName)}
                         disabled={isBusy}
                         onClick={() => void remove(account)}
                         size="icon-sm"
                         type="button"
                         variant="ghost"
                       >
-                        {busy === `remove:${account.id}` ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                        {busy === `remove:${account.id}` ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : (
+                          <Trash2 className="size-4" />
+                        )}
                       </Button>
                     </div>
                   }
@@ -364,13 +391,13 @@ function AntigravityAccountsForProfile({ onConfigSaved }: AntigravityAccountsPro
                   }
                   description={account.enabled ? copy.enabled : copy.disabled}
                   key={account.id}
-                  title={<span aria-label={copy.accountLabel(label)}>{label}</span>}
+                  title={<span>{label}</span>}
                 />
               )
             })}
           </div>
         )}
       </div>
-    </SettingsSection>
+    </div>
   )
 }

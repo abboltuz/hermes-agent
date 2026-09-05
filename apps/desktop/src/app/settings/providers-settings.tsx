@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import type { ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useState } from 'react'
 
 import { runInTerminal } from '@/app/right-sidebar/store'
 import {
@@ -130,12 +130,14 @@ function OAuthPicker({
   onDisconnect,
   onTerminalDisconnect,
   onWantApiKey,
+  onConfigSaved,
   providers
 }: {
   disconnecting: null | string
   onDisconnect: (provider: OAuthProvider) => void
   onTerminalDisconnect: (provider: OAuthProvider) => void
   onWantApiKey: () => void
+  onConfigSaved?: () => void
   providers: OAuthProvider[]
 }) {
   const { t } = useI18n()
@@ -182,24 +184,32 @@ function OAuthPicker({
       {connected.length > 0 && (
         <>
           <GroupLabel>{p.connected}</GroupLabel>
-          {connected.map(p => (
-            <ConnectedProviderRow
-              disconnecting={disconnecting === p.id}
-              key={p.id}
-              onDisconnect={onDisconnect}
-              onSelect={select}
-              onTerminalDisconnect={onTerminalDisconnect}
-              provider={p}
-            />
-          ))}
+          {connected.map(p =>
+            p.id === 'antigravity' ? (
+              <AntigravityProviderRow key={p.id} onConfigSaved={onConfigSaved} provider={p} />
+            ) : (
+              <ConnectedProviderRow
+                disconnecting={disconnecting === p.id}
+                key={p.id}
+                onDisconnect={onDisconnect}
+                onSelect={select}
+                onTerminalDisconnect={onTerminalDisconnect}
+                provider={p}
+              />
+            )
+          )}
         </>
       )}
       {showOthers && (
         <>
           {connected.length > 0 && <GroupLabel>{p.otherProviders}</GroupLabel>}
-          {others.map(p => (
-            <ProviderRow key={p.id} onSelect={select} provider={p} />
-          ))}
+          {others.map(p =>
+            p.id === 'antigravity' ? (
+              <AntigravityProviderRow key={p.id} onConfigSaved={onConfigSaved} provider={p} />
+            ) : (
+              <ProviderRow key={p.id} onSelect={select} provider={p} />
+            )
+          )}
           <OpenRouterProviderRow onClick={onWantApiKey} />
         </>
       )}
@@ -216,6 +226,37 @@ function OAuthPicker({
         </Button>
       )}
     </section>
+  )
+}
+
+function AntigravityProviderRow({ provider, onConfigSaved }: { provider: OAuthProvider; onConfigSaved?: () => void }) {
+  const { t } = useI18n()
+  const panelId = useId()
+  const [open, setOpen] = useState(false)
+  const [visited, setVisited] = useState(false)
+  return (
+    <div className="grid gap-2">
+      <RowButton
+        aria-controls={panelId}
+        aria-expanded={open}
+        className="flex items-center justify-between gap-2 text-left"
+        onClick={() => {
+          setVisited(true)
+          setOpen(value => !value)
+        }}
+      >
+        <span className="font-semibold">{providerTitle(provider)}</span>
+        <span className="flex items-center gap-2">
+          {provider.status?.logged_in && <span className="text-xs text-primary">{t.settings.providers.connected}</span>}
+          <ChevronDown className={cn('size-3.5 transition-transform', open && 'rotate-180')} />
+        </span>
+      </RowButton>
+      {visited && (
+        <div aria-label={providerTitle(provider)} hidden={!open} id={panelId} role="region">
+          <AntigravityAccounts embedded onConfigSaved={onConfigSaved} />
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -449,7 +490,6 @@ export function ProvidersSettings({
   }
 
   const hasOauth = oauthProviders.length > 0
-  const genericOauthProviders = oauthProviders.filter(provider => provider.id !== 'antigravity')
   // The sidebar subnav owns the Accounts/API-keys split now; with no OAuth
   // providers there's nothing for the "Accounts" view to show, so fall to keys.
   const showApiKeys = view === 'keys' || (!hasOauth && view !== 'custom-endpoints')
@@ -511,13 +551,13 @@ export function ProvidersSettings({
 
   return (
     <SettingsContent>
-      <AntigravityAccounts onConfigSaved={onConfigSaved} />
       <OAuthPicker
         disconnecting={disconnecting}
         onDisconnect={provider => void handleDisconnect(provider)}
         onTerminalDisconnect={provider => void handleTerminalDisconnect(provider)}
         onWantApiKey={() => onViewChange('keys')}
-        providers={genericOauthProviders}
+        onConfigSaved={onConfigSaved}
+        providers={oauthProviders}
       />
     </SettingsContent>
   )

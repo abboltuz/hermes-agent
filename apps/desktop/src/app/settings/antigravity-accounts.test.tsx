@@ -97,6 +97,15 @@ afterEach(() => {
 })
 
 describe('AntigravityAccounts', () => {
+  it('shows email while mutations continue to use the opaque account id', async () => {
+    rpc.listAccounts.mockResolvedValue(snapshot([account('1', { email: 'artem@example.test' })]))
+    await renderAccounts()
+    expect(await screen.findByText('artem@example.test')).toBeTruthy()
+    expect(screen.queryByText(account('1').id)).toBeNull()
+    fireEvent.click(screen.getByRole('switch', { name: /artem@example.test/ }))
+    await waitFor(() => expect(rpc.setAccountEnabled).toHaveBeenCalledWith(account('1').id, false, expect.anything()))
+  })
+
   it('lists privacy-safe account rows and refreshes under the active profile', async () => {
     await renderAccounts()
 
@@ -149,7 +158,9 @@ describe('AntigravityAccounts', () => {
     fireEvent.click(toggle)
 
     await waitFor(() => expect(rpc.setAccountEnabled).toHaveBeenCalledTimes(2))
-    expect(screen.getByRole('switch', { name: /enable antigravity account/i }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('switch', { name: /enable antigravity account/i }).getAttribute('aria-checked')).toBe(
+      'false'
+    )
   })
 
   it('bounds priority input and confirms removal before applying the server snapshot', async () => {
@@ -286,7 +297,9 @@ describe('AntigravityAccounts', () => {
 
   it('starts OAuth without a project_id own-property', async () => {
     const realRpc = await vi.importActual<typeof AntigravityRpcModule>('@/lib/antigravity-rpc')
-    createAntigravityRpc.mockImplementation((request, getActiveProfile) => realRpc.createAntigravityRpc(request, getActiveProfile))
+    createAntigravityRpc.mockImplementation((request, getActiveProfile) =>
+      realRpc.createAntigravityRpc(request, getActiveProfile)
+    )
     requestGateway.mockImplementation(async method => {
       if (method === 'antigravity.accounts.list') {
         return { accounts: snapshot([account('1')]) }
