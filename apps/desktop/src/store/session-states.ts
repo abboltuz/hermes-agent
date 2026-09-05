@@ -30,6 +30,7 @@ import {
   revealTreePane
 } from '@/components/pane-shell/tree/store'
 import type { WorkspaceMode } from '@/contrib/types'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
 import type { SessionInfo } from '@/types/hermes'
@@ -54,6 +55,7 @@ import {
 } from './session'
 import { requestForSessionProfile, type SessionOwnerScope, type SessionProfileRoute } from './session-request-router'
 import { ackStoredSessionId, markSessionUnreadFinished } from './session-unread'
+import type { TranscriptProfileScope } from './transcript-tail'
 import { isBrowserWindow, isSecondaryWindow } from './windows'
 
 // ---------------------------------------------------------------------------
@@ -1075,7 +1077,16 @@ export interface SessionTileDelegate {
   invalidateRuntimeBindings?(preserveStoredSessionIds?: ReadonlySet<string>): void
   /** Bind a live runtime id for a stored session (resume without touching
    *  the main view). Returns the runtime id, or throws. */
-  resumeTile(storedSessionId: string): Promise<string>
+  resumeTile(
+    storedSessionId: string,
+    transcript?: {
+      /** Paint persisted history independently of runtime acknowledgement. */
+      publish(messages: ChatMessage[], profile?: TranscriptProfileScope): void
+      /** Include older pages read while the runtime was connecting. */
+      current(): ChatMessage[] | null
+      isCurrent(): boolean
+    }
+  ): Promise<string>
   /** Retire one runtime's busy/awaiting claim through the wiring cache
    *  (updateSessionState), so cache, focused view, busyRef, and tile mirrors
    *  settle together. Returns false when the cache holds no busy state for

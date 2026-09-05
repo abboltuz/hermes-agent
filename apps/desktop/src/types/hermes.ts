@@ -677,11 +677,28 @@ export interface SessionSemanticEnvelope {
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
   pagination?: {
+    has_more?: boolean
     limit: number
     offset: number
     order: 'latest' | 'oldest'
     returned: number
   }
+  session_id: string
+}
+
+/** State of the model-facing history preparation started by a deferred
+ * session.resume. The durable display transcript is a separate REST surface
+ * and can remain readable while this state is preparing or failed. */
+export interface SessionPreparation {
+  attempt: number
+  message?: string
+  message_count?: number
+  phase: 'history'
+  status: 'preparation_failed' | 'preparing' | 'ready'
+}
+
+export interface SessionResumeRetryResponse {
+  preparation: SessionPreparation
   session_id: string
 }
 
@@ -746,6 +763,7 @@ export interface SessionResumeResponse {
     questions?: unknown
     request_id?: string
   }
+  preparation?: SessionPreparation
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]

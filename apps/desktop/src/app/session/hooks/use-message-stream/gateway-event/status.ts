@@ -1,3 +1,4 @@
+import { mergeSessionPreparation } from '@/app/session/retry-preparation'
 import { translateNow } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { coerceGatewayText } from '@/lib/chat-runtime'
@@ -22,6 +23,17 @@ import type { GatewayEventContext } from './types'
 export function handleStatusEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, isActiveEvent, occurredAt } = ctx
   const { compactedTurnRef, failAssistantMessage, flushQueuedDeltas, queryClient, updateSessionState } = deps
+
+  if (event.type === 'session.resume_progress') {
+    if (sessionId && payload?.preparation) {
+      updateSessionState(sessionId, state => ({
+        ...state,
+        preparation: mergeSessionPreparation(state.preparation, payload.preparation)
+      }))
+    }
+
+    return true
+  }
 
   if (event.type === 'status.update') {
     if (sessionId && payload?.kind === 'compacting') {
@@ -118,6 +130,14 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'error') {
+    // Deferred history preparation is not a failed conversation turn. The
+    // preceding session.resume_progress event carries its retryable state;
+    // consume this compatibility error without fabricating an assistant error
+    // bubble, clearing prompts, or raising a turn-failure notification.
+    if (payload?.kind === 'session_preparation') {
+      return true
+    }
+
     const errorMessage = payload?.message || 'Hermes reported an error'
     const looksLikeProviderSetup = isProviderSetupErrorMessage(errorMessage)
 

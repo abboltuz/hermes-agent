@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import logging
 import re
 import secrets
 import threading
@@ -20,6 +21,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from agent.message_provenance import is_human_intent
 
 
+logger = logging.getLogger(__name__)
 _RECOVERY_PREFIX = "[COMPACTION RECOVERY] session="
 _PROVISIONAL_RECOVERY_PREFIX = "[COMPACTION RECOVERY PENDING] session="
 _MAX_PREVIEW = 240
@@ -46,11 +48,12 @@ def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
     """Estimate complete provider-wire usage in the token domain.
 
     Provider-specific tokenizers are not available at this layer.  Keep the
-    existing structural token estimate, then conservatively account for JSON
+    existing structural token estimate, then account for JSON
     framing, escaping, route fields, and nested schemas at three serialized
     UTF-8 bytes per token.  Raw bytes are not tokens: treating them as equal
     falsely rejects large multilingual and schema-heavy requests that fit the
-    provider context window.
+    provider context window. Despite the historical function name, this is
+    not a proven upper bound for arbitrary tokenizers or multimodal payloads.
     """
     public = {
         key: value for key, value in request.items()
@@ -80,6 +83,16 @@ def _provider_wire_token_bound(request: Mapping[str, Any]) -> int:
     return max(_tokens(public), serialized_tokens)
 
 
+def estimate_provider_wire_tokens(request: Mapping[str, Any]) -> int:
+    """Public estimated token cost for one provider-shaped request.
+
+    This deliberately carries the same estimated (not verified) semantics as
+    :func:`provider_request_budget`; cold-resume compaction uses it to enforce
+    an aggregate projection cap before an agent exists.
+    """
+    return _provider_wire_token_bound(request)
+
+
 @dataclass(frozen=True)
 class ProviderRequestBudget:
     """One model/route-specific budget decision for a provider request.
@@ -87,7 +100,9 @@ class ProviderRequestBudget:
     The decision is intentionally computed from the final provider-shaped
     request.  Callers no longer need to duplicate context-window, output
     reserve, and safety-margin arithmetic when deciding whether the same wire
-    is safe to dispatch or must first trigger compaction.
+    is admitted for dispatch or must first trigger compaction. Admission using
+    an estimate must not be mistaken for verified fit. Unknown windows remain
+    compatible, but explicitly have an indeterminate fit result.
     """
 
     context_window: int | None
@@ -96,15 +111,37 @@ class ProviderRequestBudget:
     estimated_input_tokens: int
 
     @property
+    def certainty(self) -> str:
+        # This layer has no authoritative count of the complete provider wire.
+        # A recognized model name or configured context window does not verify
+        # the heuristic, especially for images/audio. Only an adapter with a
+        # complete count and window contract may add a verified path later.
+        return "estimated"
+
+    @property
     def safe_input_budget(self) -> int | None:
+        """Input allowance with reserved headroom, not proof of actual fit."""
         if self.context_window is None:
             return None
         return max(0, self.context_window - self.output_reserve - self.safety_margin)
 
     @property
-    def fits(self) -> bool:
+    def fits(self) -> bool | None:
         safe_input_budget = self.safe_input_budget
-        return safe_input_budget is None or self.estimated_input_tokens <= safe_input_budget
+        if safe_input_budget is None:
+            return None
+        return self.estimated_input_tokens <= safe_input_budget
+
+    @property
+    def fit_status(self) -> str:
+        if self.fits is None:
+            return "unknown_window"
+        return "estimated_fit" if self.fits else "estimated_overflow"
+
+    @property
+    def allows_dispatch(self) -> bool:
+        """Compatibility policy: lack of proof does not disable a provider."""
+        return self.fits is not False
 
 
 def provider_request_budget(agent: Any, request: Mapping[str, Any]) -> ProviderRequestBudget:
@@ -145,7 +182,7 @@ def provider_request_budget(agent: Any, request: Mapping[str, Any]) -> ProviderR
         context_window=context_window,
         output_reserve=output_reserve,
         safety_margin=safety_margin,
-        estimated_input_tokens=_provider_wire_token_bound(request),
+        estimated_input_tokens=estimate_provider_wire_tokens(request),
     )
 
 
@@ -181,7 +218,7 @@ def _wire_request_fits(agent: Any, request: Mapping[str, Any], *, output_reserve
     # budget resolver is authoritative and derives the same values from the
     # final request/agent pair.
     del output_reserve, safety_margin
-    return provider_request_budget(agent, request).fits
+    return provider_request_budget(agent, request).allows_dispatch
 
 
 def _compact_responses_emergency_item(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -334,7 +371,7 @@ def _emergency_native_wire_projection(
             if output_cap is not None:
                 candidate["max_output_tokens"] = output_cap
             candidate["input"] = candidate_input
-            if provider_request_budget(agent, candidate).fits:
+            if provider_request_budget(agent, candidate).allows_dispatch:
                 return candidate
     return None
 
@@ -625,6 +662,8 @@ class ContextProjectionUnfit(RuntimeError):
     ) -> None:
         self.result = result
         self.budget = budget
+        self.budget_certainty = budget.certainty if budget is not None else None
+        self.budget_status = budget.fit_status if budget is not None else None
         self.estimated_input_tokens = (
             budget.estimated_input_tokens if budget is not None else None
         )
@@ -781,29 +820,23 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     request = dict(api_kwargs)
     wire_request = _strip_provider_private(request)
     messages = request.get("messages")
-    compressor = getattr(agent, "context_compressor", None)
-    context_window = getattr(agent, "_config_context_length", None)
-    if not isinstance(context_window, int) or context_window <= 0:
-        context_window = getattr(compressor, "context_length", None)
-    output_reserve = request.get("max_tokens", request.get("max_completion_tokens", 0))
-    if "max_output_tokens" in request:
-        output_reserve = request["max_output_tokens"]
-    inference_config = request.get("inferenceConfig")
-    if isinstance(inference_config, Mapping) and isinstance(
-        inference_config.get("maxTokens"), int
-    ):
-        # Bedrock Converse carries output capacity in its nested control wire.
-        output_reserve = inference_config["maxTokens"]
-    if not isinstance(output_reserve, int) or output_reserve < 0:
-        output_reserve = 0
-    safety_margin = getattr(agent, "_compression_safety_margin", 1024)
-    if not isinstance(safety_margin, int) or safety_margin < 0:
-        safety_margin = 1024
+    wire_budget = provider_request_budget(agent, wire_request)
+    context_window = wire_budget.context_window
+    output_reserve = wire_budget.output_reserve
+    safety_margin = wire_budget.safety_margin
+    # Diagnostics contain measurements only: no request bodies, credentials or
+    # route URLs. Keep this off the wire and avoid mutating agent/session state.
+    logger.debug(
+        "provider request budget: certainty=%s status=%s estimated_input=%s "
+        "context_window=%s output_reserve=%s safety_margin=%s",
+        wire_budget.certainty, wire_budget.fit_status,
+        wire_budget.estimated_input_tokens, context_window,
+        output_reserve, safety_margin,
+    )
     # Native Responses-shaped payloads have no canonical ``messages`` list.
     # They still must pass the final provider-wire guard before dispatch.
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
-        wire_budget = provider_request_budget(agent, wire_request)
-        if not wire_budget.fits:
+        if not wire_budget.allows_dispatch:
             if bool(getattr(agent, "_provider_wire_emergency_projection", False)):
                 emergency_request = _emergency_native_wire_projection(
                     agent, wire_request
@@ -812,7 +845,7 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
                     return emergency_request
             raise ContextProjectionUnfit(CutResult(
                 [], "context_projection_unfit", False,
-                reason="final provider wire payload exceeds safe context budget",
+                reason="final provider wire payload exceeds estimated context budget",
             ), wire_budget)
         return wire_request
     if not isinstance(context_window, int) or context_window <= 0:
@@ -820,8 +853,7 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
     tools = request.get("tools") or ()
     tool_tokens = estimate_projection_tokens(tools) if isinstance(tools, Sequence) else 0
     budget = CompressionBudget(context_window, output_reserve, safety_margin, tool_schema_tokens=tool_tokens)
-    wire_budget = provider_request_budget(agent, wire_request)
-    if budget.fits(messages) and wire_budget.fits:
+    if budget.fits(messages) and wire_budget.allows_dispatch:
         return wire_request
     coordinator = ensure_compression_coordinator(agent, trigger="pre_send_fit_gate", urgency=3)
     def _candidate_wire_fits(candidate_messages: Sequence[Mapping[str, Any]]) -> bool:
@@ -848,7 +880,7 @@ def prepare_api_request(agent: Any, api_kwargs: Mapping[str, Any]) -> dict[str, 
         agent, wire_request, output_reserve=output_reserve, safety_margin=safety_margin
     ):
         if result.provider_call_allowed:
-            result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="final provider wire payload exceeds safe context budget")
+            result = replace(result, outcome="context_projection_unfit", provider_call_allowed=False, reason="final provider wire payload exceeds estimated context budget")
         raise ContextProjectionUnfit(result, provider_request_budget(agent, wire_request))
     if result.recovery_identity and not _bind_recovery_identity(
         agent, messages, result.messages, result.recovery_identity,

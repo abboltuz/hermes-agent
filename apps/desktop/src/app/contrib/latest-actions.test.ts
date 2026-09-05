@@ -23,6 +23,7 @@ function makeChatActions(): ChatActions {
     onReload: vi.fn(),
     onRemoveAttachment: vi.fn(),
     onRestoreToMessage: vi.fn(),
+    onRetryPreparation: vi.fn(),
     onRetryResume: vi.fn(),
     onSteer: vi.fn(),
     onSubmit: vi.fn(),

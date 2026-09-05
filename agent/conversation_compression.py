@@ -66,6 +66,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
@@ -2593,6 +2594,65 @@ def _compression_source_fingerprint(messages: list, system_message: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def compression_strategy_fingerprint_for_engine(
+    compressor: Any,
+    focus_topic: Optional[str],
+) -> str:
+    """Rearm failed work when its engine, route, budget or policy changes.
+
+    Persist only the digest. Credentials and incidental counters are deliberately
+    excluded; changing a worker/process generation is not a changed strategy.
+    """
+    from agent.auxiliary_client import _get_auxiliary_task_config
+
+    aux = _get_auxiliary_task_config("compression")
+    def endpoint_identity(value: Any) -> str:
+        if not isinstance(value, str) or not value:
+            return ""
+        parts = urlsplit(value)
+        query = sorted((key, item) for key, item in parse_qsl(parts.query, keep_blank_values=True)
+                       if not any(secret in key.lower() for secret in (
+                           "key", "token", "secret", "password", "signature", "credential", "auth",
+                       )))
+        return urlunsplit((parts.scheme.lower(), parts.netloc.rsplit("@", 1)[-1].lower(),
+                           parts.path.rstrip("/"), urlencode(query), ""))
+
+    def route_policy(route: dict) -> dict:
+        return {
+            **{key: route.get(key) for key in (
+                "provider", "model", "api_mode", "context_length", "max_tokens",
+                "timeout", "reasoning_effort", "reasoning_enabled",
+            )},
+            "base_url": endpoint_identity(route.get("base_url")),
+        }
+
+    fields = (
+        "model", "provider", "api_mode", "summary_model", "context_length",
+        "protect_first_n", "protect_last_n", "summary_target_ratio", "tail_mode",
+        "max_tokens", "min_tail_user_messages", "threshold_tokens", "threshold_tokens_cap",
+        "abort_on_summary_failure",
+    )
+    policy = {
+        "version": 1,
+        "engine": f"{type(compressor).__module__}.{type(compressor).__qualname__}",
+        "focus": focus_topic,
+        "engine_policy": {key: getattr(compressor, key, None) for key in fields},
+        "inherited_endpoint": endpoint_identity(getattr(compressor, "base_url", None)),
+        "auxiliary": route_policy(aux),
+        "fallback_chain": [route_policy(entry) for entry in (aux.get("fallback_chain") or [])
+                           if isinstance(entry, dict)],
+    }
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _compression_strategy_fingerprint(agent: Any, focus_topic: Optional[str]) -> str:
+    """Compatibility wrapper for normal agent-driven compaction admission."""
+    return compression_strategy_fingerprint_for_engine(
+        getattr(agent, "context_compressor", None),
+        focus_topic,
+    )
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -2627,12 +2687,17 @@ def compress_context(
     logical_id = str(getattr(agent, "_conversation_root_id", lambda: None)() or getattr(agent, "session_id", ""))
     generation = int(getattr(agent, "_compression_generation", 0) or 0)
     fingerprint = _compression_source_fingerprint(messages, system_message)
+    try:
+        strategy = _compression_strategy_fingerprint(agent, focus_topic)
+    except Exception:
+        logger.warning("Context compaction policy unavailable; keeping previous context", exc_info=True)
+        return messages, getattr(agent, "_cached_system_prompt", None) or system_message or ""
     request = CompressionRequest(
         logical_id,
         generation,
         trigger,
         urgency=3 if force else 1,
-        source_fingerprint=fingerprint,
+        source_fingerprint=f"{fingerprint}:{strategy}",
         row_watermark=len(messages),
         estimated_pressure=int(approx_tokens or 0),
         force=force,
@@ -2642,6 +2707,29 @@ def compress_context(
     if admission.outcome != "admitted":
         existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
         return messages, existing_prompt
+    db = getattr(agent, "_session_db", None)
+    # Class-level detection does not accidentally opt Mock/legacy duck-typed
+    # stores into a persistence contract they do not implement.
+    durable_claim = getattr(type(db), "claim_context_compaction", None)
+    durable_owner = None
+    if callable(durable_claim):
+        owner = uuid.uuid4().hex
+        try:
+            durable_admission = db.claim_context_compaction(
+                logical_id, fingerprint, strategy, owner=owner, force=force,
+            )
+        except Exception:
+            # Fail closed on journal contention/failure without changing history.
+            logger.warning("Context compaction admission unavailable; keeping previous context", exc_info=True)
+            durable_admission = "deferred_lock"
+        if durable_admission == "admitted":
+            durable_owner = owner
+        elif durable_admission != "unpersisted":
+            coordinator.finish_execution(request, "deferred_lock")
+            existing_prompt = getattr(agent, "_cached_system_prompt", None) or system_message or ""
+            return messages, existing_prompt
+    outcome = "aborted"
+    execution_outcome: dict[str, str] = {}
     try:
         result = _compress_context_impl(
             agent,
@@ -2654,18 +2742,12 @@ def compress_context(
             trigger=requested_trigger,
             defer_context_engine_notification=defer_context_engine_notification,
             commit_fence=commit_fence,
+            _execution_outcome=execution_outcome,
         )
         if result[0] is messages:
-            compressor = getattr(agent, "context_compressor", None)
-            blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
-            if callable(blocked) and not force and blocked(compressor):
-                outcome = "cooldown"
-            elif getattr(agent, "_compression_skipped_due_to_lock", None):
-                outcome = "deferred_lock"
-            elif getattr(agent, "api_mode", None) == "codex_app_server":
-                outcome = "native_delegated"
-            else:
-                outcome = "no_progress"
+            # The implementation reports at the gate that actually deferred
+            # work. Guard snapshots before/after it race sibling state changes.
+            outcome = execution_outcome.get("outcome", "no_progress")
         else:
             outcome = "committed"
         coordinator.finish_execution(request, outcome)
@@ -2677,6 +2759,13 @@ def compress_context(
         coordinator.finish_execution(request, "aborted")
         raise
     finally:
+        if durable_owner is not None:
+            try:
+                db.finish_context_compaction(logical_id, owner=durable_owner, outcome=outcome)
+            except Exception:
+                # An unfinished receipt remains running and then expires to a
+                # terminal state. Never mask a committed result or cancellation.
+                logger.warning("Context compaction receipt unavailable", exc_info=True)
         if coordinator.outcome not in {"aborted", "no_progress", "timed_out", "deferred_lock", "cooldown", "native_delegated", "committed"}:
             coordinator.finish_execution(request, "aborted")
 
@@ -2693,6 +2782,7 @@ def _compress_context_impl(
     trigger: Optional[str] = None,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    _execution_outcome: Optional[Dict[str, str]] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2724,6 +2814,10 @@ def _compress_context_impl(
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
 
+    # Private receipt shared only with the admission wrapper, never the engine
+    # or provider. Each actual nonexecution gate owns its disposition.
+    if _execution_outcome is None:
+        _execution_outcome = {}
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -2797,6 +2891,7 @@ def _compress_context_impl(
                     existing_prompt = agent._build_system_prompt(system_message)
                 return messages, existing_prompt
         try:
+            _execution_outcome["outcome"] = "native_delegated"
             return _compress_context_via_codex_app_server(
                 agent,
                 messages,
@@ -2820,6 +2915,7 @@ def _compress_context_impl(
             None,
         )
         if callable(blocked) and blocked(agent.context_compressor):
+            _execution_outcome["outcome"] = "cooldown"
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -3108,6 +3204,7 @@ def _compress_context_impl(
                 failure_class="lock_contended",
             )
             _complete_compaction_lifecycle()
+            _execution_outcome["outcome"] = "deferred_lock"
             return messages, _existing_sp
     _lock_released = False
     _lock_release_guard = threading.Lock()
@@ -3267,6 +3364,7 @@ def _compress_context_impl(
             None,
         )
         if callable(blocked) and blocked(compressor):
+            _execution_outcome["outcome"] = "cooldown"
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:

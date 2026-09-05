@@ -126,6 +126,7 @@ import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
+import { retryRetainedSessionPreparation } from '../session/retry-preparation'
 import { startWorkspaceSession } from '../session/workspace-session-target'
 import { PluginInstallModal } from '../settings/plugin-install-modal'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
@@ -377,6 +378,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return requestForSessionProfile<T>(owner, ambientRequestGateway, method, params ?? {}, timeoutMs, signal)
     },
     [ambientRequestGateway, runtimeIdByStoredSessionIdRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef]
+  )
+
+  const retrySessionPreparation = useCallback(
+    async (runtimeSessionId: string) => {
+      await retryRetainedSessionPreparation(requestGateway, updateSessionState, runtimeSessionId)
+    },
+    [requestGateway, updateSessionState]
   )
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
@@ -1063,6 +1071,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     // Already on screen (open tile, or the main session)? Jump to its tab;
     // otherwise load it into main. Same door every other session link uses.
     onResumeSession: sessionId => openSession(sessionId, navigate),
+    onRetryPreparation: retrySessionPreparation,
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,

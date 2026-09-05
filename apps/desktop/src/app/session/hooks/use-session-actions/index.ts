@@ -4,6 +4,7 @@ import type { NavigateFunction } from 'react-router'
 
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import { mergeSessionPreparation } from '@/app/session/retry-preparation'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
@@ -1588,6 +1589,7 @@ export function useSessionActions({
             ...(runtimeInfo ?? {}),
             messages: visibleMessagesForView,
             transcriptProvenance,
+            preparation: mergeSessionPreparation(state.preparation, resumed.preparation),
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.

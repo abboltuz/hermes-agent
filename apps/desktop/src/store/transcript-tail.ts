@@ -20,8 +20,8 @@ import type { SessionMessagesResponse } from '@/types/hermes'
 export interface TranscriptTailState {
   /** Offset (back from the newest row) where the next older page starts. */
   nextOffset: number
-  /** The last hydration page was exactly the page limit, so older rows
-   *  likely exist beyond what the in-memory store holds. */
+  /** Backend continuation (or a conservative one-shot legacy probe) says
+   *  older rows may exist beyond what the in-memory store holds. */
   possiblyTruncated: boolean
   /** Owning profile captured at hydration time, so a later backfill routes
    *  its REST read to the same backend that served the tail. */
@@ -79,7 +79,11 @@ function matchingTailEntries(storedSessionId: string): Array<[string, Transcript
   })
 }
 
-function tailStateFromPage(page: TailPage, profile?: TranscriptProfileScope): TranscriptTailState {
+function tailStateFromPage(
+  page: TailPage,
+  profile?: TranscriptProfileScope,
+  assumeArchiveWhenUnknown = false
+): TranscriptTailState {
   const pagination = page.pagination
 
   // No pagination metadata is a legacy backend that ignored the paging query
@@ -90,7 +94,8 @@ function tailStateFromPage(page: TailPage, profile?: TranscriptProfileScope): Tr
 
   return {
     nextOffset: pagination.offset + page.messages.length,
-    possiblyTruncated: page.messages.length >= pagination.limit,
+    possiblyTruncated:
+      pagination.has_more ?? (assumeArchiveWhenUnknown || page.messages.length >= pagination.limit),
     profile
   }
 }
@@ -121,7 +126,12 @@ export function recordTranscriptTail(storedSessionId: string, page: TailPage, pr
   }
 
   const key = transcriptTailKey(storedSessionId, profile)
-  setTranscriptTailEntry(key, tailStateFromPage(page, profile))
+  // A Desktop can update before its backend. Older pagination responses have
+  // no `has_more`, and this initial page now contains only active rows, so a
+  // short page cannot prove there is no compacted archive. Keep one explicit
+  // backfill probe available; recordTranscriptBackfillPage retires it when the
+  // older backend returns a short/empty page.
+  setTranscriptTailEntry(key, tailStateFromPage(page, profile, true))
 }
 
 /** Advance the bookkeeping after one older backfill page landed. */

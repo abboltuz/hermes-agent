@@ -2923,6 +2923,8 @@ export interface Translations {
     resumeStrandedTitle: string
     resumeStrandedBody: string
     resumeRetry: string
+    historyConnecting: string
+    historyReadOnly: string
     nothingToBranch: string
     branchNeedsChat: string
     sessionBusy: string

@@ -263,7 +263,8 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
 export const UserMessage: FC<{
   onCancel?: () => Promise<void> | void
   onRequestRestoreConfirm?: (messageId: string, target: RestoreMessageTarget) => void
-}> = ({ onCancel, onRequestRestoreConfirm }) => {
+  readOnly?: boolean
+}> = ({ onCancel, onRequestRestoreConfirm, readOnly: explicitReadOnly = false }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
   const messageId = useAuiState(s => s.message.id)
@@ -331,7 +332,7 @@ export const UserMessage: FC<{
   // Watch windows spectate a subagent run driven elsewhere — prompts can't be
   // edited, restored, or stopped from here. The bubble stays a button that
   // toggles the 2-line clamp so long prompts are still fully readable.
-  const readOnly = isWatchWindow()
+  const readOnly = explicitReadOnly || isWatchWindow()
   const [expanded, setExpanded] = useState(false)
   const clampActive = !(readOnly && expanded)
 

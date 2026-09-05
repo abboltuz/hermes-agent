@@ -230,6 +230,11 @@ def test_compressed_summary_marker_survives_restart_via_resume_history(tmp_path)
     assert by_content["derivative summary"].get("_compressed_summary") is True
     assert "_compressed_summary" not in by_content["durable user evidence"]
 
+    model_only = reopened.get_model_resume_conversation("s1")
+    model_only_by_content = {m.get("content"): m for m in model_only}
+    assert model_only_by_content["derivative summary"].get("_compressed_summary") is True
+    assert "_compressed_summary" not in model_only_by_content["durable user evidence"]
+
     plain = reopened.get_messages_as_conversation("s1")
     assert all("_compressed_summary" not in m for m in plain)
 

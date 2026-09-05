@@ -1032,7 +1032,25 @@ export const ja = defineLocale({
       },
       loading: 'プロバイダーを読み込み中...',
       antigravity: {
-        title: 'Antigravity アカウント', description: '認証情報を表示せずに Antigravity アカウントを管理します。', projectId: 'プロジェクト ID', connect: 'アカウントを接続', connectFailed: 'Antigravity のサインインを開始できませんでした', loadFailed: 'Antigravity アカウントを読み込めませんでした。', mutationFailed: 'Antigravity アカウントを更新できませんでした。', emptyTitle: 'Antigravity アカウントがありません', empty: '開始するにはアカウントを接続してください。', enabled: '有効', disabled: '無効', priority: '優先度', priorityFor: account => `Antigravity アカウント ${account} の優先度`, priorityInvalid: '優先度は 1 から 999999 の範囲にしてください。', savePriority: '優先度を保存', enableAccount: account => `Antigravity アカウント ${account} を有効化`, accountLabel: account => `Antigravity アカウント ${account}`, removeAccount: account => `Antigravity アカウント ${account} を削除`, removeConfirm: 'この Antigravity アカウントを削除しますか？'
+        title: 'Antigravity アカウント',
+        description: '認証情報を表示せずに Antigravity アカウントを管理します。',
+        projectId: 'プロジェクト ID',
+        connect: 'アカウントを接続',
+        connectFailed: 'Antigravity のサインインを開始できませんでした',
+        loadFailed: 'Antigravity アカウントを読み込めませんでした。',
+        mutationFailed: 'Antigravity アカウントを更新できませんでした。',
+        emptyTitle: 'Antigravity アカウントがありません',
+        empty: '開始するにはアカウントを接続してください。',
+        enabled: '有効',
+        disabled: '無効',
+        priority: '優先度',
+        priorityFor: account => `Antigravity アカウント ${account} の優先度`,
+        priorityInvalid: '優先度は 1 から 999999 の範囲にしてください。',
+        savePriority: '優先度を保存',
+        enableAccount: account => `Antigravity アカウント ${account} を有効化`,
+        accountLabel: account => `Antigravity アカウント ${account}`,
+        removeAccount: account => `Antigravity アカウント ${account} を削除`,
+        removeConfirm: 'この Antigravity アカウントを削除しますか？'
       }
     },
     sessions: {
@@ -3033,6 +3051,8 @@ export const ja = defineLocale({
     resumeStrandedBody:
       'このセッションへの接続に失敗し、自動再試行も停止しました。ゲートウェイが実行中か確認してから、もう一度お試しください。',
     resumeRetry: '再試行',
+    historyConnecting: '履歴を表示しています。エージェントに接続中…',
+    historyReadOnly: '履歴は読み取り専用で表示できます。会話を続けるには再接続してください。',
     nothingToBranch: 'ブランチするものがありません',
     branchNeedsChat: 'ブランチする前にチャットを開始または再開してください。',
     sessionBusy: 'セッションが使用中',

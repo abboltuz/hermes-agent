@@ -46,6 +46,7 @@ export function latestChatActions(actions: ChatActions): ChatActions {
     onReload: (...args) => actions.onReload(...args),
     onRemoveAttachment: (...args) => actions.onRemoveAttachment(...args),
     onRestoreToMessage: latestOptional(() => actions.onRestoreToMessage),
+    onRetryPreparation: (...args) => actions.onRetryPreparation(...args),
     onRetryResume: (...args) => actions.onRetryResume(...args),
     onSteer: (...args) => actions.onSteer(...args),
     onSubmit: (...args) => actions.onSubmit(...args),

@@ -16,7 +16,7 @@
  */
 
 import { getOlderSessionMessages } from '@/hermes'
-import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText, toChatMessages } from '@/lib/chat-messages'
 import { recordTranscriptBackfillPage, type TranscriptProfileScope, transcriptTailState } from '@/store/transcript-tail'
 
 /** Older rows likely exist beyond what the in-memory store holds. */
@@ -41,26 +41,138 @@ export function mergeOlderTranscriptPage(existing: ChatMessage[], olderPage: Cha
     return existing
   }
 
-  const existingRowIds = new Set<number>()
-  const existingIds = new Set<string>()
-
-  for (const message of existing) {
-    if (message.rowId !== undefined) {
-      existingRowIds.add(message.rowId)
-    }
-
-    existingIds.add(message.id)
-  }
-
-  const fresh = olderPage.filter(
-    message => !(message.rowId !== undefined && existingRowIds.has(message.rowId)) && !existingIds.has(message.id)
-  )
+  const fresh = olderPage.filter(message => !existing.some(current => sameTranscriptIdentity(current, message)))
 
   if (fresh.length === 0) {
     return existing
   }
 
   return [...fresh, ...existing]
+}
+
+function sameTranscriptIdentity(left: ChatMessage, right: ChatMessage): boolean {
+  if (left.rowId !== undefined && right.rowId !== undefined) {
+    return left.rowId === right.rowId
+  }
+
+  if (left.semanticId || right.semanticId) {
+    return Boolean(left.semanticId) && left.semanticId === right.semanticId
+  }
+
+  return left.id === right.id
+}
+
+/**
+ * Attach a persisted tail that arrived after a runtime was already bound.
+ * Runtime messages win on overlap because they can contain richer streaming
+ * state; persisted rows fill the chronological prefix. Exact stored/runtime
+ * fencing belongs to the caller — this function only reconciles one session.
+ */
+export function mergePersistedTailIntoRuntime(
+  currentRuntime: ChatMessage[],
+  persistedTail: ChatMessage[]
+): ChatMessage[] {
+  if (persistedTail.length === 0) {
+    return currentRuntime
+  }
+
+  if (currentRuntime.length === 0) {
+    return persistedTail
+  }
+
+  // Build a shortest common supersequence. Persisted and runtime are both
+  // chronological, but either may omit rows the other carries; prepending all
+  // missing persisted rows would reorder a gap inside an overlap. The LCS
+  // anchors those gaps, and the runtime object wins at each shared identity so
+  // richer live/pending state survives hydration.
+  const persistedCount = persistedTail.length
+  const runtimeCount = currentRuntime.length
+  const widths = runtimeCount + 1
+  const lcs = new Uint32Array((persistedCount + 1) * widths)
+
+  const turnContexts = (messages: ChatMessage[]) => {
+    let preceding: ChatMessage | undefined
+    let assistantOrdinal = 0
+
+    return messages.map(message => {
+      const context = { assistantOrdinal, precedingUser: preceding }
+
+      if (message.role === 'user') {
+        preceding = message
+        assistantOrdinal = 0
+      } else if (message.role === 'assistant') {
+        assistantOrdinal += 1
+      }
+
+      return context
+    })
+  }
+
+  const persistedContexts = turnContexts(persistedTail)
+  const runtimeContexts = turnContexts(currentRuntime)
+  const normalizedText = (message: ChatMessage) => chatMessageText(message).replace(/\s+/g, ' ').trim()
+
+  const sameOrStrictExtension = (left: string, right: string) =>
+    left === right || (Boolean(left) && Boolean(right) && (left.startsWith(right) || right.startsWith(left)))
+
+  const orderedIdentityMatches = (persistedIndex: number, runtimeIndex: number) => {
+    const persisted = persistedTail[persistedIndex]
+    const runtime = currentRuntime[runtimeIndex]
+
+    if (sameTranscriptIdentity(persisted, runtime)) {
+      return true
+    }
+
+    if (persisted.role !== 'assistant' || runtime.role !== 'assistant') {
+      return false
+    }
+
+    const persistedContext = persistedContexts[persistedIndex]
+    const runtimeContext = runtimeContexts[runtimeIndex]
+    const persistedUser = persistedContext.precedingUser
+    const runtimeUser = runtimeContext.precedingUser
+    const persistedText = normalizedText(persisted)
+
+    return (
+      Boolean(persistedUser) &&
+      Boolean(runtimeUser) &&
+      sameTranscriptIdentity(persistedUser!, runtimeUser!) &&
+      persistedContext.assistantOrdinal === runtimeContext.assistantOrdinal &&
+      sameOrStrictExtension(persistedText, normalizedText(runtime))
+    )
+  }
+
+  for (let persistedIndex = persistedCount - 1; persistedIndex >= 0; persistedIndex -= 1) {
+    for (let runtimeIndex = runtimeCount - 1; runtimeIndex >= 0; runtimeIndex -= 1) {
+      const offset = persistedIndex * widths + runtimeIndex
+
+      lcs[offset] = orderedIdentityMatches(persistedIndex, runtimeIndex)
+        ? lcs[(persistedIndex + 1) * widths + runtimeIndex + 1] + 1
+        : Math.max(lcs[(persistedIndex + 1) * widths + runtimeIndex], lcs[offset + 1])
+    }
+  }
+
+  const merged: ChatMessage[] = []
+  let persistedIndex = 0
+  let runtimeIndex = 0
+
+  while (persistedIndex < persistedCount && runtimeIndex < runtimeCount) {
+    if (orderedIdentityMatches(persistedIndex, runtimeIndex)) {
+      merged.push(currentRuntime[runtimeIndex])
+      persistedIndex += 1
+      runtimeIndex += 1
+    } else if (lcs[(persistedIndex + 1) * widths + runtimeIndex] >= lcs[persistedIndex * widths + runtimeIndex + 1]) {
+      merged.push(persistedTail[persistedIndex])
+      persistedIndex += 1
+    } else {
+      merged.push(currentRuntime[runtimeIndex])
+      runtimeIndex += 1
+    }
+  }
+
+  merged.push(...persistedTail.slice(persistedIndex), ...currentRuntime.slice(runtimeIndex))
+
+  return merged
 }
 
 /**
@@ -79,11 +191,7 @@ export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], pre
 
   const first = refreshedTail[0]
 
-  const anchor = previous.findIndex(
-    message =>
-      (first.rowId !== undefined && message.rowId !== undefined && message.rowId === first.rowId) ||
-      message.id === first.id
-  )
+  const anchor = previous.findIndex(message => sameTranscriptIdentity(message, first))
 
   if (anchor <= 0) {
     return refreshedTail

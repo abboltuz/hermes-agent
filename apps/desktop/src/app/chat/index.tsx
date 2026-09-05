@@ -15,7 +15,8 @@ import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { $sessionTileDragging, $sessionTileEdgeHover } from '@/components/pane-shell/tree/store'
 import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
-import { ErrorState } from '@/components/ui/error-state'
+import { ErrorBanner, ErrorState } from '@/components/ui/error-state'
+import { Loader } from '@/components/ui/loader'
 import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import { type HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -29,6 +30,7 @@ import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
+import { notifyError } from '@/store/notifications'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
@@ -48,7 +50,7 @@ import {
   shouldMigrateComposerScope
 } from '@/store/session'
 import { $focusedStoredSessionId, sessionTileDelegate } from '@/store/session-states'
-import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
+import { $transcriptTailBySessionId, type TranscriptProfileScope, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
@@ -103,6 +105,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onRestoreToMessage?: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
+  onRetryPreparation: (runtimeSessionId: string) => Promise<void> | void
   onRetryResume: (sessionId: string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   onDismissError?: (messageId: string) => void
@@ -192,6 +195,7 @@ interface ChatRuntimeBoundaryProps {
 }
 
 const NO_MESSAGES: ChatMessage[] = []
+const ignoreNewMessage = async () => undefined
 
 /**
  * The view's $messages, live only while this surface is the VISIBLE tab.
@@ -277,9 +281,13 @@ function ChatRuntimeBoundary({
     ? getSessionOwnerHint(storedId, connectionId ? { connectionId, profile: activeProfile } : undefined)
     : undefined
 
-  const tailProfile = ownerRoute
-    ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
-    : undefined
+  const tailProfile = useMemo(
+    () =>
+      ownerRoute
+        ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
+        : undefined,
+    [ownerRoute]
+  )
 
   const tailState = storedId && transcriptTailStates ? transcriptTailState(storedId, tailProfile) : undefined
   const restBackfillAvailable = Boolean(tailState?.possiblyTruncated)
@@ -325,10 +333,7 @@ function ChatRuntimeBoundary({
     messageRepository: runtimeMessageRepository,
     isRunning: busy,
     setMessages: onThreadMessagesChange,
-    onNew: async () => {
-      // Submission is handled explicitly by ChatBar.
-      // Keeping this no-op avoids duplicate prompt.submit calls.
-    },
+    onNew: ignoreNewMessage,
     onEdit,
     onCancel: async () => onCancel(),
     onReload
@@ -341,15 +346,79 @@ function ChatRuntimeBoundary({
   )
 }
 
+function StoredTranscriptRuntime({
+  children,
+  historyProfile,
+  onOlderPage
+}: {
+  children: React.ReactNode
+  historyProfile?: TranscriptProfileScope
+  onOlderPage: (messages: ChatMessage[]) => void
+}) {
+  const view = useSessionView()
+  const messages = useMessagesWhileVisible(view.$messages)
+  const repository = useRuntimeMessageRepository(messages)
+
+  const runtimeStore = useMemo(
+    () => ({ messageRepository: repository, isRunning: false, onNew: ignoreNewMessage }),
+    [repository]
+  )
+
+  const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeStore)
+  const storedId = useStore(view.$storedId)
+  const tailStates = useStore($transcriptTailBySessionId)
+  const olderAvailable = Boolean(storedId && tailStates && transcriptBackfillAvailable(storedId, historyProfile))
+
+  const expandWindow = useCallback(() => {
+    if (!storedId) {
+      return
+    }
+
+    void backfillOlderTranscriptPage({
+      storedSessionId: storedId,
+      profile: historyProfile,
+      isCurrent: () => view.$storedId.get() === storedId && view.$runtimeId.get() === null,
+      applyOlderPage: onOlderPage
+    })
+  }, [historyProfile, onOlderPage, storedId, view])
+
+  const transcriptWindow = useMemo(() => ({ olderAvailable, expandWindow }), [expandWindow, olderAvailable])
+
+  return (
+    <TranscriptWindowProvider value={transcriptWindow}>
+      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+    </TranscriptWindowProvider>
+  )
+}
+
+/** The existing transcript renderer without agent capabilities or a composer.
+ *  Durable history remains navigable while no runtime has been bound. */
+export function StoredSessionTranscript({
+  onOlderPage,
+  historyProfile
+}: {
+  onOlderPage: (messages: ChatMessage[]) => void
+  historyProfile?: TranscriptProfileScope
+}) {
+  const view = useSessionView()
+  const storedId = useStore(view.$storedId)
+
+  return (
+    <StoredTranscriptRuntime historyProfile={historyProfile} onOlderPage={onOlderPage}>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <Thread readOnly sessionKey={storedId} />
+      </div>
+    </StoredTranscriptRuntime>
+  )
+}
+
 // Memoized: the tile caller (session-tile.tsx) and the contrib surface re-render
 // on idle ticks unrelated to the chat; with stable callback props (hoisted to
 // useCallback at the call sites) memo() lets the whole chat shell skip those.
 const CURSOR_MODEL_CATALOG_REFRESH_MS = 5 * 60 * 1000
 
 function modelOptionsIncludeConfiguredCursor(data: ModelOptionsResponse | undefined): boolean {
-  return Boolean(
-    data?.providers?.some(provider => provider.slug === 'cursor' && provider.authenticated !== false)
-  )
+  return Boolean(data?.providers?.some(provider => provider.slug === 'cursor' && provider.authenticated !== false))
 }
 
 export const ChatView = memo(function ChatView(props: ChatViewProps) {
@@ -387,6 +456,7 @@ const ChatViewContent = memo(function ChatViewContent({
   onEdit,
   onReload,
   onRestoreToMessage,
+  onRetryPreparation,
   onRetryResume,
   onTranscribeAudio,
   onDismissError
@@ -413,6 +483,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const sessionAnchor = isPrimary ? 'workspace' : `session-tile:${storedId ?? ''}`
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
+  const preparation = useStore(view.$preparation)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
@@ -521,6 +592,11 @@ const ChatViewContent = memo(function ChatViewContent({
   // session can't blank the current one.
   const resumeExhausted = isPrimary && isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
 
+  const preparationBlocked =
+    Boolean(activeSessionId) && Boolean(preparation) && preparation?.status !== 'ready'
+
+  const preparationFailed = preparation?.status === 'preparation_failed'
+
   const loadingSession =
     !resumeExhausted && isRoutedSessionView && (routeSessionMismatch || (messagesEmpty && !activeSessionId))
 
@@ -528,7 +604,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // Hide the composer in the exhausted error state too: there's no live runtime
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
-  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
+  const showChatBar = !loadingSession && !resumeExhausted && !preparationBlocked && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
@@ -611,6 +687,16 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const overlayKind: DragKind = dragKind === 'files' ? 'files' : sessionDragging && !sessionEdgeHover ? 'session' : null
 
+  const retryPreparation = useCallback(() => {
+    if (!activeSessionId) {
+      return
+    }
+
+    void Promise.resolve(onRetryPreparation(activeSessionId)).catch(error => {
+      notifyError(error, t.desktop.resumeStrandedTitle)
+    })
+  }, [activeSessionId, onRetryPreparation, t.desktop.resumeStrandedTitle])
+
   return (
     <div
       className={cn(
@@ -664,6 +750,7 @@ const ChatViewContent = memo(function ChatViewContent({
             onCancel={haltRun}
             onDismissError={onDismissError}
             onRestoreToMessage={onRestoreToMessage}
+            readOnly={preparationBlocked}
             sessionId={activeSessionId}
             sessionKey={threadKey}
           />
@@ -700,6 +787,22 @@ const ChatViewContent = memo(function ChatViewContent({
           <ChatDropOverlay kind={overlayKind} />
           <ChatSwapOverlay profile={gatewaySwapTarget} />
         </div>
+        {preparationBlocked && (
+          <div className="shrink-0 space-y-2 border-t border-(--ui-border-subtle) px-4 py-3" role="status">
+            {preparationFailed ? (
+              <>
+                <ErrorBanner>
+                  {t.desktop.historyReadOnly} {preparation?.message}
+                </ErrorBanner>
+                <Button onClick={retryPreparation} size="sm" variant="outline">
+                  {t.desktop.resumeRetry}
+                </Button>
+              </>
+            ) : (
+              <Loader label={t.desktop.historyConnecting} />
+            )}
+          </div>
+        )}
         {/* Composer renders OUTSIDE the contain:[layout paint] wrapper above:
             that wrapper is a containing block for — and clips — position:fixed
             descendants, so the popped-out (fixed) composer would anchor to the

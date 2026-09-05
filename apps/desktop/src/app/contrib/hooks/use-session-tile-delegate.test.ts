@@ -1,9 +1,12 @@
-import { renderHook } from '@testing-library/react'
+import { renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
+import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { setSessionOwnerHint, setSessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
+import { deferred } from '@/test/deferred'
 import type { SessionInfo } from '@/types/hermes'
 
 import { useSessionTileDelegate } from './use-session-tile-delegate'
@@ -71,6 +74,215 @@ describe('useSessionTileDelegate resumeTile', () => {
     setSessions([])
   })
 
+  it.each([false, true])('keeps history available when runtime fails (runtime first: %s)', async runtimeFirst => {
+    setSessions([row({ id: 'readable', profile: 'owner' })])
+    const history = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+    const runtime = deferred<{ session_id: string }>()
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(history.promise)
+    vi.mocked(requestGatewayForProfile).mockReturnValueOnce(runtime.promise)
+    const publish = vi.fn()
+    renderTile(vi.fn())
+
+    const opening = sessionTileDelegate()!.resumeTile('readable', {
+      publish,
+      current: () => null,
+      isCurrent: () => true
+    })
+
+    const settled = opening.catch(error => error)
+    await waitFor(() => expect(requestGatewayForProfile).toHaveBeenCalled())
+    const failure = new Error('request timed out: session.resume')
+
+    if (runtimeFirst) {
+      runtime.reject(failure)
+      // Runtime failure is surfaced immediately; a slow archive read cannot
+      // hold the retry state hostage.
+      expect(await settled).toBe(failure)
+    }
+
+    history.resolve({
+      session_id: 'readable',
+      messages: [{ id: 7, role: 'user', content: 'durable history' }]
+    } as never)
+    await waitFor(() => expect(publish).toHaveBeenCalledOnce())
+    expect(publish.mock.calls[0][0][0].rowId).toBe(7)
+    expect(publish.mock.calls[0][1]).toBe('owner')
+
+    if (!runtimeFirst) {
+      runtime.reject(failure)
+      expect(await settled).toBe(failure)
+    }
+  })
+
+  it('binds a ready runtime without waiting for a slow archive read', async () => {
+    setSessions([row({ id: 'runtime-ready', profile: 'owner' })])
+    const history = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(history.promise)
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({
+      session_id: 'live-ready',
+      messages: [{ row_id: 9, role: 'assistant', content: 'resume tail' }],
+      preparation: { attempt: 1, phase: 'history', status: 'preparing' }
+    } as never)
+    const updateSessionState = vi.fn()
+    const runtimeIdByStoredSessionIdRef = { current: new Map<string, string>() }
+    const publish = vi.fn()
+    renderTile(vi.fn(), { runtimeIdByStoredSessionIdRef, updateSessionState })
+
+    await expect(
+      sessionTileDelegate()!.resumeTile('runtime-ready', {
+        publish,
+        current: () => null,
+        isCurrent: () => true
+      })
+    ).resolves.toBe('live-ready')
+    expect(updateSessionState).toHaveBeenCalledOnce()
+    // useSessionStateCache establishes this reverse binding as part of the
+    // first update; the mock records updaters, so mirror that side effect.
+    runtimeIdByStoredSessionIdRef.current.set('runtime-ready', 'live-ready')
+
+    const initialUpdate = updateSessionState.mock.calls[0][1]
+    let state = initialUpdate({ messages: [] })
+    expect(state.messages.map((message: ChatMessage) => message.rowId)).toEqual([9])
+    expect(state.preparation).toEqual({ attempt: 1, phase: 'history', status: 'preparing' })
+
+    history.resolve({
+      session_id: 'runtime-ready',
+      messages: [
+        { id: 7, role: 'user', content: 'persisted question' },
+        { id: 8, role: 'assistant', content: 'persisted answer' }
+      ]
+    } as never)
+    await waitFor(() => expect(updateSessionState).toHaveBeenCalledTimes(2))
+    const lateUpdate = updateSessionState.mock.calls[1][1]
+    state = lateUpdate(state)
+
+    expect(publish).toHaveBeenCalledOnce()
+    expect(state.messages.map((message: ChatMessage) => message.rowId)).toEqual([7, 8, 9])
+  })
+
+  it('does not regress an event-ready tile when the resume acknowledgement arrives later', async () => {
+    setSessions([row({ id: 'runtime-race', profile: 'owner' })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({ messages: [], session_id: 'runtime-race' } as never)
+    const runtime = deferred<Awaited<ReturnType<typeof requestGatewayForProfile>>>()
+    vi.mocked(requestGatewayForProfile).mockReturnValueOnce(runtime.promise)
+    const states = new Map<string, ReturnType<typeof createClientSessionState>>()
+
+    const updateSessionState = vi.fn(
+      (
+        runtimeId: string,
+        updater: (
+          state: ReturnType<typeof createClientSessionState>
+        ) => ReturnType<typeof createClientSessionState>
+      ) => {
+        const current = states.get(runtimeId) ?? createClientSessionState('runtime-race')
+        const next = updater(current)
+
+        states.set(runtimeId, next)
+
+        return next
+      }
+    )
+
+    renderTile(vi.fn(), {
+      sessionStateByRuntimeIdRef: { current: states as Map<string, unknown> },
+      updateSessionState
+    })
+
+    const opening = sessionTileDelegate()!.resumeTile('runtime-race', {
+      publish: vi.fn(),
+      current: () => null,
+      isCurrent: () => true
+    })
+
+    await waitFor(() => expect(requestGatewayForProfile).toHaveBeenCalled())
+    states.set('live-race', {
+      ...createClientSessionState('runtime-race'),
+      preparation: { attempt: 1, message_count: 42, phase: 'history', status: 'ready' }
+    })
+    runtime.resolve({
+      session_id: 'live-race',
+      messages: [],
+      preparation: { attempt: 1, phase: 'history', status: 'preparing' }
+    } as never)
+
+    await expect(opening).resolves.toBe('live-race')
+    expect(states.get('live-race')?.preparation?.status).toBe('ready')
+  })
+
+  it('drops a late archive tail after the stored session is rebound elsewhere', async () => {
+    setSessions([row({ id: 'rebound', profile: 'owner' })])
+    const history = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(history.promise)
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({ session_id: 'old-runtime' } as never)
+    const runtimeIdByStoredSessionIdRef = { current: new Map<string, string>() }
+    const updateSessionState = vi.fn()
+    const publish = vi.fn()
+    renderTile(vi.fn(), { runtimeIdByStoredSessionIdRef, updateSessionState })
+
+    await sessionTileDelegate()!.resumeTile('rebound', {
+      publish,
+      current: () => null,
+      isCurrent: () => true
+    })
+    runtimeIdByStoredSessionIdRef.current.set('rebound', 'new-runtime')
+    history.resolve({
+      session_id: 'rebound',
+      messages: [{ id: 1, role: 'user', content: 'stale tail' }]
+    } as never)
+
+    await waitFor(() => expect(publish).toHaveBeenCalledOnce())
+    expect(updateSessionState).toHaveBeenCalledOnce()
+  })
+
+  it('carries preview backfill into the runtime without overwriting a newer live tail', async () => {
+    setSessions([row({ id: 'backfill', profile: 'owner' })])
+    const runtime = deferred<{ session_id: string }>()
+    vi.mocked(requestGatewayForProfile).mockReturnValueOnce(runtime.promise)
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({
+      session_id: 'backfill',
+      messages: [{ id: 2, role: 'user', content: 'latest' }]
+    } as never)
+    let preview: ChatMessage[] | null = null
+    const updateSessionState = vi.fn()
+    renderTile(vi.fn(), { updateSessionState })
+
+    const opening = sessionTileDelegate()!.resumeTile('backfill', {
+      publish: messages => {
+        preview = messages
+      },
+      current: () => preview,
+      isCurrent: () => true
+    })
+
+    await waitFor(() => expect(preview).not.toBeNull())
+    const older = toChatMessages([{ id: 1, role: 'user', content: 'older' }] as never)
+    preview = [...older, ...preview!]
+    runtime.resolve({ session_id: 'live-backfill' })
+    await opening
+    const update = updateSessionState.mock.calls[0][1]
+    expect(update({ messages: [] }).messages.map((message: ChatMessage) => message.rowId)).toEqual([1, 2])
+
+    const live = toChatMessages([
+      { id: 2, role: 'user', content: 'latest' },
+      { id: 3, role: 'assistant', content: 'new output' }
+    ] as never)
+
+    expect(update({ messages: live }).messages.map((message: ChatMessage) => message.rowId)).toEqual([1, 2, 3])
+  })
+
+  it('does not bind an obsolete preview attempt into the runtime cache', async () => {
+    setSessions([row({ id: 'obsolete', profile: 'owner' })])
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({ session_id: 'old-runtime' } as never)
+    const updateSessionState = vi.fn()
+    renderTile(vi.fn(), { updateSessionState })
+    await sessionTileDelegate()!.resumeTile('obsolete', {
+      publish: vi.fn(),
+      current: () => null,
+      isCurrent: () => false
+    })
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
   it('carries the owning profile into a cold tile resume so it cannot fork profiles', async () => {
     // A tile opens a session owned by another profile. Resuming without the
     // profile lets the gateway fall back to the launch-profile DB and clone the
@@ -96,7 +308,9 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-x',
         cols: 96,
         profile: 'ai-engineer',
-        omit_messages: true
+        omit_messages: true,
+        defer_history: true,
+        source: 'desktop'
       },
       undefined,
       undefined
@@ -124,7 +338,9 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-y',
         cols: 96,
         profile: 'default',
-        omit_messages: true
+        omit_messages: true,
+        defer_history: true,
+        source: 'desktop'
       },
       undefined,
       undefined
@@ -146,6 +362,8 @@ describe('useSessionTileDelegate resumeTile', () => {
       session_id: 'stored-shared',
       cols: 96,
       omit_messages: true,
+      defer_history: true,
+      source: 'desktop',
       profile: 'default'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -175,6 +393,8 @@ describe('useSessionTileDelegate resumeTile', () => {
       session_id: 'stored-remote',
       cols: 96,
       omit_messages: true,
+      defer_history: true,
+      source: 'desktop',
       profile: 'backend-oxcoder'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -218,7 +438,9 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-b',
         cols: 96,
         profile: 'default',
-        omit_messages: true
+        omit_messages: true,
+        defer_history: true,
+        source: 'desktop'
       },
       undefined,
       undefined

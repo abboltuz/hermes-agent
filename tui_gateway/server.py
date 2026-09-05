@@ -2538,11 +2538,33 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
 
 def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
-    ready = session.get("agent_ready")
-    if ready is not None and not ready.wait(timeout=timeout):
-        return _err(rid, 5032, "agent initialization timed out")
-    err = session.get("agent_error")
-    return _err(rid, 5032, err) if err else None
+    deadline = time.monotonic() + timeout
+    history_lock = session.setdefault("history_lock", threading.Lock())
+    while True:
+        with history_lock:
+            ready = session.get("agent_ready")
+            generation = int(session.get("agent_build_generation") or 0)
+        if ready is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not ready.wait(timeout=remaining):
+            return _err(rid, 5032, "agent initialization timed out")
+        with history_lock:
+            # An explicit preparation retry replaces both the Event and its
+            # result. Follow the new generation instead of interpreting an old
+            # signalled Event against freshly-cleared error state.
+            if (
+                session.get("agent_ready") is not ready
+                or int(session.get("agent_build_generation") or 0) != generation
+            ):
+                continue
+            err = session.get("agent_error")
+            agent = session.get("agent")
+        if err:
+            return _err(rid, 5032, err)
+        if agent is None:
+            return _err(rid, 5032, "agent initialization completed without an agent")
+        return None
 
 
 # The deferred prompt path waits in short slices so a cancel is honored
@@ -2598,21 +2620,11 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     Returns ``None`` on success OR when the turn was cancelled mid-wait (the
     caller's cancel branch owns that messaging), an ``_err`` dict otherwise.
     """
-    ready = session.get("agent_ready")
-    if ready is None:
-        return None
     start = time.monotonic()
     cap = _agent_build_wait_cap()
     notified_slow = False
-    while not ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
-        with session["history_lock"]:
-            cancelled = session.get("_turn_cancel_requested") or not session.get(
-                "running"
-            )
-        if cancelled:
-            # The caller's cancel/not-running branch emits the user-visible
-            # event for this — bail without an error of our own.
-            return None
+    history_lock = session.setdefault("history_lock", threading.Lock())
+    while True:
         waited = time.monotonic() - start
         if waited >= cap:
             return _err(
@@ -2621,46 +2633,93 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
                 f"agent initialization timed out after {int(waited)}s — "
                 "your message was not sent; retry once the session is ready",
             )
-        build_thread = session.get("_agent_build_thread")
-        if (
-            build_thread is not None
-            and not build_thread.is_alive()
-            and not ready.is_set()
-        ):
-            # _build's ``finally`` guarantees ready.set(); a dead thread with
-            # ready still unset means the build died hard (interpreter-level
-            # kill) — don't wait on a corpse for the rest of the cap.
-            return _err(
-                rid,
-                5032,
-                session.get("agent_error")
-                or "agent initialization failed before completing",
-            )
-        if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
-            # One keyed, replace-in-place notice: the desktop shows it as a
-            # toast, the TUI in its status bar. Without this the extended wait
-            # would be exactly the silent hang this function exists to fix.
-            notified_slow = True
-            _emit(
-                "notification.show",
-                sid,
-                {
-                    "text": (
-                        "Still starting the agent (tool discovery / model "
-                        "setup) — your message will be sent as soon as it's "
-                        "ready."
-                    ),
-                    "level": "info",
-                    "kind": "agent",
-                    "ttl_ms": None,
-                    "key": _AGENT_BUILD_SLOW_NOTICE_KEY,
-                    "id": _AGENT_BUILD_SLOW_NOTICE_KEY,
-                },
-            )
-    if notified_slow:
-        _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
-    err = session.get("agent_error")
-    return _err(rid, 5032, err) if err else None
+        with history_lock:
+            ready = session.get("agent_ready")
+            generation = int(session.get("agent_build_generation") or 0)
+        if ready is None:
+            return None
+        while not ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
+            with history_lock:
+                cancelled = session.get("_turn_cancel_requested") or not session.get(
+                    "running"
+                )
+                generation_changed = (
+                    session.get("agent_ready") is not ready
+                    or int(session.get("agent_build_generation") or 0) != generation
+                )
+                build_thread = session.get("_agent_build_thread")
+                build_error = session.get("agent_error")
+            if cancelled:
+                # The caller's cancel/not-running branch emits the user-visible
+                # event for this — bail without an error of our own.
+                return None
+            if generation_changed:
+                break
+            waited = time.monotonic() - start
+            if waited >= cap:
+                return _err(
+                    rid,
+                    5032,
+                    f"agent initialization timed out after {int(waited)}s — "
+                    "your message was not sent; retry once the session is ready",
+                )
+            if (
+                build_thread is not None
+                and not build_thread.is_alive()
+                and not ready.is_set()
+            ):
+                # _build's ``finally`` guarantees ready.set(); a dead thread with
+                # ready still unset means the build died hard (interpreter-level
+                # kill) — don't wait on a corpse for the rest of the cap.
+                return _err(
+                    rid,
+                    5032,
+                    build_error or "agent initialization failed before completing",
+                )
+            if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
+                # One keyed, replace-in-place notice: the desktop shows it as a
+                # toast, the TUI in its status bar. Without this the extended wait
+                # would be exactly the silent hang this function exists to fix.
+                notified_slow = True
+                _emit(
+                    "notification.show",
+                    sid,
+                    {
+                        "text": (
+                            "Still starting the agent (tool discovery / model "
+                            "setup) — your message will be sent as soon as it's "
+                            "ready."
+                        ),
+                        "level": "info",
+                        "kind": "agent",
+                        "ttl_ms": None,
+                        "key": _AGENT_BUILD_SLOW_NOTICE_KEY,
+                        "id": _AGENT_BUILD_SLOW_NOTICE_KEY,
+                    },
+                )
+        else:
+            # Event completion and its result belong to one generation. Read
+            # both under the same lock used by session.resume.retry; otherwise
+            # retry can replace the Event and clear the error between them.
+            with history_lock:
+                if (
+                    session.get("agent_ready") is not ready
+                    or int(session.get("agent_build_generation") or 0) != generation
+                ):
+                    continue
+                err = session.get("agent_error")
+                agent = session.get("agent")
+            if notified_slow:
+                _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
+            if err:
+                return _err(rid, 5032, err)
+            if agent is None:
+                return _err(rid, 5032, "agent initialization completed without an agent")
+            return None
+
+        # The inner wait observed a replacement generation. Preserve the
+        # original total timeout and progress-notice state, then follow it.
+        continue
 
 
 def _start_agent_build(sid: str, session: dict) -> None:
@@ -2684,11 +2743,17 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # prompt/RPC builds the agent normally so the user can talk to the session.
     if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
         return
+    history_lock = session.setdefault("history_lock", threading.Lock())
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
         if ready.is_set() or session.get("agent_build_started"):
             return
         session["agent_build_started"] = True
+        build_generation = int(session.get("agent_build_generation") or 0)
+        # A preparation retry replaces this Event. Capture the generation's
+        # exact fence now: an older build thread must never start waiting on a
+        # newer attempt just because it reached _build after the replacement.
+        history_ready = session.get("resume_history_ready")
         # An upgrading lazy session is now genuinely mid-construction — restore
         # its "still starting" eviction exemption.
         session.pop("lazy", None)
@@ -2706,13 +2771,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
         secret_token = None
         session_db = None
         owns_db = False
+        built_agent = None
+        db_transferred_to_built_agent = False
+        published_built_agent = False
         profile_home = current.get("profile_home")
         try:
-            history_ready = current.get("resume_history_ready")
             if history_ready is not None:
                 if not history_ready.wait(timeout=300.0):
                     raise TimeoutError("session history hydration timed out")
-                if history_error := current.get("resume_history_error"):
+                with history_lock:
+                    if int(current.get("agent_build_generation") or 0) != build_generation:
+                        return
+                    history_error = current.get("resume_history_error")
+                if history_error:
                     raise RuntimeError(str(history_error))
                 with _sessions_lock:
                     if _sessions.get(sid) is not current:
@@ -2775,9 +2846,20 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
-                agent = _make_agent(sid, key, **kw)
+                built_agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
+
+            # Establish ownership before the agent becomes reachable from the
+            # session record. Then every close race has exactly one owner: if
+            # publication wins, session teardown closes it; if close/retry wins,
+            # this builder closes its still-local agent. There is no interval
+            # where teardown can see the agent while its dedicated DB is still
+            # builder-owned.
+            if owns_db and session_db is not None:
+                if not _transfer_db_to_agent(built_agent, session_db):
+                    raise RuntimeError("failed to transfer dedicated session database to agent")
+                db_transferred_to_built_agent = True
 
             # Bot Mode gate hint: the DB title lands post-first-turn
             # (pending_title), but the system prompt builds at turn START —
@@ -2785,11 +2867,25 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # gate (agent/system_prompt.py) doesn't depend on write order.
             _title_hint = str(current.get("pending_title") or "").strip()
             if _title_hint:
-                agent._session_title_hint = _title_hint
+                built_agent._session_title_hint = _title_hint
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
+            # Retry can invalidate this generation while provider discovery is
+            # still constructing the agent. Membership + generation + publish
+            # are one atomic ownership claim relative to session.close/pop and
+            # session.resume.retry (both use this lock order).
+            with _sessions_lock:
+                with history_lock:
+                    if (
+                        _sessions.get(sid) is not current
+                        or int(current.get("agent_build_generation") or 0)
+                        != build_generation
+                    ):
+                        return
+                    current["agent"] = built_agent
+                    published_built_agent = True
+            agent = built_agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -2858,8 +2954,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            # A failed deferred-history attempt can be explicitly retried on
+            # the same runtime. Its old build waiter may unwind after the retry
+            # has installed a fresh ready event; fence that stale waiter from
+            # poisoning the new generation.
+            with history_lock:
+                generation_current = (
+                    int(current.get("agent_build_generation") or 0)
+                    == build_generation
+                )
+                if generation_current:
+                    current["agent_error"] = str(e)
+            if generation_current:
+                _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -2882,16 +2989,25 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
-            # Dedicated profile handle: hand it to the agent that will actually
-            # be torn down, or close it here when no such agent exists. Both
-            # non-transfer cases are real: the except above (build raised, so
-            # nothing holds the handle) and `replaced` (the session was reaped
-            # mid-build, so this agent is discarded and _teardown_session will
-            # never reach it). Transferring to a discarded agent would leak the
-            # handle exactly as before.
+            # A locally-constructed agent invalidated before publication owns
+            # its dedicated DB plus provider/MCP/client resources. Dispose that
+            # one local owner explicitly. Once published, teardown owns it even
+            # if the session was popped while this finally block was starting.
+            disposed_local_agent = False
+            if built_agent is not None and not published_built_agent:
+                try:
+                    if hasattr(built_agent, "close"):
+                        built_agent.close()
+                        disposed_local_agent = True
+                except Exception:
+                    logger.debug("failed to close superseded agent build for %s", sid, exc_info=True)
+            # A transfer failure (or a fake/legacy agent without close()) keeps
+            # DB ownership local. Avoid double-close when agent.close() already
+            # discharged a successful transfer.
             if owns_db and session_db is not None:
-                built = None if replaced else current.get("agent")
-                if not _transfer_db_to_agent(built, session_db):
+                if not db_transferred_to_built_agent or (
+                    not published_built_agent and not disposed_local_agent
+                ):
                     with contextlib.suppress(Exception):
                         session_db.close()
             ready.set()
@@ -6298,7 +6414,9 @@ def _current_profile_name() -> str:
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
 # v6: plugins.manage list rows carry the canonical registry key; toggles are
 #     key-addressed (keyless rows render read-only in Desktop Settings).
-DESKTOP_BACKEND_CONTRACT = 6
+# v7: deferred session.resume exposes model-history preparation state and the
+#     idempotent session.resume.retry RPC while retaining a readable runtime.
+DESKTOP_BACKEND_CONTRACT = 7
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -9633,8 +9751,280 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+def _assert_session_resume_safe(
+    db, stored_id: str, message_count=None, *, profile_home=None, model_only=False
+) -> None:
+    """Apply the owning profile's policy, independent of caller/thread context."""
+    from hermes_state import (
+        SessionExportTooLargeError,
+        SessionResumeTooLargeError,
+        resolved_max_resume_messages,
+    )
+
+    home_token = set_hermes_home_override(profile_home or _hermes_home)
+    try:
+        model_check = getattr(db, "assert_export_safe", None) if model_only else None
+        if callable(model_check):
+            limit = resolved_max_resume_messages()
+            try:
+                model_check(stored_id, max_messages=limit)
+            except SessionExportTooLargeError as exc:
+                raise SessionResumeTooLargeError(
+                    exc.message_count,
+                    limit,
+                    scope="in its model-facing working segment",
+                ) from exc
+        else:
+            safety_check = getattr(db, "assert_resume_safe", None)
+            if callable(safety_check):
+                safety_check(stored_id)
+            else:
+                limit = resolved_max_resume_messages()
+                count = int(message_count or 0)
+                if limit and count > limit:
+                    raise SessionResumeTooLargeError(count, limit)
+    except SessionResumeTooLargeError:
+        raise
+    except Exception as exc:
+        # Preserve compatibility with legacy/adaptor stores: only a proven
+        # over-limit blocks; counting failures are observable, not a new outage.
+        logger.warning(
+            "resume safety check failed for %s (proceeding without guard): %s",
+            stored_id, exc,
+        )
+    finally:
+        reset_hermes_home_override(home_token)
+
+
+def _resume_preparation_payload(session: dict | None) -> dict | None:
+    """Return the public, JSON-safe state of deferred model-history setup."""
+    preparation = (session or {}).get("resume_preparation")
+    return dict(preparation) if isinstance(preparation, dict) else None
+
+
+def _resume_hard_summary_callback(session: dict):
+    """Build the cold-resume summarizer from the session's persisted route."""
+    from agent.context_compressor import ContextCompressor
+
+    overrides = session.get("resume_runtime_overrides") or {}
+    model_override = overrides.get("model_override") or {}
+    compressor = ContextCompressor(
+        model=str(model_override.get("model") or "resume-hard-summary"),
+        provider=str(
+            model_override.get("provider")
+            or overrides.get("provider_override")
+            or ""
+        ),
+        base_url=str(model_override.get("base_url") or ""),
+        api_mode=str(model_override.get("api_mode") or ""),
+        quiet_mode=True,
+        # Hard-recovery already supplies a hierarchical bounded digest. Lean
+        # augmentation can issue additional chunk-digest calls; keep this
+        # refinement to one bounded compressor operation. The compressor may
+        # still apply its configured finite auxiliary-to-main fallback.
+        tail_mode="legacy",
+    )
+
+    def summarize(messages, previous_summary):
+        compressor._previous_summary = previous_summary
+        compressor._summary_has_user_turn = any(
+            bool(message.get("_compressed_summary_has_user_turn"))
+            for message in messages
+            if isinstance(message, dict)
+        )
+        return compressor._generate_summary(list(messages))
+
+    try:
+        summarize._resume_context_window = int(compressor.context_length)
+    except Exception:
+        summarize._resume_context_window = 128_000
+    try:
+        from agent.conversation_compression import (
+            compression_strategy_fingerprint_for_engine,
+        )
+
+        summarize._resume_strategy_identity = compression_strategy_fingerprint_for_engine(
+            compressor,
+            None,
+        )
+    except Exception:
+        # Stripped/scaffold builds may omit the normal compression module.
+        # Retain a credential-free minimal route identity so a model/provider
+        # change still rearms a prior terminal recovery receipt.
+        summarize._resume_strategy_identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "model": model_override.get("model") or "",
+                    "provider": (
+                        model_override.get("provider")
+                        or overrides.get("provider_override")
+                        or ""
+                    ),
+                    "api_mode": model_override.get("api_mode") or "",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    return summarize
+
+
+def _recover_oversized_model_resume(
+    sid: str,
+    session: dict,
+    stored_id: str,
+    db,
+    error,
+    *,
+    attempt: int,
+) -> None:
+    """Run cold recovery entirely inside the stored session owner's scope."""
+    profile_home = session.get("profile_home")
+    home_token = set_hermes_home_override(profile_home or _hermes_home)
+    secret_token = None
+    try:
+        if profile_home:
+            secret_token = set_secret_scope(
+                build_profile_secret_scope(Path(profile_home))
+            )
+        _recover_oversized_model_resume_in_owner_scope(
+            sid,
+            session,
+            stored_id,
+            db,
+            error,
+            attempt=attempt,
+        )
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _recover_oversized_model_resume_in_owner_scope(
+    sid: str,
+    session: dict,
+    stored_id: str,
+    db,
+    error,
+    *,
+    attempt: int,
+) -> None:
+    """Hard-summarize an oversized tip after owner scope is installed."""
+    loaded_cfg = _load_cfg() or {}
+    compression_cfg = loaded_cfg.get("compression") or {}
+    if not isinstance(compression_cfg, dict):
+        compression_cfg = {}
+    if is_truthy_value(compression_cfg.get("checkpoint_required"), default=False):
+        raise RuntimeError(
+            "BLOCKED_MISSING_PREREQUISITE: automatic cold-resume compaction "
+            "cannot run while compression.checkpoint_required is enabled; "
+            "the checkpoint provider is initialized only after resume"
+        )
+
+    from agent.resume_hard_compaction import (
+        ResumeHardCompactionPolicy,
+        compact_oversized_resume,
+    )
+
+    # Compact well below the row guard so concurrent tail appends and the
+    # summary carrier have runway. The final provider-shaped token gate still
+    # decides actual dispatch fit; this target is the cold materialization cap.
+    limit = int(getattr(error, "limit", 512) or 512)
+    if limit < 4:
+        # A replay-safe hard projection needs room for the summary carrier,
+        # legacy alternation wrapper and at least one live tail row. Preserve
+        # the original transcript instead of publishing a candidate that the
+        # configured guard will reject anyway.
+        raise error
+    target_rows = max(4, min(512, limit // 2))
+    summary_callback = _resume_hard_summary_callback(session)
+    context_window = int(
+        getattr(summary_callback, "_resume_context_window", 128_000) or 128_000
+    )
+    # This is explicitly an estimated pre-agent history allowance. Reserve the
+    # majority of the discovered/configured window for system instructions,
+    # tool schemas, output and tokenizer uncertainty; the final provider-shaped
+    # gate remains authoritative after agent construction.
+    max_projection_tokens = max(1_000, min(64_000, int(context_window * 0.375)))
+    max_summary_chars = max(1_000, min(32_000, max_projection_tokens))
+    max_tail_message_chars = max(
+        1_000,
+        min(16_000, max_projection_tokens * 2),
+    )
+    strategy_identity = str(
+        getattr(summary_callback, "_resume_strategy_identity", "") or ""
+    )
+    history_lock = session["history_lock"]
+
+    def progress(phase: str, count: int) -> None:
+        with history_lock:
+            preparation = session.get("resume_preparation") or {}
+            if (
+                _sessions.get(sid) is not session
+                or int(preparation.get("attempt") or 0) != attempt
+            ):
+                return
+            session["resume_preparation"] = {
+                "attempt": attempt,
+                "message": (
+                    f"Building bounded context from {count} durable message(s)"
+                    if phase == "summarizing"
+                    else f"Published bounded context with {count} active message(s)"
+                ),
+                "phase": "compaction",
+                "status": "preparing",
+            }
+        _emit(
+            "session.resume_progress",
+            sid,
+            {
+                "phase": "compaction",
+                "status": "loading",
+                "preparation": _resume_preparation_payload(session),
+            },
+        )
+
+    compact_oversized_resume(
+        db,
+        stored_id,
+        policy=ResumeHardCompactionPolicy(
+            target_rows=target_rows,
+            max_summary_chars=max_summary_chars,
+            max_tail_message_chars=max_tail_message_chars,
+            max_projection_tokens=max_projection_tokens,
+            strategy_identity=strategy_identity,
+        ),
+        summarize=summary_callback,
+        progress=progress,
+        # An explicit preparation retry may rearm a terminal receipt for
+        # the same unchanged legacy source. Automatic first open may not.
+        force=attempt > 1,
+    )
+
+
+def _resume_hydration_db(session: dict):
+    """Open the exact profile store for an explicit preparation retry."""
+    profile_home = str(session.get("profile_home") or "").strip()
+    if not profile_home:
+        return _get_db(), False
+    try:
+        from hermes_state import SessionDB
+
+        return SessionDB(db_path=Path(profile_home) / "state.db"), True
+    except Exception as exc:
+        logger.warning("resume retry store unavailable for %s: %s", profile_home, exc)
+        return None, False
+
+
 def _schedule_resume_hydration(
-    sid: str, stored_id: str, db, *, close_db: bool = False
+    sid: str,
+    stored_id: str,
+    db,
+    *,
+    close_db: bool = False,
+    attempt: int = 1,
+    model_only: bool = False,
 ) -> None:
     """Load a cold resume's transcript off the JSON-RPC response path."""
 
@@ -9643,23 +10033,82 @@ def _schedule_resume_hydration(
         try:
             if session is None:
                 return
+            preparation = session.get("resume_preparation") or {}
+            if (
+                preparation.get("status") != "preparing"
+                or int(preparation.get("attempt") or 0) != attempt
+            ):
+                return
             _emit(
                 "session.resume_progress",
                 sid,
-                {"phase": "history", "status": "loading"},
+                {
+                    "phase": "history",
+                    "status": "loading",
+                    "preparation": _resume_preparation_payload(session),
+                },
             )
+            try:
+                _assert_session_resume_safe(
+                    db, stored_id, session.get("resume_message_count"),
+                    profile_home=session.get("profile_home"),
+                    model_only=model_only,
+                )
+            except Exception as exc:
+                from hermes_state import SessionResumeTooLargeError
+
+                if not model_only or not isinstance(exc, SessionResumeTooLargeError):
+                    raise
+                _recover_oversized_model_resume(
+                    sid,
+                    session,
+                    stored_id,
+                    db,
+                    exc,
+                    attempt=attempt,
+                )
+                # Publication must actually satisfy the same owner-scoped
+                # admission that rejected the legacy tip. Never assume the
+                # compactor's storage bound equals the configured policy.
+                _assert_session_resume_safe(
+                    db,
+                    stored_id,
+                    None,
+                    profile_home=session.get("profile_home"),
+                    model_only=True,
+                )
             db.reopen_session(stored_id)
-            raw_history, display_history = db.get_resume_conversations(stored_id)
-            prefix = db.get_ancestor_display_prefix(stored_id)
+            if model_only:
+                # Desktop owns display hydration through the independently
+                # paged REST archive. Preparing the model must therefore read
+                # only the tip's bounded working context; loading the full
+                # lineage here would make agent readiness scale with archive
+                # size a second time, despite messages_omitted=true.
+                raw_history = db.get_model_resume_conversation(stored_id)
+                display_history = raw_history
+                prefix = []
+            else:
+                raw_history, display_history = db.get_resume_conversations(stored_id)
+                prefix = db.get_ancestor_display_prefix(stored_id)
             history = sanitize_replay_history(raw_history)
 
-            if _sessions.get(sid) is not session:
+            if (
+                _sessions.get(sid) is not session
+                or int((session.get("resume_preparation") or {}).get("attempt") or 0)
+                != attempt
+            ):
                 return
             with session["history_lock"]:
                 session["history"] = history
                 session["display_history_prefix"] = prefix
                 session["resume_hydrating"] = False
                 session["resume_message_count"] = len(display_history)
+                session["resume_preparation"] = {
+                    "attempt": attempt,
+                    "message_count": len(display_history),
+                    "phase": "history",
+                    "status": "ready",
+                }
             session["resume_history_ready"].set()
             _emit(
                 "session.resume_progress",
@@ -9668,30 +10117,46 @@ def _schedule_resume_hydration(
                     "message_count": len(display_history),
                     "phase": "history",
                     "status": "complete",
+                    "preparation": _resume_preparation_payload(session),
                 },
             )
             _maybe_schedule_auto_continue(sid, session, stored_id)
             _start_agent_build(sid, session)
         except Exception as exc:
-            if _sessions.get(sid) is not session:
+            if (
+                _sessions.get(sid) is not session
+                or int((session.get("resume_preparation") or {}).get("attempt") or 0)
+                != attempt
+            ):
                 return
             message = f"resume failed: {exc}"
-            session["resume_hydrating"] = False
-            session["resume_history_error"] = message
-            session["agent_error"] = message
-            session["resume_history_ready"].set()
-            session["agent_ready"].set()
+            with session["history_lock"]:
+                session["resume_hydrating"] = False
+                session["resume_history_error"] = message
+                session["agent_error"] = message
+                session["resume_preparation"] = {
+                    "attempt": attempt,
+                    "message": message,
+                    "phase": "history",
+                    "status": "preparation_failed",
+                }
+                session["resume_history_ready"].set()
+                session["agent_ready"].set()
             _emit(
                 "session.resume_progress",
                 sid,
-                {"message": message, "phase": "history", "status": "failed"},
+                {
+                    "message": message,
+                    "phase": "history",
+                    "status": "failed",
+                    "preparation": _resume_preparation_payload(session),
+                },
             )
-            _emit("error", sid, {"message": message})
-            with _sessions_lock:
-                discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
-            lease = (discarded or {}).get("active_session_lease")
-            if lease is not None:
-                lease.release()
+            _emit(
+                "error",
+                sid,
+                {"kind": "session_preparation", "message": message},
+            )
         finally:
             if close_db and hasattr(db, "close"):
                 try:
@@ -9712,6 +10177,9 @@ def _session_pending_kind(sid: str) -> str:
 
 
 def _session_live_status(sid: str, session: dict) -> str:
+    preparation_status = (session.get("resume_preparation") or {}).get("status")
+    if preparation_status in {"preparing", "preparation_failed"}:
+        return preparation_status
     if _session_pending_kind(sid):
         return "waiting"
     ready = session.get("agent_ready")
@@ -9956,6 +10424,8 @@ def _live_session_payload(
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
     }
+    if preparation := _resume_preparation_payload(session):
+        payload["preparation"] = preparation
     if inflight:
         payload["inflight"] = inflight
     if queued:

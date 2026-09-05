@@ -8,6 +8,7 @@ import {
   backfillOlderTranscriptPage,
   graftRefreshedTailOntoBackfill,
   mergeOlderTranscriptPage,
+  mergePersistedTailIntoRuntime,
   transcriptBackfillAvailable
 } from './transcript-backfill'
 
@@ -52,13 +53,32 @@ describe('transcript tail bookkeeping', () => {
     expect(transcriptBackfillAvailable('stored-1')).toBe(true)
   })
 
-  it('marks a short page as complete', () => {
+  it('keeps one archive probe for an older backend with no continuation bit', () => {
     recordTranscriptTail('stored-1', {
       messages: [row(1, 'only')],
       pagination: { limit: 120, offset: 0, order: 'latest', returned: 1 }
     })
 
+    expect(transcriptBackfillAvailable('stored-1')).toBe(true)
+  })
+
+  it('marks a short page complete when the backend explicitly denies continuation', () => {
+    recordTranscriptTail('stored-1', {
+      messages: [row(1, 'only')],
+      pagination: { has_more: false, limit: 120, offset: 0, order: 'latest', returned: 1 }
+    })
+
     expect(transcriptBackfillAvailable('stored-1')).toBe(false)
+  })
+
+  it('honors an explicit archive continuation on a short working page', () => {
+    recordTranscriptTail('stored-1', {
+      messages: [row(1, 'working tail')],
+      pagination: { has_more: true, limit: 120, offset: 0, order: 'latest', returned: 1 }
+    })
+
+    expect(transcriptTailState('stored-1')).toMatchObject({ nextOffset: 1, possiblyTruncated: true })
+    expect(transcriptBackfillAvailable('stored-1')).toBe(true)
   })
 
   it('treats a legacy response without pagination metadata as complete', () => {
@@ -122,6 +142,13 @@ describe('mergeOlderTranscriptPage', () => {
     expect(mergeOlderTranscriptPage(existing, older).map(m => m.rowId)).toEqual([1, 2, 3])
   })
 
+  it('does not collapse distinct durable rows that reuse a transient rendered id', () => {
+    const existing = [chat('collided-id', 2)]
+    const older = [chat('collided-id', 1)]
+
+    expect(mergeOlderTranscriptPage(existing, older).map(m => m.rowId)).toEqual([1, 2])
+  })
+
   it('keeps reference identity when every older row is already present', () => {
     const existing = [chat('a', 1), chat('b', 2)]
     const older = [chat('a', 1)]
@@ -151,11 +178,114 @@ describe('graftRefreshedTailOntoBackfill', () => {
     expect(graftRefreshedTailOntoBackfill(refreshed, previous)).toBe(refreshed)
   })
 
+  it('does not anchor distinct durable rows that reuse a transient rendered id', () => {
+    const previous = [chat('collided-id', 1), chat('tail', 2)]
+    const refreshed = [chat('collided-id', 3)]
+
+    expect(graftRefreshedTailOntoBackfill(refreshed, previous)).toBe(refreshed)
+  })
+
   it('returns the refreshed tail when it is not shorter than the previous transcript', () => {
     const previous = [chat('a', 1)]
     const refreshed = [chat('a', 1), chat('b', 2)]
 
     expect(graftRefreshedTailOntoBackfill(refreshed, previous)).toBe(refreshed)
+  })
+})
+
+describe('mergePersistedTailIntoRuntime', () => {
+  it('hydrates an empty runtime from a late persisted tail', () => {
+    const persisted = [chat('a', 1), chat('b', 2)]
+
+    expect(mergePersistedTailIntoRuntime([], persisted)).toBe(persisted)
+  })
+
+  it('keeps live messages authoritative while filling their persisted prefix', () => {
+    const persisted = [chat('a', 1), chat('b-stored', 2)]
+    const live = [chat('b-live', 2), chat('c-live', 3)]
+
+    const merged = mergePersistedTailIntoRuntime(live, persisted)
+
+    expect(merged.map(message => message.id)).toEqual(['a', 'b-live', 'c-live'])
+    expect(merged.map(message => message.rowId)).toEqual([1, 2, 3])
+  })
+
+  it('inserts a persisted gap inside an ordered runtime overlap', () => {
+    const persisted = [chat('stored-a', 1), chat('stored-b', 2), chat('stored-c', 3)]
+    const live = [chat('live-a', 1), chat('live-c', 3), chat('live-d', 4)]
+
+    const merged = mergePersistedTailIntoRuntime(live, persisted)
+
+    expect(merged.map(message => message.id)).toEqual(['live-a', 'stored-b', 'live-c', 'live-d'])
+    expect(merged.map(message => message.rowId)).toEqual([1, 2, 3, 4])
+  })
+
+  it('dedupes a newly persisted optimistic turn by semantic identity', () => {
+    const persisted = [{ ...chat('stored-user', 9), semanticId: 'desktop:prompt-9' }]
+    const optimistic = [{ ...chat('user-optimistic'), semanticId: 'desktop:prompt-9' }]
+
+    expect(mergePersistedTailIntoRuntime(optimistic, persisted)).toEqual(optimistic)
+  })
+
+  it('dedupes a committed assistant only inside its proven user turn', () => {
+    const persisted = [
+      { ...chat('stored-user', 9), semanticId: 'desktop:prompt-9' },
+      { ...chat('stored-assistant', 10), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    const live = [
+      { ...chat('user-optimistic'), semanticId: 'desktop:prompt-9' },
+      { ...chat('assistant-stream'), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(live, persisted)).toEqual(live)
+  })
+
+  it('keeps one live assistant while its proven persisted copy is further ahead', () => {
+    const persisted = [
+      { ...chat('stored-user', 9), semanticId: 'desktop:prompt-9' },
+      { ...chat('stored-assistant', 10), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    const pending = [
+      { ...chat('user-optimistic'), semanticId: 'desktop:prompt-9' },
+      {
+        ...chat('assistant-stream'),
+        pending: true,
+        role: 'assistant' as const,
+        parts: [{ type: 'text' as const, text: 'Do' }]
+      }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(pending, persisted)).toEqual(pending)
+
+    const complete = [
+      pending[0],
+      { ...pending[1], pending: false, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(complete, persisted)).toEqual(complete)
+  })
+
+  it('keeps identical assistant text under different identified user turns', () => {
+    const persisted = [
+      { ...chat('stored-user', 9), semanticId: 'desktop:older' },
+      { ...chat('stored-assistant', 10), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    const live = [
+      { ...chat('user-optimistic'), semanticId: 'desktop:newer' },
+      { ...chat('assistant-stream'), role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Done.' }] }
+    ]
+
+    expect(mergePersistedTailIntoRuntime(live, persisted)).toEqual([...persisted, ...live])
+  })
+
+  it('does not collapse text-identical turns with different semantic identities', () => {
+    const persisted = [{ ...chat('stored-user', 9), semanticId: 'desktop:older' }]
+    const optimistic = [{ ...chat('user-optimistic'), semanticId: 'desktop:newer' }]
+
+    expect(mergePersistedTailIntoRuntime(optimistic, persisted)).toEqual([...persisted, ...optimistic])
   })
 })
 
@@ -327,7 +457,7 @@ describe('backfillOlderTranscriptPage', () => {
   it('resolves false without fetching when the tail is not truncated', async () => {
     recordTranscriptTail('stored-1', {
       messages: [row(1, 'only')],
-      pagination: { limit: 120, offset: 0, order: 'latest', returned: 1 }
+      pagination: { has_more: false, limit: 120, offset: 0, order: 'latest', returned: 1 }
     })
 
     const applied = await backfillOlderTranscriptPage({

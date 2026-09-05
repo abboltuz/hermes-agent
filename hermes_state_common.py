@@ -521,6 +521,101 @@ CREATE TABLE IF NOT EXISTS compression_recovery (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS context_compaction_jobs (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_fingerprint TEXT NOT NULL,
+    strategy_fingerprint TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, source_fingerprint, strategy_fingerprint)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_context_compaction_running
+    ON context_compaction_jobs(session_id) WHERE outcome = 'running';
+
+-- Append-only growth is already fenced by a message-id watermark. Updates or
+-- deletes of existing rows need a separate CAS revision so a cold compactor
+-- cannot publish a projection derived from bytes that changed while it paged.
+CREATE TABLE IF NOT EXISTS message_mutation_revisions (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO message_mutation_revisions (session_id, revision)
+SELECT id, 0 FROM sessions;
+CREATE TRIGGER IF NOT EXISTS message_mutation_session_insert
+AFTER INSERT ON sessions
+BEGIN
+    INSERT OR IGNORE INTO message_mutation_revisions (session_id, revision)
+    VALUES (NEW.id, 0);
+END;
+CREATE TRIGGER IF NOT EXISTS message_mutation_update
+AFTER UPDATE ON messages
+BEGIN
+    UPDATE message_mutation_revisions SET revision = revision + 1
+    WHERE session_id = OLD.session_id;
+    UPDATE message_mutation_revisions SET revision = revision + 1
+    WHERE session_id = NEW.session_id AND NEW.session_id <> OLD.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS message_mutation_delete
+AFTER DELETE ON messages
+BEGIN
+    UPDATE message_mutation_revisions SET revision = revision + 1
+    WHERE session_id = OLD.session_id;
+END;
+
+CREATE TABLE IF NOT EXISTS working_context_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    format_version INTEGER NOT NULL DEFAULT 1,
+    generation INTEGER NOT NULL,
+    watermark INTEGER NOT NULL,
+    message_ids TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    payload_bytes INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(session_id, generation)
+);
+CREATE TABLE IF NOT EXISTS working_context_heads (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    snapshot_id INTEGER NOT NULL REFERENCES working_context_snapshots(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS working_context_tail (
+    session_id TEXT NOT NULL REFERENCES working_context_heads(session_id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    PRIMARY KEY (session_id, message_id)
+);
+
+-- Membership-changing writes invalidate the manifest in the same transaction,
+-- including legacy writers that do not know about snapshots. Appends above the
+-- watermark stay a readable tail. Content/sidecar changes are read through the
+-- references, not cached in this manifest, so require no payload duplication.
+CREATE TRIGGER IF NOT EXISTS working_context_message_delete AFTER DELETE ON messages
+BEGIN
+    DELETE FROM working_context_heads WHERE session_id = OLD.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS working_context_message_update
+AFTER UPDATE OF id, session_id, active ON messages
+BEGIN
+    DELETE FROM working_context_heads WHERE session_id IN (OLD.session_id, NEW.session_id);
+END;
+CREATE TRIGGER IF NOT EXISTS working_context_message_insert AFTER INSERT ON messages
+WHEN NEW.id <= COALESCE((SELECT s.watermark FROM working_context_heads h
+    JOIN working_context_snapshots s ON s.id = h.snapshot_id
+    WHERE h.session_id = NEW.session_id), -1)
+BEGIN
+    DELETE FROM working_context_heads WHERE session_id = NEW.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS working_context_tail_insert AFTER INSERT ON messages
+WHEN NEW.active = 1
+BEGIN
+    INSERT INTO working_context_tail (session_id, message_id)
+    SELECT NEW.session_id, NEW.id FROM working_context_heads h
+    JOIN working_context_snapshots s ON s.id = h.snapshot_id
+    WHERE h.session_id = NEW.session_id AND NEW.id > s.watermark;
+END;
+
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,

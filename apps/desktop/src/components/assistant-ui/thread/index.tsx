@@ -44,6 +44,7 @@ interface ThreadProps {
   onRestoreToMessage?: (messageId: string, target?: RestoreMessageTarget) => Promise<void> | void
   sessionId?: string | null
   sessionKey?: string | null
+  readOnly?: boolean
 }
 
 // memo'd on purpose, and load-bearing for session-switch cost. ChatView
@@ -64,7 +65,8 @@ export const Thread = memo(function Thread({
   onDismissError,
   onRestoreToMessage,
   sessionId = null,
-  sessionKey
+  sessionKey,
+  readOnly = false
 }: ThreadProps) {
   const { t } = useI18n()
   const copy = t.assistant.thread
@@ -129,6 +131,7 @@ export const Thread = memo(function Thread({
             hasBranchInNewChat ? messageId => callbacksRef.current.onBranchInNewChat?.(messageId) : undefined
           }
           onDismissError={hasDismissError ? messageId => callbacksRef.current.onDismissError?.(messageId) : undefined}
+          readOnly={readOnly}
         />
       ),
       SystemMessage,
@@ -141,10 +144,11 @@ export const Thread = memo(function Thread({
         <UserMessage
           onCancel={hasCancel ? () => callbacksRef.current.onCancel?.() : undefined}
           onRequestRestoreConfirm={hasRestoreToMessage ? requestRestoreConfirm : undefined}
+          readOnly={readOnly}
         />
       )
     }),
-    [hasBranchInNewChat, hasCancel, hasDismissError, hasRestoreToMessage, requestRestoreConfirm]
+    [hasBranchInNewChat, hasCancel, hasDismissError, hasRestoreToMessage, readOnly, requestRestoreConfirm]
   )
 
   const emptyPlaceholder = intro ? (
