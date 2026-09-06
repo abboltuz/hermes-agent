@@ -6671,7 +6671,7 @@ def _effective_provider_for_client(client: Any, fallback: str) -> str:
 
 
 def _to_async_client(sync_client, model: str, is_vision: bool = False):
-    """Convert a sync client to its async counterpart, preserving Codex routing.
+    """Convert a sync client to its async counterpart, preserving its transport.
 
     When ``is_vision=True`` and the underlying base URL is Copilot, the
     resulting async client carries the ``Copilot-Vision-Request: true``
@@ -6684,6 +6684,10 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return sync_client, model
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
+    from agent.antigravity_bridge_client import AntigravityBridgeClient, AsyncAntigravityBridgeClient
+
+    if isinstance(sync_client, AntigravityBridgeClient):
+        return AsyncAntigravityBridgeClient(sync_client), model
     try:
         from agent.cursor_bridge_client import CursorBridgeClient, AsyncCursorBridgeClient
         if isinstance(sync_client, CursorBridgeClient):
@@ -9348,12 +9352,20 @@ def _build_call_kwargs(
             from hermes_cli.providers import nous_api_mode
 
             _nous_on_messages = nous_api_mode(model) == "anthropic_messages"
+        # OpenRouter budgets credit against the requested output cap; omitting
+        # it can reserve the model's full window and reject an affordable call.
+        # Preserve explicit caps (#41035 / #41055 by @liuhao1024, #99725).
+        _is_openrouter = (
+            _provider_norm == "openrouter"
+            or base_url_host_matches(_effective_base, "openrouter.ai")
+        )
         if (
             _is_anthropic_compat_endpoint(provider, _effective_base)
             or _nous_on_messages
             or _is_nvidia_nim
             or _is_moa
             or _is_gemini_native
+            or _is_openrouter
         ):
             # Use auxiliary_max_tokens_param() so models that require
             # max_completion_tokens (GPT-5 family, Copilot) get the right

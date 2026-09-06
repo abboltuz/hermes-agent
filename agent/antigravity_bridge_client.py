@@ -408,8 +408,10 @@ class AntigravityBridgeClient:
 class AsyncAntigravityBridgeClient:
     supports_abort_inflight = True
 
-    def __init__(self, **kwargs: Any):
-        self._sync = AntigravityBridgeClient(**kwargs)
+    def __init__(self, sync_client: AntigravityBridgeClient | None = None, **kwargs: Any):
+        # Conversion transfers the existing client's lifecycle to this wrapper;
+        # do not spawn a second bridge or discard an explicit bridge command.
+        self._sync = sync_client if sync_client is not None else AntigravityBridgeClient(**kwargs)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     async def _create(self, **kwargs: Any) -> Any:
