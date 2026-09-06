@@ -10922,6 +10922,12 @@ def _default_spawn(
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    from hermes_cli.kanban_model_route import card_model_route, WORKER_ROUTE_ENV
+
+    route = card_model_route(task, env.get("HERMES_HOME"))
+    env.pop(WORKER_ROUTE_ENV, None)
+    if route:
+        env[WORKER_ROUTE_ENV] = json.dumps(route)
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an

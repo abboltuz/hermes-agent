@@ -654,6 +654,48 @@ def test_antigravity_command_resolution_fails_closed_for_missing_managed_artifac
     assert resolve_antigravity_bridge_command() is None
 
 
+@pytest.mark.parametrize("profile", [None, "coder", "reviewer"])
+@pytest.mark.parametrize("protocol", ["antigravity-openai-shared-v1", "antigravity-openai-v1"])
+def test_antigravity_managed_launch_uses_installation_root(tmp_path, monkeypatch, profile, protocol):
+    import shlex
+    from agent.antigravity_bridge_transport import AntigravityBridgeProcess, resolve_antigravity_bridge_command
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+
+    root = tmp_path / "installation"
+    command = root / "antigravity-bridge" / "bin" / "antigravity-bridge"
+    command.parent.mkdir(parents=True)
+    # This local child only validates its environment and emits readiness.
+    child_code = (
+        "import json, os\n"
+        f"assert os.environ['HERMES_HOME'] == {str(root)!r}\n"
+        f"assert os.environ['HERMES_ANTIGRAVITY_SHARED_ROOT'] == {str(root)!r}\n"
+        f"assert os.environ['HERMES_ANTIGRAVITY_PYTHON'] == {sys.executable!r}\n"
+        f"print('antigravity-bridge ready ' + json.dumps({{'protocol': {protocol!r}, 'host': '127.0.0.1', 'port': 12345}}), flush=True)\n"
+    )
+    command.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(child_code)}\n")
+    command.chmod(0o700)
+    launch_home = root / "profiles" / profile if profile else root
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    context_home = root / "profiles" / "another-task"
+    token = set_hermes_home_override(context_home)
+    try:
+        assert resolve_antigravity_bridge_command() == str(command)
+        process = AntigravityBridgeProcess(str(command), startup_timeout=3)
+        try:
+            if protocol == "antigravity-openai-shared-v1":
+                assert process.start().base_url == "http://127.0.0.1:12345"
+            else:
+                with pytest.raises(RuntimeError, match="update required"):
+                    process.start()
+        finally:
+            process.stop()
+        assert get_hermes_home() == context_home
+        assert os.environ["HERMES_HOME"] == str(launch_home)
+        assert "HERMES_ANTIGRAVITY_SHARED_ROOT" not in os.environ
+    finally:
+        reset_hermes_home_override(token)
+
+
 class _AccountTransport:
     def __init__(self, responses: dict[tuple[str, str], Any]):
         self.responses = responses

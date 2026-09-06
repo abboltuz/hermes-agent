@@ -14,6 +14,7 @@ const MALFORMED_PERCENT_ESCAPE = /%(?![0-9a-f]{2})/i
 const APPROVED_OAUTH_URL_RAW_PREFIX = /^https:\/\/accounts\.google\.com(?::\d+)?\/o\/oauth2\/v2\/auth(?:\?|$)/i
 
 export interface AntigravityAccount {
+  email?: string | null
   enabled: boolean
   id: string
   priority: number
@@ -113,11 +114,7 @@ function isSafeText(value: unknown, maximumLength = 4096): value is string {
 }
 
 function isApprovedOAuthUrl(value: unknown): value is string {
-  if (
-    !isSafeText(value, 8192) ||
-    MALFORMED_PERCENT_ESCAPE.test(value) ||
-    !APPROVED_OAUTH_URL_RAW_PREFIX.test(value)
-  ) {
+  if (!isSafeText(value, 8192) || MALFORMED_PERCENT_ESCAPE.test(value) || !APPROVED_OAUTH_URL_RAW_PREFIX.test(value)) {
     return false
   }
 
@@ -170,7 +167,11 @@ function parseAccount(value: unknown): AntigravityAccount {
     throw invalidResponse()
   }
 
-  return { enabled: value.enabled, id: value.id, priority: value.priority }
+  const email = value.email
+  if (email !== undefined && email !== null && !isSafeText(email, 320)) {
+    throw invalidResponse()
+  }
+  return { enabled: value.enabled, id: value.id, priority: value.priority, ...(email === undefined ? {} : { email }) }
 }
 
 function parseSnapshot(value: unknown): AntigravityAccountsSnapshot {

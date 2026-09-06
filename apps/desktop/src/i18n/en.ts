@@ -1117,7 +1117,7 @@ export const en: Translations = {
       loading: 'Loading providers...',
       antigravity: {
         title: 'Antigravity accounts',
-        description: 'Manage the accounts used by Antigravity without exposing account credentials.',
+        description: 'Accounts and priorities are shared by all agents and profiles in this Hermes installation.',
         projectId: 'Project ID',
         connect: 'Connect account',
         connectFailed: 'Could not start Antigravity sign-in',

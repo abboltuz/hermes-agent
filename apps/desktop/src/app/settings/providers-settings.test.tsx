@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { atom } from 'nanostores'
+import { useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ConfirmHost } from '@/components/confirm-host'
@@ -11,6 +12,7 @@ const disconnectOAuthProvider = vi.fn()
 const getEnvVars = vi.fn()
 const startManualProviderOAuth = vi.fn()
 const startManualLocalEndpoint = vi.fn()
+const accountControlsUnmount = vi.fn()
 const onboarding = atom({ manual: false })
 
 vi.mock('@/hermes', () => ({
@@ -26,7 +28,15 @@ vi.mock('@/store/onboarding', () => ({
 }))
 
 vi.mock('./antigravity-accounts', () => ({
-  AntigravityAccounts: () => <section data-testid="antigravity-accounts">Managed Antigravity accounts</section>
+  AntigravityAccounts: ({ onConfigSaved }: { onConfigSaved?: () => void }) => {
+    useEffect(() => () => accountControlsUnmount(), [])
+
+    return (
+      <section data-testid="antigravity-accounts">
+        Managed Antigravity accounts<button onClick={onConfigSaved}>Save test accounts</button>
+      </section>
+    )
+  }
 }))
 
 function provider(id: string, loggedIn: boolean, patch: Partial<OAuthProvider> = {}): OAuthProvider {
@@ -100,7 +110,7 @@ describe('ProvidersSettings', () => {
   it('disconnects a connected provider account and refreshes the accounts list', async () => {
     await renderProvidersSettings()
 
-    expect(screen.getByTestId('antigravity-accounts')).toBeTruthy()
+    expect(screen.queryByTestId('antigravity-accounts')).toBeNull()
     const remove = await screen.findByRole('button', { name: 'Remove Nous Portal' })
     await act(async () => {
       fireEvent.click(remove)
@@ -240,7 +250,7 @@ describe('ProvidersSettings', () => {
     await waitFor(() => expect(startManualLocalEndpoint).toHaveBeenCalledWith(null))
   })
 
-  it('keeps Antigravity on its dedicated account surface while normal providers retain generic onboarding', async () => {
+  it('opens Antigravity account controls inline with the other providers', async () => {
     listOAuthProviders.mockResolvedValue({
       providers: [
         provider('antigravity', false, {
@@ -254,12 +264,25 @@ describe('ProvidersSettings', () => {
 
     await renderProvidersSettings()
 
-    const accounts = screen.getByTestId('antigravity-accounts')
+    expect(screen.queryByTestId('antigravity-accounts')).toBeNull()
     fireEvent.click(await screen.findByRole('button', { name: /Other providers/ }))
     const cursor = await screen.findByText('Cursor')
 
-    expect(accounts.compareDocumentPosition(cursor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(screen.queryByText('Google Antigravity')).toBeNull()
+    const row = screen.getByRole('button', { name: 'Google Antigravity' })
+    expect(row.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(row)
+    const accounts = await screen.findByTestId('antigravity-accounts')
+    expect(row.getAttribute('aria-expanded')).toBe('true')
+    fireEvent.click(row)
+    expect(accounts.closest('[hidden]')).not.toBeNull()
+    fireEvent.click(row)
+    expect(screen.getByTestId('antigravity-accounts')).toBe(accounts)
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse' }))
+    expect(accounts.closest('[hidden]')).not.toBeNull()
+    expect(accountControlsUnmount).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: /Other providers/ }))
+    expect(screen.getByTestId('antigravity-accounts')).toBe(accounts)
+    expect(accountControlsUnmount).not.toHaveBeenCalled()
     expect(screen.queryByText('hermes auth add antigravity')).toBeNull()
 
     fireEvent.click(cursor)
@@ -281,9 +304,42 @@ describe('ProvidersSettings', () => {
 
     await renderProvidersSettings()
 
+    fireEvent.click(await screen.findByRole('button', { name: /Other providers/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Google Antigravity' }))
     expect(await screen.findByTestId('antigravity-accounts')).toBeTruthy()
-    expect(screen.queryByText('Google Antigravity')).toBeNull()
     expect(startManualProviderOAuth).not.toHaveBeenCalledWith('antigravity')
+  })
+
+  it('keeps account controls mounted when refreshed status moves the provider between groups', async () => {
+    listOAuthProviders.mockResolvedValue({
+      providers: [provider('antigravity', false, { name: 'Google Antigravity', flow: 'external' })]
+    })
+    await renderProvidersSettings()
+    fireEvent.click(await screen.findByRole('button', { name: /Other providers/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Google Antigravity' }))
+    const controls = await screen.findByTestId('antigravity-accounts')
+    listOAuthProviders.mockResolvedValue({
+      providers: [provider('antigravity', true, { name: 'Google Antigravity', flow: 'external' })]
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save test accounts' }))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /Google Antigravity/ }).textContent).toContain('Connected')
+    )
+    expect(screen.getByTestId('antigravity-accounts')).toBe(controls)
+    expect(accountControlsUnmount).not.toHaveBeenCalled()
+  })
+
+  it('shows connected Antigravity as a regular expandable provider without generic disconnect', async () => {
+    listOAuthProviders.mockResolvedValue({
+      providers: [provider('antigravity', true, { name: 'Google Antigravity', flow: 'external' })]
+    })
+    await renderProvidersSettings()
+    const row = await screen.findByRole('button', { name: /Google Antigravity/ })
+    expect(screen.queryByTestId('antigravity-accounts')).toBeNull()
+    fireEvent.click(row)
+    expect(await screen.findByTestId('antigravity-accounts')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Remove Google Antigravity/ })).toBeNull()
+    expect(startManualProviderOAuth).not.toHaveBeenCalled()
   })
 
   it('removes connected Cursor through the normal disconnect API without terminal affordances', async () => {

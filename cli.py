@@ -1478,6 +1478,7 @@ def _should_run_kanban_goal_loop(result) -> bool:
     """Keep goal-mode continuation behind the terminal-result boundary."""
     return (
         os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+        and not (isinstance(result, dict) and result.get("failed"))
         and not (
             isinstance(result, dict)
             and isinstance(result.get("terminal_transition"), dict)
@@ -5469,6 +5470,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Merge new ``fallback_providers`` entries with any legacy
         # ``fallback_model`` entries so old configs still participate.
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        from hermes_cli.kanban_model_route import worker_model_route
+
+        if worker_model_route() is not None:
+            # An explicitly pinned card must not switch the primary worker to
+            # another provider while its judge remains on the launch route.
+            self._fallback_model = []
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -21170,7 +21177,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str):
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -21209,6 +21216,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     if task is None:
         return
 
+    from hermes_cli.kanban_model_route import judge_route_for_task
+
+    try:
+        judge_route = judge_route_for_task(task)
+    except ValueError:
+        return {"failed": True, "failure_reason": "invalid_card_model_route",
+                "final_response": "Invalid card model route; worker continuation stopped"}
     goal_parts = [task.title or ""]
     if task.body:
         goal_parts.append(task.body)
@@ -21238,7 +21252,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         },
     ).as_message_fields()
 
-    def _run_turn(prompt: str) -> str:
+    def _run_turn(prompt: str):
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
@@ -21253,7 +21267,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
-        return resp or ""
+        return result
 
     def _task_status() -> "str | None":
         c = _kb.connect()
@@ -21280,7 +21294,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
+    decision = _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
@@ -21288,8 +21302,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         block_fn=_block,
         max_turns=max_turns,
         first_response=first_response or "",
+        judge_route=judge_route,
         log=lambda m: logger.info("%s", m),
     )
+    return decision.get("failure_result")
 
 
 def main(
@@ -21843,7 +21859,9 @@ def main(
                         # normal worker and every non-kanban `-q` run.
                         if _should_run_kanban_goal_loop(result):
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                continuation_failure = _run_kanban_goal_loop_q(cli, response)
+                                if continuation_failure is not None:
+                                    result = continuation_failure
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 

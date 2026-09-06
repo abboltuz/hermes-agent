@@ -1,8 +1,9 @@
 """Antigravity account and OAuth JSON-RPC handlers.
 
 The gateway retains only one synchronous, plugin-local account service per
-profile home.  The service itself owns the bridge client and its credential
-boundary; this adapter only validates RPC shapes, delegates, and emits the
+profile home. Each client attaches to the same installation-owned Antigravity
+pool; profile-scoped RPC lifetimes do not isolate accounts. This adapter
+only validates RPC shapes, delegates, and emits the
 already materialized safe results.
 """
 from __future__ import annotations

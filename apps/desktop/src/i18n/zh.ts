@@ -1310,7 +1310,7 @@ export const zh: Translations = {
       loading: '正在加载提供方...',
       antigravity: {
         title: 'Antigravity 账号',
-        description: '管理 Antigravity 账号，不会显示账号凭据。',
+        description: '此 Hermes 安装中的所有代理和配置文件共享账号与优先级。',
         projectId: '项目 ID',
         connect: '连接账号',
         connectFailed: '无法开始 Antigravity 登录',

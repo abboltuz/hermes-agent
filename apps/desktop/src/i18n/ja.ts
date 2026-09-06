@@ -1033,7 +1033,7 @@ export const ja = defineLocale({
       loading: 'プロバイダーを読み込み中...',
       antigravity: {
         title: 'Antigravity アカウント',
-        description: '認証情報を表示せずに Antigravity アカウントを管理します。',
+        description: 'アカウントと優先順位は、この Hermes のすべてのエージェントとプロファイルで共有されます。',
         projectId: 'プロジェクト ID',
         connect: 'アカウントを接続',
         connectFailed: 'Antigravity のサインインを開始できませんでした',
