@@ -131,7 +131,8 @@ def test_ordinary_profile_inheritance_remains_compatible(tmp_path):
 
 
 @pytest.mark.parametrize("provider", ["custom:auto", "custom:main", "custom:moa",
-                                    "actual-computer", "actualcomputer", "aci", "custom:aci"])
+                                    "actual-computer", "actualcomputer", "aci", "custom:aci",
+                                    "custom", "custom:", "custom:custom", "ollama"])
 def test_dynamic_alias_cannot_be_a_card_pin_or_snapshot(monkeypatch, provider):
     with pytest.raises(ValueError):
         card_model_route(task(provider_override=provider))
@@ -139,6 +140,11 @@ def test_dynamic_alias_cannot_be_a_card_pin_or_snapshot(monkeypatch, provider):
     monkeypatch.setenv(WORKER_ROUTE_ENV, json.dumps({"provider": provider, "model": "test-model"}))
     with pytest.raises(ValueError):
         judge_route_for_task(task())
+
+
+@pytest.mark.parametrize("provider", ["myrelay", "custom:myrelay"])
+def test_named_custom_card_route_is_preserved(provider):
+    assert card_model_route(task(provider_override=provider))["provider"] == provider
 
 
 @pytest.mark.parametrize("surface", ["cli", "tool"])

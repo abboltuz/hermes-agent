@@ -6,7 +6,7 @@ This candidate repairs verified adapter/control-flow failures without changing
 context compression, session history, credentials, live profiles, or provider
 HTTP 400 handling. It does not diagnose the underlying network ConnectError.
 The installed runtime and primary source branch are not promotion targets until
-the owner approves a independently reviewed candidate.
+the owner approves an independently reviewed candidate.
 
 ## Contracts
 
@@ -31,6 +31,10 @@ the owner approves a independently reviewed candidate.
   before process spawn. Missing pins are rejected there, not sent as a model
   name to a provider. Ordinary profile inheritance and model-only overrides
   remain compatible. No live profile is migrated by this patch.
+- Reserved aliases cannot opt a pinned route back into auto-discovery. A
+  strictly pinned card must use a named custom provider rather than bare
+  `custom`, since the card does not carry an explicit endpoint. Direct strict
+  auxiliary calls may use bare `custom` with an explicit `base_url`.
 - `call_llm(..., allow_fallback=False)` is call-scoped and opt-in. Task-specific
   budget/timeout settings remain, but auxiliary task endpoint/model/API mode
   cannot replace the explicit route. Provider-internal SDK retries and account

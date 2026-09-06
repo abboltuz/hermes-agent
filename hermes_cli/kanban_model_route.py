@@ -17,8 +17,10 @@ def _is_dynamic_provider(provider):
 
     name = provider.strip().lower()
     if name.startswith("custom:"):
-        name = name.split(":", 1)[1].strip()
-    return normalize_provider(name) in {"auto", "main", "actual", "moa"}
+        name = name.split(":", 1)[1].strip() or "custom"
+    # Cards carry no explicit endpoint. Bare custom therefore cannot identify
+    # a strict route; use a named custom provider instead of ambient discovery.
+    return normalize_provider(name) in {"auto", "main", "actual", "moa", "custom"}
 
 
 def card_model_route(task, profile_home=None):
