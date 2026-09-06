@@ -10088,8 +10088,13 @@ def call_llm(
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
+    allow_fallback: bool = True,
 ) -> Any:
-    """Run an auxiliary LLM request, applying the configured task limit."""
+    """Run an auxiliary LLM request, applying the configured task limit.
+
+    ``allow_fallback=False`` pins an explicit provider/model for this call;
+    errors propagate to its owner without auxiliary retries or route fallback.
+    """
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -10142,6 +10147,7 @@ def call_llm(
                 stream=stream,
                 stream_options=stream_options,
                 route_info=route_info,
+                allow_fallback=allow_fallback,
             )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -10192,6 +10198,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    allow_fallback: bool = True,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -10223,6 +10230,9 @@ def _call_llm_impl(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        allow_fallback: False requires a concrete explicit provider/model and
+            disables task-config route inheritance, auxiliary retries and
+            provider/model fallback. The caller owns recovery from failures.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -10235,16 +10245,24 @@ def _call_llm_impl(
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
+    if not allow_fallback:
+        if (
+            not isinstance(provider, str)
+            or provider.strip().lower() in {"", "auto", "actual", "main", "moa"}
+            or not isinstance(model, str)
+            or model.strip().lower() in {"", "auto"}
+        ):
+            raise ValueError("allow_fallback=False requires an explicit provider and model")
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
+        task if allow_fallback else None, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
     effective_provider = resolved_provider
 
-    if task == "vision":
+    if task == "vision" and allow_fallback:
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -10279,11 +10297,16 @@ def _call_llm_impl(
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
             task=task,
+            **({"is_vision": True} if task == "vision" else {}),
         )
         effective_provider = _effective_provider_for_client(
             client, resolved_provider,
         )
         if client is None:
+            if not allow_fallback:
+                raise RuntimeError(
+                    f"Pinned auxiliary provider '{resolved_provider}' is unavailable; fallback is disabled"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -10449,6 +10472,8 @@ def _call_llm_impl(
                 task,
                 provider=request_provider, base_url=_base_info)
         except Exception as transient_err:
+            if not allow_fallback:
+                raise
             if not _is_transient_transport_error(transient_err):
                 raise
             # Critical-path tasks skip the same-provider retry on a
@@ -10496,6 +10521,8 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if not allow_fallback:
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
