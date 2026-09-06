@@ -10094,6 +10094,8 @@ def call_llm(
 
     ``allow_fallback=False`` pins an explicit provider/model for this call;
     errors propagate to its owner without auxiliary retries or route fallback.
+    Bare ``custom`` additionally requires a caller-supplied ``base_url``;
+    a named custom provider resolves its own saved endpoint.
     """
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
@@ -10246,13 +10248,27 @@ def _call_llm_impl(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     if not allow_fallback:
+        # Check aliases before resolution or a cache hit. In particular,
+        # _normalize_aux_provider("custom:main") reads the ambient main route;
+        # strict calls must reject that alias rather than resolve it first.
+        from hermes_cli.providers import normalize_provider
+
+        pinned_provider = provider.strip().lower() if isinstance(provider, str) else ""
+        if pinned_provider.startswith("custom:"):
+            pinned_provider = pinned_provider.split(":", 1)[1].strip() or "custom"
+        pinned_provider = normalize_provider(pinned_provider)
         if (
-            not isinstance(provider, str)
-            or provider.strip().lower() in {"", "auto", "actual", "main", "moa"}
+            pinned_provider in {"", "auto", "actual", "main", "moa"}
             or not isinstance(model, str)
             or model.strip().lower() in {"", "auto"}
         ):
             raise ValueError("allow_fallback=False requires an explicit provider and model")
+        if pinned_provider == "custom" and not (isinstance(base_url, str) and base_url.strip()):
+            # Bare custom is an autodetection route: it can select any available
+            # API-key provider, including through a previously cached client.
+            # Require an endpoint from the caller; named custom routes continue
+            # resolving their own saved endpoint through the normal resolver.
+            raise ValueError("Pinned custom provider requires an explicit base_url")
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task if allow_fallback else None, provider, model, base_url, api_key)
