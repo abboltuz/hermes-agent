@@ -12,6 +12,15 @@ REQUIRED_MODEL = "__KANBAN_CARD_MODEL_REQUIRED__"
 WORKER_ROUTE_ENV = "HERMES_KANBAN_MODEL_ROUTE"
 
 
+def _is_dynamic_provider(provider):
+    from hermes_cli.providers import normalize_provider
+
+    name = provider.strip().lower()
+    if name.startswith("custom:"):
+        name = name.split(":", 1)[1].strip()
+    return normalize_provider(name) in {"auto", "main", "actual", "moa"}
+
+
 def card_model_route(task, profile_home=None):
     model = str(getattr(task, "model_override", None) or "").strip()
     provider = str(getattr(task, "provider_override", None) or "").strip()
@@ -31,7 +40,7 @@ def card_model_route(task, profile_home=None):
         raise ValueError("Card requires an explicit provider and model before worker startup")
     if provider and not model:
         raise ValueError("Card provider requires a model")
-    if model.lower() == "auto" or provider.lower() in {"auto", "main", "actual", "moa"}:
+    if model.lower() == "auto" or _is_dynamic_provider(provider):
         raise ValueError("Card model overrides must name a concrete route")
     # Model-only overrides and profile inheritance remain supported upstream.
     return {"provider": provider, "model": model} if provider and model else None
@@ -48,7 +57,7 @@ def worker_model_route():
         raise ValueError("Invalid worker model route snapshot")
     route = {key: value.strip() for key, value in route.items()}
     if (route["model"] == REQUIRED_MODEL or route["model"].lower() == "auto"
-            or route["provider"].lower() in {"auto", "main", "actual", "moa"}):
+            or _is_dynamic_provider(route["provider"])):
         raise ValueError("Invalid worker model route snapshot")
     return route
 

@@ -130,6 +130,17 @@ def test_ordinary_profile_inheritance_remains_compatible(tmp_path):
     assert card_model_route(task(), tmp_path) == {"provider": "antigravity", "model": "test-model"}
 
 
+@pytest.mark.parametrize("provider", ["custom:auto", "custom:main", "custom:moa",
+                                    "actual-computer", "actualcomputer", "aci", "custom:aci"])
+def test_dynamic_alias_cannot_be_a_card_pin_or_snapshot(monkeypatch, provider):
+    with pytest.raises(ValueError):
+        card_model_route(task(provider_override=provider))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    monkeypatch.setenv(WORKER_ROUTE_ENV, json.dumps({"provider": provider, "model": "test-model"}))
+    with pytest.raises(ValueError):
+        judge_route_for_task(task())
+
+
 @pytest.mark.parametrize("surface", ["cli", "tool"])
 def test_handoff_judge_uses_pinned_route_not_auxiliary_default(monkeypatch, surface):
     from agent import auxiliary_client
