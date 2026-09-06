@@ -161,3 +161,49 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_required_card_route_is_validated_before_spawn(monkeypatch, tmp_path):
+    import pytest
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_model_route import REQUIRED_MODEL
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(f"model:\n  default: {REQUIRED_MODEL}\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_k: pytest.fail("must not spawn"))
+    with pytest.raises(ValueError, match="explicit provider and model"):
+        kb._default_spawn(_make_task(kb, assignee="elias"), str(tmp_path))
+
+
+def test_worker_route_snapshot_and_inherited_route_isolation(monkeypatch, tmp_path):
+    import json
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_model_route import WORKER_ROUTE_ENV
+
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv(WORKER_ROUTE_ENV, '{"provider":"stale","model":"stale"}')
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = []
+
+    def fake_popen(cmd, **kwargs):
+        from types import SimpleNamespace
+        captured.append((cmd, kwargs["env"]))
+        return SimpleNamespace(pid=4244)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    worker = _make_task(kb, assignee="elias")
+    worker.model_override = "selected-model"
+    worker.provider_override = "antigravity"
+    kb._default_spawn(worker, str(tmp_path))
+    cmd, env = captured[-1]
+    assert json.loads(env[WORKER_ROUTE_ENV]) == {"provider": "antigravity", "model": "selected-model"}
+    assert cmd[cmd.index("--provider") + 1] == "antigravity"
+    assert cmd[cmd.index("-m") + 1] == "selected-model"
+    worker.model_override = worker.provider_override = None
+    kb._default_spawn(worker, str(tmp_path))
+    assert WORKER_ROUTE_ENV not in captured[-1][1]

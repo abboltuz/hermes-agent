@@ -306,16 +306,31 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
-    if not task or not task.goal_mode or not _goal_judge_available():
-        return None
+def _goal_mode_handoff_rejection(task, evidence: str):
+    """Return ``(verdict, reason_or_None)`` for a goal-mode terminal handoff.
+
+    ``{"done", None}`` means the judge allows the handoff; anything else is
+    a rejection whose verdict disambiguates the guidance the caller gives
+    the worker (``continue`` = not done yet, ``blocked`` = judged
+    unachievable — see #100954).
+    """
+    if not task or not task.goal_mode:
+        return ("done", None)
+    from hermes_cli.kanban_model_route import judge_route_for_task
+
+    try:
+        route = judge_route_for_task(task)
+    except ValueError:
+        return ("continue", "Invalid card model route; repair the route before handoff")
+    if route is None and not _goal_judge_available():
+        return ("done", None)
     verdict = "done"
     reason = ""
     try:
         verdict, reason, _, _, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
+            **({"route": route} if route else {}),
         )
     except Exception as judge_exc:
         # Keep the existing fail-open semantics: an unavailable/broken
@@ -325,7 +340,7 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+    return (verdict, None if verdict == "done" else reason)
 
 
 # ---------------------------------------------------------------------------
@@ -813,10 +828,18 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            gate_verdict, rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
             )
+            if gate_verdict == "blocked":
+                return tool_error(
+                    f"Goal completion rejected: judge ruled the goal "
+                    f"unachievable — {rejection}. The task will NOT complete "
+                    f"silently. Either re-scope the task with kanban_edit, "
+                    f"or record the block with kanban_block and hand the "
+                    f"decision to a human / reviewer."
+                )
             if rejection is not None:
                 return tool_error(
                     f"Goal completion rejected by judge: {rejection}. "
@@ -1028,7 +1051,13 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            gate_verdict, rejection = _goal_mode_handoff_rejection(task, summary)
+            if gate_verdict == "blocked":
+                return tool_error(
+                    f"Goal review handoff rejected: judge ruled the goal "
+                    f"unachievable — {rejection}. Record the block with "
+                    f"kanban_block instead of requesting review."
+                )
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
