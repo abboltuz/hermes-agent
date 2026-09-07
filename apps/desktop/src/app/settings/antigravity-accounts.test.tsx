@@ -97,6 +97,26 @@ afterEach(() => {
 })
 
 describe('AntigravityAccounts', () => {
+  it('keeps the verification reason visible until a refreshed successful status replaces it', async () => {
+    rpc.listAccounts.mockResolvedValueOnce(
+      snapshot([account('1', { enabled: false, status: 'verification_required' })])
+    )
+    rpc.setAccountEnabled.mockResolvedValueOnce(
+      snapshot([account('1', { enabled: true, status: 'verification_required' })])
+    )
+    await renderAccounts()
+    expect(await screen.findByText('Google account verification required')).toBeTruthy()
+    const toggle = screen.getByRole('switch', { name: /enable antigravity account/i })
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    fireEvent.click(toggle)
+    await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('true'))
+    expect(screen.getByText('Google account verification required')).toBeTruthy()
+    rpc.listAccounts.mockResolvedValueOnce(snapshot([account('1', { enabled: true, status: 'available' })]))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText('Enabled')).toBeTruthy()
+    expect(screen.queryByText('Google account verification required')).toBeNull()
+  })
+
   it('shows email while mutations continue to use the opaque account id', async () => {
     rpc.listAccounts.mockResolvedValue(snapshot([account('1', { email: 'artem@example.test' })]))
     await renderAccounts()

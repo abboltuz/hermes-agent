@@ -48,6 +48,23 @@ function requestStub(): AntigravityGatewayRequest {
 }
 
 describe('createAntigravityRpc', () => {
+  it.each([false, true])('preserves verification status independently of enabled=%s', async enabled => {
+    const row = { ...snapshot.accounts[0], enabled, status: 'verification_required' }
+    const request: AntigravityGatewayRequest = vi.fn(async () => ({ accounts: { accounts: [row] } }))
+
+    await expect(createAntigravityRpc(request, () => 'default').listAccounts()).resolves.toEqual({ accounts: [row] })
+  })
+
+  it('does not expose unknown account status text', async () => {
+    const request: AntigravityGatewayRequest = vi.fn(async () => ({
+      accounts: { accounts: [{ ...snapshot.accounts[0], status: 'private diagnostic' }] }
+    }))
+
+    await expect(createAntigravityRpc(request, () => 'default').listAccounts()).rejects.toThrow(
+      'Invalid Antigravity response.'
+    )
+  })
+
   it('projects email but not private account fields', async () => {
     const request: AntigravityGatewayRequest = vi.fn(async () => ({
       accounts: { accounts: [{ ...snapshot.accounts[0], email: 'artem@example.test', refreshToken: 'private' }] }

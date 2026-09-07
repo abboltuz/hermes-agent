@@ -29,5 +29,13 @@ per-attempt diagnostics. A generic HTTP 403 without a specific reason is not
 evidence that an API key is invalid. Terminal guidance directs Antigravity
 users to connected Google account settings rather than API-key setup.
 
+Verification-required rows remain valid whether the account is automatically
+disabled or explicitly re-enabled for a retry. Other enabled/status consistency
+checks, aggregate checks and current-account checks remain enforced. Desktop
+retains the optional finite account status and shows the verification reason
+ahead of the generic enabled/disabled label. Merely toggling enable does not
+hide the reason; a refreshed successful backend status does. Older snapshots
+without status keep their existing enabled/disabled presentation.
+
 No account migration, credentials, context handling, card lifecycle, fallback
 configuration, runtime installation, packaging, or restart is changed here.

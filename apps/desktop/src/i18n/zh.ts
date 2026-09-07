@@ -1309,6 +1309,7 @@ export const zh: Translations = {
       },
       loading: '正在加载提供方...',
       antigravity: {
+        verificationRequired: '需要验证 Google 账号',
         title: 'Antigravity 账号',
         description: '此 Hermes 安装中的所有代理和配置文件共享账号与优先级。',
         projectId: '项目 ID',
