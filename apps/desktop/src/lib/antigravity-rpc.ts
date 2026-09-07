@@ -12,12 +12,14 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const ACCOUNT_ID_PATTERN = new RegExp(`^acct_${UUID_PATTERN.source.slice(1, -1)}$`)
 const MALFORMED_PERCENT_ESCAPE = /%(?![0-9a-f]{2})/i
 const APPROVED_OAUTH_URL_RAW_PREFIX = /^https:\/\/accounts\.google\.com(?::\d+)?\/o\/oauth2\/v2\/auth(?:\?|$)/i
+const ACCOUNT_STATUSES = ['disabled', 'verification_required', 'cooling_down', 'limited', 'available'] as const
 
 export interface AntigravityAccount {
   email?: string | null
   enabled: boolean
   id: string
   priority: number
+  status?: (typeof ACCOUNT_STATUSES)[number]
 }
 
 export interface AntigravityAccountsSnapshot {
@@ -171,7 +173,20 @@ function parseAccount(value: unknown): AntigravityAccount {
   if (email !== undefined && email !== null && !isSafeText(email, 320)) {
     throw invalidResponse()
   }
-  return { enabled: value.enabled, id: value.id, priority: value.priority, ...(email === undefined ? {} : { email }) }
+
+  const status = ACCOUNT_STATUSES.find(candidate => candidate === value.status)
+
+  if (value.status !== undefined && status === undefined) {
+    throw invalidResponse()
+  }
+
+  return {
+    enabled: value.enabled,
+    id: value.id,
+    priority: value.priority,
+    ...(email === undefined ? {} : { email }),
+    ...(status === undefined ? {} : { status })
+  }
 }
 
 function parseSnapshot(value: unknown): AntigravityAccountsSnapshot {

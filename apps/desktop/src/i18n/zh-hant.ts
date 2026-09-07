@@ -997,6 +997,7 @@ export const zhHant = defineLocale({
       },
       loading: '正在載入提供方...',
       antigravity: {
+        verificationRequired: '需要驗證 Google 帳號',
         title: 'Antigravity 帳號',
         description: '此 Hermes 安裝中的所有代理與設定檔共用帳號及優先順序。',
         projectId: '專案 ID',

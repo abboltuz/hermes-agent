@@ -136,7 +136,11 @@ def _materialize_snapshot(value: Any) -> dict[str, Any]:
         "limited": sum(account["status"] in {"verification_required", "cooling_down", "limited"} for account in accounts),
     } or record["connected"] is not (len(accounts) > 0):
         raise _invalid_response()
-    if any((account["status"] == "disabled") is account["enabled"] for account in accounts):
+    # A verification challenge disables the account automatically. The reason
+    # remains visible while disabled and during an explicit user-directed retry.
+    if any(account["status"] != "verification_required"
+           and (account["status"] == "disabled") is account["enabled"]
+           for account in accounts):
         raise _invalid_response()
     safe_current: dict[str, str | None] = {}
     for family, account_id in current.items():

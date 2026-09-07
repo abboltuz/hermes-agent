@@ -963,6 +963,7 @@ export interface Translations {
       }
       loading: string
       antigravity: {
+        verificationRequired: string
         title: string
         description: string
         projectId: string

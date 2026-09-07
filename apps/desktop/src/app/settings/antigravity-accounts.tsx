@@ -389,7 +389,13 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
                       </p>
                     ) : undefined
                   }
-                  description={account.enabled ? copy.enabled : copy.disabled}
+                  description={
+                    account.status === 'verification_required'
+                      ? copy.verificationRequired
+                      : account.enabled
+                        ? copy.enabled
+                        : copy.disabled
+                  }
                   key={account.id}
                   title={<span>{label}</span>}
                 />

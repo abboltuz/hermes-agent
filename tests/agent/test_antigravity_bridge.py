@@ -1000,3 +1000,34 @@ def test_antigravity_account_facade_rejects_dangling_or_disabled_current_account
     client, _transport = _account_client({("GET", "/v1/accounts"): snapshot})
     with pytest.raises(AntigravityBridgeError, match="invalid Antigravity bridge response"):
         client.list_accounts()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_verification_accounts_remain_visible_when_disabled_or_retrying(enabled):
+    snapshot = _public_snapshot()
+    snapshot["accounts"][0].update(enabled=enabled, status="verification_required")
+    snapshot.update(enabled=int(enabled), available=0, limited=1)
+    snapshot["current"]["claude"] = ACCOUNT_ID if enabled else None
+    client, _transport = _account_client({("GET", "/v1/accounts"): snapshot})
+    result = client.list_accounts()
+    assert result["accounts"][0]["status"] == "verification_required"
+    assert result["accounts"][0]["enabled"] is enabled
+    assert result["limited"] == 1
+    assert result["available"] == 0
+
+
+@pytest.mark.parametrize("status,enabled", [
+    ("disabled", True), ("available", False), ("limited", False),
+    ("cooling_down", False),
+])
+def test_nonverification_status_still_requires_coherent_enabled_state(status, enabled):
+    from agent.antigravity_bridge_transport import AntigravityBridgeError
+
+    snapshot = _public_snapshot()
+    snapshot["accounts"][0].update(status=status, enabled=enabled)
+    snapshot.update(enabled=int(enabled), available=int(status == "available"),
+                    limited=int(status in {"limited", "cooling_down"}))
+    snapshot["current"]["claude"] = None
+    client, _transport = _account_client({("GET", "/v1/accounts"): snapshot})
+    with pytest.raises(AntigravityBridgeError, match="invalid Antigravity bridge response"):
+        client.list_accounts()

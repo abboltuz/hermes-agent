@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import atexit
+import http.client
 import json
 import logging
 import os
 import queue
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -25,6 +27,26 @@ STARTUP_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
 MAX_READY_LINE_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ERROR_BYTES = 8 * 1024
+ERROR_READ_TIMEOUT_SECONDS = 1.0
+DIAGNOSTIC_HEADER = "x-hermes-antigravity-request-id"
+_DIAGNOSTIC_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+# This is a public bridge contract, not provider-controlled display text.
+_ERROR_MESSAGES = {
+    "VALIDATION_REQUIRED": "Google requires account verification. Check Antigravity account settings.",
+    "PERMISSION_DENIED": "The provider denied permission for this request.",
+    "UNAUTHENTICATED": "The provider rejected account authentication.",
+    "RATE_LIMIT_EXCEEDED": "The provider reported a rate limit.",
+    "QUOTA_EXHAUSTED": "The provider reported exhausted quota.",
+    "MODEL_CAPACITY_EXHAUSTED": "The provider reported exhausted model capacity.",
+    "MODEL_NOT_FOUND": "The provider could not find the requested model.",
+    "INVALID_REQUEST": "The provider rejected the request format.",
+    "UPSTREAM_UNAVAILABLE": "The upstream service is unavailable.",
+    "SERVICE_DISABLED": "The provider reports that the required service is disabled.",
+    "ACCESS_TOKEN_SCOPE_INSUFFICIENT": "The provider reports insufficient account authorization scope.",
+    "INTERNAL_ERROR": "The bridge encountered an internal error.",
+    "UNKNOWN": "No specific provider reason was available.",
+}
 
 
 class AntigravityBridgeError(RuntimeError):
@@ -32,11 +54,90 @@ class AntigravityBridgeError(RuntimeError):
 
 
 class AntigravityBridgeHTTPError(AntigravityBridgeError):
-    """A bridge HTTP failure with only its safe status available to callers."""
+    """A bridge failure containing only validated public diagnostic fields."""
 
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, *, code: str | None = None,
+                 diagnostic_id: str | None = None):
         self.status_code = status_code
-        super().__init__(f"bridge HTTP {status_code}")
+        self.code = code if type(code) is str and code in _ERROR_MESSAGES else None
+        self.diagnostic_id = _safe_diagnostic_id(diagnostic_id)
+        message = f"bridge HTTP {status_code}"
+        if self.code:
+            message += f": {self.code} — {_ERROR_MESSAGES[self.code]}"
+        if self.diagnostic_id:
+            message += f" (diagnostic_id={self.diagnostic_id})"
+        super().__init__(message)
+
+
+def _safe_diagnostic_id(value: Any) -> str | None:
+    return value if type(value) is str and _DIAGNOSTIC_UUID.fullmatch(value) else None
+
+
+def _read_error_body(response: Any, deadline: float) -> bytes:
+    """Read a small diagnostic within a wall deadline; never drain an error.
+
+    urllib's read(n) may wait indefinitely on a trickling peer. For its
+    non-chunked HTTPResponse, read1 makes at most one socket read; reset that
+    socket's timeout to the remaining budget on every iteration. Unknown
+    response wrappers and chunked bodies safely fall back to status-only.
+    """
+    sock = getattr(getattr(getattr(response.fp, "fp", None), "raw", None), "_sock", None)
+    if not isinstance(sock, socket.socket) or getattr(response.fp, "chunked", True):
+        return b""
+    content_length = response.headers.get("Content-Length")
+    if (type(content_length) is not str or not content_length.isdecimal()
+            or len(content_length) > 8 or int(content_length) > MAX_ERROR_BYTES):
+        return b""
+    expected_length = int(content_length)
+    data = bytearray()
+    while len(data) <= MAX_ERROR_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return b""
+        sock.settimeout(remaining)
+        chunk = response.fp.read1(MAX_ERROR_BYTES + 1 - len(data))
+        if not chunk:
+            return bytes(data) if len(data) == expected_length else b""
+        data.extend(chunk)
+        if len(data) == expected_length:
+            return bytes(data)
+    return b""
+
+
+def _http_error(response: Any, request_deadline: float) -> AntigravityBridgeError:
+    """Materialize safe diagnostics and close the original error response."""
+    status = response.code
+    try:
+        if type(status) is not int or not 100 <= status <= 599:
+            return AntigravityBridgeError("Antigravity bridge request failed")
+        diagnostic_id = _safe_diagnostic_id(response.headers.get(DIAGNOSTIC_HEADER))
+        code = None
+        try:
+            raw = _read_error_body(response, min(request_deadline, time.monotonic() + ERROR_READ_TIMEOUT_SECONDS))
+            payload = json.loads(raw) if raw else None
+            error = payload.get("error") if type(payload) is dict else None
+            if type(error) is dict:
+                candidate = error.get("code")
+                if type(candidate) is str and candidate in _ERROR_MESSAGES:
+                    code = candidate
+                body_id = _safe_diagnostic_id(error.get("diagnostic_id"))
+                # A disagreeing envelope cannot establish a correlation.
+                if diagnostic_id and body_id and diagnostic_id != body_id:
+                    code, diagnostic_id = None, None
+                else:
+                    diagnostic_id = diagnostic_id or body_id
+        except (OSError, ValueError, RecursionError, http.client.HTTPException):
+            pass
+        error = AntigravityBridgeHTTPError(status, code=code, diagnostic_id=diagnostic_id)
+        logger.warning("antigravity_http_error %s", json.dumps({
+            "status": status, "code": error.code, "diagnostic_id": error.diagnostic_id,
+        }, separators=(",", ":")))
+        return error
+    finally:
+        try:
+            response.close()
+        except OSError:
+            pass
 
 
 def redact_antigravity_text(text: str, token: str = "") -> str:
@@ -297,14 +398,12 @@ class AntigravityHTTPTransport:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect()
         )
+        deadline = time.monotonic() + timeout
         try:
             with opener.open(request, timeout=timeout) as response:
                 data = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
-            code = exc.code
-            if isinstance(code, bool) or not isinstance(code, int) or not 100 <= code <= 599:
-                raise AntigravityBridgeError("Antigravity bridge request failed") from None
-            raise AntigravityBridgeHTTPError(code) from None
+            raise _http_error(exc, deadline) from None
         except (urllib.error.URLError, OSError) as exc:
             raise AntigravityBridgeError("Antigravity bridge request failed") from exc
         if len(data) > MAX_RESPONSE_BYTES:
@@ -337,13 +436,11 @@ class AntigravityHTTPTransport:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect()
         )
+        deadline = time.monotonic() + timeout
         try:
             response = opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            code = exc.code
-            if isinstance(code, bool) or not isinstance(code, int) or not 100 <= code <= 599:
-                raise AntigravityBridgeError("Antigravity bridge request failed") from None
-            raise AntigravityBridgeHTTPError(code) from None
+            raise _http_error(exc, deadline) from None
         except (urllib.error.URLError, OSError) as exc:
             raise AntigravityBridgeError("Antigravity bridge request failed") from exc
         content_type = str(response.headers.get("Content-Type") or "")

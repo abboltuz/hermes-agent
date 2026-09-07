@@ -6788,6 +6788,13 @@ def run_conversation(
                             "Nous model access",
                         ):
                             pass
+                        elif _provider in {"antigravity", "google-antigravity"}:
+                            agent._vprint(
+                                f"{agent.log_prefix}   💡 Antigravity uses connected Google accounts, not an API key. "
+                                "Check Settings → Providers → Antigravity for account status. "
+                                "Use the diagnostic ID, when present, to locate the specific refusal in bridge logs.",
+                                force=True,
+                            )
                         elif _provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
                             if _provider == "openai-codex":
                                 agent._vprint(f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)

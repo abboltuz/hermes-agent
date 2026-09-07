@@ -1116,6 +1116,7 @@ export const en: Translations = {
       },
       loading: 'Loading providers...',
       antigravity: {
+        verificationRequired: 'Google account verification required',
         title: 'Antigravity accounts',
         description: 'Accounts and priorities are shared by all agents and profiles in this Hermes installation.',
         projectId: 'Project ID',

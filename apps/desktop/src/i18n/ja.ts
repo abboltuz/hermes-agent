@@ -1032,6 +1032,7 @@ export const ja = defineLocale({
       },
       loading: 'プロバイダーを読み込み中...',
       antigravity: {
+        verificationRequired: 'Google アカウントの確認が必要です',
         title: 'Antigravity アカウント',
         description: 'アカウントと優先順位は、この Hermes のすべてのエージェントとプロファイルで共有されます。',
         projectId: 'プロジェクト ID',
