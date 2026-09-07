@@ -127,3 +127,30 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
     # The original page was tens of kilobytes; a summary is short.
     assert len(error) < 500
     assert len(error) < len(_CLOUDFLARE_CHALLENGE_HTML)
+
+
+def test_antigravity_refusal_preserves_reason_without_api_key_advice():
+    from agent.antigravity_bridge_transport import AntigravityBridgeHTTPError
+
+    agent = _make_agent()
+    agent.provider = "antigravity"
+    diagnostic_id = "a63536c5-3b73-4e96-a339-8513e46460ab"
+    agent.client.chat.completions.create.side_effect = AntigravityBridgeHTTPError(
+        403, code="VALIDATION_REQUIRED", diagnostic_id=diagnostic_id,
+    )
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_vprint") as output,
+    ):
+        result = agent.run_conversation("test prompt")
+
+    assert agent.client.chat.completions.create.called
+    assert result.get("failed") is True
+    assert "403" in result["error"]
+    assert "VALIDATION_REQUIRED" in result["error"]
+    assert diagnostic_id in result["error"]
+    advice = " ".join(str(call.args[0]) for call in output.call_args_list)
+    assert "connected Google accounts" in advice
+    assert "Your API key was rejected" not in advice
