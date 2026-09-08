@@ -60,6 +60,27 @@ def _run_lightpanda_process_result(
     return result, chrome_fallback, screenshot_fallback
 
 
+def _run_image_extraction_result(monkeypatch, src, *, task_key="task::local"):
+    images = [{
+        "src": src,
+        "alt": "avatar",
+        "width": 640,
+        "height": 480,
+    }]
+    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(bt, "_last_session_key", lambda _task: task_key)
+    monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda _task: False)
+    monkeypatch.setattr(
+        bt,
+        "_run_browser_command",
+        lambda *_args, **_kwargs: {
+            "success": True,
+            "data": {"result": images},
+        },
+    )
+    return json.loads(bt.browser_get_images(task_id="task"))
+
+
 @pytest.fixture(autouse=True)
 def _reset_browser_caches():
     bt._cached_command_timeout = None
@@ -793,6 +814,201 @@ class TestCommandTimeoutRecovery:
 
         assert response["success"] is False
         assert "private-token" not in json.dumps(response)
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "https://user:private-password@example.com/a.png",
+            "https://user@example.com/a.png",
+            "https://%75ser:private-password@example.com/a.png",
+        ],
+    )
+    def test_image_url_rejects_userinfo_before_safety_checks(
+        self, monkeypatch, caplog, src
+    ):
+        always_blocked = Mock(side_effect=AssertionError("must reject before safety"))
+        network_safe = Mock(side_effect=AssertionError("must reject before safety"))
+        monkeypatch.setattr(bt, "_is_always_blocked_url", always_blocked)
+        monkeypatch.setattr(bt, "_is_safe_url", network_safe)
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-password" not in json.dumps(response)
+        assert "private-password" not in caplog.text
+        always_blocked.assert_not_called()
+        network_safe.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "ACCESS_TOKEN=private-query-value",
+            "%61ccess_%74oken=private-query-value",
+            "%2561ccess_token=private-query-value",
+            "ApiKey=private-query-value",
+        ],
+    )
+    def test_image_url_rejects_encoded_or_case_varied_credential_query(
+        self, monkeypatch, caplog, query
+    ):
+        network_safe = Mock(side_effect=AssertionError("must reject before DNS safety"))
+        monkeypatch.setattr(bt, "_is_safe_url", network_safe)
+        src = f"https://example.com/a.png?{query}"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-query-value" not in json.dumps(response)
+        assert "private-query-value" not in caplog.text
+        network_safe.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "fragment",
+        [
+            "access_token=private-fragment-value",
+            "%61ccess_%74oken=private-fragment-value",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+        ],
+    )
+    def test_image_url_strips_fragment_before_publication(
+        self, monkeypatch, caplog, fragment
+    ):
+        src = f"https://example.com/a.png?size=large#{fragment}"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is True
+        assert response["images"][0]["src"] == (
+            "https://example.com/a.png?size=large"
+        )
+        assert "private-fragment-value" not in json.dumps(response)
+        assert "private-fragment-value" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "https://[broken/private-secret?access_token=private-query-value",
+            "https://example.com:invalid/private-secret?token=private-query-value",
+            "https://example.com/a.png\x00private-secret",
+        ],
+    )
+    def test_malformed_secret_image_url_fails_without_logs_or_safety_call(
+        self, monkeypatch, caplog, src
+    ):
+        network_safe = Mock(side_effect=AssertionError("must reject before safety"))
+        monkeypatch.setattr(bt, "_is_safe_url", network_safe)
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-secret" not in json.dumps(response)
+        assert "private-query-value" not in json.dumps(response)
+        assert "private-secret" not in caplog.text
+        assert "private-query-value" not in caplog.text
+        network_safe.assert_not_called()
+
+    def test_network_safety_receives_origin_only_and_exception_is_sanitized(
+        self, monkeypatch, caplog
+    ):
+        seen_urls = []
+        private_value = "private-benign-query-value"
+
+        def fail_safety(url):
+            seen_urls.append(url)
+            raise RuntimeError(f"checker failed near {private_value}")
+
+        monkeypatch.setattr(bt, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(bt, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(bt, "_is_always_blocked_url", lambda _url: False)
+        monkeypatch.setattr(bt, "_is_safe_url", fail_safety)
+        src = f"https://example.com/private-path.png?theme={private_value}#private-fragment"
+
+        response = _run_image_extraction_result(
+            monkeypatch,
+            src,
+            task_key="task",
+        )
+
+        assert response["success"] is False
+        assert seen_urls == ["https://example.com/"]
+        assert private_value not in json.dumps(response)
+        assert private_value not in caplog.text
+        assert "private-path" not in caplog.text
+
+    def test_valid_image_url_is_preserved_except_fragment(self, monkeypatch):
+        src = "https://cdn.example.com/images/a%20b.png?size=large&theme=dark#section"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is True
+        assert response["images"][0]["src"] == (
+            "https://cdn.example.com/images/a%20b.png?size=large&theme=dark"
+        )
+
+    @pytest.mark.parametrize(
+        "entrypoint,confirmed_results,expected_calls",
+        [
+            (
+                lambda: bt.browser_snapshot(task_id="task"),
+                [{"success": True, "data": {"snapshot": "private", "refs": {}}}],
+                2,
+            ),
+            (
+                lambda: bt.browser_get_images(task_id="task"),
+                [{"success": True, "data": {"result": "[]"}}],
+                2,
+            ),
+            (
+                lambda: bt.browser_vision("inspect", task_id="task"),
+                [],
+                1,
+            ),
+            (
+                lambda: bt.browser_console(task_id="task"),
+                [],
+                1,
+            ),
+            (
+                lambda: bt.browser_back(task_id="task"),
+                [{"success": True, "data": {"url": "https://example.com"}}],
+                2,
+            ),
+            (
+                lambda: bt.browser_click("e1", task_id="task"),
+                [],
+                1,
+            ),
+        ],
+        ids=["snapshot", "images", "vision", "console", "back", "click"],
+    )
+    def test_content_and_action_siblings_fail_closed_on_unknown_safety_probe(
+        self, monkeypatch, entrypoint, confirmed_results, expected_calls
+    ):
+        unknown = bt._unknown_browser_command_result(
+            "private probe output",
+            "timeout_outcome_unknown",
+        )
+        run_command = Mock(side_effect=[*confirmed_results, unknown])
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_last_session_key", lambda _task: "task")
+        monkeypatch.setattr(bt, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(bt, "_is_local_sidecar_key", lambda _task: False)
+        monkeypatch.setattr(bt, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(bt, "_run_browser_command", run_command)
+
+        raw_response = entrypoint()
+        response = (
+            raw_response
+            if isinstance(raw_response, dict)
+            else json.loads(raw_response)
+        )
+
+        assert response["success"] is False
+        assert response["error_code"] == "timeout_outcome_unknown"
+        assert response["outcome"] == "unknown"
+        assert response["retry_safe"] is False
+        assert "private probe output" not in json.dumps(response)
+        assert run_command.call_count == expected_calls
 
     @pytest.mark.parametrize(
         ("command", "args"),

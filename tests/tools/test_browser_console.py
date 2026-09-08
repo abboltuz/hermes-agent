@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 
 import pytest
 
@@ -59,6 +59,95 @@ class TestBrowserConsole:
         # Both console and errors should get --clear
         assert calls[0][0] == ("test", "console", ["--clear"])
         assert calls[1][0] == ("test", "errors", ["--clear"])
+
+    @pytest.mark.parametrize("clear", [False, True])
+    @pytest.mark.parametrize("unknown_kind", ["timeout", "transport", "protocol"])
+    def test_first_unknown_stops_before_errors_command(
+        self, clear, unknown_kind
+    ):
+        import tools.browser_tool as bt
+
+        first_result = bt._unknown_browser_command_result(
+            "private first-step diagnostic",
+            f"{unknown_kind}_outcome_unknown",
+        )
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = first_result
+            result = json.loads(bt.browser_console(clear=clear, task_id="test"))
+
+        assert result["success"] is False
+        assert result["error_code"] == f"{unknown_kind}_outcome_unknown"
+        assert result["outcome"] == "unknown"
+        assert result["retry_safe"] is False
+        assert "private first-step diagnostic" not in json.dumps(result)
+        expected_args = ["--clear"] if clear else []
+        mock_cmd.assert_called_once_with("test", "console", expected_args)
+
+    @pytest.mark.parametrize("clear", [False, True])
+    def test_first_definite_failure_is_truthful_and_stops(self, clear):
+        from tools.browser_tool import browser_console
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": False,
+                "error": "console capability unavailable",
+            }
+            result = json.loads(browser_console(clear=clear, task_id="test"))
+
+        assert result == {
+            "success": False,
+            "error": "console capability unavailable",
+        }
+        expected_args = ["--clear"] if clear else []
+        mock_cmd.assert_called_once_with("test", "console", expected_args)
+
+    @pytest.mark.parametrize("clear", [False, True])
+    @pytest.mark.parametrize("second_unknown", [False, True])
+    def test_second_failure_preserves_sanitized_partial_evidence(
+        self, clear, second_unknown
+    ):
+        import tools.browser_tool as bt
+
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+        console_result = {
+            "success": True,
+            "data": {
+                "messages": [{"type": "log", "text": f"before {secret}"}],
+            },
+        }
+        if second_unknown:
+            errors_result = bt._unknown_browser_command_result(
+                "private second-step diagnostic",
+                "timeout_outcome_unknown",
+            )
+        else:
+            errors_result = {
+                "success": False,
+                "error": "errors capability unavailable",
+            }
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [console_result, errors_result]
+            result = json.loads(bt.browser_console(clear=clear, task_id="test"))
+
+        assert result["success"] is False
+        assert result["partial"] is True
+        assert result["total_messages"] == 1
+        assert result["total_errors"] == 0
+        assert secret not in json.dumps(result)
+        if second_unknown:
+            assert result["error_code"] == "timeout_outcome_unknown"
+            assert result["outcome"] == "unknown"
+            assert result["retry_safe"] is False
+            assert "private second-step diagnostic" not in json.dumps(result)
+        else:
+            assert result["error"] == "errors capability unavailable"
+
+        expected_args = ["--clear"] if clear else []
+        assert mock_cmd.call_args_list == [
+            call("test", "console", expected_args),
+            call("test", "errors", expected_args),
+        ]
 
 
     def test_redacts_secrets_from_console_messages_and_errors(self):

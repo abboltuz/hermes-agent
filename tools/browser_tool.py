@@ -4075,26 +4075,26 @@ def browser_snapshot(
             and not _allow_private_urls()
         ):
             try:
-                _url_result = _run_browser_command(
-                    effective_task_id, "eval", ["window.location.href"],
-                    timeout=5, _engine_override="auto",
+                _current_url = _current_page_private_url(effective_task_id)
+                if _current_url:
+                    return json.dumps({
+                        "success": False,
+                        "error": (
+                            "Blocked: page URL targets a private or internal address "
+                            f"({_current_url}). This may have been caused by a "
+                            "JavaScript navigation via browser_console."
+                        ),
+                    }, ensure_ascii=False)
+            except _BrowserSafetyProbeUnknown as _probe_unknown:
+                return json.dumps(
+                    _browser_safety_probe_unknown_result(_probe_unknown),
+                    ensure_ascii=False,
                 )
-                if _url_result.get("success"):
-                    _current_url = (
-                        _browser_result_string(_url_result, "result")
-                        .strip().strip('"').strip("'")
-                    )
-                    if _current_url and not _is_safe_url(_current_url):
-                        return json.dumps({
-                            "success": False,
-                            "error": (
-                                "Blocked: page URL targets a private or internal address "
-                                f"({_current_url}). This may have been caused by a "
-                                "JavaScript navigation via browser_console."
-                            ),
-                        }, ensure_ascii=False)
             except Exception as _url_exc:
-                logger.debug("browser_snapshot: URL safety check failed (%s)", _url_exc)
+                logger.debug(
+                    "browser_snapshot: URL safety check failed (%s)",
+                    type(_url_exc).__name__,
+                )
 
         # Oversized snapshots truncate at line boundaries; the full
         # accessibility tree is stored to cache/web and the appended note
@@ -4316,7 +4316,13 @@ def browser_back(task_id: Optional[str] = None) -> str:
         # press via _blocked_private_page_action) — the floor must fire for
         # every backend, not just the initial navigate.
         if _eval_ssrf_guard_active(effective_task_id):
-            _blocked_url = _current_page_private_url(effective_task_id)
+            try:
+                _blocked_url = _current_page_private_url(effective_task_id)
+            except _BrowserSafetyProbeUnknown as _probe_unknown:
+                return json.dumps(
+                    _browser_safety_probe_unknown_result(_probe_unknown),
+                    ensure_ascii=False,
+                )
             if _blocked_url:
                 return json.dumps({
                     "success": False,
@@ -4381,7 +4387,13 @@ def _blocked_private_page_action(effective_task_id: str, action: str) -> Optiona
     """Return a blocked payload when an unsafe cloud page would receive input."""
     if not _eval_ssrf_guard_active(effective_task_id):
         return None
-    blocked_url = _current_page_private_url(effective_task_id)
+    try:
+        blocked_url = _current_page_private_url(effective_task_id)
+    except _BrowserSafetyProbeUnknown as _probe_unknown:
+        return json.dumps(
+            _browser_safety_probe_unknown_result(_probe_unknown),
+            ensure_ascii=False,
+        )
     if not blocked_url:
         return None
     return json.dumps({
@@ -4392,6 +4404,61 @@ def _blocked_private_page_action(effective_task_id: str, action: str) -> Optiona
             "browser mode."
         ),
     }, ensure_ascii=False)
+
+
+def _browser_result_outcome_unknown(result: Any) -> bool:
+    """Return whether an internal browser result has an ambiguous outcome."""
+    return isinstance(result, dict) and (
+        result.get("retry_safe") is False or result.get("outcome") == "unknown"
+    )
+
+
+def _browser_console_step_failure(
+    step: str,
+    result: Any,
+    messages: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Shape a truthful console aggregation failure with optional evidence."""
+    partial_messages = messages or []
+    if _browser_result_outcome_unknown(result):
+        allowed_codes = {
+            "timeout_outcome_unknown",
+            "transport_outcome_unknown",
+            "protocol_outcome_unknown",
+        }
+        result_code = result.get("error_code") if isinstance(result, dict) else None
+        error_code = (
+            result_code
+            if result_code in allowed_codes
+            else "browser_console_outcome_unknown"
+        )
+        response = _unknown_browser_command_result(
+            f"Browser {step} command returned an unknown outcome.",
+            error_code,
+        )
+    else:
+        error = result.get("error") if isinstance(result, dict) else None
+        if not isinstance(error, str) or not error.strip():
+            error = f"Browser {step} command failed."
+        response = {
+            "success": False,
+            "error": _bounded_redacted_browser_text(
+                error.strip(),
+                _MAX_BROWSER_PUBLIC_TEXT,
+            ),
+        }
+
+    if partial_messages:
+        response.update({
+            "partial": True,
+            "console_messages": partial_messages,
+            "js_errors": [],
+            "total_messages": len(partial_messages),
+            "total_errors": 0,
+        })
+    if isinstance(result, dict):
+        _copy_fallback_warning(response, result)
+    return json.dumps(response, ensure_ascii=False)
 
 
 def browser_console(clear: bool = False, expression: Optional[str] = None, task_id: Optional[str] = None) -> str:
@@ -4426,7 +4493,13 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         return _invalidated_browser_binding_response()
 
     if _eval_ssrf_guard_active(effective_task_id):
-        _blocked_url = _current_page_private_url(effective_task_id)
+        try:
+            _blocked_url = _current_page_private_url(effective_task_id)
+        except _BrowserSafetyProbeUnknown as _probe_unknown:
+            return json.dumps(
+                _browser_safety_probe_unknown_result(_probe_unknown),
+                ensure_ascii=False,
+            )
         if _blocked_url:
             return json.dumps({
                 "success": False,
@@ -4441,53 +4514,51 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     error_args = ["--clear"] if clear else []
 
     console_result = _run_browser_command(effective_task_id, "console", console_args)
+    if (
+        not isinstance(console_result, dict)
+        or _browser_result_outcome_unknown(console_result)
+        or not console_result.get("success")
+    ):
+        return _browser_console_step_failure("console", console_result)
+
+    console_data = console_result.get("data", {})
+    if not isinstance(console_data, dict):
+        return _browser_console_step_failure("console", {})
+    clean_messages = _sanitize_browser_message_items(
+        console_data.get("messages", []),
+        ("type", "text"),
+    )
+    if clean_messages is None:
+        return _browser_console_step_failure("console", {})
+    messages = [{
+        "type": msg.get("type", "log"),
+        "text": msg.get("text", ""),
+        "source": "console",
+    } for msg in clean_messages]
+
+    # With --clear each command mutates a separate buffer. Never clear the
+    # errors buffer until the console clear has a confirmed, validated result.
     errors_result = _run_browser_command(effective_task_id, "errors", error_args)
+    if (
+        not isinstance(errors_result, dict)
+        or _browser_result_outcome_unknown(errors_result)
+        or not errors_result.get("success")
+    ):
+        return _browser_console_step_failure("errors", errors_result, messages)
 
-    messages = []
-    if console_result.get("success"):
-        console_data = console_result.get("data", {})
-        if not isinstance(console_data, dict):
-            return json.dumps({
-                "success": False,
-                "error": "Browser console returned an invalid result.",
-            }, ensure_ascii=False)
-        raw_messages = console_data.get("messages", [])
-        clean_messages = _sanitize_browser_message_items(
-            raw_messages,
-            ("type", "text"),
-        )
-        if clean_messages is None:
-            return json.dumps({
-                "success": False,
-                "error": "Browser console returned an invalid result.",
-            }, ensure_ascii=False)
-        for msg in clean_messages:
-            messages.append({
-                "type": msg.get("type", "log"),
-                "text": msg.get("text", ""),
-                "source": "console",
-            })
-
-    errors = []
-    if errors_result.get("success"):
-        errors_data = errors_result.get("data", {})
-        if not isinstance(errors_data, dict):
-            return json.dumps({
-                "success": False,
-                "error": "Browser errors command returned an invalid result.",
-            }, ensure_ascii=False)
-        raw_errors = errors_data.get("errors", [])
-        clean_errors = _sanitize_browser_message_items(raw_errors, ("message",))
-        if clean_errors is None:
-            return json.dumps({
-                "success": False,
-                "error": "Browser errors command returned an invalid result.",
-            }, ensure_ascii=False)
-        for err in clean_errors:
-            errors.append({
-                "message": err.get("message", ""),
-                "source": "exception",
-            })
+    errors_data = errors_result.get("data", {})
+    if not isinstance(errors_data, dict):
+        return _browser_console_step_failure("errors", {}, messages)
+    clean_errors = _sanitize_browser_message_items(
+        errors_data.get("errors", []),
+        ("message",),
+    )
+    if clean_errors is None:
+        return _browser_console_step_failure("errors", {}, messages)
+    errors = [{
+        "message": err.get("message", ""),
+        "source": "exception",
+    } for err in clean_errors]
 
     response = {
         "success": True,
@@ -4542,20 +4613,53 @@ def _expression_targets_private_url(expression: str) -> Optional[str]:
     return None
 
 
+class _BrowserSafetyProbeUnknown(RuntimeError):
+    """A current-page safety probe was dispatched but has unknown outcome."""
+
+    def __init__(self, error_code: str):
+        super().__init__("browser safety probe outcome is unknown")
+        self.error_code = error_code
+
+
+def _browser_safety_probe_unknown_result(
+    exc: _BrowserSafetyProbeUnknown,
+) -> Dict[str, Any]:
+    allowed_codes = {
+        "timeout_outcome_unknown",
+        "transport_outcome_unknown",
+        "protocol_outcome_unknown",
+    }
+    error_code = (
+        exc.error_code
+        if exc.error_code in allowed_codes
+        else "browser_safety_probe_outcome_unknown"
+    )
+    return _unknown_browser_command_result(
+        "Browser current-page safety probe returned an unknown outcome.",
+        error_code,
+    )
+
+
 def _current_page_private_url(effective_task_id: str) -> Optional[str]:
     """Return the current page URL when it targets a private/internal address.
 
     Reads ``window.location.href`` via a low-cost eval and returns it when the
     page has been navigated (e.g. via ``location.href = '...'`` in a prior
-    eval) to an address the SSRF guard would reject.  Returns ``None`` when the
-    page is public, the URL can't be determined, or the check errors (fail-open
-    on probe failure, matching the snapshot/vision guards).
+    eval) to an address the SSRF guard would reject. Returns ``None`` when the
+    page is public or a definite probe failure has no URL. An ambiguous
+    dispatched probe raises ``_BrowserSafetyProbeUnknown`` so callers withhold
+    content and do not dispatch a follow-up action.
     """
     try:
         url_result = _run_browser_command(
             effective_task_id, "eval", ["window.location.href"],
             timeout=5, _engine_override="auto",
         )
+        if _browser_result_outcome_unknown(url_result):
+            error_code = url_result.get("error_code")
+            raise _BrowserSafetyProbeUnknown(
+                error_code if isinstance(error_code, str) else ""
+            )
         if url_result.get("success"):
             current_url = (
                 _browser_result_string(url_result, "result")
@@ -4565,8 +4669,13 @@ def _current_page_private_url(effective_task_id: str) -> Optional[str]:
                 _is_always_blocked_url(current_url) or not _is_safe_url(current_url)
             ):
                 return current_url
+    except _BrowserSafetyProbeUnknown:
+        raise
     except Exception as exc:
-        logger.debug("_current_page_private_url: probe failed (%s)", exc)
+        logger.debug(
+            "_current_page_private_url: probe failed (%s)",
+            type(exc).__name__,
+        )
     return None
 
 
@@ -4779,7 +4888,13 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
                 # Post-eval page-URL recheck: if this (or a prior) eval
                 # navigated the page to a private address, withhold the result.
                 if _eval_ssrf_guard_active(effective_task_id):
-                    _blocked_url = _current_page_private_url(effective_task_id)
+                    try:
+                        _blocked_url = _current_page_private_url(effective_task_id)
+                    except _BrowserSafetyProbeUnknown as _probe_unknown:
+                        return json.dumps(
+                            _browser_safety_probe_unknown_result(_probe_unknown),
+                            ensure_ascii=False,
+                        )
                     if _blocked_url:
                         return json.dumps({
                             "success": False,
@@ -4868,7 +4983,13 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     # Post-eval page-URL recheck: if this (or a prior) eval navigated the page
     # to a private address, withhold the result (mirrors the supervisor path).
     if _eval_ssrf_guard_active(effective_task_id):
-        _blocked_url = _current_page_private_url(effective_task_id)
+        try:
+            _blocked_url = _current_page_private_url(effective_task_id)
+        except _BrowserSafetyProbeUnknown as _probe_unknown:
+            return json.dumps(
+                _browser_safety_probe_unknown_result(_probe_unknown),
+                ensure_ascii=False,
+            )
         if _blocked_url:
             return json.dumps({
                 "success": False,
@@ -5033,23 +5154,121 @@ def _sanitize_browser_image_items(
         ):
             return None
 
-        decoded_src = urllib.parse.unquote(src)
-        if _PREFIX_RE.search(src) or _PREFIX_RE.search(decoded_src):
+        # Parse locally before any helper that may log its argument. Image
+        # URLs are untrusted page data and can carry credentials in userinfo,
+        # query values, or fragments. Fragments are never needed to identify
+        # an image resource, so remove them unconditionally.
+        if any(ord(char) < 0x20 for char in src):
             return None
-        if _sensitive_query_param_name(src) or _is_always_blocked_url(src):
+        try:
+            parsed_src = urllib.parse.urlsplit(src)
+            username = parsed_src.username
+            password = parsed_src.password
+            hostname = parsed_src.hostname
+            # Accessing port also validates malformed/non-numeric port text.
+            parsed_src.port
+        except (TypeError, ValueError, UnicodeError):
             return None
-        parsed_src = urllib.parse.urlparse(src)
+
+        scheme = parsed_src.scheme.lower()
+        if scheme not in {"http", "https", "blob", "file"}:
+            return None
+        if username is not None or password is not None:
+            return None
+        if scheme in {"http", "https"} and not hostname:
+            return None
+        if scheme == "blob" and "@" in parsed_src.path:
+            return None
         if (
-            parsed_src.scheme.lower() in {"http", "https"}
+            scheme == "file"
             and not _is_local_backend()
             and not _is_local_sidecar_key(effective_task_id)
-            and not _allow_private_urls()
-            and not _is_safe_url(src)
+        ):
+            return None
+
+        fragmentless_src = urllib.parse.urlunsplit((
+            parsed_src.scheme,
+            parsed_src.netloc,
+            parsed_src.path,
+            parsed_src.query,
+            "",
+        ))
+        decoded_src = fragmentless_src
+        for _ in range(3):
+            next_decoded = urllib.parse.unquote(decoded_src)
+            if next_decoded == decoded_src:
+                break
+            decoded_src = next_decoded
+        if _PREFIX_RE.search(fragmentless_src) or _PREFIX_RE.search(decoded_src):
+            return None
+
+        # Probe only normalized query *names* through the shared policy. Secret
+        # values never reach that helper (or any logger), while repeated
+        # unquoting catches encoded/case-varied credential names.
+        try:
+            query_pairs = urllib.parse.parse_qsl(
+                parsed_src.query,
+                keep_blank_values=True,
+            )
+            query_names = []
+            for key, _value in query_pairs:
+                decoded_key = key
+                for _ in range(3):
+                    next_key = urllib.parse.unquote(decoded_key)
+                    if next_key == decoded_key:
+                        break
+                    decoded_key = next_key
+                query_names.append((decoded_key, "present"))
+            query_probe = urllib.parse.urlunsplit((
+                parsed_src.scheme,
+                parsed_src.netloc,
+                parsed_src.path,
+                urllib.parse.urlencode(query_names),
+                "",
+            ))
+        except (TypeError, ValueError, UnicodeError):
+            return None
+        if _sensitive_query_param_name(query_probe):
+            return None
+
+        # Network safety needs only the origin. Passing an origin-only URL
+        # ensures any exception inside the shared checker cannot log a page
+        # path or query value.
+        safety_url = urllib.parse.urlunsplit((
+            parsed_src.scheme,
+            parsed_src.netloc,
+            "/",
+            "",
+            "",
+        ))
+        try:
+            always_blocked = _is_always_blocked_url(safety_url)
+            network_safe = (
+                scheme not in {"http", "https"}
+                or _is_local_backend()
+                or _is_local_sidecar_key(effective_task_id)
+                or _allow_private_urls()
+                or _is_safe_url(safety_url)
+            )
+        except Exception:
+            return None
+        if always_blocked or not network_safe:
+            return None
+
+        public_src = _bounded_redacted_browser_text(
+            fragmentless_src,
+            _MAX_BROWSER_IMAGE_URL,
+        )
+        if not public_src:
+            return None
+        if (
+            len(public_src) > _MAX_BROWSER_IMAGE_URL
+            or _PREFIX_RE.search(public_src)
         ):
             return None
 
         sanitized.append({
-            "src": _bounded_redacted_browser_text(src, _MAX_BROWSER_IMAGE_URL),
+            "src": public_src,
             "alt": _bounded_redacted_browser_text(alt, _MAX_BROWSER_IMAGE_ALT),
             "width": width,
             "height": height,
@@ -5090,7 +5309,13 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
     if result.get("success"):
         # ── Private-network guard (sibling of snapshot/vision/eval guards) ──
         if _eval_ssrf_guard_active(effective_task_id):
-            _blocked_url = _current_page_private_url(effective_task_id)
+            try:
+                _blocked_url = _current_page_private_url(effective_task_id)
+            except _BrowserSafetyProbeUnknown as _probe_unknown:
+                return json.dumps(
+                    _browser_safety_probe_unknown_result(_probe_unknown),
+                    ensure_ascii=False,
+                )
             if _blocked_url:
                 return json.dumps({
                     "success": False,
@@ -5184,26 +5409,26 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         and not _allow_private_urls()
     ):
         try:
-            _url_result = _run_browser_command(
-                effective_task_id, "eval", ["window.location.href"],
-                timeout=5, _engine_override="auto",
+            _current_url = _current_page_private_url(effective_task_id)
+            if _current_url:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "Blocked: page URL targets a private or internal address "
+                        f"({_current_url}). This may have been caused by a "
+                        "JavaScript navigation via browser_console."
+                    ),
+                }, ensure_ascii=False)
+        except _BrowserSafetyProbeUnknown as _probe_unknown:
+            return json.dumps(
+                _browser_safety_probe_unknown_result(_probe_unknown),
+                ensure_ascii=False,
             )
-            if _url_result.get("success"):
-                _current_url = (
-                    _browser_result_string(_url_result, "result")
-                    .strip().strip('"').strip("'")
-                )
-                if _current_url and not _is_safe_url(_current_url):
-                    return json.dumps({
-                        "success": False,
-                        "error": (
-                            "Blocked: page URL targets a private or internal address "
-                            f"({_current_url}). This may have been caused by a "
-                            "JavaScript navigation via browser_console."
-                        ),
-                    }, ensure_ascii=False)
         except Exception as _url_exc:
-            logger.debug("browser_vision: URL safety check failed (%s)", _url_exc)
+            logger.debug(
+                "browser_vision: URL safety check failed (%s)",
+                type(_url_exc).__name__,
+            )
 
     # Lightpanda has no graphical renderer — pre-route screenshots to Chrome
     # via the fallback helper instead of letting the normal path fail with a
