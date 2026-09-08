@@ -474,6 +474,22 @@ def _format_browser_timeout_error(
     return "\n".join(parts)
 
 
+def _unknown_browser_command_result(error: str, error_code: str) -> Dict[str, Any]:
+    """Return a stable result for a dispatched command with unknown outcome."""
+    guidance = (
+        "The browser command may have taken effect. Do not repeat it automatically; "
+        "inspect the current state or navigate again before continuing."
+    )
+    return {
+        "success": False,
+        "error": f"{error}\n{guidance}",
+        "error_code": error_code,
+        "outcome": "unknown",
+        "retry_safe": False,
+        "recovery": "inspect_or_renavigate",
+    }
+
+
 def _get_vision_model() -> Optional[str]:
     """Model for browser_vision (screenshot analysis — multimodal)."""
     return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
@@ -1134,6 +1150,12 @@ def _lightpanda_fallback_reason(engine: str, command: str, result: Dict[str, Any
     switched from Lightpanda to Chrome for completeness.
     """
     if engine != "lightpanda":
+        return None
+
+    # A dispatched command that timed out or lost transport may already have
+    # changed browser state. Retrying it in Chrome can duplicate navigation,
+    # clicks, submissions, text entry, or arbitrary eval side effects.
+    if result.get("retry_safe") is False or result.get("outcome") == "unknown":
         return None
 
     # Only retry commands where Chrome can meaningfully produce a different
@@ -3010,6 +3032,7 @@ def _run_browser_command(
         command
     ] + args
 
+    command_dispatched = False
     try:
         # Give each task its own socket directory to prevent concurrency conflicts.
         # Without this, parallel workers fight over the same default socket path,
@@ -3096,6 +3119,7 @@ def _run_browser_command(
                 env=browser_env,
                 **_popen_extra,
             )
+            command_dispatched = True
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
@@ -3116,10 +3140,10 @@ def _run_browser_command(
                 )
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
-            result = {
-                "success": False,
-                "error": _format_browser_timeout_error(command, timeout, stdout, stderr),
-            }
+            result = _unknown_browser_command_result(
+                _format_browser_timeout_error(command, timeout, stdout, stderr),
+                "timeout_outcome_unknown",
+            )
             # Fall through to fallback check below
         else:
             with open(stdout_path, "r", encoding="utf-8") as f:
@@ -3203,11 +3227,17 @@ def _run_browser_command(
 
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
-        result = {"success": False, "error": str(e)}
+        if command_dispatched:
+            result = _unknown_browser_command_result(
+                str(e),
+                "transport_outcome_unknown",
+            )
+        else:
+            result = {"success": False, "error": str(e)}
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
-    # This runs for ALL exit paths (timeout, empty, non-JSON, nonzero rc, parsed).
+    # Unknown outcomes never retry: the original command may have succeeded.
     fallback_reason = _lightpanda_fallback_reason(engine, command, result)
     if fallback_reason:
         logger.info(
@@ -5046,15 +5076,14 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         _cleanup_single_browser_session(session_key)
 
     # Drop stale last-active ownership. Cleaning a bare task drops its binding;
-    # cleaning a sidecar drops the binding only if that sidecar was still the
-    # recorded owner. This prevents a later click/snapshot from resurrecting a
-    # cleaned sidecar on about:blank while preserving a primary-session binding.
+    # cleaning the currently bound sidecar replaces it with an invalidation
+    # tombstone. This prevents a later click/snapshot from falling through to
+    # the unrelated cloud primary while preserving any valid other binding.
     with _cleanup_lock:
         if _is_local_sidecar_key(task_id):
             if _last_active_session_key.get(bare_task_id) == task_id:
                 _last_active_session_key.pop(bare_task_id, None)
-            if _invalidated_session_bindings.get(bare_task_id) == task_id:
-                _invalidated_session_bindings.pop(bare_task_id, None)
+                _invalidated_session_bindings[bare_task_id] = task_id
         else:
             _last_active_session_key.pop(bare_task_id, None)
             _invalidated_session_bindings.pop(bare_task_id, None)

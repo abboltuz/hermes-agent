@@ -151,6 +151,132 @@ class TestCommandTimeoutRecovery:
         assert bt._active_sessions["race"] is replacement
         assert tmp_path.exists()
 
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("open", ["https://example.com"]),
+            ("click", ["@e1"]),
+            ("fill", ["@e1", "value"]),
+            ("scroll", ["down", "500"]),
+            ("back", []),
+            ("press", ["Enter"]),
+            ("eval", ["document.title"]),
+            ("snapshot", ["-c"]),
+            ("screenshot", []),
+            ("console", []),
+            ("errors", []),
+        ],
+    )
+    def test_lightpanda_timeout_unknown_is_never_replayed(
+        self, monkeypatch, tmp_path, command, args
+    ):
+        task_id = "lightpanda-timeout"
+        bt._active_sessions[task_id] = {
+            "session_name": "lightpanda-session",
+            "bb_session_id": None,
+            "cdp_url": None,
+        }
+        process = Mock(returncode=0)
+        process.wait.side_effect = [subprocess.TimeoutExpired("agent-browser", 1), -9]
+        chrome_fallback = Mock(side_effect=AssertionError("must not replay timeout"))
+        screenshot_fallback = Mock(side_effect=AssertionError("must not replay timeout"))
+
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
+        monkeypatch.setattr(bt, "_get_browser_engine", lambda: "lightpanda")
+        monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(bt, "_stop_cdp_supervisor", lambda _: None)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+        monkeypatch.setattr(bt, "_run_chrome_fallback_command", chrome_fallback)
+        monkeypatch.setattr(bt, "_chrome_fallback_screenshot", screenshot_fallback)
+        monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        result = bt._run_browser_command(task_id, command, args, timeout=1)
+
+        assert result["success"] is False
+        assert result["error_code"] == "timeout_outcome_unknown"
+        assert result["outcome"] == "unknown"
+        assert result["retry_safe"] is False
+        assert result["recovery"] == "inspect_or_renavigate"
+        assert "Do not repeat" in result["error"]
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    def test_lightpanda_transport_unknown_is_never_replayed(
+        self, monkeypatch, tmp_path
+    ):
+        task_id = "lightpanda-transport"
+        bt._active_sessions[task_id] = {
+            "session_name": "lightpanda-session",
+            "bb_session_id": None,
+            "cdp_url": None,
+        }
+        process = Mock(returncode=0)
+        process.wait.side_effect = OSError("transport lost after dispatch")
+        chrome_fallback = Mock(side_effect=AssertionError("must not replay unknown"))
+
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
+        monkeypatch.setattr(bt, "_get_browser_engine", lambda: "lightpanda")
+        monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+        monkeypatch.setattr(bt, "_run_chrome_fallback_command", chrome_fallback)
+        monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        result = bt._run_browser_command(task_id, "click", ["@e1"], timeout=1)
+
+        assert result["error_code"] == "transport_outcome_unknown"
+        assert result["outcome"] == "unknown"
+        assert result["retry_safe"] is False
+        chrome_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("open", ["https://example.com"]),
+            ("click", ["@e1"]),
+            ("snapshot", ["-c"]),
+        ],
+    )
+    def test_lightpanda_definite_eligible_failure_still_falls_back(
+        self, monkeypatch, tmp_path, command, args
+    ):
+        task_id = "lightpanda-definite-failure"
+        bt._active_sessions[task_id] = {
+            "session_name": "lightpanda-session",
+            "bb_session_id": None,
+            "cdp_url": None,
+        }
+        process = Mock(returncode=1)
+        process.wait.return_value = 1
+        chrome_fallback = Mock(return_value={"success": True, "data": {}})
+
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
+        monkeypatch.setattr(bt, "_get_browser_engine", lambda: "lightpanda")
+        monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+        monkeypatch.setattr(bt, "_run_chrome_fallback_command", chrome_fallback)
+        monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        result = bt._run_browser_command(task_id, command, args, timeout=1)
+
+        assert result["success"] is True
+        assert result["browser_engine"] == "chrome"
+        chrome_fallback.assert_called_once_with(task_id, command, args, 1)
+
     def test_local_sidecar_timeout_blocks_non_navigation_until_rebind(
         self, monkeypatch, tmp_path
     ):

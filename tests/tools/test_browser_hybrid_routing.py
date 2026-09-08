@@ -10,6 +10,7 @@ These tests cover the routing decision layer — session_key selection,
 sidecar detection, last-active-session tracking, and the config toggle.
 The downstream session creation is covered by test_browser_cloud_fallback.py.
 """
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -17,10 +18,36 @@ import pytest
 import tools.browser_tool as browser_tool
 
 
+def _assert_non_navigation_blocked(monkeypatch, task_id):
+    forbidden_run = Mock(side_effect=AssertionError("must not target cloud session"))
+    monkeypatch.setattr(browser_tool, "_run_browser_command", forbidden_run)
+    actions = [
+        lambda: browser_tool.browser_click("e1", task_id=task_id),
+        lambda: browser_tool.browser_type("e1", "value", task_id=task_id),
+        lambda: browser_tool.browser_snapshot(task_id=task_id),
+        lambda: browser_tool.browser_scroll("down", task_id=task_id),
+        lambda: browser_tool.browser_back(task_id=task_id),
+        lambda: browser_tool.browser_press("Enter", task_id=task_id),
+        lambda: browser_tool.browser_console(task_id=task_id),
+        lambda: browser_tool.browser_console(
+            expression="document.title", task_id=task_id
+        ),
+        lambda: browser_tool.browser_get_images(task_id=task_id),
+        lambda: browser_tool.browser_vision("What is visible?", task_id=task_id),
+    ]
+    for action in actions:
+        response = action()
+        payload = response if isinstance(response, dict) else json.loads(response)
+        assert payload["success"] is False
+        assert "Navigate successfully" in payload["error"]
+    forbidden_run.assert_not_called()
+
+
 @pytest.fixture(autouse=True)
 def _reset_routing_state(monkeypatch):
     """Clear module-level caches so each test starts clean."""
     monkeypatch.setattr(browser_tool, "_active_sessions", {})
+    monkeypatch.setattr(browser_tool, "_session_last_activity", {})
     monkeypatch.setattr(browser_tool, "_last_active_session_key", {})
     monkeypatch.setattr(browser_tool, "_invalidated_session_bindings", {})
     monkeypatch.setattr(browser_tool, "_cached_cloud_provider", None)
@@ -171,12 +198,16 @@ class TestCleanupHybridSessions:
         monkeypatch.setattr(
             browser_tool, "_last_active_session_key", {"default": "default::local"}
         )
+        monkeypatch.setattr(
+            browser_tool, "_invalidated_session_bindings", {"default": "default::local"}
+        )
 
         browser_tool.cleanup_browser("default")
 
         assert set(reaped) == {"default", "default::local"}
         # last-active pointer dropped
         assert "default" not in browser_tool._last_active_session_key
+        assert "default" not in browser_tool._invalidated_session_bindings
 
 
     def test_cleanup_sidecar_directly_keeps_primary(self, monkeypatch):
@@ -198,14 +229,69 @@ class TestCleanupHybridSessions:
         monkeypatch.setattr(
             browser_tool, "_last_active_session_key", {"default": "default::local"}
         )
+
+        browser_tool.cleanup_browser("default::local")
+
+        assert reaped == ["default::local"]
+        # The cleaned sidecar is no longer live, but its exact backend affinity
+        # stays tombstoned so follow-up actions cannot hit the cloud primary.
+        assert "default" not in browser_tool._last_active_session_key
+        assert browser_tool._invalidated_session_bindings == {
+            "default": "default::local"
+        }
+        _assert_non_navigation_blocked(monkeypatch, "default")
+
+    def test_cleanup_unrelated_sidecar_preserves_valid_primary_binding(self, monkeypatch):
+        reaped = []
         monkeypatch.setattr(
-            browser_tool, "_invalidated_session_bindings", {"default": "default::local"}
+            browser_tool,
+            "_cleanup_single_browser_session",
+            lambda key: reaped.append(key),
+        )
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {
+                "default": {"session_name": "cloud_sess"},
+                "default::local": {"session_name": "local_sess"},
+            },
+        )
+        monkeypatch.setattr(
+            browser_tool, "_last_active_session_key", {"default": "default"}
         )
 
         browser_tool.cleanup_browser("default::local")
 
         assert reaped == ["default::local"]
-        # The cleaned sidecar must not remain the recorded owner; otherwise a
-        # later click/snapshot could resurrect it instead of using the primary.
-        assert "default" not in browser_tool._last_active_session_key
-        assert "default" not in browser_tool._invalidated_session_bindings
+        assert browser_tool._last_active_session_key == {"default": "default"}
+        assert browser_tool._invalidated_session_bindings == {}
+
+    def test_inactivity_cleanup_tombstones_current_sidecar(self, monkeypatch):
+        cloud_session = {"session_name": "cloud_sess"}
+        sidecar_session = {"session_name": "local_sess"}
+        browser_tool._active_sessions.update({
+            "default": cloud_session,
+            "default::local": sidecar_session,
+        })
+        browser_tool._session_last_activity.update({
+            "default": 100.0,
+            "default::local": 1.0,
+        })
+        browser_tool._last_active_session_key["default"] = "default::local"
+
+        def cleanup_one(session_key):
+            browser_tool._active_sessions.pop(session_key, None)
+            browser_tool._session_last_activity.pop(session_key, None)
+
+        monkeypatch.setattr(browser_tool, "_cleanup_single_browser_session", cleanup_one)
+        monkeypatch.setattr(browser_tool.time, "time", lambda: 100.0)
+        monkeypatch.setattr(browser_tool, "BROWSER_SESSION_INACTIVITY_TIMEOUT", 30)
+
+        browser_tool._cleanup_inactive_browser_sessions()
+
+        assert browser_tool._active_sessions == {"default": cloud_session}
+        assert browser_tool._last_active_session_key == {}
+        assert browser_tool._invalidated_session_bindings == {
+            "default": "default::local"
+        }
+        _assert_non_navigation_blocked(monkeypatch, "default")
