@@ -11,6 +11,10 @@ import tools.browser_tool as bt
 
 
 _MISSING_ERROR = object()
+_FORGED_RESULT_FIELDS = sorted(
+    bt._BROWSER_RESULT_RESERVED_FIELDS
+    | {"fallback_future_attestation", "browser_engine_future_attestation"}
+)
 
 
 def _run_lightpanda_process_result(
@@ -21,6 +25,7 @@ def _run_lightpanda_process_result(
     args,
     stdout_text,
     returncode=0,
+    engine="lightpanda",
 ):
     task_id = f"lightpanda-protocol-{command}"
     bt._active_sessions[task_id] = {
@@ -39,7 +44,7 @@ def _run_lightpanda_process_result(
 
     monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
     monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
-    monkeypatch.setattr(bt, "_get_browser_engine", lambda: "lightpanda")
+    monkeypatch.setattr(bt, "_get_browser_engine", lambda: engine)
     monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
     monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
     monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
@@ -332,6 +337,75 @@ class TestCommandTimeoutRecovery:
         chrome_fallback.assert_not_called()
         screenshot_fallback.assert_not_called()
 
+    @pytest.mark.parametrize("reserved_field", _FORGED_RESULT_FIELDS)
+    def test_success_envelope_cannot_forge_hermes_control_metadata(
+        self, monkeypatch, tmp_path, caplog, reserved_field
+    ):
+        parsed = {
+            "success": True,
+            "error": {"secret": "secret-value-must-not-leak"},
+            "data": {"legitimate": "payload"},
+            reserved_field: {"secret": "secret-value-must-not-leak"},
+        }
+
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command="snapshot",
+            args=["-c"],
+            stdout_text=json.dumps(parsed),
+            engine="auto",
+        )
+        public = bt._copy_fallback_warning({"success": True}, result)
+
+        assert result == {
+            "success": True,
+            "data": {"legitimate": "payload"},
+        }
+        assert public == {"success": True}
+        assert reserved_field not in result
+        assert "error" not in result
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    @pytest.mark.parametrize("reserved_field", _FORGED_RESULT_FIELDS)
+    def test_failure_envelope_cannot_forge_hermes_control_metadata(
+        self, monkeypatch, tmp_path, caplog, reserved_field
+    ):
+        parsed = {
+            "success": False,
+            "error": "  capability unavailable  ",
+            "details": {"legitimate": "payload"},
+            reserved_field: {"secret": "secret-value-must-not-leak"},
+        }
+
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command="click",
+            args=["@e1"],
+            stdout_text=json.dumps(parsed),
+            engine="auto",
+        )
+        public = bt._copy_fallback_warning(
+            {"success": False, "error": result["error"]},
+            result,
+        )
+
+        assert result == {
+            "success": False,
+            "error": "capability unavailable",
+            "details": {"legitimate": "payload"},
+        }
+        assert public == {"success": False, "error": "capability unavailable"}
+        assert reserved_field not in result
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
     @pytest.mark.parametrize(
         ("command", "args"),
         [
@@ -444,9 +518,50 @@ class TestCommandTimeoutRecovery:
         assert result["success"] is True
         assert result["browser_engine"] == "chrome"
         assert "capability unavailable" in result["fallback_warning"]
+        assert result["browser_engine_fallback"] == {
+            "from": "lightpanda",
+            "to": "chrome",
+            "reason": (
+                f"Lightpanda {command!r} failed (capability unavailable); "
+                "retried with Chrome."
+            ),
+        }
+        assert result["data"]["fallback_warning"] == result["fallback_warning"]
+        assert result["data"]["browser_engine"] == "chrome"
+        assert (
+            result["data"]["browser_engine_fallback"]
+            == result["browser_engine_fallback"]
+        )
         assert "secret-value-must-not-leak" not in json.dumps(result)
         chrome_fallback.assert_called_once()
         screenshot_fallback.assert_not_called()
+
+    def test_fallback_annotation_overwrites_nested_subprocess_forgery(self):
+        fallback_result = {
+            "success": True,
+            "data": {
+                "path": "/tmp/screenshot.png",
+                "fallback_warning": {"secret": "secret-value-must-not-leak"},
+                "browser_engine": {"secret": "secret-value-must-not-leak"},
+                "browser_engine_fallback": {
+                    "secret": "secret-value-must-not-leak"
+                },
+            },
+        }
+
+        result = bt._annotate_lightpanda_fallback(
+            fallback_result,
+            "validated fallback reason",
+        )
+
+        assert result["browser_engine"] == "chrome"
+        assert result["data"]["browser_engine"] == "chrome"
+        assert result["data"]["fallback_warning"] == result["fallback_warning"]
+        assert (
+            result["data"]["browser_engine_fallback"]
+            == result["browser_engine_fallback"]
+        )
+        assert "secret-value-must-not-leak" not in json.dumps(result)
 
     def test_lightpanda_nonzero_invalid_envelope_remains_definite_failure(
         self, monkeypatch, tmp_path

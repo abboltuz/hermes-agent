@@ -490,12 +490,32 @@ def _unknown_browser_command_result(error: str, error_code: str) -> Dict[str, An
     }
 
 
-_BROWSER_OUTCOME_CONTROL_FIELDS = frozenset({
+_BROWSER_RESULT_RESERVED_FIELDS = frozenset({
+    # Unknown-outcome/retry policy is owned by Hermes.
     "error_code",
     "outcome",
     "retry_safe",
     "recovery",
+    # Cross-engine fallback attestations are added only after Hermes performs
+    # a fallback. Cloud-session siblings are reserved here too so a subprocess
+    # envelope cannot impersonate any current fallback provenance.
+    "fallback",
+    "fallback_warning",
+    "fallback_reason",
+    "fallback_from_cloud",
+    "fallback_provider",
+    "browser_engine",
+    "browser_engine_fallback",
 })
+
+
+def _is_reserved_browser_result_field(key: str) -> bool:
+    """Return whether a subprocess result key is Hermes-owned metadata."""
+    return (
+        key in _BROWSER_RESULT_RESERVED_FIELDS
+        or key.startswith("fallback_")
+        or key.startswith("browser_engine_")
+    )
 
 
 def _validated_browser_command_result(
@@ -540,10 +560,14 @@ def _validated_browser_command_result(
     result = {
         key: value
         for key, value in parsed.items()
-        if key not in _BROWSER_OUTCOME_CONTROL_FIELDS
+        if not _is_reserved_browser_result_field(key)
     }
     if result["success"] is False:
         result["error"] = error.strip()
+    else:
+        # A successful command has no failure reason. Never let an untrusted
+        # subprocess smuggle arbitrary/nested content through this field.
+        result.pop("error", None)
     return result
 
 
@@ -1282,12 +1306,15 @@ def _annotate_lightpanda_fallback(result: Dict[str, Any], reason: str) -> Dict[s
     data = annotated.get("data")
     if isinstance(data, dict):
         data = dict(data)
-        data.setdefault("fallback_warning", warning)
-        data.setdefault("browser_engine", "chrome")
-        data.setdefault(
-            "browser_engine_fallback",
-            {"from": "lightpanda", "to": "chrome", "reason": reason},
-        )
+        # These are Hermes attestations, not browser payload. Always replace
+        # same-named subprocess values rather than preserving a forgery.
+        data["fallback_warning"] = warning
+        data["browser_engine"] = "chrome"
+        data["browser_engine_fallback"] = {
+            "from": "lightpanda",
+            "to": "chrome",
+            "reason": reason,
+        }
         annotated["data"] = data
     return annotated
 
@@ -1434,14 +1461,47 @@ def _run_chrome_fallback_command(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-            return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
+            return _unknown_browser_command_result(
+                f"Chrome fallback command '{cmd}' timed out.",
+                "timeout_outcome_unknown",
+            )
         try:
             with open(stdout_path, "r", encoding="utf-8") as f:
                 stdout = f.read().strip()
             if stdout:
-                return json.loads(stdout.split("\n")[-1])
-        except Exception as exc:
-            logger.debug("Chrome fallback tmp cmd '%s' error: %s", cmd, exc)
+                try:
+                    parsed = json.loads(stdout.split("\n")[-1])
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "Chrome fallback tmp cmd '%s' returned non-JSON output "
+                        "(rc=%s, chars=%d)",
+                        cmd,
+                        proc.returncode,
+                        len(stdout),
+                    )
+                    if proc.returncode == 0:
+                        return _unknown_browser_command_result(
+                            f"Chrome fallback command '{cmd}' returned a non-JSON protocol response.",
+                            "protocol_outcome_unknown",
+                        )
+                    return {
+                        "success": False,
+                        "error": f"Chrome fallback '{cmd}' failed with exit code {proc.returncode}",
+                    }
+                return _validated_browser_command_result(parsed, cmd, proc.returncode)
+            if proc.returncode == 0 and cmd in _EMPTY_OK_COMMANDS:
+                return {"success": True, "data": {}}
+            if proc.returncode == 0:
+                return _unknown_browser_command_result(
+                    f"Chrome fallback command '{cmd}' returned no output despite a successful process exit.",
+                    "protocol_outcome_unknown",
+                )
+        except OSError as exc:
+            logger.debug("Chrome fallback tmp cmd '%s' transport error: %s", cmd, exc)
+            return _unknown_browser_command_result(
+                f"Chrome fallback command '{cmd}' lost its result transport.",
+                "transport_outcome_unknown",
+            )
         finally:
             for pth in (stdout_path, stderr_path):
                 try:
