@@ -39,7 +39,8 @@ def _run_lightpanda_process_result(
     screenshot_fallback = Mock(return_value={"success": True, "data": {}})
 
     def popen(*_args, **kwargs):
-        os.write(kwargs["stdout"], stdout_text.encode("utf-8"))
+        output = stdout_text if isinstance(stdout_text, bytes) else stdout_text.encode("utf-8")
+        os.write(kwargs["stdout"], output)
         return process
 
     monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
@@ -336,6 +337,237 @@ class TestCommandTimeoutRecovery:
         assert "secret-value-must-not-leak" not in json.dumps(result)
         chrome_fallback.assert_not_called()
         screenshot_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("open", ["https://example.com"]),
+            ("snapshot", ["-c"]),
+            ("screenshot", []),
+            ("eval", ["document.title"]),
+            ("console", []),
+            ("errors", []),
+            ("back", []),
+            ("record", ["stop"]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "data_value",
+        [
+            ["secret-value-must-not-leak"],
+            "secret-value-must-not-leak",
+            42,
+            True,
+        ],
+        ids=["list", "string", "number", "bool"],
+    )
+    def test_success_envelope_rejects_non_object_data_without_replay(
+        self, monkeypatch, tmp_path, caplog, command, args, data_value
+    ):
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command=command,
+            args=args,
+            stdout_text=json.dumps({"success": True, "data": data_value}),
+        )
+
+        assert result["success"] is False
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert result["outcome"] == "unknown"
+        assert result["retry_safe"] is False
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "data"),
+        [
+            ("open", {"title": ["secret-value-must-not-leak"]}),
+            ("open", {"url": 42}),
+            ("snapshot", {"snapshot": ["secret-value-must-not-leak"]}),
+            ("snapshot", {"refs": ["secret-value-must-not-leak"]}),
+            ("screenshot", {"path": ["secret-value-must-not-leak"]}),
+            ("screenshot", {"path": "bad\x00secret-value-must-not-leak"}),
+            ("screenshot", {"annotations": {"secret": "secret-value-must-not-leak"}}),
+            ("back", {"url": ["secret-value-must-not-leak"]}),
+            ("record", {"path": ["secret-value-must-not-leak"]}),
+            ("console", {"messages": {"secret": "secret-value-must-not-leak"}}),
+            ("console", {"messages": [["secret-value-must-not-leak"]]}),
+            ("console", {"messages": [{"text": {"secret": "secret-value-must-not-leak"}}]}),
+            ("errors", {"errors": {"secret": "secret-value-must-not-leak"}}),
+            ("errors", {"errors": [["secret-value-must-not-leak"]]}),
+            ("errors", {"errors": [{"message": {"secret": "secret-value-must-not-leak"}}]}),
+        ],
+    )
+    def test_success_envelope_rejects_invalid_consumed_member_types(
+        self, monkeypatch, tmp_path, caplog, command, data
+    ):
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command=command,
+            args=[],
+            stdout_text=json.dumps({"success": True, "data": data}),
+        )
+
+        assert result["success"] is False
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert result["retry_safe"] is False
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "data_value",
+        [_MISSING_ERROR, None],
+        ids=["missing", "null"],
+    )
+    def test_success_envelope_normalizes_absent_or_null_data(
+        self, monkeypatch, tmp_path, data_value
+    ):
+        envelope = {"success": True}
+        if data_value is not _MISSING_ERROR:
+            envelope["data"] = data_value
+
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command="click",
+            args=["@e1"],
+            stdout_text=json.dumps(envelope),
+            engine="auto",
+        )
+
+        assert result == {"success": True, "data": {}}
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "data"),
+        [
+            ("open", {"title": "Example", "url": "https://example.com"}),
+            ("snapshot", {"snapshot": "button Example", "refs": {"e1": {}}}),
+            ("screenshot", {"path": "/tmp/example.png", "annotations": []}),
+            ("eval", {"result": {"arbitrary": [1, True, None]}}),
+            ("console", {"messages": [{"type": "log", "text": "ok"}]}),
+            ("errors", {"errors": [{"message": "ok"}]}),
+        ],
+    )
+    def test_success_envelope_preserves_valid_command_shapes(
+        self, command, data
+    ):
+        result = bt._validated_browser_command_result(
+            {"success": True, "data": data},
+            command,
+            0,
+        )
+
+        assert result == {"success": True, "data": data}
+
+    def test_eval_result_remains_arbitrary_but_url_accessor_is_typed(self):
+        result = bt._validated_browser_command_result(
+            {"success": True, "data": {"result": {"arbitrary": [1, 2]}}},
+            "eval",
+            0,
+        )
+
+        assert result["data"]["result"] == {"arbitrary": [1, 2]}
+        assert bt._browser_result_string(result, "result") == ""
+
+    def test_image_extraction_rejects_non_list_eval_result(self, monkeypatch):
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_last_session_key", lambda _task: "task")
+        monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda _task: False)
+        monkeypatch.setattr(
+            bt,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: {
+                "success": True,
+                "data": {"result": {"not": "an image list"}},
+            },
+        )
+
+        response = json.loads(bt.browser_get_images(task_id="task"))
+
+        assert response == {
+            "success": False,
+            "error": "Browser image extraction returned an invalid result.",
+        }
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("open", ["https://example.com"]),
+            ("snapshot", ["-c"]),
+            ("screenshot", []),
+            ("eval", ["document.title"]),
+        ],
+    )
+    def test_main_command_invalid_utf8_is_protocol_unknown_without_replay(
+        self, monkeypatch, tmp_path, caplog, command, args
+    ):
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command=command,
+            args=args,
+            stdout_text=b"\xffsecret-value-must-not-leak",
+        )
+
+        assert result["success"] is False
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert result["retry_safe"] is False
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    def test_temporary_chrome_invalid_utf8_is_protocol_unknown(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        outputs = iter([
+            b'{"success":true,"data":{"url":"https://example.com"}}',
+            b"\xffsecret-value-must-not-leak",
+            b"",
+        ])
+
+        def popen(*_args, **kwargs):
+            os.write(kwargs["stdout"], next(outputs))
+            process = Mock(returncode=0)
+            process.wait.return_value = 0
+            return process
+
+        monkeypatch.setattr(
+            bt,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: {
+                "success": True,
+                "data": {"result": "https://example.com"},
+            },
+        )
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/bin/agent-browser")
+        monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+        monkeypatch.setattr(subprocess, "Popen", popen)
+
+        result = bt._run_chrome_fallback_command(
+            "task",
+            "click",
+            ["@e1"],
+            timeout=1,
+        )
+
+        assert result["success"] is False
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert result["outcome"] == "unknown"
+        assert result["retry_safe"] is False
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
 
     @pytest.mark.parametrize("reserved_field", _FORGED_RESULT_FIELDS)
     def test_success_envelope_cannot_forge_hermes_control_metadata(

@@ -518,6 +518,75 @@ def _is_reserved_browser_result_field(key: str) -> bool:
     )
 
 
+def _invalid_browser_protocol_result(command: str, returncode: int) -> Dict[str, Any]:
+    """Return a sanitized result for an invalid subprocess protocol envelope."""
+    logger.warning(
+        "browser '%s' returned an invalid protocol envelope (rc=%s)",
+        command,
+        returncode,
+    )
+    if returncode == 0:
+        return _unknown_browser_command_result(
+            f"Browser command '{command}' returned an invalid protocol response.",
+            "protocol_outcome_unknown",
+        )
+    return {
+        "success": False,
+        "error": (
+            f"Browser command '{command}' failed with exit code {returncode} "
+            "and returned an invalid protocol response."
+        ),
+    }
+
+
+def _browser_success_data_is_valid(command: str, data: Dict[str, Any]) -> bool:
+    """Validate only members Hermes consumes; keep arbitrary eval results."""
+    string_fields = {
+        "open": ("title", "url"),
+        "back": ("url",),
+        "record": ("path",),
+    }
+    for field in string_fields.get(command, ()):
+        if field in data and not isinstance(data[field], str):
+            return False
+
+    if command == "snapshot":
+        if "snapshot" in data and not isinstance(data["snapshot"], str):
+            return False
+        if "refs" in data and not isinstance(data["refs"], dict):
+            return False
+
+    if command == "screenshot":
+        if "path" in data:
+            path = data["path"]
+            if not isinstance(path, str) or "\x00" in path:
+                return False
+        if "annotations" in data and not isinstance(data["annotations"], list):
+            return False
+
+    collection_specs = {
+        "console": ("messages", ("type", "text")),
+        "errors": ("errors", ("message",)),
+    }
+    spec = collection_specs.get(command)
+    if spec:
+        collection_field, item_string_fields = spec
+        if collection_field in data:
+            items = data[collection_field]
+            if not isinstance(items, list):
+                return False
+            for item in items:
+                if not isinstance(item, dict):
+                    return False
+                if any(
+                    field in item and not isinstance(item[field], str)
+                    for field in item_string_fields
+                ):
+                    return False
+
+    return True
+
+
 def _validated_browser_command_result(
     parsed: Any,
     command: str,
@@ -539,23 +608,14 @@ def _validated_browser_command_result(
     ) if valid_shape else False
 
     if not valid_shape or not valid_error:
-        logger.warning(
-            "browser '%s' returned an invalid protocol envelope (rc=%s)",
-            command,
-            returncode,
-        )
-        if returncode == 0:
-            return _unknown_browser_command_result(
-                f"Browser command '{command}' returned an invalid protocol response.",
-                "protocol_outcome_unknown",
-            )
-        return {
-            "success": False,
-            "error": (
-                f"Browser command '{command}' failed with exit code {returncode} "
-                "and returned an invalid protocol response."
-            ),
-        }
+        return _invalid_browser_protocol_result(command, returncode)
+
+    data = parsed.get("data")
+    if parsed["success"] is True:
+        if data is None:
+            data = {}
+        if not isinstance(data, dict) or not _browser_success_data_is_valid(command, data):
+            return _invalid_browser_protocol_result(command, returncode)
 
     result = {
         key: value
@@ -568,7 +628,17 @@ def _validated_browser_command_result(
         # A successful command has no failure reason. Never let an untrusted
         # subprocess smuggle arbitrary/nested content through this field.
         result.pop("error", None)
+        result["data"] = data
     return result
+
+
+def _browser_result_string(result: Dict[str, Any], field: str) -> str:
+    """Read a string result member without constraining arbitrary eval data."""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return ""
+    value = data.get(field)
+    return value if isinstance(value, str) else ""
 
 
 def _get_vision_model() -> Optional[str]:
@@ -1256,9 +1326,13 @@ def _lightpanda_fallback_reason(engine: str, command: str, result: Dict[str, Any
         return f"Lightpanda {command!r} failed ({error}); retried with Chrome."
 
     data = result.get("data", {})
+    if not isinstance(data, dict):
+        return None
 
     if command == "snapshot":
         snap = data.get("snapshot", "")
+        if not isinstance(snap, str):
+            return None
         # Empty or near-empty snapshots indicate Lightpanda couldn't render
         if not snap or len(snap.strip()) < 20:
             return "Lightpanda returned an empty/too-short snapshot; retried with Chrome."
@@ -1268,6 +1342,8 @@ def _lightpanda_fallback_reason(engine: str, command: str, result: Dict[str, Any
         # Since LP PR #1766 resized it to 1920x1080, the placeholder is
         # ~17 KB.  Real Chromium screenshots are typically 100 KB+.
         path = data.get("path", "")
+        if not isinstance(path, str) or "\x00" in path:
+            return None
         if path:
             try:
                 size = os.path.getsize(path)
@@ -1352,7 +1428,7 @@ def _run_chrome_fallback_command(
     )
     current_url = None
     if url_result.get("success"):
-        current_url = url_result.get("data", {}).get("result", "").strip().strip('"').strip("'")
+        current_url = _browser_result_string(url_result, "result").strip().strip('"').strip("'")
     if not current_url:
         logger.warning("Chrome fallback: could not determine current URL from LP session")
         return {"success": False, "error": "Chrome fallback failed: could not determine current URL"}
@@ -1496,6 +1572,24 @@ def _run_chrome_fallback_command(
                     f"Chrome fallback command '{cmd}' returned no output despite a successful process exit.",
                     "protocol_outcome_unknown",
                 )
+        except UnicodeError:
+            logger.debug(
+                "Chrome fallback tmp cmd '%s' returned non-UTF-8 output (rc=%s)",
+                cmd,
+                proc.returncode,
+            )
+            if proc.returncode == 0:
+                return _unknown_browser_command_result(
+                    f"Chrome fallback command '{cmd}' returned an invalid text encoding.",
+                    "protocol_outcome_unknown",
+                )
+            return {
+                "success": False,
+                "error": (
+                    f"Chrome fallback '{cmd}' failed with exit code "
+                    f"{proc.returncode} and invalid text output."
+                ),
+            }
         except OSError as exc:
             logger.debug("Chrome fallback tmp cmd '%s' transport error: %s", cmd, exc)
             return _unknown_browser_command_result(
@@ -3153,6 +3247,7 @@ def _run_browser_command(
     ] + args
 
     command_dispatched = False
+    command_returncode: Optional[int] = None
     try:
         # Give each task its own socket directory to prevent concurrency conflicts.
         # Without this, parallel workers fight over the same default socket path,
@@ -3249,7 +3344,16 @@ def _run_browser_command(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-            stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
+            try:
+                stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
+            except UnicodeError:
+                # The timeout already makes the outcome unknown. Invalid
+                # diagnostic bytes must neither change retry policy nor leak.
+                stdout, stderr = "", ""
+                logger.warning(
+                    "browser '%s' timed out with non-UTF-8 diagnostic output",
+                    command,
+                )
             _unlink_command_output_files(stdout_path, stderr_path)
             _discard_timed_out_browser_session(task_id, session_info, task_socket_dir)
             if stderr and stderr.strip():
@@ -3266,11 +3370,16 @@ def _run_browser_command(
             )
             # Fall through to fallback check below
         else:
-            with open(stdout_path, "r", encoding="utf-8") as f:
-                stdout = f.read()
-            with open(stderr_path, "r", encoding="utf-8") as f:
-                stderr = f.read()
             returncode = proc.returncode
+            command_returncode = returncode
+            try:
+                with open(stdout_path, "r", encoding="utf-8") as f:
+                    stdout = f.read()
+                with open(stderr_path, "r", encoding="utf-8") as f:
+                    stderr = f.read()
+            except UnicodeError:
+                _unlink_command_output_files(stdout_path, stderr_path)
+                raise
 
             # Clean up temp files (best-effort)
             for p in (stdout_path, stderr_path):
@@ -3370,6 +3479,30 @@ def _run_browser_command(
             else:
                 result = {"success": True, "data": {}}
 
+    except UnicodeError:
+        logger.warning(
+            "browser '%s' returned non-UTF-8 command output (rc=%s)",
+            command,
+            command_returncode,
+        )
+        if command_dispatched and command_returncode == 0:
+            result = _unknown_browser_command_result(
+                f"Browser command '{command}' returned an invalid text encoding.",
+                "protocol_outcome_unknown",
+            )
+        elif command_dispatched:
+            result = {
+                "success": False,
+                "error": (
+                    f"Browser command '{command}' failed with exit code "
+                    f"{command_returncode} and invalid text output."
+                ),
+            }
+        else:
+            result = {
+                "success": False,
+                "error": f"Browser command '{command}' failed while encoding command text.",
+            }
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         if command_dispatched:
@@ -3837,7 +3970,7 @@ def browser_snapshot(
                 )
                 if _url_result.get("success"):
                     _current_url = (
-                        _url_result.get("data", {}).get("result", "")
+                        _browser_result_string(_url_result, "result")
                         .strip().strip('"').strip("'")
                     )
                     if _current_url and not _is_safe_url(_current_url):
@@ -4285,7 +4418,7 @@ def _current_page_private_url(effective_task_id: str) -> Optional[str]:
         )
         if url_result.get("success"):
             current_url = (
-                url_result.get("data", {}).get("result", "")
+                _browser_result_string(url_result, "result")
                 .strip().strip('"').strip("'")
             )
             if current_url and (
@@ -4720,7 +4853,7 @@ def _maybe_stop_recording(task_id: str):
     try:
         result = _run_browser_command(task_id, "record", ["stop"])
         if result.get("success"):
-            path = result.get("data", {}).get("path", "")
+            path = _browser_result_string(result, "path")
             logger.info("Saved browser recording for session %s: %s", task_id, path)
     except Exception as e:
         logger.debug("Could not stop recording for %s: %s", task_id, e)
@@ -4782,6 +4915,12 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
                 images = json.loads(raw_result)
             else:
                 images = raw_result
+
+            if not isinstance(images, list):
+                return json.dumps({
+                    "success": False,
+                    "error": "Browser image extraction returned an invalid result.",
+                }, ensure_ascii=False)
 
             response = {
                 "success": True,
@@ -4857,7 +4996,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             )
             if _url_result.get("success"):
                 _current_url = (
-                    _url_result.get("data", {}).get("result", "")
+                    _browser_result_string(_url_result, "result")
                     .strip().strip('"').strip("'")
                 )
                 if _current_url and not _is_safe_url(_current_url):
@@ -4893,7 +5032,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         if fb_result.get("success"):
             _lp_prerouted = True
             _lp_fallback_warning = fb_result.get("fallback_warning")
-            fb_path = fb_result.get("data", {}).get("path", "")
+            fb_path = _browser_result_string(fb_result, "path")
             if fb_path and os.path.exists(fb_path):
                 from hermes_constants import get_hermes_dir
                 screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
@@ -4961,7 +5100,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             }
             return json.dumps(_copy_fallback_warning(error_response, result), ensure_ascii=False)
 
-        actual_screenshot_path = result.get("data", {}).get("path")
+        actual_screenshot_path = _browser_result_string(result, "path")
         if actual_screenshot_path:
             screenshot_path = Path(actual_screenshot_path)
 
