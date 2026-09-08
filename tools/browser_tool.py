@@ -1549,7 +1549,18 @@ def _session_info_owned_by_task(session_info: Dict[str, Any], task_id: str, sess
     return True
 
 
-def _last_session_key(task_id: str) -> str:
+def _invalidated_browser_binding_response() -> str:
+    """Return the fail-closed response for an invalidated browser binding."""
+    return json.dumps({
+        "success": False,
+        "error": (
+            "The active browser session was invalidated after a timeout or cleanup. "
+            "Navigate successfully before using another browser action."
+        ),
+    }, ensure_ascii=False)
+
+
+def _last_session_key(task_id: str) -> Optional[str]:
     """Return the live session key to use for a non-nav browser tool call.
 
     ``browser_navigate`` records which concrete session key served a task's
@@ -1561,14 +1572,22 @@ def _last_session_key(task_id: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    recorded_key = _last_active_session_key.get(task_id)
-    if not recorded_key:
-        return task_id
     with _cleanup_lock:
+        if task_id in _invalidated_session_bindings:
+            return None
+        recorded_key = _last_active_session_key.get(task_id)
+        if not recorded_key:
+            return task_id
         session_info = _active_sessions.get(recorded_key)
         if session_info and _session_info_owned_by_task(session_info, task_id, recorded_key):
             return recorded_key
         _last_active_session_key.pop(task_id, None)
+        if (
+            _is_local_sidecar_key(recorded_key)
+            and _bare_task_id_for_session_key(recorded_key) == task_id
+        ):
+            _invalidated_session_bindings[task_id] = recorded_key
+            return None
     logger.debug(
         "browser session ownership: dropping stale/mismatched last-active binding %s -> %s",
         task_id,
@@ -1650,6 +1669,11 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # navigation.  Without this, a task that navigated to localhost on the local
 # sidecar would fall back to the cloud session on its next snapshot call.
 _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
+# A timed-out local sidecar must not make follow-up actions fall back to the
+# unrelated cloud session under the bare task id.  Keep a bounded tombstone
+# until a successful navigation establishes a new binding or explicit cleanup
+# ends the task/browser lifecycle.
+_invalidated_session_bindings: Dict[str, str] = {}  # task_id -> invalidated session_key
 _LOCAL_SUFFIX = "::local"
 
 # Flag to track if cleanup has been done
@@ -2846,7 +2870,11 @@ def _discard_timed_out_browser_session(
 
         bare_task_id = _bare_task_id_for_session_key(task_id)
         if _last_active_session_key.get(bare_task_id) == task_id:
-            _last_active_session_key.pop(bare_task_id, None)
+            if _is_local_sidecar_key(task_id):
+                _invalidated_session_bindings[bare_task_id] = task_id
+            else:
+                _last_active_session_key.pop(bare_task_id, None)
+                _invalidated_session_bindings.pop(bare_task_id, None)
 
     session_name = str(session_info.get("session_name") or "")
     if session_name:
@@ -3521,7 +3549,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Remember only a successful, non-blocked navigation as the task owner.
         # Failed opens and blocked redirects must not retarget follow-up clicks
         # or snapshots to a newly-created but irrelevant session.
-        _last_active_session_key[effective_task_id] = nav_session_key
+        with _cleanup_lock:
+            _last_active_session_key[effective_task_id] = nav_session_key
+            _invalidated_session_bindings.pop(effective_task_id, None)
         _copy_fallback_warning(response, result)
 
         # Detect common "blocked" page patterns from title/url
@@ -3601,6 +3631,8 @@ def browser_snapshot(
         return camofox_snapshot(full, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
 
     # Build command args based on full flag
     args = []
@@ -3699,6 +3731,8 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         return camofox_click(ref, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
     blocked = _blocked_private_page_action(effective_task_id, "click")
     if blocked is not None:
         return blocked
@@ -3740,6 +3774,8 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         return camofox_type(ref, text, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
     blocked = _blocked_private_page_action(effective_task_id, "type")
     if blocked is not None:
         return blocked
@@ -3814,6 +3850,8 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
         return result
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
 
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
     if not result.get("success"):
@@ -3845,6 +3883,8 @@ def browser_back(task_id: Optional[str] = None) -> str:
         return camofox_back(task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
     result = _run_browser_command(effective_task_id, "back", [])
 
     if result.get("success"):
@@ -3897,6 +3937,8 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
         return camofox_press(key, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
     blocked = _blocked_private_page_action(effective_task_id, "press")
     if blocked is not None:
         return blocked
@@ -3961,6 +4003,8 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         return camofox_console(clear, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
 
     if _eval_ssrf_guard_active(effective_task_id):
         _blocked_url = _current_page_private_url(effective_task_id)
@@ -4234,6 +4278,8 @@ def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
 def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
 
     if _eval_ssrf_guard_active(effective_task_id):
         blocked_literal = _expression_targets_private_url(expression)
@@ -4523,6 +4569,8 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         return camofox_get_images(task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
 
     # Use eval to run JavaScript that extracts images
     js_code = """JSON.stringify(
@@ -4615,6 +4663,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     effective_task_id = _last_session_key(task_id or "default")
+    if effective_task_id is None:
+        return _invalidated_browser_binding_response()
 
     # ── Private-network guard: block vision from eval-navigated private pages ──
     # After any eval (browser_console) that may have changed location.href to a
@@ -4999,11 +5049,15 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     # cleaning a sidecar drops the binding only if that sidecar was still the
     # recorded owner. This prevents a later click/snapshot from resurrecting a
     # cleaned sidecar on about:blank while preserving a primary-session binding.
-    if _is_local_sidecar_key(task_id):
-        if _last_active_session_key.get(bare_task_id) == task_id:
+    with _cleanup_lock:
+        if _is_local_sidecar_key(task_id):
+            if _last_active_session_key.get(bare_task_id) == task_id:
+                _last_active_session_key.pop(bare_task_id, None)
+            if _invalidated_session_bindings.get(bare_task_id) == task_id:
+                _invalidated_session_bindings.pop(bare_task_id, None)
+        else:
             _last_active_session_key.pop(bare_task_id, None)
-    else:
-        _last_active_session_key.pop(bare_task_id, None)
+            _invalidated_session_bindings.pop(bare_task_id, None)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:
@@ -5111,6 +5165,10 @@ def cleanup_all_browsers() -> None:
         SUPERVISOR_REGISTRY.stop_all()
     except Exception:
         pass
+
+    with _cleanup_lock:
+        _last_active_session_key.clear()
+        _invalidated_session_bindings.clear()
 
     # Reset cached lookups so they are re-evaluated on next use.
     global _cached_agent_browser, _agent_browser_resolved

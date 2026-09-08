@@ -1,5 +1,6 @@
 """Tests for browser first-open timeout and timeout diagnostics."""
 
+import json
 import subprocess
 from unittest.mock import Mock, patch
 
@@ -15,12 +16,14 @@ def _reset_browser_caches():
     bt._active_sessions.clear()
     bt._session_last_activity.clear()
     bt._last_active_session_key.clear()
+    bt._invalidated_session_bindings.clear()
     yield
     bt._cached_command_timeout = None
     bt._command_timeout_resolved = False
     bt._active_sessions.clear()
     bt._session_last_activity.clear()
     bt._last_active_session_key.clear()
+    bt._invalidated_session_bindings.clear()
 
 
 class TestOpenCommandTimeout:
@@ -121,6 +124,7 @@ class TestCommandTimeoutRecovery:
         bt._run_browser_command(task_id, "click", ["@e1"], timeout=1)
 
         assert task_id not in bt._last_active_session_key
+        assert task_id not in bt._invalidated_session_bindings
         assert not (tmp_path / "agent-browser-stuck-session").exists()
         if not cloud:
             assert task_id not in bt._active_sessions and task_id not in bt._session_last_activity
@@ -146,6 +150,110 @@ class TestCommandTimeoutRecovery:
 
         assert bt._active_sessions["race"] is replacement
         assert tmp_path.exists()
+
+    def test_local_sidecar_timeout_blocks_non_navigation_until_rebind(
+        self, monkeypatch, tmp_path
+    ):
+        task_id = "hybrid-task"
+        sidecar_key = f"{task_id}::local"
+        cloud_session = {
+            "session_name": "cloud-session",
+            "bb_session_id": "cloud-id",
+            "cdp_url": "ws://cloud.invalid/devtools/browser/1",
+        }
+        local_session = {
+            "session_name": "local-session",
+            "bb_session_id": None,
+            "cdp_url": None,
+        }
+        bt._active_sessions[task_id] = cloud_session
+        bt._active_sessions[sidecar_key] = local_session
+        bt._session_last_activity[sidecar_key] = 1.0
+        bt._last_active_session_key[task_id] = sidecar_key
+
+        process = Mock()
+        process.returncode = 0
+        process.wait.side_effect = [subprocess.TimeoutExpired("agent-browser", 1), -9]
+
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
+        monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(bt, "_stop_cdp_supervisor", lambda _: None)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+        monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        result = bt._run_browser_command(sidecar_key, "click", ["@e1"], timeout=1)
+
+        assert result["success"] is False
+        assert bt._active_sessions[task_id] is cloud_session
+        assert sidecar_key not in bt._active_sessions
+        assert bt._last_active_session_key[task_id] == sidecar_key
+        assert bt._invalidated_session_bindings[task_id] == sidecar_key
+
+        forbidden_run = Mock(side_effect=AssertionError("must not target cloud session"))
+        monkeypatch.setattr(bt, "_run_browser_command", forbidden_run)
+        actions = [
+            lambda: bt.browser_click("e1", task_id=task_id),
+            lambda: bt.browser_type("e1", "value", task_id=task_id),
+            lambda: bt.browser_snapshot(task_id=task_id),
+            lambda: bt.browser_scroll("down", task_id=task_id),
+            lambda: bt.browser_back(task_id=task_id),
+            lambda: bt.browser_press("Enter", task_id=task_id),
+            lambda: bt.browser_console(task_id=task_id),
+            lambda: bt.browser_console(expression="document.title", task_id=task_id),
+            lambda: bt.browser_get_images(task_id=task_id),
+            lambda: bt.browser_vision("What is visible?", task_id=task_id),
+        ]
+        for action in actions:
+            response = action()
+            payload = response if isinstance(response, dict) else json.loads(response)
+            assert payload["success"] is False
+            assert "Navigate successfully" in payload["error"]
+        forbidden_run.assert_not_called()
+
+        replacement_sidecar = {
+            "session_name": "replacement-local",
+            "bb_session_id": None,
+            "cdp_url": None,
+            "_first_nav": False,
+            "features": {"local": True},
+        }
+        calls = []
+
+        def successful_run(session_key, command, args=None, timeout=None, **_kwargs):
+            calls.append((session_key, command))
+            if command == "open":
+                return {
+                    "success": True,
+                    "data": {"title": "Local", "url": args[0]},
+                }
+            if command == "snapshot":
+                return {"success": True, "data": {"snapshot": "", "refs": {}}}
+            return {"success": True, "data": {}}
+
+        def get_replacement(session_key):
+            bt._active_sessions[session_key] = replacement_sidecar
+            return replacement_sidecar
+
+        monkeypatch.setattr(bt, "_navigation_session_key", lambda _task, _url: sidecar_key)
+        monkeypatch.setattr(bt, "_get_session_info", get_replacement)
+        monkeypatch.setattr(bt, "_run_browser_command", successful_run)
+        monkeypatch.setattr(bt, "_is_local_backend", lambda: True)
+        monkeypatch.setattr(bt, "check_website_access", lambda _url: None)
+
+        navigation = json.loads(bt.browser_navigate("http://localhost:3000", task_id=task_id))
+        assert navigation["success"] is True
+        assert task_id not in bt._invalidated_session_bindings
+        assert bt._last_active_session_key[task_id] == sidecar_key
+
+        click = json.loads(bt.browser_click("e2", task_id=task_id))
+        assert click["success"] is True
+        assert calls[-1] == (sidecar_key, "click")
+        assert all(session_key != task_id for session_key, _command in calls)
 
 
 class TestBrowserNavigateOpenTimeout:

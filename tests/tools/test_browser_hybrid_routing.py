@@ -22,6 +22,7 @@ def _reset_routing_state(monkeypatch):
     """Clear module-level caches so each test starts clean."""
     monkeypatch.setattr(browser_tool, "_active_sessions", {})
     monkeypatch.setattr(browser_tool, "_last_active_session_key", {})
+    monkeypatch.setattr(browser_tool, "_invalidated_session_bindings", {})
     monkeypatch.setattr(browser_tool, "_cached_cloud_provider", None)
     monkeypatch.setattr(browser_tool, "_cloud_provider_resolved", False)
     monkeypatch.setattr(browser_tool, "_auto_local_for_private_urls_resolved", False)
@@ -88,6 +89,21 @@ class TestSessionKeyHelpers:
 
         assert browser_tool._last_session_key("default") == "default"
         assert last_active == {}
+
+    def test_missing_owned_sidecar_becomes_invalidated_binding(self, monkeypatch):
+        last_active = {"default": "default::local"}
+        invalidated = {}
+        monkeypatch.setattr(browser_tool, "_last_active_session_key", last_active)
+        monkeypatch.setattr(browser_tool, "_invalidated_session_bindings", invalidated)
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {"default": {"session_name": "cloud-session"}},
+        )
+
+        assert browser_tool._last_session_key("default") is None
+        assert last_active == {}
+        assert invalidated == {"default": "default::local"}
 
 
 class TestHybridRoutingSessionCreation:
@@ -182,6 +198,9 @@ class TestCleanupHybridSessions:
         monkeypatch.setattr(
             browser_tool, "_last_active_session_key", {"default": "default::local"}
         )
+        monkeypatch.setattr(
+            browser_tool, "_invalidated_session_bindings", {"default": "default::local"}
+        )
 
         browser_tool.cleanup_browser("default::local")
 
@@ -189,3 +208,4 @@ class TestCleanupHybridSessions:
         # The cleaned sidecar must not remain the recorded owner; otherwise a
         # later click/snapshot could resurrect it instead of using the primary.
         assert "default" not in browser_tool._last_active_session_key
+        assert "default" not in browser_tool._invalidated_session_bindings
