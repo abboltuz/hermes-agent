@@ -3171,22 +3171,43 @@ def _run_browser_command(
             # Some commands (close, record) legitimately return no output.
             if not stdout_text and returncode == 0 and command not in _EMPTY_OK_COMMANDS:
                 logger.warning("browser '%s' returned empty output (rc=0)", command)
-                result = {"success": False, "error": f"Browser command '{command}' returned no output"}
+                result = _unknown_browser_command_result(
+                    f"Browser command '{command}' returned no output despite a successful process exit.",
+                    "protocol_outcome_unknown",
+                )
             elif stdout_text:
                 try:
                     parsed = json.loads(stdout_text)
+                    if not isinstance(parsed, dict) or not isinstance(parsed.get("success"), bool):
+                        if returncode == 0:
+                            result = _unknown_browser_command_result(
+                                f"Browser command '{command}' returned an invalid protocol response.",
+                                "protocol_outcome_unknown",
+                            )
+                        else:
+                            result = {
+                                "success": False,
+                                "error": (
+                                    f"Browser command '{command}' returned an invalid "
+                                    f"protocol response (exit code {returncode})."
+                                ),
+                            }
+                    else:
+                        result = parsed
                     # Warn if snapshot came back empty (common sign of daemon/CDP issues)
-                    if command == "snapshot" and parsed.get("success"):
+                    if command == "snapshot" and result.get("success"):
                         snap_data = parsed.get("data", {})
                         if not snap_data.get("snapshot") and not snap_data.get("refs"):
                             logger.warning("snapshot returned empty content. "
                                            "Possible stale daemon or CDP connection issue. "
                                            "returncode=%s", returncode)
-                    result = parsed
                 except json.JSONDecodeError:
-                    raw = stdout_text[:2000]
-                    logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
-                                   command, returncode, raw[:500])
+                    logger.warning(
+                        "browser '%s' returned non-JSON output (rc=%s, chars=%d)",
+                        command,
+                        returncode,
+                        len(stdout_text),
+                    )
 
                     if command == "screenshot":
                         stderr_text = (stderr or "").strip()
@@ -3204,18 +3225,33 @@ def _run_browser_command(
                                 "success": True,
                                 "data": {
                                     "path": recovered_path,
-                                    "raw": raw,
                                 },
                             }
+                        elif returncode == 0:
+                            result = _unknown_browser_command_result(
+                                "Browser command 'screenshot' returned a non-JSON protocol response.",
+                                "protocol_outcome_unknown",
+                            )
                         else:
                             result = {
                                 "success": False,
-                                "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
+                                "error": (
+                                    "Browser command 'screenshot' returned a non-JSON "
+                                    f"protocol response (exit code {returncode})."
+                                ),
                             }
+                    elif returncode == 0:
+                        result = _unknown_browser_command_result(
+                            f"Browser command '{command}' returned a non-JSON protocol response.",
+                            "protocol_outcome_unknown",
+                        )
                     else:
                         result = {
                             "success": False,
-                            "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
+                            "error": (
+                                f"Browser command '{command}' returned a non-JSON "
+                                f"protocol response (exit code {returncode})."
+                            ),
                         }
             elif returncode != 0:
                 # Check for errors

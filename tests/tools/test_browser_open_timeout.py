@@ -1,12 +1,54 @@
 """Tests for browser first-open timeout and timeout diagnostics."""
 
 import json
+import os
 import subprocess
 from unittest.mock import Mock, patch
 
 import pytest
 
 import tools.browser_tool as bt
+
+
+def _run_lightpanda_process_result(
+    monkeypatch,
+    tmp_path,
+    *,
+    command,
+    args,
+    stdout_text,
+    returncode=0,
+):
+    task_id = f"lightpanda-protocol-{command}"
+    bt._active_sessions[task_id] = {
+        "session_name": f"lightpanda-{command}",
+        "bb_session_id": None,
+        "cdp_url": None,
+    }
+    process = Mock(returncode=returncode)
+    process.wait.return_value = returncode
+    chrome_fallback = Mock(return_value={"success": True, "data": {}})
+    screenshot_fallback = Mock(return_value={"success": True, "data": {}})
+
+    def popen(*_args, **kwargs):
+        os.write(kwargs["stdout"], stdout_text.encode("utf-8"))
+        return process
+
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+    monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
+    monkeypatch.setattr(bt, "_get_browser_engine", lambda: "lightpanda")
+    monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+    monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
+    monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+    monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+    monkeypatch.setattr(bt, "_run_chrome_fallback_command", chrome_fallback)
+    monkeypatch.setattr(bt, "_chrome_fallback_screenshot", screenshot_fallback)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+    result = bt._run_browser_command(task_id, command, args, timeout=1)
+    return result, chrome_fallback, screenshot_fallback
 
 
 @pytest.fixture(autouse=True)
@@ -237,6 +279,86 @@ class TestCommandTimeoutRecovery:
         assert result["outcome"] == "unknown"
         assert result["retry_safe"] is False
         chrome_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("open", ["https://example.com"]),
+            ("click", ["@e1"]),
+            ("eval", ["document.title"]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "stdout_text",
+        [
+            "",
+            "malformed-response secret-value-must-not-leak",
+            '{"data":{"secret":"secret-value-must-not-leak"}}',
+        ],
+        ids=["empty", "non-json", "invalid-schema"],
+    )
+    def test_lightpanda_successful_process_protocol_unknown_is_never_replayed(
+        self, monkeypatch, tmp_path, command, args, stdout_text
+    ):
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command=command,
+            args=args,
+            stdout_text=stdout_text,
+        )
+
+        assert result["success"] is False
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert result["outcome"] == "unknown"
+        assert result["retry_safe"] is False
+        assert result["recovery"] == "inspect_or_renavigate"
+        assert "Do not repeat" in result["error"]
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    def test_non_json_screenshot_path_recovery_remains_successful(
+        self, monkeypatch, tmp_path
+    ):
+        screenshot_path = tmp_path / "recovered-screenshot.png"
+        screenshot_path.write_bytes(b"x" * 25_000)
+        malformed = (
+            f"Screenshot saved to '{screenshot_path}' "
+            "secret-value-must-not-leak"
+        )
+
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command="screenshot",
+            args=[],
+            stdout_text=malformed,
+        )
+
+        assert result == {
+            "success": True,
+            "data": {"path": str(screenshot_path)},
+        }
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    def test_lightpanda_valid_structured_failure_still_falls_back(
+        self, monkeypatch, tmp_path
+    ):
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command="click",
+            args=["@e1"],
+            stdout_text=json.dumps({"success": False, "error": "capability unavailable"}),
+        )
+
+        assert result["success"] is True
+        assert result["browser_engine"] == "chrome"
+        chrome_fallback.assert_called_once()
+        screenshot_fallback.assert_not_called()
 
     @pytest.mark.parametrize(
         ("command", "args"),
