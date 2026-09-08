@@ -522,6 +522,8 @@ _MAX_BROWSER_COLLECTION_ITEMS = 10_000
 _MAX_BROWSER_IMAGE_URL = 8_192
 _MAX_BROWSER_IMAGE_ALT = 2_000
 _MAX_BROWSER_IMAGE_DIMENSION = 1_000_000
+_MAX_BROWSER_URL_DECODE_PASSES = 8
+_MAX_BROWSER_URL_QUERY_FIELDS = 256
 
 
 def _bounded_redacted_browser_text(value: str, limit: int) -> str:
@@ -534,6 +536,83 @@ def _bounded_redacted_browser_text(value: str, limit: int) -> str:
     if limit <= 1:
         return "…"[:limit]
     return redacted[: limit - 1] + "…"
+
+
+def _browser_url_has_forbidden_controls(value: str) -> bool:
+    """Reject characters that can split logs/protocol records or hide URL data."""
+    return any(
+        ord(char) <= 0x1F
+        or 0x7F <= ord(char) <= 0x9F
+        or ord(char) in {0x2028, 0x2029}
+        for char in value
+    )
+
+
+def _browser_url_has_invalid_escape(value: str) -> bool:
+    """Return whether a percent is not followed by exactly two hex digits."""
+    hex_digits = frozenset("0123456789abcdefABCDEF")
+    for index, char in enumerate(value):
+        if char != "%":
+            continue
+        if (
+            index + 2 >= len(value)
+            or value[index + 1] not in hex_digits
+            or value[index + 2] not in hex_digits
+        ):
+            return True
+    return False
+
+
+
+
+def _browser_url_security_representations(value: Any) -> Optional[Tuple[str, ...]]:
+    """Return bounded percent-decoded URL forms, or ``None`` on ambiguity.
+
+    Security decisions inspect the raw form and every decoded form. Decoding
+    stops only when no escape remains; an invalid escape, invalid UTF-8,
+    forbidden control, expansion beyond the public URL bound, or nesting that
+    still has escapes after the pass limit fails closed.
+    """
+    import urllib.parse
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_BROWSER_IMAGE_URL
+    ):
+        return None
+    representations = [value]
+    current = value
+    for _ in range(_MAX_BROWSER_URL_DECODE_PASSES):
+        if (
+            _browser_url_has_forbidden_controls(current)
+            or _browser_url_has_invalid_escape(current)
+        ):
+            return None
+        if "%" not in current:
+            return tuple(representations)
+        try:
+            decoded = urllib.parse.unquote_to_bytes(current).decode(
+                "utf-8",
+                errors="strict",
+            )
+        except (UnicodeError, ValueError):
+            return None
+        if (
+            len(decoded) > _MAX_BROWSER_IMAGE_URL
+            or _browser_url_has_forbidden_controls(decoded)
+        ):
+            return None
+        if decoded == current:
+            return tuple(representations)
+        representations.append(decoded)
+        current = decoded
+
+    # A fully-decoded value contains no remaining escape introducer. Any
+    # residual '%' after the bound may conceal another delimiter/credential.
+    if "%" in current:
+        return None
+    return tuple(representations)
 
 
 def _sanitize_browser_annotations(value: Any) -> Optional[List[Dict[str, Any]]]:
@@ -5123,13 +5202,159 @@ def _maybe_stop_recording(task_id: str):
             _recording_sessions.discard(task_id)
 
 
+def _browser_url_component_has_sensitive_name(value: str) -> Optional[bool]:
+    """Check a decoded query/fragment name without passing its value onward."""
+    import urllib.parse
+
+    representations = _browser_url_security_representations(value)
+    if representations is None:
+        return None
+    key = representations[-1]
+    probe = urllib.parse.urlunsplit((
+        "https",
+        "browser-url-policy.invalid",
+        "/",
+        urllib.parse.urlencode([(key, "present")]),
+        "",
+    ))
+    try:
+        return _sensitive_query_param_name(probe) is not None
+    except Exception:
+        return None
+
+
+def _browser_url_parts_have_sensitive_names(
+    parsed: Any,
+) -> Optional[bool]:
+    """Inspect credential-like names in query and fragment-like parameters."""
+    import urllib.parse
+
+    sections = [parsed.query]
+    fragment = parsed.fragment
+    if fragment:
+        sections.append(fragment)
+        if "?" in fragment:
+            sections.append(fragment.split("?", 1)[1])
+    for section in sections:
+        if not section:
+            continue
+        try:
+            pairs = urllib.parse.parse_qsl(
+                section,
+                keep_blank_values=True,
+                max_num_fields=_MAX_BROWSER_URL_QUERY_FIELDS,
+            )
+        except (TypeError, ValueError, UnicodeError):
+            return None
+        for key, value in pairs:
+            if not value:
+                continue
+            sensitive = _browser_url_component_has_sensitive_name(key)
+            if sensitive is None:
+                return None
+            if sensitive:
+                return True
+    return False
+
+
+def _browser_image_url_for_publication(
+    src: Any,
+    effective_task_id: str,
+) -> Optional[str]:
+    """Validate all encoded URL forms and return a fragment-free public URL."""
+    import urllib.parse
+    from agent.redact import _PREFIX_RE
+
+    representations = _browser_url_security_representations(src)
+    if representations is None:
+        return None
+
+    parsed_forms = []
+    for representation in representations:
+        if _PREFIX_RE.search(representation):
+            return None
+        try:
+            parsed = urllib.parse.urlsplit(representation)
+            username = parsed.username
+            password = parsed.password
+            hostname = parsed.hostname
+            # Accessing port validates malformed/non-numeric port text.
+            parsed.port
+        except (TypeError, ValueError, UnicodeError):
+            return None
+
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https", "blob", "file"}:
+            return None
+        if username is not None or password is not None:
+            return None
+        if scheme in {"http", "https"} and not hostname:
+            return None
+        if scheme == "blob" and "@" in parsed.path:
+            return None
+        sensitive_names = _browser_url_parts_have_sensitive_names(parsed)
+        if sensitive_names is None or sensitive_names:
+            return None
+        parsed_forms.append(parsed)
+
+    parsed_src = parsed_forms[0]
+    scheme = parsed_src.scheme.lower()
+    if (
+        scheme == "file"
+        and not _is_local_backend()
+        and not _is_local_sidecar_key(effective_task_id)
+    ):
+        return None
+
+    fragmentless_src = urllib.parse.urlunsplit((
+        parsed_src.scheme,
+        parsed_src.netloc,
+        parsed_src.path,
+        parsed_src.query,
+        "",
+    ))
+
+    # Network safety needs only the origin. Passing an origin-only URL ensures
+    # checker exceptions cannot log a page path, query, fragment, or userinfo.
+    safety_url = urllib.parse.urlunsplit((
+        parsed_src.scheme,
+        parsed_src.netloc,
+        "/",
+        "",
+        "",
+    ))
+    try:
+        always_blocked = _is_always_blocked_url(safety_url)
+        network_safe = (
+            scheme not in {"http", "https"}
+            or _is_local_backend()
+            or _is_local_sidecar_key(effective_task_id)
+            or _allow_private_urls()
+            or _is_safe_url(safety_url)
+        )
+    except Exception:
+        return None
+    if always_blocked or not network_safe:
+        return None
+
+    public_src = _bounded_redacted_browser_text(
+        fragmentless_src,
+        _MAX_BROWSER_IMAGE_URL,
+    )
+    if (
+        not public_src
+        or len(public_src) > _MAX_BROWSER_IMAGE_URL
+        or _PREFIX_RE.search(public_src)
+    ):
+        return None
+    return public_src
+
+
 def _sanitize_browser_image_items(
     value: Any,
     effective_task_id: str,
 ) -> Optional[List[Dict[str, Any]]]:
     """Validate and minimize the exact result of Hermes' image-extractor JS."""
-    import urllib.parse
-    from agent.redact import _PREFIX_RE
 
     if not isinstance(value, list) or len(value) > _MAX_BROWSER_COLLECTION_ITEMS:
         return None
@@ -5153,118 +5378,8 @@ def _sanitize_browser_image_items(
             or not (0 <= height <= _MAX_BROWSER_IMAGE_DIMENSION)
         ):
             return None
-
-        # Parse locally before any helper that may log its argument. Image
-        # URLs are untrusted page data and can carry credentials in userinfo,
-        # query values, or fragments. Fragments are never needed to identify
-        # an image resource, so remove them unconditionally.
-        if any(ord(char) < 0x20 for char in src):
-            return None
-        try:
-            parsed_src = urllib.parse.urlsplit(src)
-            username = parsed_src.username
-            password = parsed_src.password
-            hostname = parsed_src.hostname
-            # Accessing port also validates malformed/non-numeric port text.
-            parsed_src.port
-        except (TypeError, ValueError, UnicodeError):
-            return None
-
-        scheme = parsed_src.scheme.lower()
-        if scheme not in {"http", "https", "blob", "file"}:
-            return None
-        if username is not None or password is not None:
-            return None
-        if scheme in {"http", "https"} and not hostname:
-            return None
-        if scheme == "blob" and "@" in parsed_src.path:
-            return None
-        if (
-            scheme == "file"
-            and not _is_local_backend()
-            and not _is_local_sidecar_key(effective_task_id)
-        ):
-            return None
-
-        fragmentless_src = urllib.parse.urlunsplit((
-            parsed_src.scheme,
-            parsed_src.netloc,
-            parsed_src.path,
-            parsed_src.query,
-            "",
-        ))
-        decoded_src = fragmentless_src
-        for _ in range(3):
-            next_decoded = urllib.parse.unquote(decoded_src)
-            if next_decoded == decoded_src:
-                break
-            decoded_src = next_decoded
-        if _PREFIX_RE.search(fragmentless_src) or _PREFIX_RE.search(decoded_src):
-            return None
-
-        # Probe only normalized query *names* through the shared policy. Secret
-        # values never reach that helper (or any logger), while repeated
-        # unquoting catches encoded/case-varied credential names.
-        try:
-            query_pairs = urllib.parse.parse_qsl(
-                parsed_src.query,
-                keep_blank_values=True,
-            )
-            query_names = []
-            for key, _value in query_pairs:
-                decoded_key = key
-                for _ in range(3):
-                    next_key = urllib.parse.unquote(decoded_key)
-                    if next_key == decoded_key:
-                        break
-                    decoded_key = next_key
-                query_names.append((decoded_key, "present"))
-            query_probe = urllib.parse.urlunsplit((
-                parsed_src.scheme,
-                parsed_src.netloc,
-                parsed_src.path,
-                urllib.parse.urlencode(query_names),
-                "",
-            ))
-        except (TypeError, ValueError, UnicodeError):
-            return None
-        if _sensitive_query_param_name(query_probe):
-            return None
-
-        # Network safety needs only the origin. Passing an origin-only URL
-        # ensures any exception inside the shared checker cannot log a page
-        # path or query value.
-        safety_url = urllib.parse.urlunsplit((
-            parsed_src.scheme,
-            parsed_src.netloc,
-            "/",
-            "",
-            "",
-        ))
-        try:
-            always_blocked = _is_always_blocked_url(safety_url)
-            network_safe = (
-                scheme not in {"http", "https"}
-                or _is_local_backend()
-                or _is_local_sidecar_key(effective_task_id)
-                or _allow_private_urls()
-                or _is_safe_url(safety_url)
-            )
-        except Exception:
-            return None
-        if always_blocked or not network_safe:
-            return None
-
-        public_src = _bounded_redacted_browser_text(
-            fragmentless_src,
-            _MAX_BROWSER_IMAGE_URL,
-        )
-        if not public_src:
-            return None
-        if (
-            len(public_src) > _MAX_BROWSER_IMAGE_URL
-            or _PREFIX_RE.search(public_src)
-        ):
+        public_src = _browser_image_url_for_publication(src, effective_task_id)
+        if public_src is None:
             return None
 
         sanitized.append({

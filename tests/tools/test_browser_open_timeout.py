@@ -81,6 +81,14 @@ def _run_image_extraction_result(monkeypatch, src, *, task_key="task::local"):
     return json.loads(bt.browser_get_images(task_id="task"))
 
 
+def _nest_percent_encoding(value, depth):
+    """Nest existing percent escapes without exponentially growing text."""
+    assert depth >= 1 and "%" in value
+    for _ in range(depth - 1):
+        value = value.replace("%", "%25")
+    return value
+
+
 @pytest.fixture(autouse=True)
 def _reset_browser_caches():
     bt._cached_command_timeout = None
@@ -865,9 +873,9 @@ class TestCommandTimeoutRecovery:
     @pytest.mark.parametrize(
         "fragment",
         [
-            "access_token=private-fragment-value",
-            "%61ccess_%74oken=private-fragment-value",
-            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            "section-two",
+            "view=large",
+            "%73ection-two",
         ],
     )
     def test_image_url_strips_fragment_before_publication(
@@ -881,8 +889,8 @@ class TestCommandTimeoutRecovery:
         assert response["images"][0]["src"] == (
             "https://example.com/a.png?size=large"
         )
-        assert "private-fragment-value" not in json.dumps(response)
-        assert "private-fragment-value" not in caplog.text
+        assert fragment not in json.dumps(response)
+        assert fragment not in caplog.text
 
     @pytest.mark.parametrize(
         "src",
@@ -944,6 +952,137 @@ class TestCommandTimeoutRecovery:
         assert response["images"][0]["src"] == (
             "https://cdn.example.com/images/a%20b.png?size=large&theme=dark"
         )
+
+    @pytest.mark.parametrize(
+        "depth",
+        [1, 4, 6, bt._MAX_BROWSER_URL_DECODE_PASSES + 1],
+    )
+    @pytest.mark.parametrize(
+        "url_builder,encoded_seed",
+        [
+            (
+                lambda encoded: f"https://example.com/{encoded}",
+                "%73k-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            ),
+            (
+                lambda encoded: f"https://example.com/a.png{encoded}access_token=opaque",
+                "%3F",
+            ),
+            (
+                lambda encoded: f"https://example.com/a.png?{encoded}=opaque",
+                "%61ccess_token",
+            ),
+            (
+                lambda encoded: f"https://user{encoded}example.com/a.png",
+                "%40",
+            ),
+            (
+                lambda encoded: f"https://example.com/a.png{encoded}access_token=opaque",
+                "%23",
+            ),
+        ],
+        ids=["token-path", "hidden-query", "query-name", "userinfo", "fragment"],
+    )
+    def test_nested_encoded_image_url_attacks_fail_closed_at_every_depth(
+        self, monkeypatch, caplog, depth, url_builder, encoded_seed
+    ):
+        src = url_builder(_nest_percent_encoding(encoded_seed, depth))
+        item = {
+            "src": src,
+            "alt": "avatar",
+            "width": 1,
+            "height": 1,
+        }
+
+        direct_url = bt._browser_image_url_for_publication(src, "task::local")
+        direct_items = bt._sanitize_browser_image_items([item], "task::local")
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert direct_url is None
+        assert direct_items is None
+        assert response["success"] is False
+        assert "abcdefghijklmnopqrstuvwxyz0123456789" not in json.dumps(response)
+        assert "opaque" not in json.dumps(response)
+        assert src not in caplog.text
+
+    @pytest.mark.parametrize(
+        "depth",
+        [1, 4, 6, bt._MAX_BROWSER_URL_DECODE_PASSES + 1],
+    )
+    @pytest.mark.parametrize(
+        "encoded_control",
+        ["%00", "%0D%0A", "%7F", "%C2%85"],
+        ids=["nul", "crlf", "del", "c1"],
+    )
+    def test_nested_encoded_url_controls_fail_closed_without_public_or_log_leak(
+        self, monkeypatch, caplog, depth, encoded_control
+    ):
+        nested = _nest_percent_encoding(encoded_control, depth)
+        src = f"https://example.com/a{nested}private-control.png"
+        item = {
+            "src": src,
+            "alt": "avatar",
+            "width": 1,
+            "height": 1,
+        }
+
+        assert bt._browser_url_security_representations(src) is None
+        assert bt._sanitize_browser_image_items([item], "task::local") is None
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-control" not in json.dumps(response)
+        assert "private-control" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "raw_control",
+        ["\x00", "\r\n", "\x7f", "\x85", "\u2028", "\u2029"],
+        ids=["nul", "crlf", "del", "c1", "line-separator", "paragraph-separator"],
+    )
+    def test_raw_url_controls_fail_closed(self, monkeypatch, caplog, raw_control):
+        src = f"https://example.com/a{raw_control}private-control.png"
+
+        assert bt._browser_url_security_representations(src) is None
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-control" not in json.dumps(response)
+        assert "private-control" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "https://example.com/a.png#ACCESS_TOKEN=private-fragment-value",
+            "https://example.com/a.png#%61ccess_%74oken=private-fragment-value",
+            "https://example.com/a.png#route?%2561ccess_token=private-fragment-value",
+            "https://example.com/a.png#sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+        ],
+    )
+    def test_sensitive_fragment_is_rejected_without_leak(
+        self, monkeypatch, caplog, src
+    ):
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-fragment-value" not in json.dumps(response)
+        assert "abcdefghijklmnopqrstuvwxyz0123456789" not in json.dumps(response)
+        assert "private-fragment-value" not in caplog.text
+        assert "abcdefghijklmnopqrstuvwxyz0123456789" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "https://example.com/images/a%20b.png?theme=dark",
+            "https://example.com/images/K%C3%B6ln.png?image_size=large",
+            "https://example.com/images/a%2Fb.png?color%5Fmode=dark",
+            "blob:https://example.com/7d4cb48b-1000-4000-8000-123456789abc",
+        ],
+    )
+    def test_safe_encoded_image_urls_remain_unchanged(self, monkeypatch, src):
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is True
+        assert response["images"][0]["src"] == src
 
     @pytest.mark.parametrize(
         "entrypoint,confirmed_results,expected_calls",
