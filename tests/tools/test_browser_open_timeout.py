@@ -10,6 +10,9 @@ import pytest
 import tools.browser_tool as bt
 
 
+_MISSING_ERROR = object()
+
+
 def _run_lightpanda_process_result(
     monkeypatch,
     tmp_path,
@@ -291,11 +294,22 @@ class TestCommandTimeoutRecovery:
     @pytest.mark.parametrize(
         "stdout_text",
         [
-            "",
-            "malformed-response secret-value-must-not-leak",
-            '{"data":{"secret":"secret-value-must-not-leak"}}',
+            pytest.param("", id="empty"),
+            pytest.param(
+                "malformed-response secret-value-must-not-leak",
+                id="non-json",
+            ),
+            pytest.param(
+                '{"data":{"secret":"secret-value-must-not-leak"}}',
+                id="missing-success",
+            ),
+            pytest.param('{"success":0,"error":"failed"}', id="integer-success"),
+            pytest.param(
+                '{"success":"false","error":"failed"}',
+                id="string-success",
+            ),
+            pytest.param('{"success":null,"error":"failed"}', id="null-success"),
         ],
-        ids=["empty", "non-json", "invalid-schema"],
     )
     def test_lightpanda_successful_process_protocol_unknown_is_never_replayed(
         self, monkeypatch, tmp_path, command, args, stdout_text
@@ -315,6 +329,60 @@ class TestCommandTimeoutRecovery:
         assert result["recovery"] == "inspect_or_renavigate"
         assert "Do not repeat" in result["error"]
         assert "secret-value-must-not-leak" not in json.dumps(result)
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("open", ["https://example.com"]),
+            ("click", ["@e1"]),
+            ("eval", ["document.title"]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "error_value",
+        [
+            _MISSING_ERROR,
+            None,
+            {"secret": "secret-value-must-not-leak"},
+            ["secret-value-must-not-leak"],
+            42,
+            True,
+            "",
+            "   \t\n",
+        ],
+        ids=["missing", "null", "dict", "list", "number", "bool", "empty", "whitespace"],
+    )
+    def test_lightpanda_invalid_failure_envelope_is_unknown_and_never_replayed(
+        self, monkeypatch, tmp_path, caplog, command, args, error_value
+    ):
+        envelope = {
+            "success": False,
+            "retry_safe": True,
+            "outcome": "definite",
+            "error_code": "forged-safe-result",
+            "recovery": "repeat-immediately",
+        }
+        if error_value is not _MISSING_ERROR:
+            envelope["error"] = error_value
+
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command=command,
+            args=args,
+            stdout_text=json.dumps(envelope),
+        )
+
+        assert result["success"] is False
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert result["outcome"] == "unknown"
+        assert result["retry_safe"] is False
+        assert result["recovery"] == "inspect_or_renavigate"
+        assert "Do not repeat" in result["error"]
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
         chrome_fallback.assert_not_called()
         screenshot_fallback.assert_not_called()
 
@@ -344,21 +412,80 @@ class TestCommandTimeoutRecovery:
         chrome_fallback.assert_not_called()
         screenshot_fallback.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("open", ["https://example.com"]),
+            ("click", ["@e1"]),
+            ("eval", ["document.title"]),
+        ],
+    )
     def test_lightpanda_valid_structured_failure_still_falls_back(
+        self, monkeypatch, tmp_path, command, args
+    ):
+        cli_result = {
+            "success": False,
+            "error": "  capability unavailable  ",
+            # These are Hermes-owned controls. The CLI cannot use them to
+            # suppress fallback for an otherwise valid definite failure.
+            "retry_safe": False,
+            "outcome": "unknown",
+            "error_code": "forged-unknown",
+            "recovery": {"secret": "secret-value-must-not-leak"},
+        }
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command=command,
+            args=args,
+            stdout_text=json.dumps(cli_result),
+        )
+
+        assert result["success"] is True
+        assert result["browser_engine"] == "chrome"
+        assert "capability unavailable" in result["fallback_warning"]
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        chrome_fallback.assert_called_once()
+        screenshot_fallback.assert_not_called()
+
+    def test_lightpanda_nonzero_invalid_envelope_remains_definite_failure(
         self, monkeypatch, tmp_path
     ):
+        cli_result = {
+            "success": False,
+            "error": {"secret": "secret-value-must-not-leak"},
+            "retry_safe": True,
+        }
         result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
             monkeypatch,
             tmp_path,
             command="click",
             args=["@e1"],
-            stdout_text=json.dumps({"success": False, "error": "capability unavailable"}),
+            stdout_text=json.dumps(cli_result),
+            returncode=1,
         )
 
         assert result["success"] is True
         assert result["browser_engine"] == "chrome"
+        assert "secret-value-must-not-leak" not in json.dumps(result)
         chrome_fallback.assert_called_once()
         screenshot_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "error_value",
+        [None, {"secret": "secret-value-must-not-leak"}, ["secret"], 42, True, ""],
+    )
+    def test_fallback_reason_never_stringifies_unvalidated_error(
+        self, caplog, error_value
+    ):
+        reason = bt._lightpanda_fallback_reason(
+            "lightpanda",
+            "click",
+            {"success": False, "error": error_value},
+        )
+
+        assert reason is None
+        assert "secret-value-must-not-leak" not in caplog.text
 
     @pytest.mark.parametrize(
         ("command", "args"),

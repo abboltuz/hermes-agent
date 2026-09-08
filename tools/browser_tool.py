@@ -490,6 +490,63 @@ def _unknown_browser_command_result(error: str, error_code: str) -> Dict[str, An
     }
 
 
+_BROWSER_OUTCOME_CONTROL_FIELDS = frozenset({
+    "error_code",
+    "outcome",
+    "retry_safe",
+    "recovery",
+})
+
+
+def _validated_browser_command_result(
+    parsed: Any,
+    command: str,
+    returncode: int,
+) -> Dict[str, Any]:
+    """Validate a CLI result envelope without trusting retry control fields.
+
+    Successful-process failures require a non-empty string ``error``; leading
+    and trailing whitespace is stripped. A malformed rc=0 envelope cannot
+    prove whether a dispatched action took effect, so replace it wholesale
+    with Hermes-owned unknown-outcome fields. A nonzero process exit is itself
+    a definite failure and remains eligible for the established fallback.
+    """
+    valid_shape = isinstance(parsed, dict) and type(parsed.get("success")) is bool
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    valid_error = (
+        parsed.get("success") is not False
+        or (isinstance(error, str) and bool(error.strip()))
+    ) if valid_shape else False
+
+    if not valid_shape or not valid_error:
+        logger.warning(
+            "browser '%s' returned an invalid protocol envelope (rc=%s)",
+            command,
+            returncode,
+        )
+        if returncode == 0:
+            return _unknown_browser_command_result(
+                f"Browser command '{command}' returned an invalid protocol response.",
+                "protocol_outcome_unknown",
+            )
+        return {
+            "success": False,
+            "error": (
+                f"Browser command '{command}' failed with exit code {returncode} "
+                "and returned an invalid protocol response."
+            ),
+        }
+
+    result = {
+        key: value
+        for key, value in parsed.items()
+        if key not in _BROWSER_OUTCOME_CONTROL_FIELDS
+    }
+    if result["success"] is False:
+        result["error"] = error.strip()
+    return result
+
+
 def _get_vision_model() -> Optional[str]:
     """Model for browser_vision (screenshot analysis — multimodal)."""
     return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
@@ -1168,7 +1225,10 @@ def _lightpanda_fallback_reason(engine: str, command: str, result: Dict[str, Any
 
     # Explicit failure
     if not result.get("success"):
-        error = str(result.get("error") or "command failed").strip()
+        error = result.get("error")
+        if not isinstance(error, str) or not error.strip():
+            return None
+        error = error.strip()
         return f"Lightpanda {command!r} failed ({error}); retried with Chrome."
 
     data = result.get("data", {})
@@ -3178,25 +3238,14 @@ def _run_browser_command(
             elif stdout_text:
                 try:
                     parsed = json.loads(stdout_text)
-                    if not isinstance(parsed, dict) or not isinstance(parsed.get("success"), bool):
-                        if returncode == 0:
-                            result = _unknown_browser_command_result(
-                                f"Browser command '{command}' returned an invalid protocol response.",
-                                "protocol_outcome_unknown",
-                            )
-                        else:
-                            result = {
-                                "success": False,
-                                "error": (
-                                    f"Browser command '{command}' returned an invalid "
-                                    f"protocol response (exit code {returncode})."
-                                ),
-                            }
-                    else:
-                        result = parsed
+                    result = _validated_browser_command_result(
+                        parsed,
+                        command,
+                        returncode,
+                    )
                     # Warn if snapshot came back empty (common sign of daemon/CDP issues)
                     if command == "snapshot" and result.get("success"):
-                        snap_data = parsed.get("data", {})
+                        snap_data = result.get("data", {})
                         if not snap_data.get("snapshot") and not snap_data.get("refs"):
                             logger.warning("snapshot returned empty content. "
                                            "Possible stale daemon or CDP connection issue. "
