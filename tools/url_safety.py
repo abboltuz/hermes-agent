@@ -31,8 +31,9 @@ import os
 import socket
 import asyncio
 import re
+import unicodedata
 from typing import Any, Optional
-from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import quote, unquote_to_bytes, urljoin, urlparse, urlsplit, urlunsplit
 
 from hermes_constants import get_hermes_home_override
 from utils import is_truthy_value
@@ -103,35 +104,194 @@ def normalize_url_for_request(url: str) -> str:
     return urlunsplit((parsed.scheme, netloc, path, query, fragment))
 
 
-# Query parameter names that are unambiguously credential-bearing. Kept
-# deliberately narrow: bare English words that double as normal page facets
-# (``code`` on promo/challenge pages, ``key``/``auth``/``session``/``sig`` as
-# search or routing params) are intentionally EXCLUDED to avoid blocking
-# ordinary browsing. Prefix-based token redaction (``is_safe_url``) still
-# catches recognizable vendor key shapes; this set is the belt-and-suspenders
-# for opaque secrets that carry an explicit credential-named parameter.
-_SENSITIVE_QUERY_PARAM_NAMES = frozenset({
+# Canonical names shared by URL exfiltration checks and public browser URL
+# shaping. These are exact matches after bounded normalization, not substring
+# matches: e.g. ``monkey`` and ``authorship`` remain ordinary parameter names.
+# The set intentionally covers the credential names understood by the forced
+# public-output redactor as well as common OAuth/session/signing names.
+_SENSITIVE_URL_PARAM_NAMES = frozenset({
     "access_token",
+    "access_key",
     "api_key",
+    "api_token",
     "apikey",
+    "auth",
     "auth_token",
     "authorization",
     "awsaccesskeyid",
+    "bearer",
     "client_secret",
+    "code",
+    "cookie",
     "credential",
     "credentials",
+    "id_token",
     "jwt",
+    "key",
+    "key_material",
+    "pass",
     "password",
     "passwd",
+    "pw",
+    "raw_secret",
+    "refresh_token",
     "secret",
+    "secret_input",
+    "secret_key",
+    "secret_value",
+    "session",
     "session_id",
     "signature",
     "token",
     "x_amz_security_token",
     "x_amz_signature",
-    "x-amz-security-token",
-    "x-amz-signature",
 })
+
+_MAX_SENSITIVE_PARAM_NAME_CHARS = 256
+_MAX_SENSITIVE_PARAM_DECODE_PASSES = 8
+_MAX_SENSITIVE_PARAM_FIELDS = 256
+_INVALID_SENSITIVE_PARAM_NAME = "<invalid>"
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _sensitive_param_name_has_forbidden_controls(value: str) -> bool:
+    """Reject controls and Unicode line separators in untrusted URL names."""
+    return any(
+        ord(char) <= 0x1F
+        or 0x7F <= ord(char) <= 0x9F
+        or ord(char) in {0x2028, 0x2029}
+        for char in value
+    )
+
+
+def _sensitive_param_name_has_invalid_escape(value: str) -> bool:
+    """Return whether a percent is not followed by two hexadecimal digits."""
+    return any(
+        char == "%"
+        and (
+            index + 2 >= len(value)
+            or value[index + 1] not in _HEX_DIGITS
+            or value[index + 2] not in _HEX_DIGITS
+        )
+        for index, char in enumerate(value)
+    )
+
+
+def canonical_sensitive_param_name(name: Any) -> Optional[str]:
+    """Return a bounded canonical URL parameter name, or ``None`` if unsafe.
+
+    Percent escapes are decoded until stable, with a strict iteration bound.
+    NFKC/casefold then makes Unicode compatibility forms deterministic;
+    repeated array suffixes are ignored; punctuation and separators collapse
+    to underscores. Non-ASCII letters left after NFKC are ambiguous at this
+    security boundary and fail closed rather than inviting homoglyph bypasses.
+    """
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > _MAX_SENSITIVE_PARAM_NAME_CHARS
+    ):
+        return None
+
+    current = name
+    for _ in range(_MAX_SENSITIVE_PARAM_DECODE_PASSES):
+        if (
+            _sensitive_param_name_has_forbidden_controls(current)
+            or _sensitive_param_name_has_invalid_escape(current)
+        ):
+            return None
+        if "%" not in current:
+            break
+        try:
+            decoded = unquote_to_bytes(current).decode("utf-8", errors="strict")
+        except (UnicodeError, ValueError):
+            return None
+        if (
+            not decoded
+            or len(decoded) > _MAX_SENSITIVE_PARAM_NAME_CHARS
+            or _sensitive_param_name_has_forbidden_controls(decoded)
+        ):
+            return None
+        current = decoded
+    else:
+        # A name requiring more layers than the bound is deliberately
+        # ambiguous, even when the next decode would happen to look benign.
+        if "%" in current:
+            return None
+
+    if "%" in current:
+        return None
+    try:
+        normalized = unicodedata.normalize("NFKC", current).casefold().strip()
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    while normalized.endswith("[]"):
+        normalized = normalized[:-2].rstrip()
+    if not normalized or _sensitive_param_name_has_forbidden_controls(normalized):
+        return None
+
+    canonical_parts = []
+    separator_pending = False
+    for char in normalized:
+        if "a" <= char <= "z" or "0" <= char <= "9":
+            if separator_pending and canonical_parts:
+                canonical_parts.append("_")
+            canonical_parts.append(char)
+            separator_pending = False
+            continue
+        category = unicodedata.category(char)
+        if char == "_" or category[0] in {"P", "S", "Z"} or char.isspace():
+            separator_pending = True
+            continue
+        # NFKC resolves full-width/compatibility letters. Any remaining
+        # non-ASCII letter/number is ambiguous (potential homoglyph), and a
+        # combining/control-like value is not a legitimate public URL name.
+        return None
+
+    canonical = "".join(canonical_parts).strip("_")
+    if not canonical or len(canonical) > _MAX_SENSITIVE_PARAM_NAME_CHARS:
+        return None
+    return canonical
+
+
+def is_sensitive_url_param_name(name: Any, *, fail_closed: bool = True) -> bool:
+    """Return whether one encoded parameter name is credential-bearing."""
+    canonical = canonical_sensitive_param_name(name)
+    if canonical is None:
+        return fail_closed
+    return canonical in _SENSITIVE_URL_PARAM_NAMES
+
+
+def sensitive_param_name_in_section(section: Any) -> Optional[str]:
+    """Find a sensitive name in an ``&``/``;`` separated query-like section.
+
+    Parameter values are never decoded, normalized, logged, or passed to the
+    name predicate. Invalid/ambiguous names return a fixed marker so callers
+    fail closed without reflecting untrusted content.
+    """
+    if not isinstance(section, str) or not section:
+        return None
+    if len(section) > 16_384 or _sensitive_param_name_has_forbidden_controls(section):
+        return _INVALID_SENSITIVE_PARAM_NAME
+    segments = re.split(r"[&;]", section)
+    if len(segments) > _MAX_SENSITIVE_PARAM_FIELDS:
+        return _INVALID_SENSITIVE_PARAM_NAME
+    for segment in segments:
+        if not segment:
+            continue
+        name, separator, _value = segment.partition("=")
+        if not name:
+            return _INVALID_SENSITIVE_PARAM_NAME
+        canonical = canonical_sensitive_param_name(name)
+        if canonical is None:
+            return _INVALID_SENSITIVE_PARAM_NAME
+        if canonical in _SENSITIVE_URL_PARAM_NAMES:
+            return canonical
+        # A bare fragment route is a name-like segment but not a form field;
+        # it is safe only after the same canonical validation above.
+        if not separator:
+            continue
+    return None
 
 
 def sensitive_query_param_name(url: str) -> Optional[str]:
@@ -150,10 +310,7 @@ def sensitive_query_param_name(url: str) -> Optional[str]:
         return None
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.query:
         return None
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if value and unquote(key).lower() in _SENSITIVE_QUERY_PARAM_NAMES:
-            return key
-    return None
+    return sensitive_param_name_in_section(parsed.query)
 
 
 def has_sensitive_query_params(url: str) -> bool:

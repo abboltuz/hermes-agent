@@ -117,13 +117,8 @@ class TestWebExtractSecretExfil:
         assert "access_token" in parsed["error"]
 
     @pytest.mark.asyncio
-    async def test_allows_ambiguous_english_word_query_param(self):
-        """Generic query names that double as normal page facets must NOT block.
-
-        ``?code=`` (promo/challenge pages), ``?key=`` (search facets),
-        ``?session=`` etc. are ordinary browsing params. Only unambiguously
-        credential-named params are blocked, so web_extract stays usable.
-        """
+    async def test_blocks_bare_credential_names_under_canonical_policy(self):
+        """Bare credential names follow the forced-redaction safety policy."""
         from tools.web_tools import web_extract_tool
 
         for url in (
@@ -133,11 +128,8 @@ class TestWebExtractSecretExfil:
         ):
             result = await web_extract_tool(urls=[url])
             parsed = json.loads(result)
-            # Not blocked by the credential-query guard (may fail for other
-            # reasons like a missing backend, but never with this specific
-            # error string).
-            if parsed.get("success") is False:
-                assert "credential-like query parameter" not in parsed.get("error", ""), url
+            assert parsed["success"] is False
+            assert "credential-like query parameter" in parsed["error"], url
 
     @pytest.mark.asyncio
     async def test_allows_normal_url(self):

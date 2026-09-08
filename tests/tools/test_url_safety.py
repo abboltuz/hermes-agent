@@ -6,7 +6,10 @@ from unittest.mock import patch
 import httpx
 
 from tools.url_safety import (
+    canonical_sensitive_param_name,
+    has_sensitive_query_params,
     is_safe_url,
+    is_sensitive_url_param_name,
     async_is_safe_url,
     is_always_blocked_url,
     normalize_url_for_request,
@@ -19,6 +22,8 @@ from tools.url_safety import (
     _is_blocked_ip,
     _global_allow_private_urls,
     _reset_allow_private_cache,
+    sensitive_param_name_in_section,
+    sensitive_query_param_name,
 )
 
 import ipaddress
@@ -57,6 +62,128 @@ class TestNormalizeUrlForRequest:
             normalize_url_for_request("https://example.com/r?next=https:// evil.example")
             == "https://example.com/r?next=https://%20evil.example"
         )
+
+
+class TestSensitiveUrlParameterNames:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "token",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "auth",
+            "authorization",
+            "session",
+            "session_id",
+            "key",
+            "api_key",
+            "apikey",
+            "code",
+            "secret",
+            "client_secret",
+            "password",
+            "passwd",
+            "credential",
+            "cookie",
+            "jwt",
+            "auth_token",
+            "signature",
+            "x_amz_security_token",
+            "bearer",
+            "secret_value",
+            "raw_secret",
+            "secret_input",
+            "key_material",
+        ],
+    )
+    def test_canonical_sensitive_set_matches_exact_names(self, name):
+        assert canonical_sensitive_param_name(name) == name
+        assert is_sensitive_url_param_name(name) is True
+
+    @pytest.mark.parametrize(
+        "encoded, expected",
+        [
+            ("ACCESS_TOKEN", "access_token"),
+            (" access-token ", "access_token"),
+            ("access.token", "access_token"),
+            ("access token", "access_token"),
+            ("access+token", "access_token"),
+            ("access_token[]", "access_token"),
+            ("access_token[][]", "access_token"),
+            ("access%2dtoken", "access_token"),
+            ("%61ccess%5Ftoken", "access_token"),
+            ("%2561ccess%255Ftoken", "access_token"),
+            ("ＡＣＣＥＳＳ＿ＴＯＫＥＮ", "access_token"),
+        ],
+    )
+    def test_normalizes_encoded_case_array_and_separator_variants(
+        self, encoded, expected
+    ):
+        assert canonical_sensitive_param_name(encoded) == expected
+        assert is_sensitive_url_param_name(encoded) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "monkey",
+            "authorship",
+            "sessionize",
+            "codec",
+            "secretary",
+            "tokenizer",
+            "cookiejar",
+            "hockey",
+        ],
+    )
+    def test_exact_matching_avoids_substring_false_positives(self, name):
+        assert canonical_sensitive_param_name(name) == name
+        assert is_sensitive_url_param_name(name) is False
+
+    @pytest.mark.parametrize("depth", [1, 4, 6, 8])
+    def test_decodes_sensitive_name_until_stable_within_bound(self, depth):
+        encoded = "%61ccess%5Ftoken"
+        for _ in range(depth - 1):
+            encoded = encoded.replace("%", "%25")
+        assert canonical_sensitive_param_name(encoded) == "access_token"
+        assert is_sensitive_url_param_name(encoded) is True
+
+    def test_excessive_nesting_and_literal_percent_escape_fail_closed(self):
+        encoded = "%61ccess%5Ftoken"
+        for _ in range(8):
+            encoded = encoded.replace("%", "%25")
+        assert canonical_sensitive_param_name(encoded) is None
+        assert is_sensitive_url_param_name(encoded) is True
+        # A literal percent escape decodes to a residual invalid ``%`` and is
+        # intentionally ambiguous under the current fail-closed policy.
+        assert canonical_sensitive_param_name("theme%25") is None
+        assert is_sensitive_url_param_name("theme%25") is True
+
+    @pytest.mark.parametrize(
+        "section, expected",
+        [
+            ("theme=dark&access-token[]=opaque", "access_token"),
+            ("theme=dark;SESSION.ID[][]=opaque", "session_id"),
+            ("%61uth=opaque", "auth"),
+            ("monkey=banana;authorship=art", None),
+            ("access_token=", "access_token"),
+            ("=opaque", "<invalid>"),
+        ],
+    )
+    def test_section_parser_supports_ampersand_and_semicolon(self, section, expected):
+        assert sensitive_param_name_in_section(section) == expected
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            ("https://example.com/a?ACCESS.TOKEN[]=opaque", "access_token"),
+            ("https://example.com/a?theme=dark;cookie=opaque", "cookie"),
+            ("https://example.com/a?monkey=banana", None),
+        ],
+    )
+    def test_query_policy_uses_shared_canonical_predicate(self, url, expected):
+        assert sensitive_query_param_name(url) == expected
+        assert has_sensitive_query_params(url) is (expected is not None)
 
 
 class TestIsSafeUrl:

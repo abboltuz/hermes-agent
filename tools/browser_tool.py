@@ -152,6 +152,7 @@ try:
         is_safe_url as _is_safe_url,
         is_always_blocked_url as _is_always_blocked_url,
         normalize_url_for_request as _normalize_url_for_request,
+        sensitive_param_name_in_section as _sensitive_param_name_in_section,
         sensitive_query_param_name as _sensitive_query_param_name,
     )
 except Exception:
@@ -159,6 +160,7 @@ except Exception:
     _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
     _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
     _sensitive_query_param_name = lambda url: None  # noqa: E731 — best-effort fallback
+    _sensitive_param_name_in_section = lambda section: "<invalid>" if section else None  # noqa: E731
 # Browser-provider ABC + registry — PR #25214 moved the per-vendor providers
 # (Browserbase / Browser Use / Firecrawl) out of ``tools/browser_providers/``
 # and into ``plugins/browser/<vendor>/``. The dispatcher consults the
@@ -523,7 +525,6 @@ _MAX_BROWSER_IMAGE_URL = 8_192
 _MAX_BROWSER_IMAGE_ALT = 2_000
 _MAX_BROWSER_IMAGE_DIMENSION = 1_000_000
 _MAX_BROWSER_URL_DECODE_PASSES = 8
-_MAX_BROWSER_URL_QUERY_FIELDS = 256
 
 
 def _bounded_redacted_browser_text(value: str, limit: int) -> str:
@@ -5202,33 +5203,10 @@ def _maybe_stop_recording(task_id: str):
             _recording_sessions.discard(task_id)
 
 
-def _browser_url_component_has_sensitive_name(value: str) -> Optional[bool]:
-    """Check a decoded query/fragment name without passing its value onward."""
-    import urllib.parse
-
-    representations = _browser_url_security_representations(value)
-    if representations is None:
-        return None
-    key = representations[-1]
-    probe = urllib.parse.urlunsplit((
-        "https",
-        "browser-url-policy.invalid",
-        "/",
-        urllib.parse.urlencode([(key, "present")]),
-        "",
-    ))
-    try:
-        return _sensitive_query_param_name(probe) is not None
-    except Exception:
-        return None
-
-
 def _browser_url_parts_have_sensitive_names(
     parsed: Any,
 ) -> Optional[bool]:
     """Inspect credential-like names in query and fragment-like parameters."""
-    import urllib.parse
-
     sections = [parsed.query]
     fragment = parsed.fragment
     if fragment:
@@ -5239,21 +5217,11 @@ def _browser_url_parts_have_sensitive_names(
         if not section:
             continue
         try:
-            pairs = urllib.parse.parse_qsl(
-                section,
-                keep_blank_values=True,
-                max_num_fields=_MAX_BROWSER_URL_QUERY_FIELDS,
-            )
+            sensitive_name = _sensitive_param_name_in_section(section)
         except (TypeError, ValueError, UnicodeError):
             return None
-        for key, value in pairs:
-            if not value:
-                continue
-            sensitive = _browser_url_component_has_sensitive_name(key)
-            if sensitive is None:
-                return None
-            if sensitive:
-                return True
+        if sensitive_name is not None:
+            return True
     return False
 
 

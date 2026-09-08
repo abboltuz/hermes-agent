@@ -871,6 +871,129 @@ class TestCommandTimeoutRecovery:
         network_safe.assert_not_called()
 
     @pytest.mark.parametrize(
+        "name",
+        [
+            "token",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "auth",
+            "authorization",
+            "session",
+            "session_id",
+            "key",
+            "api_key",
+            "apikey",
+            "code",
+            "secret",
+            "client_secret",
+            "password",
+            "passwd",
+            "credential",
+            "cookie",
+            "jwt",
+        ],
+    )
+    def test_public_image_rejects_every_canonical_sensitive_query_name(
+        self, monkeypatch, caplog, name
+    ):
+        private_value = f"private-{name}-value"
+        src = f"https://example.com/a.png?theme=dark&{name}={private_value}"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert private_value not in json.dumps(response)
+        assert private_value not in caplog.text
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "ACCESS_TOKEN[]=private-normalized-value",
+            "access_token[][]=private-normalized-value",
+            "access%2dtoken=private-normalized-value",
+            "access.token=private-normalized-value",
+            "access+token=private-normalized-value",
+            "%61ccess%5Ftoken=private-normalized-value",
+            "theme=dark;access-token[]=private-normalized-value",
+        ],
+    )
+    def test_public_image_rejects_normalized_sensitive_name_variants(
+        self, monkeypatch, caplog, query
+    ):
+        src = f"https://example.com/a.png?{query}"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-normalized-value" not in json.dumps(response)
+        assert "private-normalized-value" not in caplog.text
+
+    @pytest.mark.parametrize("depth", [1, 4, 6, bt._MAX_BROWSER_URL_DECODE_PASSES + 1])
+    def test_public_image_rejects_nested_sensitive_query_name(
+        self, monkeypatch, caplog, depth
+    ):
+        nested_name = _nest_percent_encoding("%61ccess%5Ftoken", depth)
+        src = f"https://example.com/a.png?{nested_name}=private-nested-name-value"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-nested-name-value" not in json.dumps(response)
+        assert "private-nested-name-value" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "fragment",
+        [
+            "route;access-token[]=private-fragment-param-value",
+            "route?%61CCESS.TOKEN[][]=private-fragment-param-value",
+        ],
+    )
+    def test_public_image_rejects_normalized_sensitive_fragment_name(
+        self, monkeypatch, caplog, fragment
+    ):
+        src = f"https://example.com/a.png#section;{fragment}"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-fragment-param-value" not in json.dumps(response)
+        assert "private-fragment-param-value" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "monkey",
+            "authorship",
+            "sessionize",
+            "codec",
+            "secretary",
+            "tokenizer",
+            "cookiejar",
+        ],
+    )
+    def test_public_image_preserves_false_positive_control_query_names(
+        self, monkeypatch, name
+    ):
+        src = f"https://example.com/a.png?{name}=benign%20value"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is True
+        assert response["images"][0]["src"] == src
+
+    def test_public_image_literal_percent_escape_policy_is_fail_closed(
+        self, monkeypatch, caplog
+    ):
+        src = "https://example.com/a%25.png?theme=private-percent-value"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-percent-value" not in json.dumps(response)
+        assert "private-percent-value" not in caplog.text
+
+    @pytest.mark.parametrize(
         "fragment",
         [
             "section-two",
