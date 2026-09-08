@@ -441,13 +441,21 @@ def _format_browser_timeout_error(
     stdout: str,
     stderr: str,
 ) -> str:
-    """Build an actionable timeout message from captured daemon output."""
-    parts = [f"Command timed out after {timeout} seconds"]
-    detail = (stderr or stdout or "").strip()
-    if detail:
-        parts.append(detail[:1500])
+    """Build an actionable timeout message without exposing captured output.
 
-    combined = f"{stderr}\n{stdout}".lower()
+    The CLI may have printed page text, form values, cookies, or credentials
+    before it wedged.  Run the strongest browser-output redactor first, then
+    use the redacted text only to select fixed, bounded launch diagnostics.
+    Captured lines are never copied into logs or the public error.
+    """
+    parts = [f"Command timed out after {timeout} seconds"]
+    redacted = _redact_browser_output(f"{stderr}\n{stdout}")
+    combined = redacted[:16_000].lower() if isinstance(redacted, str) else ""
+    if "daemon process exited" in combined:
+        parts.append("Daemon process exited during startup.")
+    elif "failed to launch" in combined or "browser process exited" in combined:
+        parts.append("Browser process failed during startup.")
+
     hints: list[str] = []
     if "sandbox" in combined:
         hints.append(
@@ -508,6 +516,82 @@ _BROWSER_RESULT_RESERVED_FIELDS = frozenset({
     "browser_engine_fallback",
 })
 
+_MAX_BROWSER_PUBLIC_TEXT = 16_384
+_MAX_BROWSER_ANNOTATION_LABEL = 1_000
+_MAX_BROWSER_COLLECTION_ITEMS = 10_000
+_MAX_BROWSER_IMAGE_URL = 8_192
+_MAX_BROWSER_IMAGE_ALT = 2_000
+_MAX_BROWSER_IMAGE_DIMENSION = 1_000_000
+
+
+def _bounded_redacted_browser_text(value: str, limit: int) -> str:
+    """Force-redact and bound one browser-originated string."""
+    redacted = _redact_browser_output(value)
+    if not isinstance(redacted, str):
+        return ""
+    if len(redacted) <= limit:
+        return redacted
+    if limit <= 1:
+        return "…"[:limit]
+    return redacted[: limit - 1] + "…"
+
+
+def _sanitize_browser_annotations(value: Any) -> Optional[List[Dict[str, Any]]]:
+    """Validate the agent-browser annotation contract and strip extra fields.
+
+    The JSON contract consumed by Hermes is ``[{id: int, label: str}]``.  No
+    other annotation member is used, so retaining one would only widen the
+    untrusted subprocess-to-model boundary.
+    """
+    if not isinstance(value, list) or len(value) > _MAX_BROWSER_COLLECTION_ITEMS:
+        return None
+    sanitized: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        annotation_id = item.get("id")
+        label = item.get("label")
+        if (
+            type(annotation_id) is not int
+            or annotation_id < 0
+            or annotation_id > _MAX_BROWSER_COLLECTION_ITEMS
+            or not isinstance(label, str)
+        ):
+            return None
+        sanitized.append({
+            "id": annotation_id,
+            "label": _bounded_redacted_browser_text(
+                label,
+                _MAX_BROWSER_ANNOTATION_LABEL,
+            ),
+        })
+    return sanitized
+
+
+def _sanitize_browser_message_items(
+    value: Any,
+    fields: Tuple[str, ...],
+) -> Optional[List[Dict[str, str]]]:
+    """Validate, redact, and minimize console/error collection items."""
+    if not isinstance(value, list) or len(value) > _MAX_BROWSER_COLLECTION_ITEMS:
+        return None
+    sanitized: List[Dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        clean: Dict[str, str] = {}
+        for field in fields:
+            if field in item:
+                field_value = item[field]
+                if not isinstance(field_value, str):
+                    return None
+                clean[field] = _bounded_redacted_browser_text(
+                    field_value,
+                    64 if field == "type" else _MAX_BROWSER_PUBLIC_TEXT,
+                )
+        sanitized.append(clean)
+    return sanitized
+
 
 def _is_reserved_browser_result_field(key: str) -> bool:
     """Return whether a subprocess result key is Hermes-owned metadata."""
@@ -539,8 +623,12 @@ def _invalid_browser_protocol_result(command: str, returncode: int) -> Dict[str,
     }
 
 
-def _browser_success_data_is_valid(command: str, data: Dict[str, Any]) -> bool:
-    """Validate only members Hermes consumes; keep arbitrary eval results."""
+def _sanitize_browser_success_data(
+    command: str,
+    data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Validate/sanitize members Hermes consumes; keep arbitrary eval results."""
+    sanitized = dict(data)
     string_fields = {
         "open": ("title", "url"),
         "back": ("url",),
@@ -548,21 +636,24 @@ def _browser_success_data_is_valid(command: str, data: Dict[str, Any]) -> bool:
     }
     for field in string_fields.get(command, ()):
         if field in data and not isinstance(data[field], str):
-            return False
+            return None
 
     if command == "snapshot":
         if "snapshot" in data and not isinstance(data["snapshot"], str):
-            return False
+            return None
         if "refs" in data and not isinstance(data["refs"], dict):
-            return False
+            return None
 
     if command == "screenshot":
         if "path" in data:
             path = data["path"]
             if not isinstance(path, str) or "\x00" in path:
-                return False
-        if "annotations" in data and not isinstance(data["annotations"], list):
-            return False
+                return None
+        if "annotations" in data:
+            annotations = _sanitize_browser_annotations(data["annotations"])
+            if annotations is None:
+                return None
+            sanitized["annotations"] = annotations
 
     collection_specs = {
         "console": ("messages", ("type", "text")),
@@ -573,18 +664,12 @@ def _browser_success_data_is_valid(command: str, data: Dict[str, Any]) -> bool:
         collection_field, item_string_fields = spec
         if collection_field in data:
             items = data[collection_field]
-            if not isinstance(items, list):
-                return False
-            for item in items:
-                if not isinstance(item, dict):
-                    return False
-                if any(
-                    field in item and not isinstance(item[field], str)
-                    for field in item_string_fields
-                ):
-                    return False
+            clean_items = _sanitize_browser_message_items(items, item_string_fields)
+            if clean_items is None:
+                return None
+            sanitized[collection_field] = clean_items
 
-    return True
+    return sanitized
 
 
 def _validated_browser_command_result(
@@ -614,7 +699,10 @@ def _validated_browser_command_result(
     if parsed["success"] is True:
         if data is None:
             data = {}
-        if not isinstance(data, dict) or not _browser_success_data_is_valid(command, data):
+        if not isinstance(data, dict):
+            return _invalid_browser_protocol_result(command, returncode)
+        data = _sanitize_browser_success_data(command, data)
+        if data is None:
             return _invalid_browser_protocol_result(command, returncode)
 
     result = {
@@ -623,7 +711,10 @@ def _validated_browser_command_result(
         if not _is_reserved_browser_result_field(key)
     }
     if result["success"] is False:
-        result["error"] = error.strip()
+        result["error"] = _bounded_redacted_browser_text(
+            error.strip(),
+            _MAX_BROWSER_PUBLIC_TEXT,
+        )
     else:
         # A successful command has no failure reason. Never let an untrusted
         # subprocess smuggle arbitrary/nested content through this field.
@@ -1537,6 +1628,7 @@ def _run_chrome_fallback_command(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+            _unlink_command_output_files(stdout_path, stderr_path)
             return _unknown_browser_command_result(
                 f"Chrome fallback command '{cmd}' timed out.",
                 "timeout_outcome_unknown",
@@ -1591,7 +1683,11 @@ def _run_chrome_fallback_command(
                 ),
             }
         except OSError as exc:
-            logger.debug("Chrome fallback tmp cmd '%s' transport error: %s", cmd, exc)
+            logger.debug(
+                "Chrome fallback tmp cmd '%s' transport error (%s)",
+                cmd,
+                type(exc).__name__,
+            )
             return _unknown_browser_command_result(
                 f"Chrome fallback command '{cmd}' lost its result transport.",
                 "transport_outcome_unknown",
@@ -3356,16 +3452,16 @@ def _run_browser_command(
                 )
             _unlink_command_output_files(stdout_path, stderr_path)
             _discard_timed_out_browser_session(task_id, session_info, task_socket_dir)
-            if stderr and stderr.strip():
-                logger.warning(
-                    "browser '%s' stderr after timeout: %s",
-                    command,
-                    stderr.strip()[:500],
-                )
+            timeout_error = _format_browser_timeout_error(
+                command,
+                timeout,
+                stdout,
+                stderr,
+            )
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
             result = _unknown_browser_command_result(
-                _format_browser_timeout_error(command, timeout, stdout, stderr),
+                timeout_error,
                 "timeout_outcome_unknown",
             )
             # Fall through to fallback check below
@@ -3391,7 +3487,8 @@ def _run_browser_command(
             # Log stderr for diagnostics — use warning level on failure so it's visible
             if stderr and stderr.strip():
                 level = logging.WARNING if returncode != 0 else logging.DEBUG
-                logger.log(level, "browser '%s' stderr: %s", command, stderr.strip()[:500])
+                safe_stderr = _bounded_redacted_browser_text(stderr.strip(), 500)
+                logger.log(level, "browser '%s' stderr: %s", command, safe_stderr)
 
             stdout_text = stdout.strip()
 
@@ -3473,7 +3570,11 @@ def _run_browser_command(
                         }
             elif returncode != 0:
                 # Check for errors
-                error_msg = stderr.strip() if stderr else f"Command failed with code {returncode}"
+                error_msg = (
+                    _bounded_redacted_browser_text(stderr.strip(), _MAX_BROWSER_PUBLIC_TEXT)
+                    if stderr
+                    else f"Command failed with code {returncode}"
+                )
                 logger.warning("browser '%s' failed (rc=%s): %s", command, returncode, error_msg[:300])
                 result = {"success": False, "error": error_msg}
             else:
@@ -3504,14 +3605,24 @@ def _run_browser_command(
                 "error": f"Browser command '{command}' failed while encoding command text.",
             }
     except Exception as e:
-        logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
+        # Post-dispatch exception text/tracebacks can contain untrusted command
+        # output.  Log only the exception class and return a fixed diagnostic.
+        logger.warning(
+            "browser '%s' transport exception (%s, dispatched=%s)",
+            command,
+            type(e).__name__,
+            command_dispatched,
+        )
         if command_dispatched:
             result = _unknown_browser_command_result(
-                str(e),
+                f"Browser command '{command}' lost its result transport.",
                 "transport_outcome_unknown",
             )
         else:
-            result = {"success": False, "error": str(e)}
+            result = {
+                "success": False,
+                "error": f"Browser command '{command}' could not be dispatched.",
+            }
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
@@ -4334,18 +4445,47 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
 
     messages = []
     if console_result.get("success"):
-        for msg in console_result.get("data", {}).get("messages", []):
+        console_data = console_result.get("data", {})
+        if not isinstance(console_data, dict):
+            return json.dumps({
+                "success": False,
+                "error": "Browser console returned an invalid result.",
+            }, ensure_ascii=False)
+        raw_messages = console_data.get("messages", [])
+        clean_messages = _sanitize_browser_message_items(
+            raw_messages,
+            ("type", "text"),
+        )
+        if clean_messages is None:
+            return json.dumps({
+                "success": False,
+                "error": "Browser console returned an invalid result.",
+            }, ensure_ascii=False)
+        for msg in clean_messages:
             messages.append({
                 "type": msg.get("type", "log"),
-                "text": _redact_browser_output(msg.get("text", "")),
+                "text": msg.get("text", ""),
                 "source": "console",
             })
 
     errors = []
     if errors_result.get("success"):
-        for err in errors_result.get("data", {}).get("errors", []):
+        errors_data = errors_result.get("data", {})
+        if not isinstance(errors_data, dict):
+            return json.dumps({
+                "success": False,
+                "error": "Browser errors command returned an invalid result.",
+            }, ensure_ascii=False)
+        raw_errors = errors_data.get("errors", [])
+        clean_errors = _sanitize_browser_message_items(raw_errors, ("message",))
+        if clean_errors is None:
+            return json.dumps({
+                "success": False,
+                "error": "Browser errors command returned an invalid result.",
+            }, ensure_ascii=False)
+        for err in clean_errors:
             errors.append({
-                "message": _redact_browser_output(err.get("message", "")),
+                "message": err.get("message", ""),
                 "source": "exception",
             })
 
@@ -4862,6 +5002,61 @@ def _maybe_stop_recording(task_id: str):
             _recording_sessions.discard(task_id)
 
 
+def _sanitize_browser_image_items(
+    value: Any,
+    effective_task_id: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """Validate and minimize the exact result of Hermes' image-extractor JS."""
+    import urllib.parse
+    from agent.redact import _PREFIX_RE
+
+    if not isinstance(value, list) or len(value) > _MAX_BROWSER_COLLECTION_ITEMS:
+        return None
+
+    sanitized: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        src = item.get("src")
+        alt = item.get("alt")
+        width = item.get("width")
+        height = item.get("height")
+        if (
+            not isinstance(src, str)
+            or not src
+            or len(src) > _MAX_BROWSER_IMAGE_URL
+            or not isinstance(alt, str)
+            or type(width) is not int
+            or type(height) is not int
+            or not (0 <= width <= _MAX_BROWSER_IMAGE_DIMENSION)
+            or not (0 <= height <= _MAX_BROWSER_IMAGE_DIMENSION)
+        ):
+            return None
+
+        decoded_src = urllib.parse.unquote(src)
+        if _PREFIX_RE.search(src) or _PREFIX_RE.search(decoded_src):
+            return None
+        if _sensitive_query_param_name(src) or _is_always_blocked_url(src):
+            return None
+        parsed_src = urllib.parse.urlparse(src)
+        if (
+            parsed_src.scheme.lower() in {"http", "https"}
+            and not _is_local_backend()
+            and not _is_local_sidecar_key(effective_task_id)
+            and not _allow_private_urls()
+            and not _is_safe_url(src)
+        ):
+            return None
+
+        sanitized.append({
+            "src": _bounded_redacted_browser_text(src, _MAX_BROWSER_IMAGE_URL),
+            "alt": _bounded_redacted_browser_text(alt, _MAX_BROWSER_IMAGE_ALT),
+            "width": width,
+            "height": height,
+        })
+    return sanitized
+
+
 def browser_get_images(task_id: Optional[str] = None) -> str:
     """
     Get all images on the current page.
@@ -4916,7 +5111,8 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
             else:
                 images = raw_result
 
-            if not isinstance(images, list):
+            images = _sanitize_browser_image_items(images, effective_task_id)
+            if images is None:
                 return json.dumps({
                     "success": False,
                     "error": "Browser image extraction returned an invalid result.",
@@ -4924,16 +5120,14 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
 
             response = {
                 "success": True,
-                "images": _redact_browser_output(images),
+                "images": images,
                 "count": len(images)
             }
             return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
         except json.JSONDecodeError:
             response = {
-                "success": True,
-                "images": [],
-                "count": 0,
-                "warning": "Could not parse image data"
+                "success": False,
+                "error": "Browser image extraction returned an invalid result.",
             }
             return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
     else:
@@ -5099,6 +5293,29 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 "error": f"Failed to take screenshot ({mode} mode): {error_detail}"
             }
             return json.dumps(_copy_fallback_warning(error_response, result), ensure_ascii=False)
+
+        # Defense in depth for alternate/mock command runners: only validated,
+        # minimized annotations may reach native metadata or the auxiliary LLM
+        # response. The normal subprocess path has already applied this check.
+        result_data = result.get("data", {})
+        if not isinstance(result_data, dict):
+            return json.dumps({
+                "success": False,
+                "error": "Browser screenshot returned an invalid result.",
+            }, ensure_ascii=False)
+        if "annotations" in result_data:
+            clean_annotations = _sanitize_browser_annotations(
+                result_data["annotations"]
+            )
+            if clean_annotations is None:
+                return json.dumps({
+                    "success": False,
+                    "error": "Browser screenshot returned invalid annotations.",
+                }, ensure_ascii=False)
+            result = dict(result)
+            result_data = dict(result_data)
+            result_data["annotations"] = clean_annotations
+            result["data"] = result_data
 
         actual_screenshot_path = _browser_result_string(result, "path")
         if actual_screenshot_path:

@@ -86,6 +86,31 @@ class TestBrowserConsole:
         assert fake_key not in redacted_text
         assert "***" in redacted_text or "..." in redacted_text
 
+    @pytest.mark.parametrize(
+        "console_response,errors_response",
+        [
+            (
+                {"success": True, "data": {"messages": [42]}},
+                {"success": True, "data": {"errors": []}},
+            ),
+            (
+                {"success": True, "data": {"messages": []}},
+                {"success": True, "data": {"errors": [{"message": {"secret": "private"}}]}},
+            ),
+        ],
+    )
+    def test_rejects_malformed_public_collection_items(
+        self, console_response, errors_response
+    ):
+        from tools.browser_tool import browser_console
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [console_response, errors_response]
+            result = json.loads(browser_console(task_id="test"))
+
+        assert result["success"] is False
+        assert "private" not in json.dumps(result)
+
     def test_redacts_secrets_from_eval_result(self):
         from tools.browser_tool import _browser_eval
 
@@ -317,6 +342,122 @@ class TestBrowserVisionConfig:
         assert f"Screenshot path: {screenshot}" in result["text_summary"]
         mock_get_vision_model.assert_not_called()
         mock_llm.assert_not_called()
+
+    def test_browser_vision_native_metadata_redacts_and_minimizes_annotations(
+        self, tmp_path
+    ):
+        from agent.auxiliary_client import clear_runtime_main, set_runtime_main
+        from tools.browser_tool import browser_vision
+
+        shots_dir, screenshot = self._setup_screenshot(tmp_path)
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+        set_runtime_main("brand-new-provider", "llava-v1.6")
+        try:
+            with (
+                patch("hermes_constants.get_hermes_dir", return_value=shots_dir),
+                patch("tools.browser_tool._cleanup_old_screenshots"),
+                patch(
+                    "tools.browser_tool._run_browser_command",
+                    return_value={
+                        "success": True,
+                        "data": {
+                            "path": str(screenshot),
+                            "annotations": [{
+                                "id": 1,
+                                "label": f"Search {secret}",
+                                "nested": {"secret": "nested-private-value"},
+                            }],
+                        },
+                    },
+                ),
+                patch(
+                    "hermes_cli.config.load_config",
+                    return_value={"model": {"supports_vision": True}},
+                ),
+            ):
+                result = browser_vision(
+                    "what is on the page?",
+                    annotate=True,
+                    task_id="test",
+                )
+        finally:
+            clear_runtime_main()
+
+        annotations = result["meta"]["annotations"]
+        assert set(annotations[0]) == {"id", "label"}
+        assert secret not in json.dumps(result)
+        assert "nested-private-value" not in json.dumps(result)
+
+    def test_browser_vision_rejects_malformed_annotations_before_publication(
+        self, tmp_path
+    ):
+        from tools.browser_tool import browser_vision
+
+        shots_dir, screenshot = self._setup_screenshot(tmp_path)
+        secret = "private-annotation-value"
+        with (
+            patch("hermes_constants.get_hermes_dir", return_value=shots_dir),
+            patch("tools.browser_tool._cleanup_old_screenshots"),
+            patch(
+                "tools.browser_tool._run_browser_command",
+                return_value={
+                    "success": True,
+                    "data": {
+                        "path": str(screenshot),
+                        "annotations": [{"id": 1, "label": {"secret": secret}}],
+                    },
+                },
+            ),
+        ):
+            result = browser_vision(
+                "what is on the page?",
+                annotate=True,
+                task_id="test",
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert secret not in json.dumps(payload)
+
+    def test_browser_vision_aux_response_sanitizes_annotations(self, tmp_path):
+        from tools.browser_tool import browser_vision
+
+        shots_dir, screenshot = self._setup_screenshot(tmp_path)
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Screenshot analysis"
+        mock_response.choices = [mock_choice]
+        with (
+            patch("hermes_constants.get_hermes_dir", return_value=shots_dir),
+            patch("tools.browser_tool._cleanup_old_screenshots"),
+            patch(
+                "tools.browser_tool._run_browser_command",
+                return_value={
+                    "success": True,
+                    "data": {
+                        "path": str(screenshot),
+                        "annotations": [{
+                            "id": 1,
+                            "label": f"Search {secret}",
+                            "nested": {"secret": "nested-private-value"},
+                        }],
+                    },
+                },
+            ),
+            patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+            patch("tools.browser_tool.call_llm", return_value=mock_response),
+        ):
+            result = json.loads(browser_vision(
+                "what is on the page?",
+                annotate=True,
+                task_id="test",
+            ))
+
+        assert result["success"] is True
+        assert set(result["annotations"][0]) == {"id", "label"}
+        assert secret not in json.dumps(result)
+        assert "nested-private-value" not in json.dumps(result)
 
     def test_browser_vision_native_fast_path_caps_history_embed(self, tmp_path):
         """Oversized screenshots are resized before entering history (#92699).

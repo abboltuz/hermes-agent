@@ -130,6 +130,30 @@ class TestTimeoutErrorFormatting:
         err = bt._format_browser_timeout_error("open", 60, "", "")
         assert "agent-browser install --with-deps" in err
 
+    @pytest.mark.parametrize("stream", ["stdout", "stderr"])
+    @pytest.mark.parametrize(
+        "private_text",
+        [
+            "Authorization: Bearer sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            "Cookie: session_id=private-cookie-value",
+            "password=private-password-value",
+            "private form text: patient record 123-45-6789",
+        ],
+    )
+    def test_captured_output_is_never_copied_to_timeout_error(
+        self, stream, private_text
+    ):
+        output = f"Daemon process exited during startup\n{private_text}"
+        err = bt._format_browser_timeout_error(
+            "open",
+            60,
+            output if stream == "stdout" else "",
+            output if stream == "stderr" else "",
+        )
+
+        assert "Daemon process exited during startup." in err
+        assert private_text not in err
+
 
 class TestReadCommandOutputFiles:
     def test_reads_stdout_and_stderr(self, tmp_path):
@@ -288,6 +312,84 @@ class TestCommandTimeoutRecovery:
         assert result["outcome"] == "unknown"
         assert result["retry_safe"] is False
         chrome_fallback.assert_not_called()
+
+    @pytest.mark.parametrize("stream", ["stdout", "stderr"])
+    @pytest.mark.parametrize(
+        "private_text",
+        [
+            "Authorization: Bearer sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            "Cookie: session_id=private-cookie-value",
+            "password=private-password-value",
+            "private form text must never reach model or logs",
+        ],
+    )
+    def test_timeout_output_is_absent_from_result_and_logs(
+        self, monkeypatch, tmp_path, caplog, stream, private_text
+    ):
+        task_id = f"timeout-private-{stream}"
+        bt._active_sessions[task_id] = {
+            "session_name": f"timeout-private-{stream}",
+            "bb_session_id": None,
+            "cdp_url": None,
+        }
+        process = Mock(returncode=0)
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired("agent-browser", 1),
+            -9,
+        ]
+        diagnostic = f"Daemon process exited during startup\n{private_text}".encode()
+
+        def popen(*_args, **kwargs):
+            os.write(kwargs[stream], diagnostic)
+            return process
+
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
+        monkeypatch.setattr(bt, "_get_browser_engine", lambda: "auto")
+        monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        result = bt._run_browser_command(task_id, "click", ["@e1"], timeout=1)
+
+        assert result["error_code"] == "timeout_outcome_unknown"
+        assert "Daemon process exited during startup." in result["error"]
+        assert private_text not in json.dumps(result)
+        assert private_text not in caplog.text
+
+    def test_transport_exception_text_is_absent_from_result_and_logs(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        task_id = "transport-private"
+        bt._active_sessions[task_id] = {
+            "session_name": "transport-private",
+            "bb_session_id": None,
+            "cdp_url": None,
+        }
+        private_text = "private transport text must never leak"
+        process = Mock(returncode=0)
+        process.wait.side_effect = OSError(private_text)
+
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
+        monkeypatch.setattr(bt, "_get_browser_engine", lambda: "auto")
+        monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
+        monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda value: value)
+        monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        result = bt._run_browser_command(task_id, "click", ["@e1"], timeout=1)
+
+        assert result["error_code"] == "transport_outcome_unknown"
+        assert private_text not in json.dumps(result)
+        assert private_text not in caplog.text
 
     @pytest.mark.parametrize(
         ("command", "args"),
@@ -496,6 +598,201 @@ class TestCommandTimeoutRecovery:
             "success": False,
             "error": "Browser image extraction returned an invalid result.",
         }
+
+    @pytest.mark.parametrize(
+        "annotations",
+        [
+            ["secret-value-must-not-leak"],
+            [42],
+            [["secret-value-must-not-leak"]],
+            [{"id": "secret-value-must-not-leak", "label": "button"}],
+            [{"id": 1, "label": {"secret": "secret-value-must-not-leak"}}],
+            [{"id": True, "label": "secret-value-must-not-leak"}],
+            [{"id": -1, "label": "secret-value-must-not-leak"}],
+        ],
+    )
+    def test_screenshot_rejects_malformed_annotation_items_without_replay(
+        self, monkeypatch, tmp_path, caplog, annotations
+    ):
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command="screenshot",
+            args=["--annotate"],
+            stdout_text=json.dumps({
+                "success": True,
+                "data": {"path": "/tmp/example.png", "annotations": annotations},
+            }),
+        )
+
+        assert result["success"] is False
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert result["retry_safe"] is False
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    def test_screenshot_annotation_is_minimized_redacted_and_bounded(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+        result = bt._validated_browser_command_result(
+            {
+                "success": True,
+                "data": {
+                    "path": "/tmp/example.png",
+                    "annotations": [{
+                        "id": 1,
+                        "label": f"Submit {secret}" + "x" * 2_000,
+                        "hostile": {"secret": "nested-secret-must-not-leak"},
+                    }],
+                },
+            },
+            "screenshot",
+            0,
+        )
+
+        annotation = result["data"]["annotations"][0]
+        assert set(annotation) == {"id", "label"}
+        assert annotation["id"] == 1
+        assert secret not in annotation["label"]
+        assert len(annotation["label"]) <= bt._MAX_BROWSER_ANNOTATION_LABEL
+        assert "nested-secret-must-not-leak" not in json.dumps(result)
+
+    @pytest.mark.parametrize(
+        "command,data",
+        [
+            ("console", {"messages": [{"type": "log", "text": {"secret": "secret-value-must-not-leak"}}]}),
+            ("console", {"messages": [42]}),
+            ("errors", {"errors": [{"message": ["secret-value-must-not-leak"]}]}),
+            ("errors", {"errors": ["secret-value-must-not-leak"]}),
+        ],
+    )
+    def test_console_collections_reject_malformed_items_without_raw_output(
+        self, monkeypatch, tmp_path, caplog, command, data
+    ):
+        result, chrome_fallback, screenshot_fallback = _run_lightpanda_process_result(
+            monkeypatch,
+            tmp_path,
+            command=command,
+            args=[],
+            stdout_text=json.dumps({"success": True, "data": data}),
+        )
+
+        assert result["error_code"] == "protocol_outcome_unknown"
+        assert "secret-value-must-not-leak" not in json.dumps(result)
+        assert "secret-value-must-not-leak" not in caplog.text
+        chrome_fallback.assert_not_called()
+        screenshot_fallback.assert_not_called()
+
+    def test_console_collection_is_minimized_and_force_redacted(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+        result = bt._validated_browser_command_result(
+            {
+                "success": True,
+                "data": {
+                    "messages": [{
+                        "type": "log",
+                        "text": f"token {secret}",
+                        "nested": {"secret": "nested-secret-must-not-leak"},
+                    }],
+                },
+            },
+            "console",
+            0,
+        )
+
+        message = result["data"]["messages"][0]
+        assert set(message) == {"type", "text"}
+        assert secret not in message["text"]
+        assert "nested-secret-must-not-leak" not in json.dumps(result)
+
+    @pytest.mark.parametrize(
+        "images",
+        [
+            ["secret-value-must-not-leak"],
+            [42],
+            [["secret-value-must-not-leak"]],
+            [{"src": {"secret": "secret-value-must-not-leak"}, "alt": "", "width": 1, "height": 1}],
+            [{"src": "https://example.com/a.png", "alt": {"secret": "secret-value-must-not-leak"}, "width": 1, "height": 1}],
+            [{"src": "https://example.com/a.png", "alt": "", "width": True, "height": 1}],
+            [{"src": "https://example.com/a.png", "alt": "", "width": 1, "height": -1}],
+        ],
+    )
+    def test_image_extraction_rejects_malformed_items_without_leak(
+        self, monkeypatch, caplog, images
+    ):
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_last_session_key", lambda _task: "task::local")
+        monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda _task: False)
+        monkeypatch.setattr(
+            bt,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: {
+                "success": True,
+                "data": {"result": images},
+            },
+        )
+
+        response = json.loads(bt.browser_get_images(task_id="task"))
+
+        assert response == {
+            "success": False,
+            "error": "Browser image extraction returned an invalid result.",
+        }
+        assert "secret-value-must-not-leak" not in json.dumps(response)
+        assert "secret-value-must-not-leak" not in caplog.text
+
+    def test_image_extraction_minimizes_and_redacts_valid_items(self, monkeypatch):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+        images = [{
+            "src": "https://example.com/a.png",
+            "alt": f"profile {secret}",
+            "width": 640,
+            "height": 480,
+            "nested": {"secret": "nested-secret-must-not-leak"},
+        }]
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_last_session_key", lambda _task: "task::local")
+        monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda _task: False)
+        monkeypatch.setattr(
+            bt,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: {
+                "success": True,
+                "data": {"result": images},
+            },
+        )
+
+        response = json.loads(bt.browser_get_images(task_id="task"))
+
+        assert response["success"] is True
+        assert set(response["images"][0]) == {"src", "alt", "width", "height"}
+        assert secret not in response["images"][0]["alt"]
+        assert "nested-secret-must-not-leak" not in json.dumps(response)
+
+    def test_image_extraction_rejects_credential_url(self, monkeypatch):
+        images = [{
+            "src": "https://example.com/a.png?access_token=private-token",
+            "alt": "avatar",
+            "width": 1,
+            "height": 1,
+        }]
+        monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(bt, "_last_session_key", lambda _task: "task::local")
+        monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda _task: False)
+        monkeypatch.setattr(
+            bt,
+            "_run_browser_command",
+            lambda *_args, **_kwargs: {
+                "success": True,
+                "data": {"result": images},
+            },
+        )
+
+        response = json.loads(bt.browser_get_images(task_id="task"))
+
+        assert response["success"] is False
+        assert "private-token" not in json.dumps(response)
 
     @pytest.mark.parametrize(
         ("command", "args"),
