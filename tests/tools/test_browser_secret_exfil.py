@@ -132,6 +132,30 @@ class TestWebExtractSecretExfil:
             assert "credential-like query parameter" in parsed["error"], url
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "access_token[0]=private-web-bracket-value",
+            "access_token[user]=private-web-bracket-value",
+            "access_token%5Buser%5D=private-web-bracket-value",
+            "access_token%255Buser%255D=private-web-bracket-value",
+            "access_token%2525255Buser%2525255D=private-web-bracket-value",
+            "theme=dark;access_token[user]=private-web-bracket-value",
+        ],
+    )
+    async def test_web_extract_blocks_sensitive_trailing_bracket_groups(
+        self, query
+    ):
+        from tools.web_tools import web_extract_tool
+
+        result = await web_extract_tool(urls=[f"https://example.com/a?{query}"])
+
+        parsed = json.loads(result)
+        assert parsed["success"] is False
+        assert "credential-like query parameter" in parsed["error"]
+        assert "private-web-bracket-value" not in result
+
+    @pytest.mark.asyncio
     async def test_allows_normal_url(self):
         from tools.web_tools import web_extract_tool
         # This will fail due to no API key, but should NOT be blocked by secret check
@@ -188,6 +212,67 @@ class TestWebExtractSecretExfil:
 
         parsed = json.loads(result)
         assert parsed["results"][0]["url"] == "https://wttr.in/K%C3%B6ln"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "ключ=значение",
+            "café=crème",
+            "caf%C3%A9=cr%C3%A8me",
+            "access_tokenizer[user]=visible",
+            "monkey[0]=banana",
+            "sessionize[x]=summer",
+        ],
+    )
+    async def test_web_extract_allows_unicode_and_bracket_false_positives(
+        self, monkeypatch, query
+    ):
+        from agent.web_search_provider import WebSearchProvider
+        from agent import web_search_registry
+        from tools import web_tools
+
+        class FakeExtractProvider(WebSearchProvider):
+            @property
+            def name(self) -> str:
+                return "fake-extract"
+
+            def is_available(self) -> bool:
+                return True
+
+            def supports_search(self) -> bool:
+                return False
+
+            def supports_extract(self) -> bool:
+                return True
+
+            def extract(self, urls, **_kwargs):
+                return [{
+                    "url": urls[0],
+                    "title": "ok",
+                    "content": "ok",
+                    "raw_content": "ok",
+                }]
+
+        async def allow_url(_url: str) -> bool:
+            return True
+
+        web_search_registry._reset_for_tests()
+        web_search_registry.register_provider(FakeExtractProvider())
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "fake-extract")
+        monkeypatch.setattr(web_tools, "async_is_safe_url", allow_url)
+
+        try:
+            result = await web_tools.web_extract_tool(
+                urls=[f"https://example.com/a?{query}"],
+            )
+        finally:
+            web_search_registry._reset_for_tests()
+
+        parsed = json.loads(result)
+        assert parsed["results"][0]["title"] == "ok"
+        assert "credential-like query parameter" not in result
 
 
 class TestBrowserSnapshotRedaction:

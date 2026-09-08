@@ -182,9 +182,9 @@ def canonical_sensitive_param_name(name: Any) -> Optional[str]:
 
     Percent escapes are decoded until stable, with a strict iteration bound.
     NFKC/casefold then makes Unicode compatibility forms deterministic;
-    repeated array suffixes are ignored; punctuation and separators collapse
-    to underscores. Non-ASCII letters left after NFKC are ambiguous at this
-    security boundary and fail closed rather than inviting homoglyph bypasses.
+    trailing array/associative bracket groups are ignored; punctuation and
+    separators collapse to underscores. Valid Unicode letters and numbers are
+    retained so ordinary internationalized query names remain usable.
     """
     if (
         not isinstance(name, str)
@@ -225,27 +225,41 @@ def canonical_sensitive_param_name(name: Any) -> Optional[str]:
         normalized = unicodedata.normalize("NFKC", current).casefold().strip()
     except (TypeError, ValueError, UnicodeError):
         return None
-    while normalized.endswith("[]"):
-        normalized = normalized[:-2].rstrip()
+
+    # PHP/Rails-style form names may index a credential field as ``token[]``,
+    # ``token[0]`` or ``token[user]``. Security policy applies to the exact
+    # base name, while malformed/unbalanced bracket syntax remains ambiguous.
+    while normalized.endswith("]"):
+        bracket_start = normalized.rfind("[")
+        if bracket_start < 0:
+            return None
+        bracket_value = normalized[bracket_start + 1 : -1]
+        if "[" in bracket_value or "]" in bracket_value:
+            return None
+        normalized = normalized[:bracket_start].rstrip()
+    if "[" in normalized or "]" in normalized:
+        return None
     if not normalized or _sensitive_param_name_has_forbidden_controls(normalized):
         return None
 
     canonical_parts = []
     separator_pending = False
     for char in normalized:
-        if "a" <= char <= "z" or "0" <= char <= "9":
+        category = unicodedata.category(char)
+        if category[0] in {"L", "N"}:
             if separator_pending and canonical_parts:
                 canonical_parts.append("_")
             canonical_parts.append(char)
             separator_pending = False
             continue
-        category = unicodedata.category(char)
+        if category[0] == "M" and canonical_parts and not separator_pending:
+            canonical_parts.append(char)
+            continue
         if char == "_" or category[0] in {"P", "S", "Z"} or char.isspace():
             separator_pending = True
             continue
-        # NFKC resolves full-width/compatibility letters. Any remaining
-        # non-ASCII letter/number is ambiguous (potential homoglyph), and a
-        # combining/control-like value is not a legitimate public URL name.
+        # Control-like and unassigned code points are not legitimate public
+        # query names. They fail closed instead of being silently discarded.
         return None
 
     canonical = "".join(canonical_parts).strip("_")

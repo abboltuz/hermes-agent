@@ -929,6 +929,30 @@ class TestCommandTimeoutRecovery:
         assert "private-normalized-value" not in json.dumps(response)
         assert "private-normalized-value" not in caplog.text
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "access_token[0]=private-bracket-value",
+            "access_token[user]=private-bracket-value",
+            "access_token[][0][user]=private-bracket-value",
+            "access_token%5B0%5D=private-bracket-value",
+            "access_token%255Buser%255D=private-bracket-value",
+            "access_token%2525255Buser%2525255D=private-bracket-value",
+            "%61ccess%5Ftoken%255Buser%255D=private-bracket-value",
+            "theme=dark;access_token[user]=private-bracket-value",
+        ],
+    )
+    def test_public_image_rejects_sensitive_trailing_bracket_groups(
+        self, monkeypatch, caplog, query
+    ):
+        src = f"https://example.com/a.png?{query}"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is False
+        assert "private-bracket-value" not in json.dumps(response)
+        assert "private-bracket-value" not in caplog.text
+
     @pytest.mark.parametrize("depth", [1, 4, 6, bt._MAX_BROWSER_URL_DECODE_PASSES + 1])
     def test_public_image_rejects_nested_sensitive_query_name(
         self, monkeypatch, caplog, depth
@@ -976,6 +1000,27 @@ class TestCommandTimeoutRecovery:
         self, monkeypatch, name
     ):
         src = f"https://example.com/a.png?{name}=benign%20value"
+
+        response = _run_image_extraction_result(monkeypatch, src)
+
+        assert response["success"] is True
+        assert response["images"][0]["src"] == src
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "access_tokenizer[user]",
+            "monkey[0]",
+            "sessionize[x]",
+            "ключ",
+            "café",
+            "caf%C3%A9",
+        ],
+    )
+    def test_public_image_preserves_unicode_and_bracket_false_positives(
+        self, monkeypatch, name
+    ):
+        src = f"https://example.com/a.png?{name}=benign-value"
 
         response = _run_image_extraction_result(monkeypatch, src)
 

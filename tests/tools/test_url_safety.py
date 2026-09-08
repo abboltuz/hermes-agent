@@ -124,6 +124,78 @@ class TestSensitiveUrlParameterNames:
         assert is_sensitive_url_param_name(encoded) is True
 
     @pytest.mark.parametrize(
+        "encoded",
+        [
+            "access_token[0]",
+            "access_token[user]",
+            "access_token[][0][user]",
+            "access_token%5B0%5D",
+            "access_token%5Buser%5D",
+            "access_token%255Buser%255D",
+            "%61ccess%5Ftoken%255Buser%255D",
+        ],
+    )
+    def test_sensitive_policy_uses_exact_base_of_trailing_bracket_groups(
+        self, encoded
+    ):
+        assert canonical_sensitive_param_name(encoded) == "access_token"
+        assert is_sensitive_url_param_name(encoded) is True
+
+    @pytest.mark.parametrize("depth", [1, 4, 6, 8])
+    def test_decodes_trailing_bracket_groups_until_stable(self, depth):
+        encoded = "access_token%5Buser%5D"
+        for _ in range(depth - 1):
+            encoded = encoded.replace("%", "%25")
+        assert canonical_sensitive_param_name(encoded) == "access_token"
+        assert is_sensitive_url_param_name(encoded) is True
+
+    @pytest.mark.parametrize(
+        "name, expected",
+        [
+            ("ключ", "ключ"),
+            ("КЛЮЧ", "ключ"),
+            ("café", "café"),
+            ("caf%C3%A9", "café"),
+            ("Straße", "strasse"),
+        ],
+    )
+    def test_valid_unicode_names_are_canonical_but_not_sensitive(
+        self, name, expected
+    ):
+        assert canonical_sensitive_param_name(name) == expected
+        assert is_sensitive_url_param_name(name) is False
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            "%",
+            "%ZZ",
+            "caf%C3",
+            "%FF",
+            "bad\x00name",
+            "bad\u2028name",
+            "access_token[user",
+            "access_token]",
+            "access_token[[user]]",
+        ],
+    )
+    def test_malformed_or_ambiguous_names_remain_fail_closed(self, name):
+        assert canonical_sensitive_param_name(name) is None
+        assert is_sensitive_url_param_name(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "access_tokenizer[user]",
+            "monkey[0]",
+            "sessionize[x]",
+        ],
+    )
+    def test_bracket_groups_do_not_introduce_substring_matching(self, name):
+        assert is_sensitive_url_param_name(name) is False
+
+    @pytest.mark.parametrize(
         "name",
         [
             "monkey",
@@ -167,6 +239,11 @@ class TestSensitiveUrlParameterNames:
             ("%61uth=opaque", "auth"),
             ("monkey=banana;authorship=art", None),
             ("access_token=", "access_token"),
+            ("ключ=значение;café=crème", None),
+            ("caf%C3%A9=cr%C3%A8me", None),
+            ("access_token[user]=opaque", "access_token"),
+            ("theme=dark;access_token%255B0%255D=opaque", "access_token"),
+            ("monkey[0]=banana;sessionize[x]=summer", None),
             ("=opaque", "<invalid>"),
         ],
     )
