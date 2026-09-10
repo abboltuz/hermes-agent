@@ -3,6 +3,12 @@
 </p>
 
 # Hermes Agent ☤
+
+> [!NOTE]
+> This private repository is Cekasha's development and integration mirror of
+> upstream Hermes Agent. See [Cekasha Hermes Development](CEKASHA_DEVELOPMENT.md)
+> for repository boundaries, branch policy, and the separate plugins monorepo.
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
