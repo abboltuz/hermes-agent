@@ -33,16 +33,30 @@ def test_antigravity_profile_exposes_identity_and_curated_catalog():
 def test_antigravity_catalog_filters_supported_families_and_preserves_live_empty():
     from agent.antigravity_bridge_client import filter_antigravity_models
 
-    assert filter_antigravity_models([
+    accepted = [
         {"id": "antigravity-claude-sonnet-4-6"},
         {"id": "antigravity-gemini-3-pro"},
+        {"id": "antigravity-gpt-oss-120b"},
         {"id": "claude-sonnet-4"},
         {"id": "gemini-2.5-pro"},
+    ]
+    rejected = [
         {"id": "gpt-5"},
+        {"id": "gpt-oss-120b"},
+        {"id": "antigravity-gpt-oss-120b-medium"},
+        {"id": "antigravity-gpt-oss-120b-tiered"},
+        {"id": "antigravity-gpt-oss-120b://private"},
+        {"id": "chat_antigravity-gpt-oss-120b"},
+        {"id": "tab_antigravity-gpt-oss-120b"},
+        {"id": "antigravity-gpt-oss-120b\n"},
+        {"id": "antigravity-gpt-oss-120b" + "x" * 97},
+        {"id": "bridge-secret-token"},
         {"id": "claude-sonnet-4"},
-    ]) == [
+    ]
+    assert filter_antigravity_models(accepted + rejected) == [
         "antigravity-claude-sonnet-4-6",
         "antigravity-gemini-3-pro",
+        "antigravity-gpt-oss-120b",
         "claude-sonnet-4",
         "gemini-2.5-pro",
     ]
@@ -52,10 +66,13 @@ def test_antigravity_catalog_filters_supported_families_and_preserves_live_empty
 
 def test_antigravity_fallback_models_are_bridge_owned_supported_families():
     from agent.antigravity_bridge_client import CURATED_FALLBACK_MODELS
+    from hermes_cli.inventory import _safe_antigravity_model_ids
 
     assert CURATED_FALLBACK_MODELS
-    assert all(model.startswith(("antigravity-gemini-", "antigravity-claude-"))
-               for model in CURATED_FALLBACK_MODELS)
+    assert len(CURATED_FALLBACK_MODELS) == len(set(CURATED_FALLBACK_MODELS))
+    assert all(model.startswith("antigravity-") and len(model) <= 96 for model in CURATED_FALLBACK_MODELS)
+    assert not any(any(marker in model for marker in ("-tiered", "-medium", "chat_", "tab_")) for model in CURATED_FALLBACK_MODELS)
+    assert _safe_antigravity_model_ids(list(CURATED_FALLBACK_MODELS)) == list(CURATED_FALLBACK_MODELS)
 
 
 def test_antigravity_ready_payload_requires_loopback_contract():
@@ -261,6 +278,66 @@ ns.serve_forever()
         client.close()
         client.close()
     assert client._process is None
+
+
+def test_antigravity_client_streams_openai_chunks_across_real_subprocess_and_http(tmp_path):
+    import httpx
+
+    from agent.antigravity_bridge_client import AntigravityBridgeClient
+
+    child = tmp_path / "streaming_bridge.py"
+    child.write_text(
+        """import json, os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+token = os.environ['HERMES_ANTIGRAVITY_BRIDGE_TOKEN']
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', '0'))
+        payload = json.loads(self.rfile.read(length))
+        if self.headers.get('Authorization') != 'Bearer ' + token: self.send_error(401); return
+        if self.headers.get('Accept') != 'text/event-stream': self.send_error(406); return
+        if payload.get('stream') is not True: self.send_error(400); return
+        if 'stream_options' in payload: self.send_error(400); return
+        if 'timeout' in payload: self.send_error(400); return
+        chunks = [
+            {'id': 'chatcmpl-test', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'gemini-test', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]},
+            {'id': 'chatcmpl-test', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'gemini-test', 'choices': [{'index': 0, 'delta': {'content': 'ANTIGRAVITY_'}, 'finish_reason': None}]},
+            {'id': 'chatcmpl-test', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'gemini-test', 'choices': [{'index': 0, 'delta': {'content': 'WORKS'}, 'finish_reason': None}]},
+            {'id': 'chatcmpl-test', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'gemini-test', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]},
+            {'id': 'chatcmpl-test', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'gemini-test', 'choices': [], 'usage': {'prompt_tokens': 3, 'completion_tokens': 2, 'total_tokens': 5}},
+        ]
+        body = ''.join('data: ' + json.dumps(chunk) + '\\n\\n' for chunk in chunks) + 'data: [DONE]\\n\\n'
+        encoded = body.encode()
+        self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Content-Length', str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
+    def log_message(self, *args): pass
+ns = ThreadingHTTPServer(('127.0.0.1', 0), H)
+print('antigravity-bridge ready ' + json.dumps({'protocol': 'antigravity-openai-v1', 'host': '127.0.0.1', 'port': ns.server_port}), flush=True)
+ns.serve_forever()
+""",
+        encoding="utf-8",
+    )
+    client = AntigravityBridgeClient(bridge_command=[sys.executable, str(child)])
+    try:
+        stream = client.chat.completions.create(
+            model="gemini-test",
+            messages=[{"role": "user", "content": "reply exactly"}],
+            stream=True,
+            stream_options={"include_usage": True},
+            timeout=httpx.Timeout(connect=1, read=2, write=3, pool=4),
+        )
+        chunks = list(stream)
+        assert "".join(
+            chunk.choices[0].delta.content
+            for chunk in chunks
+            if chunk.choices and getattr(chunk.choices[0].delta, "content", None)
+        ) == "ANTIGRAVITY_WORKS"
+        assert [chunk.choices[0].finish_reason for chunk in chunks if chunk.choices
+                and chunk.choices[0].finish_reason] == ["stop"]
+        assert chunks[-1].choices == []
+        assert chunks[-1].usage.total_tokens == 5
+    finally:
+        client.close()
 
 
 def _wait_for_file(path, *, timeout=5):

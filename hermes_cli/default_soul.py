@@ -1,7 +1,8 @@
 """Default SOUL.md template seeded into HERMES_HOME on first run."""
 
 DEFAULT_SOUL_MD = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+    "You are Hermes Agent, an intelligent AI assistant. "
+    "Hermes Agent is created by Nous Research. "
     "You are helpful, knowledgeable, and direct. You assist users with a wide "
     "range of tasks including answering questions, writing and editing code, "
     "analyzing information, creative work, and executing actions via your tools. "
@@ -55,6 +56,21 @@ _LEGACY_TEMPLATE_SOULS = (
     ),
 )
 
+# Exact defaults shipped by earlier Hermes releases. These are application-
+# owned seed values, not user-authored personas, so an unchanged match is safe
+# to advance when the default identity changes. Any deviation remains protected.
+_PREVIOUS_DEFAULT_SOULS = (
+    (
+        "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+        "You are helpful, knowledgeable, and direct. You assist users with a wide "
+        "range of tasks including answering questions, writing and editing code, "
+        "analyzing information, creative work, and executing actions via your tools. "
+        "You communicate clearly, admit uncertainty when appropriate, and prioritize "
+        "being genuinely useful over being verbose unless otherwise directed below. "
+        "Be targeted and efficient in your exploration and investigations."
+    ),
+)
+
 
 def _normalize_soul(text: str) -> str:
     """Normalize SOUL.md content for legacy-template comparison."""
@@ -64,13 +80,13 @@ def _normalize_soul(text: str) -> str:
 
 
 def is_legacy_template_soul(text: str) -> bool:
-    """True if ``text`` is an old empty-template SOUL.md (no user persona).
+    """True if ``text`` is a known replaceable Hermes-owned SOUL.md seed.
 
-    Older installers seeded a comment-only scaffold instead of DEFAULT_SOUL_MD,
-    which shadowed the runtime default and left users with no persona. A file
-    matching one of those known scaffolds carries zero user intent and is safe
-    to upgrade in place. Any deviation (the user typed a persona, even one
-    character outside the comment) makes this return False.
+    Older installers seeded either a comment-only scaffold or an earlier exact
+    default, both of which can shadow the current runtime default. A file that
+    exactly matches one of those application-owned values is safe to upgrade in
+    place. Any deviation makes this return False and preserves user intent.
     """
     normalized = _normalize_soul(text)
-    return any(normalized == _normalize_soul(t) for t in _LEGACY_TEMPLATE_SOULS)
+    replaceable = (*_LEGACY_TEMPLATE_SOULS, *_PREVIOUS_DEFAULT_SOULS)
+    return any(normalized == _normalize_soul(template) for template in replaceable)

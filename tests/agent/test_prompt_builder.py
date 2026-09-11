@@ -60,6 +60,22 @@ def _drain_truncation_warnings():
 
 
 class TestGuidanceConstants:
+    def test_default_identity_separates_agent_identity_from_nous_authorship(self):
+        sentences = [
+            sentence.strip()
+            for sentence in DEFAULT_AGENT_IDENTITY.split(".")
+            if sentence.strip()
+        ]
+
+        assert sentences[0].startswith("You are Hermes Agent")
+        assert "Nous Research" not in sentences[0]
+        assert "Hermes Agent is created by Nous Research" in sentences
+
+    def test_seeded_default_soul_matches_runtime_identity(self):
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
+        assert DEFAULT_SOUL_MD == DEFAULT_AGENT_IDENTITY
+
     def test_computer_use_secret_authorization_remains_task_scoped(self):
         guidance = computer_use_guidance("darwin")
 

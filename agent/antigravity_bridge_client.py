@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -13,10 +14,15 @@ from agent.antigravity_bridge_transport import (
 )
 
 BRIDGE_MARKER_BASE_URL = "sdkbridge://antigravity"
-SUPPORTED_MODEL_FAMILIES = ("gemini", "claude")
+SUPPORTED_MODEL_FAMILIES = ("gemini", "claude", "gpt-oss")
 CURATED_FALLBACK_MODELS = (
-    "antigravity-gemini-3-pro",
+    "antigravity-gemini-3.8-flash",
+    "antigravity-gemini-3.7-flash",
+    "antigravity-gemini-3.6-flash",
+    "antigravity-gemini-3.1-pro",
     "antigravity-claude-sonnet-4-6",
+    "antigravity-claude-opus-4-6-thinking",
+    "antigravity-gpt-oss-120b",
 )
 
 
@@ -31,6 +37,14 @@ _REQUIRED_AUTH_QUERY_KEYS = frozenset({
     "code_challenge_method", "state", "access_type", "prompt",
 })
 _MAX_AUTH_QUERY_FIELDS = len(_REQUIRED_AUTH_QUERY_KEYS)
+_MAX_PUBLIC_MODEL_ID_LENGTH = 96
+_PUBLIC_ANTIGRAVITY_MODEL_ID = re.compile(
+    r"^(?:"
+    r"(?:antigravity-)?gemini-[1-9](?:\.\d)?-(?:pro|flash|ultra|nano|lite)(?:-(?:preview(?:-customtools)?|thinking|experimental|exp|latest))?"
+    r"|(?:antigravity-)?claude-(?:(?:opus|sonnet|haiku)-[1-9](?:-[1-9])?(?:-(?:latest|thinking|beta|preview))?|[1-9](?:-[1-9])?-(?:opus|sonnet|haiku)(?:-\d{8})?(?:-(?:latest|thinking|beta|preview))?)"
+    r"|antigravity-gpt-oss-120b"
+    r")$"
+)
 
 
 def _invalid_request() -> AntigravityBridgeError:
@@ -180,10 +194,12 @@ def filter_antigravity_models(items: list[dict[str, Any]] | None) -> list[str] |
         return None
     result: set[str] = set()
     for item in items:
-        model_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
-        if model_id and model_id.lower().startswith((
-            "gemini-", "claude-", "antigravity-gemini-", "antigravity-claude-",
-        )):
+        model_id = item.get("id") if isinstance(item, dict) else None
+        if (
+            type(model_id) is str
+            and len(model_id) <= _MAX_PUBLIC_MODEL_ID_LENGTH
+            and _PUBLIC_ANTIGRAVITY_MODEL_ID.fullmatch(model_id.lower())
+        ):
             result.add(model_id)
     return sorted(result, key=lambda value: (value.lower(), value))
 
@@ -196,15 +212,47 @@ def _namespace(value: Any) -> Any:
     return value
 
 
+def _request_timeout_seconds(value: Any, default: float = 60.0) -> float:
+    candidate = getattr(value, "read", value)
+    if type(candidate) in (int, float) and candidate > 0:
+        return float(candidate)
+    return default
+
+
+class _NamespacedStream:
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self.response = getattr(stream, "response", None)
+
+    def __iter__(self) -> "_NamespacedStream":
+        return self
+
+    def __next__(self) -> Any:
+        return _namespace(next(self._stream))
+
+    def close(self) -> None:
+        self._stream.close()
+
+
 class _Completions:
     def __init__(self, client: "AntigravityBridgeClient"):
         self.client = client
 
     def create(self, **kwargs: Any) -> Any:
-        if kwargs.get("stream"):
-            raise AntigravityBridgeError("Antigravity streaming is not available in Phase A")
         payload = dict(kwargs)
-        response = self.client._get_transport().json_request("POST", "/v1/chat/completions", payload)
+        request_timeout = _request_timeout_seconds(payload.pop("timeout", None))
+        transport = self.client._get_transport()
+        if payload.get("stream") is True:
+            # Hermes asks OpenAI-wire providers for usage chunks, but the managed
+            # bridge's strict public request schema does not expose that optional
+            # SDK extension. Usage remains optional to the shared stream consumer.
+            payload.pop("stream_options", None)
+            return _NamespacedStream(transport.stream_request(
+                "POST", "/v1/chat/completions", payload, timeout=request_timeout
+            ))
+        response = transport.json_request(
+            "POST", "/v1/chat/completions", payload, timeout=request_timeout,
+        )
         return _namespace(response)
 
 

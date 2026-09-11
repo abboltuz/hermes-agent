@@ -171,17 +171,24 @@ def test_safe_antigravity_picker_ids_allow_preview_customtools_only_for_gemini()
     valid_gemini = "antigravity-gemini-3.1-pro-preview"
     valid_customtools = "antigravity-gemini-3.1-pro-preview-customtools"
     valid_claude = "antigravity-claude-sonnet-4-6"
+    valid_gpt_oss = "antigravity-gpt-oss-120b"
     rejected = [
         "antigravity-gemini-3.1-pro-preview-customtool",
         "antigravity-gemini-3.1-pro-preview-customtools-extra",
         "antigravity-gemini-3.1-pro-preview-customtools://host",
         "antigravity-claude-sonnet-4-6-customtools",
+        "gpt-oss-120b",
+        "antigravity-gpt-oss-120b-medium",
+        "antigravity-gpt-oss-120b-extra",
+        "antigravity-gpt-oss-120b://host",
+        "antigravity-gpt-oss-120b\x00",
+        valid_gpt_oss + "x" * 97,
         valid_customtools + "x" * 97,
     ]
 
     assert _safe_antigravity_model_ids(
-        [valid_gemini, valid_customtools, valid_claude, *rejected]
-    ) == [valid_gemini, valid_customtools, valid_claude]
+        [valid_gemini, valid_customtools, valid_claude, valid_gpt_oss, *rejected]
+    ) == [valid_gemini, valid_customtools, valid_claude, valid_gpt_oss]
 
 
 def test_primary_runtime_resolves_connected_antigravity_managed_account(monkeypatch):

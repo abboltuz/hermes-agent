@@ -61,6 +61,25 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
 
+    def test_upgrades_previous_seeded_default_soul_md(self, tmp_path):
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
+        previous_default = (
+            "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+            "You are helpful, knowledgeable, and direct. You assist users with a wide "
+            "range of tasks including answering questions, writing and editing code, "
+            "analyzing information, creative work, and executing actions via your tools. "
+            "You communicate clearly, admit uncertainty when appropriate, and prioritize "
+            "being genuinely useful over being verbose unless otherwise directed below. "
+            "Be targeted and efficient in your exploration and investigations."
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            soul_path = tmp_path / "SOUL.md"
+            soul_path.write_text(previous_default, encoding="utf-8")
+            ensure_hermes_home()
+            assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
+
 
 
 
