@@ -13,14 +13,18 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
+    name: Run tests (${{ matrix.slice }})
+    # Upstream has a dedicated 96-core runner and executes the whole suite in
+    # one pass. A second upstream slice would only duplicate setup after the
+    # slowest-file floor has already been reached.
     #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
+    # Forks use ordinary 4-core GitHub-hosted runners. Preserve full coverage
+    # there by spreading the existing per-file isolation runner over eight
+    # deterministic slices instead of oversubscribing one small machine.
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(github.repository == 'NousResearch/hermes-agent' && '["full"]' || '["1/8","2/8","3/8","4/8","5/8","6/8","7/8","8/8"]') }}
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
@@ -119,7 +123,11 @@ jobs:
           # across a 6x range. The suite has sufficient concurrency at this
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '96' || '4' }}
+          # An empty value means the complete suite. The canonical runner
+          # already implements deterministic I/N slicing, so forks need no
+          # separate test-list generator or duplicated execution logic.
+          HERMES_TEST_SLICE: ${{ matrix.slice == 'full' && '' || matrix.slice }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
