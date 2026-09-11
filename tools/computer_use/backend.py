@@ -12,6 +12,22 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 
+class ComputerUseCapabilityError(RuntimeError):
+    """A requested optional backend capability is unavailable.
+
+    Optional hooks use a structured code so the model gets a fail-closed,
+    actionable response instead of a generic backend exception.  Keeping the
+    hooks non-abstract preserves compatibility with external backends that
+    predate the capability.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.operation: Optional[str] = None
+        self.next_step: Optional[str] = None
+
+
 @dataclass
 class UIElement:
     """One interactable element on the current screen."""
@@ -44,9 +60,8 @@ class CaptureResult:
     At least one of png_b64 / elements is populated depending on capture mode:
       * mode="vision" → png_b64 only
       * mode="ax"     → elements only
-      * mode="som"    → both (default): PNG already has numbered overlays
-                         drawn by the backend, and `elements` holds the
-                         matching index → element mapping.
+      * mode="som"    → both (default): a plain PNG plus a separately
+                         numbered `elements` list. The PNG is not annotated.
     """
 
     mode: str
@@ -77,6 +92,10 @@ class CaptureResult:
     # candidate metadata without arming a sticky mutation target.
     error: Optional[str] = None
     available_windows: List[Dict[str, Any]] = field(default_factory=list)
+    # Full count reported by cua-driver before any source-side max_elements
+    # truncation. Kept last to preserve the positional constructor ABI.
+    # None means the older driver did not publish a count.
+    total_elements: Optional[int] = None
 
 
 @dataclass
@@ -149,6 +168,7 @@ class ComputerUseBackend(ABC):
         app: Optional[str] = None,
         pid: Optional[int] = None,
         window_id: Optional[int] = None,
+        max_elements: Optional[int] = None,
     ) -> CaptureResult: ...
 
     # ── Pointer actions ─────────────────────────────────────────────
@@ -197,11 +217,14 @@ class ComputerUseBackend(ABC):
     # ── Keyboard ────────────────────────────────────────────────────
     @abstractmethod
     def type_text(self, text: str, *, element: Optional[int] = None,
+                  x: Optional[int] = None, y: Optional[int] = None,
                   delivery_mode: Optional[str] = None,
                   bring_to_front: bool = False) -> ActionResult: ...
 
     @abstractmethod
-    def key(self, keys: str, *, delivery_mode: Optional[str] = None,
+    def key(self, keys: str, *, element: Optional[int] = None,
+            x: Optional[int] = None, y: Optional[int] = None,
+            delivery_mode: Optional[str] = None,
             bring_to_front: bool = False) -> ActionResult:
         """Send a key combo, e.g. 'cmd+s', 'ctrl+alt+t', 'return'."""
 
@@ -217,6 +240,77 @@ class ComputerUseBackend(ABC):
         remain instantiable and simply report no windows.
         """
         return []
+
+    def list_windows_exact(
+        self,
+        *,
+        pid: Optional[int] = None,
+        on_screen_only: bool = True,
+    ) -> Dict[str, Any]:
+        """Return an exact window inventory when the backend supports it.
+
+        The compatibility fallback is intentionally limited to the historical
+        visible-window behavior.  It is labelled as non-exact and refuses an
+        off-screen request rather than pretending a legacy backend can see
+        windows on other Spaces/desktops.
+        """
+        if not on_screen_only:
+            raise ComputerUseCapabilityError(
+                "exact_window_listing_unsupported",
+                "This computer-use backend cannot enumerate off-screen windows.",
+            )
+        windows = self.list_windows()
+        if pid is not None:
+            windows = [window for window in windows if window.get("pid") == pid]
+        return {
+            "windows": windows,
+            "count": len(windows),
+            "on_screen_only": True,
+            "exact_metadata": False,
+            "compatibility_fallback": True,
+        }
+
+    def verify_state(
+        self,
+        *,
+        pid: int,
+        window_id: int,
+        expect: List[Dict[str, Any]],
+        timeout_ms: Optional[int] = None,
+        stable_samples: Optional[int] = None,
+        include_screenshot: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate bounded predicates against one exact native window."""
+        raise ComputerUseCapabilityError(
+            "verify_state_unsupported",
+            "This computer-use backend does not support deterministic state verification.",
+        )
+
+    def launch_app(
+        self,
+        *,
+        bundle_id: Optional[str] = None,
+        name: Optional[str] = None,
+        creates_new_application_instance: bool = False,
+    ) -> Dict[str, Any]:
+        """Launch an app without selecting or foregrounding its windows."""
+        raise ComputerUseCapabilityError(
+            "launch_app_unsupported",
+            "This computer-use backend does not support application launch.",
+        )
+
+    def set_window_frame(
+        self,
+        *,
+        pid: int,
+        window_id: int,
+        frame: Dict[str, Any],
+    ) -> ActionResult:
+        """Set exact desktop window geometry without changing focus."""
+        raise ComputerUseCapabilityError(
+            "set_window_frame_unsupported",
+            "This computer-use backend does not support window geometry changes.",
+        )
 
     @abstractmethod
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:

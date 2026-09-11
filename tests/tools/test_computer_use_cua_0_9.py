@@ -201,7 +201,7 @@ def test_invalid_delivery_mode_is_rejected_before_driver_call():
 @pytest.mark.parametrize(
     ("result_kwargs", "decision"),
     [
-        ({"ok": True, "effect": "confirmed", "verified": True}, "done"),
+        ({"ok": True, "effect": "confirmed", "verified": True}, "verify_postcondition"),
         (
             {
                 "ok": True,

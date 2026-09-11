@@ -47,7 +47,7 @@ class TestSchema:
         assert actions >= {
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "wait", "list_apps", "list_windows",
-            "focus_app",
+            "verify_state", "launch_app", "set_window_frame", "focus_app",
         }
 
     def test_schema_exposes_only_desktop_actions(self):
@@ -57,7 +57,8 @@ class TestSchema:
         assert actions == {
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "set_value", "wait",
-            "list_apps", "list_windows", "focus_app",
+            "list_apps", "list_windows", "verify_state", "launch_app",
+            "set_window_frame", "focus_app",
         }
         properties = COMPUTER_USE_SCHEMA["parameters"]["properties"]
         assert "browser_type_mode" not in properties
@@ -140,6 +141,45 @@ class TestDispatch:
         type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
         assert type_kw["text"] == "hello"
 
+    @pytest.mark.parametrize("action", ["type", "key"])
+    def test_untargeted_keyboard_dispatch_preserves_legacy_backend_signature(
+        self, action,
+    ):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import _dispatch
+
+        class LegacyBackend:
+            def type_text(
+                self, text, *, element=None, delivery_mode=None,
+                bring_to_front=False,
+            ):
+                return ActionResult(ok=True, action="type")
+
+            def key(
+                self, keys, *, delivery_mode=None, bring_to_front=False,
+            ):
+                return ActionResult(ok=True, action="key")
+
+        args = {"text": "hello"} if action == "type" else {"keys": "return"}
+
+        parsed = json.loads(_dispatch(LegacyBackend(), action, args))
+
+        assert parsed["ok"] is True
+
+    def test_capture_result_positional_constructor_abi_is_preserved(self):
+        from tools.computer_use.backend import CaptureResult
+
+        cap = CaptureResult(
+            "som", 800, 600, None, [], "Finder", "Downloads", 0,
+            "image/png", "note", 10, 20, None, [{"window_id": 20}],
+        )
+
+        assert cap.app == "Finder"
+        assert cap.window_title == "Downloads"
+        assert cap.pid == 10 and cap.window_id == 20
+        assert cap.available_windows == [{"window_id": 20}]
+        assert cap.total_elements is None
+
     def test_drag_action_routes_to_backend_by_element(self, noop_backend):
         """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""
         from tools.computer_use.tool import handle_computer_use
@@ -193,6 +233,35 @@ class TestDispatch:
         # No follow-up capture should have been issued.
         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
         assert len(capture_calls) == 0, "capture must not be called after a failed action"
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "timeout_outcome_unknown",
+            "transport_outcome_unknown",
+            "stale_target_after_transport_reset",
+        ],
+    )
+    def test_uncertain_transport_public_response_requires_fresh_state(
+        self, noop_backend, code,
+    ):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch.object(
+            noop_backend,
+            "click",
+            return_value=ActionResult(
+                ok=False, action="click", code=code,
+                message="outcome unknown; take fresh state",
+            ),
+        ):
+            parsed = json.loads(handle_computer_use({
+                "action": "click", "coordinate": [5, 6],
+            }))
+
+        assert parsed["code"] == code
+        assert parsed["verdict"] == {"decision": "verify_fresh_state"}
 
     @pytest.mark.parametrize(
         ("args", "unexpected"),
@@ -314,7 +383,7 @@ class TestCaptureResponse:
             def start(self): pass
             def stop(self): pass
             def is_available(self): return True
-            def capture(self, mode="som", app=None):
+            def capture(self, mode="som", app=None, max_elements=None):
                 return CaptureResult(
                     mode=mode, width=1024, height=768,
                     png_b64=fake_png, elements=[],
@@ -394,7 +463,7 @@ class TestCaptureResponse:
             def start(self): pass
             def stop(self): pass
             def is_available(self): return True
-            def capture(self, mode="som", app=None):
+            def capture(self, mode="som", app=None, max_elements=None):
                 return CaptureResult(
                     mode=mode, width=800, height=600,
                     png_b64="",
@@ -449,6 +518,52 @@ class TestCaptureResponse:
         assert len(parsed["elements"]) == cu_tool._MAX_ALLOWED_MAX_ELEMENTS
         assert parsed["total_elements"] == 5000
         assert parsed["truncated_elements"] == 5000 - cu_tool._MAX_ALLOWED_MAX_ELEMENTS
+
+    def test_source_truncated_capture_reports_full_count_without_fake_spill(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use.tool import _capture_response
+
+        cap = CaptureResult(
+            mode="ax", width=0, height=0,
+            elements=[
+                UIElement(index=i + 1, role="AXButton", label=f"el-{i}")
+                for i in range(100)
+            ],
+            total_elements=2000,
+        )
+
+        parsed = json.loads(_capture_response(cap, max_elements=100))
+
+        assert parsed["total_elements"] == 2000
+        assert parsed["truncated_elements"] == 1900
+        assert len(parsed["elements"]) == 100
+        assert "driver returned 100 of 2000 elements at source" in parsed["summary"]
+        assert "raise max_elements and recapture" in parsed["summary"]
+        assert "elements_file" not in parsed
+
+    def test_source_truncated_multimodal_meta_is_truthful(
+        self, monkeypatch,
+    ):
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use import tool as cu_tool
+
+        cap = CaptureResult(
+            mode="som", width=800, height=600, png_b64="iVBORw0KGgo=",
+            elements=[UIElement(index=i + 1, role="AXButton") for i in range(100)],
+            total_elements=2000,
+        )
+        monkeypatch.setattr(cu_tool, "_image_dimensions_from_b64", lambda _: (800, 600))
+        monkeypatch.setattr(cu_tool, "_should_route_through_aux_vision", lambda: False)
+        monkeypatch.setattr(cu_tool, "_persist_capture_image", lambda cap: None)
+
+        result = cu_tool._capture_response(cap, max_elements=100)
+
+        assert result["meta"]["total_elements"] == 2000
+        assert result["meta"]["truncated_elements"] == 1900
+        assert "elements_file" not in result["meta"]
 
 class TestCuaCaptureImageDimensions:
     def test_png_dimensions_are_sniffed_from_image_bytes(self):
@@ -1307,7 +1422,10 @@ class TestCuaDriverSessionReconnect:
         assert bridge.calls[1][0] == ("call", "list_apps", {})
         assert len(bridge.calls) == 2
 
-    def test_mutation_is_not_replayed_after_closed_transport(self):
+    @pytest.mark.parametrize(
+        "tool_name", ["click", "launch_app", "set_window_frame"],
+    )
+    def test_mutation_is_not_replayed_after_closed_transport(self, tool_name):
         """A lost response cannot prove whether a click already happened."""
         from anyio import ClosedResourceError
 
@@ -1322,7 +1440,7 @@ class TestCuaDriverSessionReconnect:
         bridge = FakeBridge()
         session = self._make_session(bridge)
 
-        result = session.call_tool("click", {"x": 20, "y": 30})
+        result = session.call_tool(tool_name, {"x": 20, "y": 30})
 
         assert result["isError"] is True
         assert result["structuredContent"]["code"] == "transport_outcome_unknown"
@@ -1330,7 +1448,10 @@ class TestCuaDriverSessionReconnect:
         assert session._reconnect_log == ["stop", "start"]
         assert len(bridge.calls) == 1
 
-    def test_timeout_marks_session_suspect_without_replaying(self):
+    @pytest.mark.parametrize(
+        "tool_name", ["click", "launch_app", "set_window_frame"],
+    )
+    def test_timeout_marks_session_suspect_without_replaying(self, tool_name):
         """An MCP timeout fails closed: outcome unknown, no silent replay (#74799)."""
         import concurrent.futures
 
@@ -1345,7 +1466,7 @@ class TestCuaDriverSessionReconnect:
         bridge = FakeBridge()
         session = self._make_session(bridge)
 
-        result = session.call_tool("click", {"x": 20, "y": 30})
+        result = session.call_tool(tool_name, {"x": 20, "y": 30})
 
         # Uncertainty surfaced in the error shape: the action MAY have taken
         # effect on the remote screen before the deadline hit.
@@ -1394,6 +1515,91 @@ class TestCuaDriverSessionReconnect:
         assert session._timeout_suspect is False
         session.call_tool("list_windows", {})
         assert session._reconnect_log == ["stop", "start"]
+
+    def test_timeout_rotates_transport_scoped_label_before_next_capture(self):
+        """A public label from a dead private transport cannot be revived."""
+        import concurrent.futures
+
+        class TransportScopedBridge:
+            def __init__(self):
+                self.transport = 1
+                self.calls = []
+                self.labels = {"hermes-public": 1}
+                self.timeout_mutation = True
+
+            def run(self, value, timeout=None):
+                _marker, name, args = value
+                self.calls.append((self.transport, name, dict(args)))
+                if name == "type_text" and self.timeout_mutation:
+                    self.timeout_mutation = False
+                    raise concurrent.futures.TimeoutError()
+                label = args.get("session")
+                if name == "start_session":
+                    if label in self.labels and self.labels[label] != self.transport:
+                        return {
+                            "isError": True,
+                            "structuredContent": {"code": "session_unavailable"},
+                        }
+                    self.labels[label] = self.transport
+                    return {"isError": False}
+                if label and self.labels.get(label) != self.transport:
+                    return {
+                        "isError": True,
+                        "structuredContent": {"code": "session_unavailable"},
+                    }
+                if name == "get_window_state":
+                    return {
+                        "isError": False,
+                        "data": "",
+                        "images": [],
+                        "structuredContent": {
+                            "elements": [{
+                                "element_index": 1,
+                                "role": "button",
+                                "label": "Recovered",
+                            }],
+                        },
+                    }
+                return {"isError": False, "structuredContent": {}}
+
+        bridge = TransportScopedBridge()
+        session = self._make_session(bridge)
+        session._declared_session_id = "hermes-public"
+
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend()
+        backend._session = session
+        backend._session_id = "hermes-public"
+        backend._active_pid = 10
+        backend._active_window_id = 20
+        session.set_transport_reset_callback(backend._handle_transport_reset)
+
+        def start_lifecycle():
+            session._reconnect_log.append("start")
+            bridge.transport += 1
+            session._transport_generation += 1
+            session._notify_transport_reset()
+
+        session._start_lifecycle_locked = start_lifecycle
+
+        first = backend.type_text("hello")
+        second = backend.capture(mode="ax", pid=10, window_id=20)
+
+        assert first.code == "timeout_outcome_unknown"
+        assert second.total_elements is None
+        assert len(second.elements) == 1
+        assert second.pid == 10 and second.window_id == 20
+        assert backend._active_pid == 10 and backend._active_window_id == 20
+        assert backend._session_id != "hermes-public"
+        assert [name for _, name, _ in bridge.calls].count("type_text") == 1
+        replacement_label = backend._session_id
+        assert bridge.calls[-2:] == [
+            (2, "start_session", {"session": replacement_label}),
+            (2, "get_window_state", {
+                "session": replacement_label, "pid": 10, "window_id": 20,
+            }),
+        ]
 
     def test_healthy_session_is_never_restarted(self):
         """Negative probe: a clean call must not touch the session lifecycle."""
@@ -2855,6 +3061,68 @@ class TestSelectiveControlContract:
         assert capture.pid == 10
         assert capture.window_id == 20
 
+    @pytest.mark.parametrize(
+        ("mode", "include_screenshot"),
+        [("ax", False), ("som", True)],
+    )
+    def test_capture_bounds_window_state_at_source(
+        self, mode, include_screenshot,
+    ):
+        backend = self._backend()
+        backend._session.supports_input_property = (
+            lambda tool, prop: tool == "get_window_state"
+            and prop in {"max_elements", "include_screenshot"}
+        )
+        backend._session.call_tool.return_value = {
+            "data": "", "images": [], "image_mime_types": [],
+            "structuredContent": {"elements": []}, "isError": False,
+        }
+
+        backend.capture(
+            mode=mode, pid=10, window_id=20, max_elements=37,
+        )
+
+        name, sent = backend._session.call_tool.call_args.args
+        assert name == "get_window_state"
+        assert sent["max_elements"] == 37
+        assert sent["include_screenshot"] is include_screenshot
+
+    @pytest.mark.parametrize("count_field", ["element_count", "total_elements"])
+    def test_capture_preserves_driver_full_element_count(self, count_field):
+        backend = self._backend()
+        backend._session.call_tool.return_value = {
+            "data": "", "images": [], "image_mime_types": [],
+            "structuredContent": {
+                count_field: 2000,
+                "elements": [
+                    {"element_index": i + 1, "role": "button", "label": str(i)}
+                    for i in range(100)
+                ],
+            },
+            "isError": False,
+        }
+
+        capture = backend.capture(
+            mode="ax", pid=10, window_id=20, max_elements=100,
+        )
+
+        assert len(capture.elements) == 100
+        assert capture.total_elements == 2000
+
+    def test_capture_omits_new_window_state_fields_for_old_driver(self):
+        backend = self._backend()
+        backend._session.supports_input_property = lambda tool, prop: False
+        backend._session.call_tool.return_value = {
+            "data": "", "images": [], "image_mime_types": [],
+            "structuredContent": {"elements": []}, "isError": False,
+        }
+
+        backend.capture(mode="ax", pid=10, window_id=20, max_elements=37)
+
+        _, sent = backend._session.call_tool.call_args.args
+        assert "max_elements" not in sent
+        assert "include_screenshot" not in sent
+
     def test_element_targeted_type_reaches_cua_schema(self):
         backend = self._backend()
         backend._snapshot_tokens = {3: "snapshot:3"}
@@ -2867,7 +3135,7 @@ class TestSelectiveControlContract:
         assert args["element_index"] == 3
         assert args["element_token"] == "snapshot:3"
 
-    def test_dispatch_rejects_unimplemented_keyboard_targets(self):
+    def test_dispatch_refuses_coordinate_type_on_old_driver(self):
         import json
 
         from tools.computer_use.tool import _dispatch
@@ -2876,13 +3144,70 @@ class TestSelectiveControlContract:
         typed = json.loads(_dispatch(
             backend, "type", {"text": "hello", "coordinate": [10, 20]},
         ))
-        keyed = json.loads(_dispatch(
-            backend, "key", {"keys": "return", "element": 3},
-        ))
-
-        assert typed["code"] == "targeted_type_coordinate_unsupported"
-        assert keyed["code"] == "targeted_key_unsupported"
+        assert typed["code"] == "coordinate_type_unsupported"
         backend._session.call_tool.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("keys", "driver_action"),
+        [("return", "press_key"), ("cmd+s", "hotkey")],
+    )
+    def test_element_targeted_key_reaches_capable_live_schema(
+        self, keys, driver_action,
+    ):
+        backend = self._backend()
+        backend._snapshot_tokens = {3: "snapshot:3"}
+
+        result = backend.key(keys, element=3)
+
+        assert result.ok is True
+        name, sent = backend._session.call_tool.call_args.args
+        assert name == driver_action
+        assert sent["element_index"] == 3
+        assert sent["element_token"] == "snapshot:3"
+
+    def test_element_targeted_key_fails_closed_on_old_driver(self):
+        backend = self._backend()
+        backend._session.supports_input_property = lambda tool, prop: False
+
+        result = backend.key("return", element=3)
+
+        assert result.code == "element_key_unsupported"
+        backend._session.call_tool.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("action", "keys", "driver_action"),
+        [("type", None, "type_text"), ("key", "return", "press_key"),
+         ("key", "cmd+s", "hotkey")],
+    )
+    def test_coordinate_keyboard_targets_reach_capable_live_schema(
+        self, action, keys, driver_action,
+    ):
+        from tools.computer_use.tool import _dispatch
+
+        backend = self._backend()
+        backend._session.supports_input_property = (
+            lambda tool, prop: tool == driver_action and prop in {"x", "y"}
+        )
+        call = {"coordinate": [17, 29]}
+        if action == "type":
+            call["text"] = "hello"
+        else:
+            call["keys"] = keys
+
+        _dispatch(backend, action, call)
+
+        name, sent = backend._session.call_tool.call_args.args
+        assert name == driver_action
+        assert sent["x"] == 17
+        assert sent["y"] == 29
+
+    @pytest.mark.parametrize("action", ["type", "key"])
+    def test_coordinate_and_element_keyboard_targets_conflict(self, action):
+        from tools.computer_use.tool import _conflicting_action_arguments
+
+        assert _conflicting_action_arguments(
+            action, {"element": 3, "coordinate": [17, 29]},
+        ) == ["element", "coordinate"]
 
     def test_double_click_omits_button_from_strict_schema(self):
         backend = self._backend()
@@ -2980,7 +3305,7 @@ class TestSelectiveControlContract:
             "session": backend._session_id,
         }) in calls
 
-    def test_error_envelope_outranks_contradictory_confirmed_effect(self):
+    def test_unknown_transport_outranks_contradictory_confirmed_effect(self):
         from tools.computer_use.backend import ActionResult
         from tools.computer_use.tool import _action_payload
 
@@ -2991,7 +3316,7 @@ class TestSelectiveControlContract:
             code="transport_outcome_unknown",
         ))
 
-        assert payload["verdict"]["decision"] == "escalate"
+        assert payload["verdict"]["decision"] == "verify_fresh_state"
 
     def test_current_route_delivery_and_evidence_are_public(self):
         from tools.computer_use.cua_backend import _action_result_from
@@ -3049,6 +3374,10 @@ class TestSelectiveControlContract:
 
         assert result.ok is False
         assert result.code == "stale_target_after_transport_reset"
+        assert backend._session_id.startswith("hermes-")
+        session.replace_declared_session_id.assert_called_once_with(
+            backend._session_id
+        )
         session.call_tool.assert_not_called()
 
     def test_capture_response_exposes_exact_target_and_ambiguity_candidates(self):
@@ -3403,6 +3732,35 @@ class TestCapturePayloadBudget:
         assert payload["total_elements"] == 50
         assert payload["truncated_elements"] == 45
 
+    def test_aux_vision_preserves_source_truncated_count_without_fake_spill(self):
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use import tool as cu_tool
+
+        elements = [
+            UIElement(index=i + 1, role="Button", label=f"btn{i}")
+            for i in range(100)
+        ]
+        cap = CaptureResult(
+            mode="som", width=1024, height=768,
+            png_b64="iVBORw0KGgo=", elements=elements,
+            total_elements=2000,
+        )
+        with patch(
+            "model_tools._run_async",
+            return_value=json.dumps({"analysis": "a screen"}),
+        ):
+            out = cu_tool._route_capture_through_aux_vision(
+                cap,
+                "driver returned 100 of 2000 elements at source",
+                visible_elements=elements,
+                truncated_elements=1900,
+            )
+
+        payload = json.loads(out)
+        assert payload["total_elements"] == 2000
+        assert payload["truncated_elements"] == 1900
+        assert "elements_file" not in payload
+
 
 class TestBoundsSpaceNote:
     def test_note_present_when_bounds_exceed_image(self):
@@ -3415,7 +3773,8 @@ class TestBoundsSpaceNote:
                            bounds=(3771, 0, 69, 60), app="")]
         note = _bounds_space_note(elems, 1455, 791)
         assert note is not None
-        assert "native desktop coordinates" in note
+        assert "native desktop coordinate space" in note
+        assert "uses the captured image pixels unchanged" in note
 
     def test_no_note_when_spaces_match(self):
         from tools.computer_use.backend import UIElement
@@ -3602,8 +3961,8 @@ class TestCaptureScreenshotPersistence:
         assert len(captures) == 2
 
 
-class TestBoundsScaleField:
-    def test_scale_reported_when_spaces_diverge(self, tmp_path, monkeypatch):
+class TestCoordinateFrameContract:
+    def test_no_scale_field_is_reported_when_spaces_diverge(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.computer_use.backend import CaptureResult, UIElement
         from tools.computer_use.tool import _capture_response
@@ -3615,15 +3974,5 @@ class TestBoundsScaleField:
                             elements=elems, app="chrome.exe",
                             window_title="", png_bytes_len=0)
         out = json.loads(_capture_response(cap))
-        assert out["bounds_scale"] == pytest.approx(3799 / 1455, abs=0.01)
-        assert f"~{out['bounds_scale']}x" in out["summary"]
-
-    def test_no_scale_when_spaces_match(self):
-        from tools.computer_use.backend import UIElement
-        from tools.computer_use.tool import _bounds_scale
-
-        elems = [UIElement(index=0, role="Button", label="OK",
-                           bounds=(10, 10, 50, 20), app="")]
-        assert _bounds_scale(elems, 1455, 791) is None
-        assert _bounds_scale([], 1455, 791) is None
-        assert _bounds_scale(elems, 0, 0) is None
+        assert "bounds_scale" not in out
+        assert "captured image pixels unchanged" in out["summary"]

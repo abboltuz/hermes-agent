@@ -59,6 +59,7 @@ from tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
     ComputerUseBackend,
+    ComputerUseCapabilityError,
     UIElement,
 )
 logger = logging.getLogger(__name__)
@@ -1964,6 +1965,10 @@ class _CuaDriverSession:
         """Register a synchronous cache invalidation hook for transport swaps."""
         self._transport_reset_callback = callback
 
+    def replace_declared_session_id(self, session_id: str) -> None:
+        """Replace the wrapper-owned public label after a transport reset."""
+        self._declared_session_id = session_id
+
     def _notify_transport_reset(self) -> None:
         callback = getattr(self, "_transport_reset_callback", None)
         if callback is None:
@@ -2143,6 +2148,7 @@ class _CuaDriverSession:
             "replacing the transport and retrying the read-only call once",
             name,
         )
+        stale_session = args.get("session")
         try:
             with self._lock:
                 self._restart_session_locked()
@@ -2153,8 +2159,15 @@ class _CuaDriverSession:
                     restore_result,
                     "the public session label could not be restored",
                 )
+            retry_args = dict(args)
+            if (
+                stale_session
+                and stale_session != self._declared_session_id
+                and retry_args.get("session") == stale_session
+            ):
+                retry_args["session"] = self._declared_session_id
             retry_result = self._bridge.run(
-                self._call_tool_async(name, args),
+                self._call_tool_async(name, retry_args),
                 timeout=timeout,
             )
         except Exception as exc:
@@ -2407,6 +2420,7 @@ class _CuaDriverSession:
         "get_window_state",
         "list_apps",
         "list_windows",
+        "verify_state",
     })
 
     # Set when an MCP call timed out (#74799): a timed-out session is
@@ -2505,7 +2519,14 @@ class _CuaDriverSession:
         self._require_started()
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+        stale_declared_session = getattr(self, "_declared_session_id", None)
         self.prepare_for_call(name, timeout)
+        if (
+            stale_declared_session
+            and stale_declared_session != self._declared_session_id
+            and args.get("session") == stale_declared_session
+        ):
+            args = {**args, "session": self._declared_session_id}
         args = self.prepare_tool_args(name, args)
 
         try:
@@ -2538,11 +2559,18 @@ class _CuaDriverSession:
             if not self._is_closed_session_error(e):
                 raise
             logger.warning("cua-driver MCP session closed during %s; reconnecting once", name)
+            stale_session = args.get("session")
             with self._lock:
                 self._restart_session_locked()
             self._restore_declared_session_after_transport_reset(timeout)
             if not self._transport_replay_is_safe(name):
                 return self._unknown_transport_outcome(name, e)
+            if (
+                stale_session
+                and stale_session != self._declared_session_id
+                and args.get("session") == stale_session
+            ):
+                args = {**args, "session": self._declared_session_id}
             result = self._bridge.run(
                 self._call_tool_async(name, args),
                 timeout=timeout,
@@ -2853,6 +2881,8 @@ class CuaDriverBackend(ComputerUseBackend):
     def _handle_transport_reset(self) -> None:
         """Invalidate every capability minted by the replaced transport."""
         self._clear_active_target()
+        self._session_id = f"hermes-{uuid.uuid4().hex[:12]}"
+        self._session.replace_declared_session_id(self._session_id)
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
@@ -3234,12 +3264,38 @@ class CuaDriverBackend(ComputerUseBackend):
         )
 
     # ── Capture ────────────────────────────────────────────────────
+    def _window_state_args(
+        self,
+        *,
+        max_elements: Optional[int],
+        include_screenshot: bool,
+    ) -> Dict[str, Any]:
+        """Build a get_window_state call from its live advertised schema."""
+        args: Dict[str, Any] = {
+            "pid": self._active_pid,
+            "window_id": self._active_window_id,
+            "session": self._session_id,
+        }
+        if (
+            max_elements is not None
+            and self._session.supports_input_property(
+                "get_window_state", "max_elements"
+            )
+        ):
+            args["max_elements"] = max_elements
+        if self._session.supports_input_property(
+            "get_window_state", "include_screenshot"
+        ):
+            args["include_screenshot"] = include_screenshot
+        return args
+
     def capture(
         self,
         mode: str = "som",
         app: Optional[str] = None,
         pid: Optional[int] = None,
         window_id: Optional[int] = None,
+        max_elements: Optional[int] = 100,
     ) -> CaptureResult:
         """Capture the frontmost on-screen window or an exact known target.
 
@@ -3431,6 +3487,7 @@ class CuaDriverBackend(ComputerUseBackend):
         png_b64: Optional[str] = None
         image_mime_type: Optional[str] = None
         elements: List[UIElement] = []
+        total_elements: Optional[int] = None
         width = height = 0
         window_title = ""
 
@@ -3474,11 +3531,10 @@ class CuaDriverBackend(ComputerUseBackend):
             if sc_out is None:
                 gws_out = self._call_capture_tool(
                     "get_window_state",
-                    {
-                        "pid": self._active_pid,
-                        "window_id": self._active_window_id,
-                        "session": self._session_id,
-                    },
+                    self._window_state_args(
+                        max_elements=max_elements,
+                        include_screenshot=True,
+                    ),
                 )
                 png_b64, image_mime_type = _image_from_tool_result(gws_out)
                 # Still grab the window title — it's cheap and useful in the
@@ -3502,11 +3558,10 @@ class CuaDriverBackend(ComputerUseBackend):
                 try:
                     cli_out = self._session._call_tool_via_cli(
                         "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
+                        self._window_state_args(
+                            max_elements=max_elements,
+                            include_screenshot=True,
+                        ),
                         30.0,
                     )
                     if cli_out.get("isError") is True:
@@ -3522,11 +3577,10 @@ class CuaDriverBackend(ComputerUseBackend):
             # get_window_state: AX tree + screenshot.
             gws_out = self._call_capture_tool(
                 "get_window_state",
-                {
-                    "pid": self._active_pid,
-                    "window_id": self._active_window_id,
-                    "session": self._session_id,
-                },
+                self._window_state_args(
+                    max_elements=max_elements,
+                    include_screenshot=mode != "ax",
+                ),
             )
             # The persistent MCP session can return a degenerate result —
             # empty/partial data with NO exception — when the bridge is flaky
@@ -3559,11 +3613,10 @@ class CuaDriverBackend(ComputerUseBackend):
                 try:
                     cli_out = self._session._call_tool_via_cli(
                         "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
+                        self._window_state_args(
+                            max_elements=max_elements,
+                            include_screenshot=mode != "ax",
+                        ),
                         30.0,
                     )
                     if cli_out.get("isError") is True:
@@ -3589,6 +3642,17 @@ class CuaDriverBackend(ComputerUseBackend):
                 elements = _parse_elements_from_structured(sc_elements)
             else:
                 elements = _parse_elements_from_tree(tree) if tree else []
+            for count_field in ("element_count", "total_elements"):
+                raw_count = structured.get(count_field)
+                if isinstance(raw_count, bool):
+                    continue
+                try:
+                    parsed_count = int(raw_count)
+                except (TypeError, ValueError):
+                    continue
+                if parsed_count >= len(elements):
+                    total_elements = parsed_count
+                    break
 
             # Surface 6: refresh the snapshot-token cache from this
             # capture. Tokens are tied to a specific cua-driver snapshot
@@ -3629,12 +3693,25 @@ class CuaDriverBackend(ComputerUseBackend):
             except Exception:
                 png_bytes_len = len(png_b64) * 3 // 4
 
+        # A suspect transport can be replaced inside the read-only capture
+        # call. The reset callback intentionally clears stale mutation state,
+        # but this successful fresh snapshot re-arms the exact target it just
+        # observed on the replacement transport.
+        self._active_pid = target["pid"]
+        self._active_window_id = target["window_id"]
+        self._last_app = app_name or app or ""
+        self._last_target = {
+            "pid": self._active_pid,
+            "window_id": self._active_window_id,
+        }
+
         return CaptureResult(
             mode=mode,
             width=width,
             height=height,
             png_b64=png_b64,
             elements=elements,
+            total_elements=total_elements,
             app=app_name,
             window_title=window_title,
             png_bytes_len=png_bytes_len,
@@ -3968,6 +4045,7 @@ class CuaDriverBackend(ComputerUseBackend):
 
     # ── Keyboard ───────────────────────────────────────────────────
     def type_text(self, text: str, *, element: Optional[int] = None,
+                  x: Optional[int] = None, y: Optional[int] = None,
                   delivery_mode: Optional[str] = None,
                   bring_to_front: bool = False) -> ActionResult:
         transport_refusal = self._prepare_mutation_transport("type_text")
@@ -3978,6 +4056,20 @@ class CuaDriverBackend(ComputerUseBackend):
         if pid is None or window_id is None:
             return ActionResult(ok=False, action="type_text",
                                 message="No active window — call capture() first.")
+        if element is not None and (x is not None or y is not None):
+            return ActionResult(
+                ok=False,
+                action="type_text",
+                code="conflicting_input_target",
+                message="type_text accepts element or x/y, not both.",
+            )
+        if (x is None) != (y is None):
+            return ActionResult(
+                ok=False,
+                action="type_text",
+                code="incomplete_coordinate_target",
+                message="type_text coordinate targeting requires both x and y.",
+            )
         args: Dict[str, Any] = {"pid": pid, "window_id": window_id, "text": text}
         if element is not None:
             if not self._session.supports_input_property("type_text", "element_index"):
@@ -3991,9 +4083,27 @@ class CuaDriverBackend(ComputerUseBackend):
                     ),
                 )
             args["element_index"] = element
+        elif x is not None and y is not None:
+            if not (
+                self._session.supports_input_property("type_text", "x")
+                and self._session.supports_input_property("type_text", "y")
+            ):
+                return ActionResult(
+                    ok=False,
+                    action="type_text",
+                    code="coordinate_type_unsupported",
+                    message=(
+                        "The connected cua-driver type_text schema does not "
+                        "accept x/y; no text was sent."
+                    ),
+                )
+            args["x"] = x
+            args["y"] = y
         return self._run_input_action("type_text", args, delivery_mode, bring_to_front)
 
-    def key(self, keys: str, *, delivery_mode: Optional[str] = None,
+    def key(self, keys: str, *, element: Optional[int] = None,
+            x: Optional[int] = None, y: Optional[int] = None,
+            delivery_mode: Optional[str] = None,
             bring_to_front: bool = False) -> ActionResult:
         key_name, modifiers = _parse_key_combo(keys)
         if not key_name:
@@ -4010,14 +4120,61 @@ class CuaDriverBackend(ComputerUseBackend):
         if pid is None or window_id is None:
             return ActionResult(ok=False, action="key",
                                 message="No active window — call capture() first.")
+        if element is not None and (x is not None or y is not None):
+            return ActionResult(
+                ok=False,
+                action="key",
+                code="conflicting_input_target",
+                message="key accepts element or x/y, not both.",
+            )
+        if (x is None) != (y is None):
+            return ActionResult(
+                ok=False,
+                action="key",
+                code="incomplete_coordinate_target",
+                message="key coordinate targeting requires both x and y.",
+            )
+        if element is not None and not self._session.supports_input_property(
+            driver_action, "element_index"
+        ):
+            return ActionResult(
+                ok=False,
+                action="key",
+                code="element_key_unsupported",
+                message=(
+                    f"The connected cua-driver {driver_action} schema does not "
+                    "accept element_index; no key was sent."
+                ),
+            )
+        if x is not None and y is not None and not (
+            self._session.supports_input_property(driver_action, "x")
+            and self._session.supports_input_property(driver_action, "y")
+        ):
+            return ActionResult(
+                ok=False,
+                action="key",
+                code="coordinate_key_unsupported",
+                message=(
+                    f"The connected cua-driver {driver_action} schema does not "
+                    "accept x/y; no key was sent."
+                ),
+            )
 
         if modifiers:
             # hotkey requires at least one modifier + one key.
             args: Dict[str, Any] = {"pid": pid, "window_id": window_id,
                                     "keys": modifiers + [key_name]}
+            if element is not None:
+                args["element_index"] = element
+            elif x is not None and y is not None:
+                args.update({"x": x, "y": y})
             return self._run_input_action("hotkey", args, delivery_mode, bring_to_front)
         else:
             args = {"pid": pid, "window_id": window_id, "key": key_name}
+            if element is not None:
+                args["element_index"] = element
+            elif x is not None and y is not None:
+                args.update({"x": x, "y": y})
             return self._run_input_action("press_key", args, delivery_mode, bring_to_front)
 
     # ── Value setter ────────────────────────────────────────────────
@@ -4083,6 +4240,175 @@ class CuaDriverBackend(ComputerUseBackend):
 
     def list_windows(self) -> List[Dict[str, Any]]:
         return self._load_windows()
+
+    def _require_live_tool_inputs(
+        self,
+        tool: str,
+        properties: List[str],
+        *,
+        code: str,
+    ) -> None:
+        """Fail closed before dispatch when a live Cua schema is too old."""
+        if not self._session._has_tool(tool):
+            raise ComputerUseCapabilityError(
+                code,
+                f"The connected cua-driver does not advertise {tool}.",
+            )
+        missing = [
+            name
+            for name in properties
+            if not self._session.supports_input_property(tool, name)
+        ]
+        if missing:
+            raise ComputerUseCapabilityError(
+                code,
+                f"The connected cua-driver {tool} schema does not accept: "
+                f"{', '.join(missing)}.",
+            )
+
+    def list_windows_exact(
+        self,
+        *,
+        pid: Optional[int] = None,
+        on_screen_only: bool = True,
+    ) -> Dict[str, Any]:
+        """Return the driver's uncollapsed window metadata.
+
+        This is deliberately separate from ``_load_windows``.  Capture and
+        focus need normalized, on-screen, sortable targets; the public
+        observation action needs truthful nullable z-order and Space metadata.
+        """
+        required_properties = ["on_screen_only"]
+        if pid is not None:
+            required_properties.append("pid")
+        self._require_live_tool_inputs(
+            "list_windows",
+            required_properties,
+            code="exact_window_listing_unsupported",
+        )
+        args: Dict[str, Any] = {
+            "on_screen_only": on_screen_only,
+            "session": self._session_id,
+        }
+        if pid is not None:
+            args["pid"] = pid
+        out = self._session.call_tool("list_windows", args)
+        if out.get("isError") is True:
+            raise CuaDriverCallError("list_windows", out)
+
+        windows: List[Dict[str, Any]] = []
+        for raw_window in _windows_from_tool_result(out):
+            if not isinstance(raw_window, dict):
+                continue
+            # Enforce the privacy scope locally too: a buggy/older driver must
+            # not leak another process's off-Space titles after a pid-scoped
+            # request.
+            if pid is not None:
+                raw_pid = _positive_int(raw_window.get("pid"))
+                if raw_pid != pid:
+                    continue
+            if on_screen_only and raw_window.get("is_on_screen") is False:
+                continue
+            windows.append(dict(raw_window))
+
+        response: Dict[str, Any] = {
+            "windows": windows,
+            "count": len(windows),
+            "on_screen_only": on_screen_only,
+            "exact_metadata": True,
+        }
+        if pid is not None:
+            response["pid"] = pid
+        for container in (
+            out.get("structuredContent"), out.get("data"), out,
+        ):
+            if isinstance(container, dict) and "current_space_id" in container:
+                response["current_space_id"] = container["current_space_id"]
+                break
+        return response
+
+    def verify_state(
+        self,
+        *,
+        pid: int,
+        window_id: int,
+        expect: List[Dict[str, Any]],
+        timeout_ms: Optional[int] = None,
+        stable_samples: Optional[int] = None,
+        include_screenshot: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Run cua-driver's bounded predicate verifier on one exact target."""
+        args: Dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+            "expect": expect,
+            "session": self._session_id,
+        }
+        optional = {
+            "timeout_ms": timeout_ms,
+            "stable_samples": stable_samples,
+            "include_screenshot": include_screenshot,
+        }
+        required_properties = ["pid", "window_id", "expect"]
+        required_properties.extend(
+            name for name, value in optional.items() if value is not None
+        )
+        self._require_live_tool_inputs(
+            "verify_state",
+            required_properties,
+            code="verify_state_unsupported",
+        )
+        args.update({name: value for name, value in optional.items() if value is not None})
+        out = self._session.call_tool("verify_state", args)
+        if out.get("isError") is True:
+            raise CuaDriverCallError("verify_state", out)
+
+        structured = out.get("structuredContent")
+        if not isinstance(structured, dict):
+            data = out.get("data")
+            structured = data if isinstance(data, dict) else {}
+        status = structured.get("status")
+        if status not in {"satisfied", "unsatisfied", "unknown"}:
+            raise ComputerUseCapabilityError(
+                "invalid_verification_result",
+                "cua-driver verify_state returned no recognized status.",
+            )
+
+        response = {
+            key: value
+            for key, value in structured.items()
+            if key not in {
+                "screenshot_png_b64", "png_b64", "screenshot_file_path",
+                "screenshot_mime_type", "mime_type",
+            }
+        }
+        png_b64, image_mime_type = _image_from_tool_result(out)
+        if png_b64:
+            width = int(structured.get("screenshot_width") or 0)
+            height = int(structured.get("screenshot_height") or 0)
+            png_bytes_len = 0
+            try:
+                raw = base64.b64decode(png_b64, validate=False)
+                png_bytes_len = len(raw)
+                detected_width, detected_height = _image_dimensions_from_bytes(raw)
+                if detected_width and detected_height:
+                    width, height = detected_width, detected_height
+            except Exception:
+                png_bytes_len = len(png_b64) * 3 // 4
+            response["_capture"] = CaptureResult(
+                mode="vision",
+                width=width,
+                height=height,
+                png_b64=png_b64,
+                elements=[],
+                app="",
+                window_title="verify_state evidence",
+                png_bytes_len=png_bytes_len,
+                image_mime_type=image_mime_type,
+                pid=pid,
+                window_id=window_id,
+            )
+        return response
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         """Target an app, optionally invoking standalone foreground focus.
@@ -4177,9 +4503,7 @@ class CuaDriverBackend(ComputerUseBackend):
         additional_arguments: Optional[List[str]] = None,
         creates_new_application_instance: bool = False,
     ) -> Dict[str, Any]:
-        """Idempotent launch. Returns ``{pid, bundle_id, name, windows[]}``
-        so callers can skip an extra ``list_windows`` round-trip before
-        ``get_window_state``.
+        """Launch without selecting, focusing, or raising a returned window.
 
         ``creates_new_application_instance=True`` forces a new instance
         even if the app is already running — use it when concurrent
@@ -4187,7 +4511,7 @@ class CuaDriverBackend(ComputerUseBackend):
         isolated window."""
         if not bundle_id and not name:
             raise ValueError("launch_app requires either bundle_id or name")
-        args: Dict[str, Any] = {"session": self._session_id}
+        args: Dict[str, Any] = {}
         if bundle_id:
             args["bundle_id"] = bundle_id
         if name:
@@ -4198,8 +4522,68 @@ class CuaDriverBackend(ComputerUseBackend):
             args["additional_arguments"] = list(additional_arguments)
         if creates_new_application_instance:
             args["creates_new_application_instance"] = True
+
+        self._require_live_tool_inputs(
+            "launch_app",
+            list(args),
+            code="launch_app_unsupported",
+        )
         out = self._session.call_tool("launch_app", args)
-        return out["structuredContent"] or {"data": out["data"]}
+        if out.get("isError") is True:
+            raise CuaDriverCallError("launch_app", out)
+        structured = out.get("structuredContent")
+        if isinstance(structured, dict):
+            return dict(structured)
+        data = out.get("data")
+        if isinstance(data, dict):
+            return dict(data)
+        return {"message": data} if isinstance(data, str) and data else {}
+
+    def set_window_frame(
+        self,
+        *,
+        pid: int,
+        window_id: int,
+        frame: Dict[str, Any],
+    ) -> ActionResult:
+        """Set exact desktop geometry without relying on sticky target state."""
+        self._require_live_tool_inputs(
+            "set_window_frame",
+            ["pid", "window_id", "x", "y", "width", "height"],
+            code="set_window_frame_unsupported",
+        )
+        args: Dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+            "x": frame["x"],
+            "y": frame["y"],
+            "width": frame["width"],
+            "height": frame["height"],
+        }
+        if self._session.supports_input_property("set_window_frame", "session"):
+            args["session"] = self._session_id
+        out = self._session.call_tool("set_window_frame", args)
+        data = out.get("data")
+        structured = out.get("structuredContent") or {}
+        message = ""
+        if isinstance(data, dict):
+            message = str(data.get("message", ""))
+        elif isinstance(data, str):
+            message = data
+        if not message and isinstance(structured, dict):
+            message = str(structured.get("message", ""))
+        meta: Dict[str, Any] = {}
+        if isinstance(data, dict):
+            meta.update(data)
+        if isinstance(structured, dict):
+            meta.update(structured)
+        return _action_result_from(
+            "set_window_frame",
+            out.get("isError") is not True,
+            message,
+            meta,
+            structured,
+        )
 
     def kill_app(self, *, pid: int) -> ActionResult:
         """Terminate by pid. Equivalent to ``kill -9`` on POSIX,

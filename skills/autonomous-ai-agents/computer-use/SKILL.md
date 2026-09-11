@@ -40,8 +40,7 @@ planned cua-driver follow-up, so currently point Hermes at the resulting
 computer_use(action="capture", mode="som", app="<the app you're driving>")
 ```
 
-Returns a screenshot with numbered overlays on every interactable
-element AND an AX-tree index like:
+Returns a plain screenshot plus a separately numbered AX-tree index like:
 
 ```
 #1  AXButton 'Back' @ (12, 80, 28, 28) [Chrome]
@@ -64,19 +63,39 @@ computer_use(action="click", element=7)
 Much more reliable than pixel coordinates for every model. Claude was
 trained on both; other models are often only reliable with indices.
 
-**Step 3 — Verify.** After any state-changing action, re-capture. You
-can save a round-trip by asking for the post-action capture inline:
+**Step 3 — Verify.** A post-action capture is fresh evidence, not proof that
+the requested postcondition holds. You can ask for that evidence inline:
 
 ```
 computer_use(action="click", element=7, capture_after=True)
 ```
 
+For a deterministic bounded check, use the exact target returned by capture
+or `list_windows`:
+
+```
+computer_use(
+    action="verify_state",
+    pid=123,
+    window_id=456,
+    expect=[{"element": {
+        "selector": {"label_contains": "Saved"},
+        "exists": True,
+    }}],
+)
+```
+
+Predicates are ANDed. Only `status="satisfied"` proves them.
+`status="unsatisfied"` means continue safely. `status="unknown"` means take
+a fresh capture or inspect again; it is never permission to claim done or to
+repeat a mutation blindly.
+
 ## Capture modes
 
 | `mode` | Returns | Best for |
 |---|---|---|
-| `som` (default) | Screenshot + numbered overlays + AX index | Vision models; preferred default |
-| `vision` | Plain screenshot | When SOM overlay interferes with what you want to verify |
+| `som` (default) | Plain screenshot + separately numbered AX index | Vision models; preferred default |
+| `vision` | Plain screenshot | When you do not need the AX index |
 | `ax` | AX tree only, no image | Text-only models, or when you don't need to see pixels |
 
 ## Actions
@@ -90,12 +109,36 @@ middle_click      element=N     OR     coordinate=[x, y]
 drag              from_coordinate=[x, y], to_coordinate=[x, y]
                   (element endpoints only when the live driver supports them)
 scroll            direction=up|down|left|right   amount=3 (ticks)
-type              text="…"
+type              text="…"   element=N OR coordinate=[x, y]
 key               keys="<save shortcut>" | "return" | "escape" | "<modifier>+t"
+                  optional coordinate=[x, y] to focus before delivery
 wait              seconds=0.5
 list_apps
+list_windows      pid=<optional>   on_screen_only=true (default)
+                  on_screen_only=false requires pid
+verify_state      pid=<exact> window_id=<exact> expect=[1..8 predicates]
+launch_app        bundle_id="<id>" OR app="<native name>"
+                  creates_new_application_instance=false
+set_window_frame  pid=<exact> window_id=<exact>
+                  frame={x, y, width, height} (desktop coordinates)
 focus_app         app="<app name>"   raise_window=false   (default: don't raise)
 ```
+
+`list_windows` preserves the driver's native window metadata, including
+nullable z-order, bounds, visibility, and Space identifiers when available.
+Off-screen enumeration is pid-scoped so titles from unrelated apps are not
+exposed globally.
+
+`launch_app` and `set_window_frame` are state-changing and approval-gated.
+Launch accepts exactly one identifier and does not pass URLs or arguments.
+Hermes never requests focus/raise; app may self-activate. Hermes does not
+silently choose among the returned zero/one/many windows. Inspect and capture
+the intended window explicitly. A `self_activation_suppressed=false` result means
+the target held focus despite re-demotion: foreground preservation failed, so
+take fresh state rather than launching again. `set_window_frame`
+uses native desktop coordinates (not screenshot-local `coordinate=[x,y]`) and
+does not require or modify the sticky input target. Even a confirmed geometry
+actuator result requires a separate `verify_state` bounds check.
 
 State-changing actions that expose it (`click`, `double_click`, `right_click`,
 `middle_click`, `drag`, `scroll`, `type`, `key`, `set_value`, and `focus_app`)
@@ -116,7 +159,8 @@ but that is the first rung, not the only one. Every input action returns a
 structured verdict; read it and climb only when the driver tells you to.
 
 Returned fields (present when the driver supports them):
-- `effect`: `"confirmed"` (driver read the result back — done), `"partial"`
+- `effect`: `"confirmed"` (driver read the actuator result back; still verify
+  the task postcondition), `"partial"`
   (some effect, requiring fresh verification), `"unverifiable"` (delivered,
   but not confirmed), `"suspected_noop"`, or `"refused"`.
 - `escalation`: `{target: "pixel" | "foreground", reason_code}` — present
@@ -128,7 +172,7 @@ Returned fields (present when the driver supports them):
 Walk it in order:
 
 1. **Element, background (default).** `click(element=N)`. If `effect:"confirmed"`,
-   you're done.
+   verify the task postcondition from fresh state before stopping.
 2. **Fresh verification.** `effect:"partial"` or `effect:"unverifiable"`
    means inspect fresh state before any retry. Do this even when
    `escalation.target` is present; it is advisory, not proof that successful
@@ -164,8 +208,8 @@ computer_use(action="click", element=7, delivery_mode="foreground")
 ```
 
 **Escalate to foreground as a REACTION to a returned signal, never as a
-prediction** from the app being Electron/Chromium/GTK. A confirmed effect is
-done and must not be duplicated. Different controls in
+prediction** from the app being Electron/Chromium/GTK. A confirmed actuator
+effect must not be duplicated, but it is not proof of the task postcondition. Different controls in
 the same app behave differently. Do NOT silently retry the same rung, and do
 NOT conclude "cua-driver can't drive this app" — climb the ladder. If
 `delivery_mode="foreground"` returns `code:"foreground_unsupported"`, the live
@@ -206,9 +250,9 @@ shortcut to use.
    to bring a window to front. Input routing works without raising.
 2. **Scope captures to an app** (`app="Chrome"`) — less noisy, fewer
    elements, doesn't leak other windows the user has open.
-3. **Don't switch virtual desktops / Spaces.** cua-driver drives
-   elements on any virtual desktop / Space regardless of which one is
-   visible.
+3. **Don't switch virtual desktops / Spaces.** Background actions can drive
+   an already known target without raising it, but Hermes' current capture
+   selector may not discover windows on another Space.
 4. **The user can be on the same machine.** They might be typing in
    another window. Don't grab focus. Don't pop modals to the front.
 
@@ -251,9 +295,9 @@ it. Select a target with `capture(app=...)` or `focus_app(app=...)` before
 input. On `click`, `type`, and other mutation actions, `app=...` is only a
 safety assertion against that sticky target; it never retargets the action.
 Hermes refuses an unknown or mismatched sticky target instead of risking input
-to another window. `type` accepts text plus an optional supported element
-target, but not a coordinate; `key` accepts only `keys` and rejects element or
-coordinate targets.
+to another window. `type` and `key` accept either an optional supported element
+target or a screenshot-pixel coordinate. Both forms are gated by the live
+driver schema and are refused without sending input when unavailable.
 
 ## Delivering screenshots to the user
 

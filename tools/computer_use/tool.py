@@ -79,13 +79,14 @@ def set_approval_callback(cb) -> None:
 
 # Actions that read, not mutate. Always allowed.
 _SAFE_ACTIONS = frozenset({
-    "capture", "wait", "list_apps", "list_windows",
+    "capture", "wait", "list_apps", "list_windows", "verify_state",
 })
 
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value", "focus_app",
+    "launch_app", "set_window_frame",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -168,7 +169,13 @@ _ACTION_ARGUMENTS = {
     "set_value": {"value", "element", "app", "capture_after"},
     "wait": {"seconds"},
     "list_apps": set(),
-    "list_windows": set(),
+    "list_windows": {"pid", "on_screen_only"},
+    "verify_state": {
+        "pid", "window_id", "expect", "timeout_ms", "stable_samples",
+        "include_screenshot",
+    },
+    "launch_app": {"bundle_id", "app", "creates_new_application_instance"},
+    "set_window_frame": {"pid", "window_id", "frame"},
     "focus_app": {"app", "raise_window", "capture_after"},
 }
 
@@ -198,6 +205,7 @@ def _conflicting_action_arguments(action: str, args: Dict[str, Any]) -> List[str
         ]
     if action in {
         "click", "double_click", "right_click", "middle_click", "scroll",
+        "type", "key",
     } and args.get("element") is not None and args.get("coordinate") is not None:
         return ["element", "coordinate"]
     if action == "drag":
@@ -212,6 +220,172 @@ def _conflicting_action_arguments(action: str, args: Dict[str, Any]) -> List[str
         if element_fields and coordinate_fields:
             return [*element_fields, *coordinate_fields]
     return []
+
+
+def _positive_int_argument(value: Any) -> bool:
+    """Whether *value* is an exact positive integer (booleans excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _finite_number(value: Any) -> bool:
+    """Whether *value* is a finite JSON number (booleans excluded)."""
+    import math
+
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _verify_state_validation_error(args: Dict[str, Any]) -> Optional[str]:
+    """Validate the bounded cua-driver verify_state grammar fail-closed."""
+    for name in ("pid", "window_id"):
+        if not _positive_int_argument(args.get(name)):
+            return f"verify_state requires `{name}` as a positive integer"
+
+    expect = args.get("expect")
+    if not isinstance(expect, list) or not 1 <= len(expect) <= 8:
+        return "verify_state requires `expect` with 1 to 8 predicates"
+
+    for index, predicate in enumerate(expect, start=1):
+        prefix = f"expect[{index}]"
+        if not isinstance(predicate, dict):
+            return f"{prefix} must be an object"
+        if set(predicate) not in ({"element"}, {"window"}):
+            return f"{prefix} must contain exactly one of `element` or `window`"
+
+        if "element" in predicate:
+            element = predicate["element"]
+            allowed = {"selector", "exists", "enabled", "selected", "value_equals"}
+            if not isinstance(element, dict) or not set(element).issubset(allowed):
+                return f"{prefix}.element contains unsupported fields"
+            selector = element.get("selector")
+            if not isinstance(selector, dict) or not selector:
+                return f"{prefix}.element requires a non-empty `selector`"
+            if not set(selector).issubset({"label_contains", "role"}):
+                return f"{prefix}.element.selector contains unsupported fields"
+            for key, value in selector.items():
+                if not isinstance(value, str) or not value:
+                    return f"{prefix}.element.selector.{key} must be a non-empty string"
+            if "exists" in element and element["exists"] is not True:
+                return f"{prefix}.element.exists only accepts true"
+            for key in ("enabled", "selected"):
+                if (
+                    key in element
+                    and element[key] is not None
+                    and not isinstance(element[key], bool)
+                ):
+                    return f"{prefix}.element.{key} must be boolean"
+            if (
+                "value_equals" in element
+                and element["value_equals"] is not None
+                and not isinstance(element["value_equals"], str)
+            ):
+                return f"{prefix}.element.value_equals must be a string"
+            continue
+
+        window = predicate["window"]
+        if not isinstance(window, dict) or not window:
+            return f"{prefix}.window must be a non-empty object"
+        if not set(window).issubset({"exists", "bounds"}):
+            return f"{prefix}.window contains unsupported fields"
+        if (
+            "exists" in window
+            and window["exists"] is not None
+            and not isinstance(window["exists"], bool)
+        ):
+            return f"{prefix}.window.exists must be boolean"
+        if "bounds" in window:
+            bounds = window["bounds"]
+            required = {"x", "y", "width", "height"}
+            allowed = required | {"tolerance_px"}
+            if not isinstance(bounds, dict) or not required.issubset(bounds):
+                return f"{prefix}.window.bounds requires x, y, width, and height"
+            if not set(bounds).issubset(allowed):
+                return f"{prefix}.window.bounds contains unsupported fields"
+            for key in required:
+                if not _finite_number(bounds[key]):
+                    return f"{prefix}.window.bounds.{key} must be a finite number"
+            if "tolerance_px" in bounds and (
+                not _finite_number(bounds["tolerance_px"])
+                or not 0 <= bounds["tolerance_px"] <= 100
+            ):
+                return f"{prefix}.window.bounds.tolerance_px must be from 0 to 100"
+
+    timeout_ms = args.get("timeout_ms")
+    if timeout_ms is not None and (
+        not isinstance(timeout_ms, int)
+        or isinstance(timeout_ms, bool)
+        or not 0 <= timeout_ms <= 10000
+    ):
+        return "verify_state timeout_ms must be an integer from 0 to 10000"
+    stable_samples = args.get("stable_samples")
+    if stable_samples is not None and (
+        not isinstance(stable_samples, int)
+        or isinstance(stable_samples, bool)
+        or not 1 <= stable_samples <= 5
+    ):
+        return "verify_state stable_samples must be an integer from 1 to 5"
+    include_screenshot = args.get("include_screenshot")
+    if include_screenshot is not None and not isinstance(include_screenshot, bool):
+        return "verify_state include_screenshot must be boolean"
+    return None
+
+
+def _observation_validation_error(action: str, args: Dict[str, Any]) -> Optional[str]:
+    if action == "verify_state":
+        return _verify_state_validation_error(args)
+    if action != "list_windows":
+        return None
+    pid = args.get("pid")
+    if pid is not None and not _positive_int_argument(pid):
+        return "list_windows pid must be a positive integer"
+    on_screen_only = args.get("on_screen_only", True)
+    if on_screen_only is None:
+        on_screen_only = True
+    if not isinstance(on_screen_only, bool):
+        return "list_windows on_screen_only must be boolean"
+    if on_screen_only is False and pid is None:
+        return "list_windows with on_screen_only=false requires pid"
+    return None
+
+
+def _window_management_validation_error(
+    action: str, args: Dict[str, Any],
+) -> Optional[str]:
+    """Validate launch/geometry requests before approval or backend creation."""
+    if action == "launch_app":
+        identifiers = []
+        for name in ("bundle_id", "app"):
+            value = args.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                return f"launch_app `{name}` must be a non-empty string"
+            identifiers.append(name)
+        if len(identifiers) != 1:
+            return "launch_app requires exactly one of `bundle_id` or `app`"
+        new_instance = args.get("creates_new_application_instance")
+        if new_instance is not None and not isinstance(new_instance, bool):
+            return "launch_app creates_new_application_instance must be boolean"
+        return None
+
+    if action != "set_window_frame":
+        return None
+    for name in ("pid", "window_id"):
+        if not _positive_int_argument(args.get(name)):
+            return f"set_window_frame requires `{name}` as a positive integer"
+    frame = args.get("frame")
+    required = {"x", "y", "width", "height"}
+    if not isinstance(frame, dict) or set(frame) != required:
+        return "set_window_frame frame requires exactly x, y, width, and height"
+    for name in required:
+        if not _finite_number(frame[name]):
+            return f"set_window_frame frame.{name} must be a finite number"
+    if frame["width"] < 1 or frame["height"] < 1:
+        return "set_window_frame frame width and height must be at least 1"
+    return None
 
 
 def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
@@ -549,11 +723,14 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         app: Optional[str] = None,
         pid: Optional[int] = None,
         window_id: Optional[int] = None,
+        max_elements: Optional[int] = None,
     ) -> CaptureResult:
-        self.calls.append((
-            "capture",
-            {"mode": mode, "app": app, "pid": pid, "window_id": window_id},
-        ))
+        capture_args = {
+            "mode": mode, "app": app, "pid": pid, "window_id": window_id,
+        }
+        if max_elements is not None:
+            capture_args["max_elements"] = max_elements
+        self.calls.append(("capture", capture_args))
         return CaptureResult(mode=mode, width=1024, height=768, png_b64=None,
                              elements=[], app=app or "", window_title="")
 
@@ -630,6 +807,22 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
                 f"{', '.join(conflicting)}; choose one target form"
             ),
             "conflicting": conflicting,
+        })
+    observation_error = _observation_validation_error(action, args)
+    if observation_error:
+        return json.dumps({
+            "ok": False,
+            "action": action,
+            "code": "invalid_observation_arguments",
+            "error": observation_error,
+        })
+    window_management_error = _window_management_validation_error(action, args)
+    if window_management_error:
+        return json.dumps({
+            "ok": False,
+            "action": action,
+            "code": "invalid_window_management_arguments",
+            "error": window_management_error,
         })
     # Per-run key for approval-state and daemon-mode isolation across
     # concurrent sessions.
@@ -780,6 +973,18 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
         return f"type {text[:60]!r}" + ("..." if len(text) > 60 else "") + fg
     if action == "key":
         return f"key {args.get('keys', '')!r}{fg}"
+    if action == "launch_app":
+        identifier = str(args.get("bundle_id") or args.get("app") or "").strip()
+        kind = "bundle_id" if args.get("bundle_id") else "name"
+        suffix = " (new native instance)" if args.get("creates_new_application_instance") else ""
+        return f"launch app by {kind} {identifier!r}{suffix}"
+    if action == "set_window_frame":
+        frame = args.get("frame") or {}
+        return (
+            f"set window pid={args.get('pid')} id={args.get('window_id')} "
+            f"frame=({frame.get('x')}, {frame.get('y')}, "
+            f"{frame.get('width')}x{frame.get('height')})"
+        )
     if action == "focus_app":
         return f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")
     return action + fg
@@ -792,14 +997,17 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         mode = str(args.get("mode", "som"))
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
+        max_elements = _coerce_max_elements(args.get("max_elements"))
         capture_kwargs: Dict[str, Any] = {"mode": mode, "app": args.get("app")}
+        if args.get("max_elements") is not None:
+            capture_kwargs["max_elements"] = max_elements
         if args.get("pid") is not None or args.get("window_id") is not None:
             capture_kwargs.update({
                 "pid": args.get("pid"),
                 "window_id": args.get("window_id"),
             })
         cap = backend.capture(**capture_kwargs)
-        return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
+        return _capture_response(cap, max_elements=max_elements)
 
     if action == "wait":
         seconds = float(args.get("seconds", 1.0))
@@ -811,8 +1019,44 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         return json.dumps({"apps": apps, "count": len(apps)})
 
     if action == "list_windows":
-        windows = backend.list_windows()
-        return json.dumps({"windows": windows, "count": len(windows)})
+        on_screen_only = args.get("on_screen_only", True)
+        if on_screen_only is None:
+            on_screen_only = True
+        result = backend.list_windows_exact(
+            pid=args.get("pid"),
+            on_screen_only=on_screen_only,
+        )
+        return json.dumps(result)
+
+    if action == "verify_state":
+        verify_kwargs: Dict[str, Any] = {
+            "pid": args["pid"],
+            "window_id": args["window_id"],
+            "expect": args["expect"],
+        }
+        for field in ("timeout_ms", "stable_samples", "include_screenshot"):
+            if args.get(field) is not None:
+                verify_kwargs[field] = args[field]
+        result = backend.verify_state(**verify_kwargs)
+        return _verification_response(result)
+
+    if action == "launch_app":
+        result = backend.launch_app(
+            bundle_id=(args["bundle_id"].strip() if args.get("bundle_id") else None),
+            name=(args["app"].strip() if args.get("app") else None),
+            creates_new_application_instance=bool(
+                args.get("creates_new_application_instance")
+            ),
+        )
+        return _launch_app_response(result)
+
+    if action == "set_window_frame":
+        res = backend.set_window_frame(
+            pid=args["pid"],
+            window_id=args["window_id"],
+            frame=dict(args["frame"]),
+        )
+        return _text_response(res)
 
     if action == "focus_app":
         app = args.get("app")
@@ -925,27 +1169,28 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "type":
-        if args.get("coordinate") is not None:
-            return json.dumps({
-                "ok": False,
-                "action": action,
-                "code": "targeted_type_coordinate_unsupported",
-                "error": "coordinate-targeted type is not supported by the live Cua contract",
-            })
-        res = backend.type_text(args.get("text", ""), element=args.get("element"),
-                                delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+        coord = args.get("coordinate") or (None, None)
+        type_kwargs: Dict[str, Any] = {
+            "element": args.get("element"),
+            "delivery_mode": delivery_mode,
+            "bring_to_front": bring_to_front,
+        }
+        if coord and coord[0] is not None and coord[1] is not None:
+            type_kwargs.update({"x": coord[0], "y": coord[1]})
+        res = backend.type_text(args.get("text", ""), **type_kwargs)
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "key":
-        if args.get("element") is not None or args.get("coordinate") is not None:
-            return json.dumps({
-                "ok": False,
-                "action": action,
-                "code": "targeted_key_unsupported",
-                "error": "targeted key delivery is not supported by the live Cua contract",
-            })
-        res = backend.key(args.get("keys", ""),
-                          delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+        coord = args.get("coordinate") or (None, None)
+        key_kwargs: Dict[str, Any] = {
+            "delivery_mode": delivery_mode,
+            "bring_to_front": bring_to_front,
+        }
+        if args.get("element") is not None:
+            key_kwargs["element"] = args["element"]
+        if coord and coord[0] is not None and coord[1] is not None:
+            key_kwargs.update({"x": coord[0], "y": coord[1]})
+        res = backend.key(args.get("keys", ""), **key_kwargs)
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "set_value":
@@ -1010,6 +1255,15 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     """
     escalation = _public_escalation(res.escalation)
 
+    # Lost responses and transport-generation invalidation require a fresh
+    # observation, never escalation/retry of an action that may have landed.
+    if res.code in {
+        "transport_outcome_unknown",
+        "timeout_outcome_unknown",
+        "stale_target_after_transport_reset",
+    }:
+        return {"decision": "verify_fresh_state"}
+
     if not res.ok or res.code is not None or res.effect == "refused":
         decision: Dict[str, Any] = {"decision": "escalate"}
         if escalation:
@@ -1018,7 +1272,7 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
     if res.effect == "partial":
         return {"decision": "verify_fresh_state"}
     if res.effect == "confirmed" or res.verified is True:
-        return {"decision": "done"}
+        return {"decision": "verify_postcondition"}
     if res.effect == "unverifiable":
         return {"decision": "verify_fresh_state"}
     if res.effect == "suspected_noop":
@@ -1067,6 +1321,109 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
 
 def _text_response(res: ActionResult) -> str:
     return json.dumps(_action_payload(res))
+
+
+def _verification_response(result: Dict[str, Any]) -> Any:
+    """Shape deterministic verification without treating transport as success.
+
+    ``satisfied`` is the only status that can prove the requested
+    postcondition.  ``unknown`` explicitly sends the caller back to fresh
+    observation; it is never collapsed into success.  A screenshot, when the
+    backend supplied one, goes through the same bounded multimodal/persistence
+    path as capture instead of being embedded in JSON.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("verify_state backend result must be an object")
+    payload = {
+        key: value
+        for key, value in result.items()
+        if key not in {
+            "_capture", "screenshot_png_b64", "png_b64",
+            "screenshot_mime_type", "mime_type",
+        }
+    }
+    status = payload.get("status")
+    payload["action"] = "verify_state"
+    payload["task_success"] = status == "satisfied"
+    if status == "satisfied":
+        payload["verdict"] = {"decision": "postcondition_satisfied"}
+    elif status == "unsatisfied":
+        payload["verdict"] = {"decision": "postcondition_unsatisfied"}
+    else:
+        payload["verdict"] = {
+            "decision": "verify_fresh_state",
+            "reason": "verification_unknown",
+        }
+
+    cap = result.get("_capture")
+    if not isinstance(cap, CaptureResult):
+        return json.dumps(payload)
+
+    capture_response = _capture_response(cap)
+    prefix = json.dumps(payload)
+    if isinstance(capture_response, dict) and capture_response.get("_multimodal"):
+        capture_response["content"][0]["text"] = (
+            prefix + "\n\n" + capture_response["content"][0]["text"]
+        )
+        capture_response["text_summary"] = (
+            prefix + "\n\n" + capture_response["text_summary"]
+        )
+        capture_response["verification_result"] = payload
+        return capture_response
+
+    try:
+        capture_payload = json.loads(capture_response)
+    except (TypeError, json.JSONDecodeError):
+        capture_payload = {"capture": capture_response}
+    capture_payload.update(payload)
+    return json.dumps(capture_payload)
+
+
+def _launch_app_response(result: Dict[str, Any]) -> str:
+    """Expose launch metadata without implying focus or selecting a window."""
+    if not isinstance(result, dict):
+        raise TypeError("launch_app backend result must be an object")
+    payload = dict(result)
+    payload.setdefault("ok", True)
+    payload["action"] = "launch_app"
+    pid = payload.get("pid")
+    has_launch_evidence = (
+        (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0)
+        or any(
+            isinstance(payload.get(key), str) and bool(payload[key].strip())
+            for key in ("bundle_id", "name", "launch_state")
+        )
+        or isinstance(payload.get("windows"), list)
+        or isinstance(payload.get("self_activation_suppressed"), bool)
+    )
+    if payload.get("self_activation_suppressed") is False:
+        payload["task_success"] = False
+        payload["foreground_preservation"] = {
+            "status": "failed",
+            "condition": "foreground_changed",
+            "warning": (
+                "The launched target held focus despite the driver's "
+                "re-demotion attempt. Hermes did not request focus or raise; "
+                "inspect fresh state before continuing."
+            ),
+        }
+        payload["verdict"] = {
+            "decision": "verify_fresh_state",
+            "reason": "foreground_changed",
+        }
+    elif not has_launch_evidence:
+        payload["task_success"] = False
+        payload["launch_evidence"] = {
+            "status": "missing",
+            "reason": "missing_launch_evidence",
+        }
+        payload["verdict"] = {
+            "decision": "verify_fresh_state",
+            "reason": "missing_launch_evidence",
+        }
+    else:
+        payload["verdict"] = {"decision": "verify_postcondition"}
+    return json.dumps(payload)
 
 
 def _enrich_escalation(res: ActionResult) -> Optional[Dict[str, Any]]:
@@ -1162,6 +1519,15 @@ def _coerce_max_elements(value: Any) -> int:
     return n
 
 
+def _reported_total_elements(cap: CaptureResult) -> int:
+    """Return a truthful count without trusting malformed driver metadata."""
+    received = len(cap.elements)
+    reported = cap.total_elements
+    if isinstance(reported, bool) or not isinstance(reported, int):
+        return received
+    return max(received, reported)
+
+
 def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
     target_fields = {
         **({"pid": cap.pid} if cap.pid is not None else {}),
@@ -1173,25 +1539,22 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             else {}
         ),
     }
-    total_elements = len(cap.elements)
+    received_elements = len(cap.elements)
+    total_elements = _reported_total_elements(cap)
     visible_elements = cap.elements[:max_elements]
     truncated_elements = max(0, total_elements - len(visible_elements))
+    source_truncated = total_elements > received_elements
     image_dimensions = _image_dimensions_from_b64(cap.png_b64 or "") if cap.png_b64 else None
     response_width = image_dimensions[0] if image_dimensions else cap.width
     response_height = image_dimensions[1] if image_dimensions else cap.height
     bounds_note = _bounds_space_note(visible_elements, response_width, response_height)
-    bounds_scale = _bounds_scale(visible_elements, response_width, response_height)
-    if bounds_note and bounds_scale:
-        bounds_note += (
-            f"; estimated scale ~{bounds_scale}x (screenshot position x "
-            f"{bounds_scale} ≈ native coordinate)"
-        )
     # When the in-context response drops detail (capped labels / capped element
     # array), spill the complete tree to a cache file so the model can read or
     # grep the full text on demand instead of losing it entirely.
     elements_file = (
         _spill_elements_to_file(cap)
-        if _capture_lost_detail(cap, visible_elements, truncated_elements)
+        if not source_truncated
+        and _capture_lost_detail(cap, visible_elements, truncated_elements)
         else None
     )
     image_too_small = bool(
@@ -1231,6 +1594,12 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         )
     if cap.note:
         summary_lines.append(f"  ({cap.note})")
+    if source_truncated:
+        summary_lines.append(
+            f"  (driver returned {received_elements} of {total_elements} "
+            "elements at source; raise max_elements and recapture to inspect "
+            "the omitted elements)"
+        )
     if elements_file:
         summary_lines.append(
             f"  (full element tree with untruncated labels saved to "
@@ -1304,8 +1673,6 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
                 payload["elements_file"] = elements_file
             if screenshot_path:
                 payload["screenshot_path"] = screenshot_path
-            if bounds_scale:
-                payload["bounds_scale"] = bounds_scale
             return json.dumps(payload)
 
         # Prefer the explicit MIME type cua-driver attaches to its image
@@ -1329,11 +1696,13 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             ],
             "text_summary": summary,
             "meta": {"mode": cap.mode, "width": response_width, "height": response_height,
-                      "elements": total_elements, "png_bytes": cap.png_bytes_len,
+                      "elements": total_elements,
+                      "total_elements": total_elements,
+                      "truncated_elements": truncated_elements,
+                      "png_bytes": cap.png_bytes_len,
                       **target_fields,
                       **({"screenshot_path": screenshot_path} if screenshot_path else {}),
-                      **({"elements_file": elements_file} if elements_file else {}),
-                      **({"bounds_scale": bounds_scale} if bounds_scale else {})},
+                      **({"elements_file": elements_file} if elements_file else {})},
         }
     # AX-only (or image-missing fallback): text path actually carries the
     # `elements` array, so the truncation note applies here.
@@ -1358,8 +1727,6 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         payload["truncated_elements"] = truncated_elements
     if elements_file:
         payload["elements_file"] = elements_file
-    if bounds_scale:
-        payload["bounds_scale"] = bounds_scale
     return json.dumps(payload)
 
 
@@ -1382,7 +1749,7 @@ def _shrink_capture_for_vision(raw: bytes, ext: str,
     was returned unchanged (already fits, or Pillow unavailable/failed — no
     worse than the pre-shrink behavior). When a downscale happened, the note
     tells the vision model the scale factor so any coordinates it reports can
-    be mapped back to the real screen instead of being silently wrong.
+    be mapped back to the original capture pixel frame instead of being silently wrong.
     """
     try:
         from io import BytesIO
@@ -1400,12 +1767,12 @@ def _shrink_capture_for_vision(raw: bytes, ext: str,
         if f"{fx:.2f}" == f"{fy:.2f}":
             factor_clause = (
                 f"multiply any coordinates you report by {fx:.2f} "
-                f"to map back to the real screen."
+                f"to map back to the original capture pixel frame."
             )
         else:
             factor_clause = (
                 f"multiply any x coordinates you report by {fx:.2f} and "
-                f"any y coordinates by {fy:.2f} to map back to the real screen."
+                f"any y coordinates by {fy:.2f} to map back to the original capture pixel frame."
             )
         scale_note = (
             f"Screenshot downscaled from {orig_w}x{orig_h} to "
@@ -1580,7 +1947,7 @@ def _route_capture_through_aux_vision(
         "app": cap.app,
         "window_title": cap.window_title,
         "elements": [_element_to_dict(e) for e in elements_out],
-        "total_elements": len(cap.elements),
+        "total_elements": _reported_total_elements(cap),
         "summary": summary,
         "vision_analysis": analysis_text,
         "vision_analysis_routed_via": "auxiliary.vision",
@@ -1797,33 +2164,6 @@ def _capture_lost_detail(
     )
 
 
-def _bounds_scale(
-    elements: List[UIElement], image_width: int, image_height: int,
-) -> Optional[float]:
-    """Estimated native-bounds → screenshot-pixel scale factor, or None.
-
-    Only meaningful when the two spaces diverge (same condition as
-    ``_bounds_space_note``). Uses the larger of the two axis ratios so the
-    estimate is driven by the axis with real extent data. Rounded to 2
-    decimals — this is a heuristic for mapping screenshot positions to
-    native coordinates, not display-metrics ground truth.
-    """
-    if not elements or image_width <= 0 or image_height <= 0:
-        return None
-    max_x = 0
-    max_y = 0
-    for e in elements:
-        try:
-            x, y, w, h = e.bounds
-        except (TypeError, ValueError):
-            continue
-        max_x = max(max_x, int(x) + int(w))
-        max_y = max(max_y, int(y) + int(h))
-    if max_x <= image_width * 1.05 and max_y <= image_height * 1.05:
-        return None
-    return round(max(max_x / image_width, max_y / image_height), 2)
-
-
 def _bounds_space_note(
     elements: List[UIElement], image_width: int, image_height: int,
 ) -> Optional[str]:
@@ -1832,11 +2172,9 @@ def _bounds_space_note(
     On HiDPI/scaled displays (common on Windows + macOS retina), cua-driver
     reports AX element bounds in native desktop coordinates while the
     screenshot is captured/downscaled to a smaller pixel grid. Nothing in the
-    response related the two, so models reading a position off the screenshot
-    and clicking by coordinate= missed by the scale factor (e.g. 2.6x on a
-    4K display with a 1455px-wide screenshot). Element bounds are what
-    click(coordinate=...) expects; the note makes that explicit whenever the
-    two spaces visibly diverge.
+    response relates the two. Coordinate actions nevertheless consume the
+    window-local screenshot pixel space directly; AX bounds must not be used
+    to scale or transform screenshot coordinates.
     """
     if not elements or image_width <= 0 or image_height <= 0:
         return None
@@ -1856,11 +2194,10 @@ def _bounds_space_note(
     if max_x <= image_width * 1.05 and max_y <= image_height * 1.05:
         return None
     return (
-        f"element bounds are in native desktop coordinates (extend to "
-        f"~{max_x}x{max_y}), NOT screenshot pixels ({image_width}x"
-        f"{image_height}). coordinate= clicks expect the native space — "
-        "derive click points from element bounds, or scale screenshot "
-        "positions up accordingly"
+        f"AX element bounds use a separate native desktop coordinate space "
+        f"(extend to ~{max_x}x{max_y}); do not derive screenshot clicks from "
+        f"them. coordinate= uses the captured image pixels unchanged "
+        f"({image_width}x{image_height})"
     )
 
 

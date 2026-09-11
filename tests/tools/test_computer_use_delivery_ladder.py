@@ -182,7 +182,7 @@ def test_text_response_surfaces_fields_additively():
 @pytest.mark.parametrize(
     ("effect", "decision"),
     [
-        ("confirmed", "done"),
+        ("confirmed", "verify_postcondition"),
         ("partial", "verify_fresh_state"),
         ("unverifiable", "verify_fresh_state"),
         ("suspected_noop", "escalate"),
@@ -227,8 +227,8 @@ def test_current_driver_effects_have_distinct_public_verdicts(effect, decision):
         ({"ok": True, "effect": "confirmed", "code": "refused_by_policy"}, "escalate"),
         ({"ok": True, "effect": "refused", "verified": True}, "escalate"),
         ({"ok": True, "effect": "partial", "verified": True}, "verify_fresh_state"),
-        ({"ok": True, "effect": "confirmed", "verified": False}, "done"),
-        ({"ok": True, "verified": True}, "done"),
+        ({"ok": True, "effect": "confirmed", "verified": False}, "verify_postcondition"),
+        ({"ok": True, "verified": True}, "verify_postcondition"),
     ],
 )
 def test_effect_precedence_never_retries_success_or_accepts_refusal(

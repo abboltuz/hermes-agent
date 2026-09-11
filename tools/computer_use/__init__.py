@@ -10,9 +10,8 @@ same machine.
 
 Unlike #4562's Anthropic-native `computer_20251124` tool, the schema here is
 a plain OpenAI function-calling schema that every tool-capable model can
-drive. Vision models get SOM (set-of-mark) captures — a screenshot with
-numbered overlays on every interactable element plus the AX tree — so they
-click by element index instead of pixel coordinates. Non-vision models can
+drive. Vision models get SOM captures — a plain screenshot plus a separately
+numbered AX element list — so they click by element index. Non-vision models can
 drive via the AX tree alone.
 
 Wiring
@@ -22,8 +21,6 @@ Wiring
 * `cua_backend.py`— default backend; speaks MCP over stdio to `cua-driver`.
 * `schema.py`     — shared schema + docstring for the generic `computer_use`
                     tool. Model-agnostic.
-* `capture.py`    — screenshot post-processing (PNG coercion, sizing, SOM
-                    overlay if the backend did not).
 
 The outer integration points (multimodal tool-result plumbing, screenshot
 eviction in the Anthropic adapter, image-aware token estimation, the
