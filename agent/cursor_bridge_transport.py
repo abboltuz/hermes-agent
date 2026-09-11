@@ -139,10 +139,11 @@ def _read_secure_auth_token_file(token_file: str) -> str:
             raise CursorBridgeError(f"could not read bridge auth token file: {exc}") from exc
     else:
         try:
+            current_uid = getattr(os, "getuid")()
             parent_stat = token_path.parent.stat(follow_symlinks=False)
             if (
                 not stat.S_ISDIR(parent_stat.st_mode)
-                or parent_stat.st_uid != os.getuid()
+                or parent_stat.st_uid != current_uid
                 or parent_stat.st_mode & 0o077
             ):
                 raise CursorBridgeError(
@@ -154,7 +155,7 @@ def _read_secure_auth_token_file(token_file: str) -> str:
                 token_stat = os.fstat(fd)
                 if (
                     not stat.S_ISREG(token_stat.st_mode)
-                    or token_stat.st_uid != os.getuid()
+                    or token_stat.st_uid != current_uid
                     or token_stat.st_mode & 0o077
                     or token_stat.st_nlink != 1
                 ):
