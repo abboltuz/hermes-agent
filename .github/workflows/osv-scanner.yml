@@ -54,6 +54,7 @@ jobs:
       # fixed artifact name, which the wrapper downloads below.
       results-file-name: osv-results.sarif
       fail-on-vuln: false
+
   emit-status:
     name: Emit review status
     runs-on: ubuntu-latest
