@@ -10,6 +10,7 @@ import {
   type MessageGroup,
   resolveThreadScrollTarget,
   subscribeToThreadForeground,
+  transcriptBackfillFrameCount,
   transcriptPaneBudget
 } from './list'
 
@@ -307,5 +308,11 @@ describe('liveTailStart', () => {
 
       expect(rendered(liveTailStart(groups))).toBeLessThanOrEqual(rendered(oldStart))
     }
+  })
+})
+
+describe('transcriptBackfillFrameCount', () => {
+  it('settles a full pane in at most three prepend commits', () => {
+    expect(transcriptBackfillFrameCount()).toBeLessThanOrEqual(3)
   })
 })
