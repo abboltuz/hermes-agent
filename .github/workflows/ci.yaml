@@ -22,8 +22,8 @@ on:
 permissions:
   contents: read
   pull-requests: write # needed by lint (PR comment) + supply-chain review_status
-  actions: read # needed by osv-scanner (SARIF upload)
-  security-events: write # needed by osv-scanner (SARIF upload)
+  actions: read # needed by osv-scanner artifact handling
+  security-events: write # used for OSV SARIF upload when Code Scanning is available
 
 concurrency:
   group: ci-${{ github.ref }}

@@ -15,7 +15,9 @@ name: OSV-Scanner
 # dep became known-vulnerable" case.
 #
 # Uses Google's officially-recommended reusable workflow, pinned by SHA.
-# Findings land in the repo's Security tab (Code Scanning > OSV-Scanner).
+# Findings are always retained as a workflow artifact. Public repositories also
+# publish them to the Security tab (Code Scanning > OSV-Scanner); private forks
+# may not have GitHub Code Scanning enabled.
 # fail-on-vuln is disabled so the job does not block merges on pre-existing
 # vulnerabilities in pinned deps that we may need to patch deliberately.
 #
@@ -54,6 +56,10 @@ jobs:
       # fixed artifact name, which the wrapper downloads below.
       results-file-name: osv-results.sarif
       fail-on-vuln: false
+      # GitHub rejects SARIF uploads when Code Scanning is unavailable in a
+      # private fork. Keep the scan and artifact, and publish to the Security
+      # tab only where that feature is available by default.
+      upload-sarif: ${{ !github.event.repository.private }}
 
   emit-status:
     name: Emit review status
