@@ -44,6 +44,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.message_provenance import stamp_provenance
 from agent.turn_context import (
+    PreflightCompressionTimedOut,
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
     build_turn_context,
@@ -2013,29 +2014,56 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
-    _ctx = build_turn_context(
-        agent,
-        user_message,
-        system_message,
-        conversation_history,
-        task_id,
-        stream_callback,
-        persist_user_message,
-        persist_user_timestamp,
-        persist_user_display_kind=persist_user_display_kind,
-        persist_user_display_metadata=persist_user_display_metadata,
-        persist_user_provenance=persist_user_provenance,
-        restore_or_build_system_prompt=_restore_or_build_system_prompt,
-        install_safe_stdio=_install_safe_stdio,
-        sanitize_surrogates=_sanitize_surrogates,
-        summarize_user_message_for_log=_summarize_user_message_for_log,
-        set_session_context=set_session_context,
-        set_current_write_origin=set_current_write_origin,
-        ra=_ra,
-        # MoA turns append per-call aggregated context to the API copy of the
-        # user message, so no byte-stable api_content sidecar can be stamped.
-        moa_active=bool(moa_config),
-    )
+    try:
+        _ctx = build_turn_context(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+            persist_user_provenance=persist_user_provenance,
+            restore_or_build_system_prompt=_restore_or_build_system_prompt,
+            install_safe_stdio=_install_safe_stdio,
+            sanitize_surrogates=_sanitize_surrogates,
+            summarize_user_message_for_log=_summarize_user_message_for_log,
+            set_session_context=set_session_context,
+            set_current_write_origin=set_current_write_origin,
+            ra=_ra,
+            # MoA turns append per-call aggregated context to the API copy of the
+            # user message, so no byte-stable api_content sidecar can be stamped.
+            moa_active=bool(moa_config),
+        )
+    except PreflightCompressionTimedOut as _preflight_timeout_exc:
+        # Turn-start fail-closed boundary: no provider call was sent while the
+        # request remained oversized. Surface the actionable typed recovery
+        # result instead of allowing a generic surface error to hide it.
+        logger.warning(
+            "Turn-start preflight compression timed out — ending turn with "
+            "typed recovery result: %s",
+            _preflight_timeout_exc,
+        )
+        from agent.agent_runtime_helpers import note_turn_persisted
+
+        # The failed inbound row is intentionally not persisted; callers can
+        # recover the session without entering a compression-growth loop.
+        note_turn_persisted(agent)
+        _final_response = str(_preflight_timeout_exc)
+        return {
+            "final_response": _final_response,
+            "messages": list(conversation_history or []),
+            "completed": False,
+            "api_calls": 0,
+            "error": _final_response,
+            "partial": True,
+            "failed": True,
+            "compression_exhausted": True,
+            "turn_exit_reason": "context_compression_timeout",
+        }
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
