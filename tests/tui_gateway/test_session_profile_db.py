@@ -32,6 +32,11 @@ from hermes_state import SessionDB
 
 SESSION_ID = "sid-profile"
 SESSION_KEY = "tui-profile-1"
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
 
 
 @pytest.fixture()
@@ -88,7 +93,9 @@ def profile_db(tmp_path):
 def _seed(db, turns=3, *, _capture_user_row_ids=None):
     db.create_session(SESSION_KEY, source="tui")
     for i in range(1, turns + 1):
-        uid = db.append_message(SESSION_KEY, "user", f"question {i}")
+        uid = db.append_message(
+            SESSION_KEY, "user", f"question {i}", **HUMAN_PROVENANCE
+        )
         if _capture_user_row_ids is not None:
             _capture_user_row_ids.append(uid)
         db.append_message(SESSION_KEY, "assistant", f"answer {i}")

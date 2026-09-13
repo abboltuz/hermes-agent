@@ -286,7 +286,13 @@ class TestHistoryDisplay:
         cli = _make_cli()
         cli.conversation_history = [
             {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": "Hello"},
+            {
+                "role": "user",
+                "content": "Hello",
+                "origin_kind": "human_user",
+                "turn_kind": "prompt",
+                "trust_kind": "user_authorized",
+            },
             {
                 "role": "assistant",
                 "content": None,
@@ -295,7 +301,13 @@ class TestHistoryDisplay:
             {"role": "tool", "content": "tool output 1"},
             {"role": "tool", "content": "tool output 2"},
             {"role": "assistant", "content": "All set."},
-            {"role": "user", "content": "A" * 250},
+            {
+                "role": "user",
+                "content": "A" * 250,
+                "origin_kind": "human_user",
+                "turn_kind": "prompt",
+                "trust_kind": "user_authorized",
+            },
         ]
 
         cli.show_history()
@@ -692,6 +704,5 @@ class TestRootLevelProviderOverride:
         })
         assert result["model"]["default"] == "flat-default-model"
         assert result["model"]["provider"] == "auto"
-
 
 

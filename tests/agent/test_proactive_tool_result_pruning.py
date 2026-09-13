@@ -130,7 +130,7 @@ def test_rearms_only_after_reclaimed_token_runway():
         _tool_msg("call_9", "ok"),
     ]
     assert sum(map(_estimate_msg_budget_tokens, grown)) < rearm_tokens
-    blocked, n2 = c.prune_tool_results_only(grown, current_tokens=1_000_000)
+    blocked, n2 = c.prune_tool_results_only(grown, current_tokens=120_000)
     assert n2 == 0
     assert blocked is grown
     assert len(_tool_by_id(blocked, "call_6")["content"]) == 9000

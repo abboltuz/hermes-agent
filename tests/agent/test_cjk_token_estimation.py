@@ -49,15 +49,15 @@ def test_cjk_tail_does_not_expand_to_english_char_budget():
 
 
 def _reference_per_char_estimate(text: str) -> int:
-    """The pre-perf-gate per-character reference implementation."""
+    """Reference implementation for dense codepoints plus sparse UTF-8."""
     dense = 0
-    sparse = 0
+    sparse = bytearray()
     for ch in text:
         if _is_cjk_token_dense_char(ch):
             dense += 1
         else:
-            sparse += 1
-    return dense + ((sparse + 3) // 4)
+            sparse.extend(ch.encode("utf-8", "replace"))
+    return dense + ((len(sparse) + 3) // 4)
 
 
 def test_perf_gated_estimator_matches_per_char_reference():
@@ -75,7 +75,6 @@ def test_perf_gated_estimator_matches_per_char_reference():
     ]
     for text in samples:
         assert estimate_tokens_rough(text) == _reference_per_char_estimate(text), repr(text)
-
 
 
 

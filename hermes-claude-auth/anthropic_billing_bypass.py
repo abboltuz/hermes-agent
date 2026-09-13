@@ -274,7 +274,7 @@ def _pascalcase_mcp_name(name: str) -> str:
 def _wrap_tool_name(name: str) -> str:
     if not isinstance(name, str) or not name:
         return name
-    if name.startswith(_MCP_HERMES_NAMESPACE):
+    if name.startswith("mcp__"):
         return name
     base = name[len(_MCP_PREFIX):] if name.startswith(_MCP_PREFIX) else name
     return _MCP_HERMES_NAMESPACE + _uppercase_first(base)
@@ -478,7 +478,7 @@ def _read_claude_config() -> Dict[str, Any]:
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}

@@ -14,11 +14,17 @@ from hermes_cli.partial_compress import (
     summarize_compress_preview,
 )
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 def _history(n_pairs: int) -> list[dict[str, str]]:
     h: list[dict[str, str]] = []
     for i in range(n_pairs):
-        h.append({"role": "user", "content": f"u{i}"})
+        h.append({"role": "user", "content": f"u{i}", **HUMAN_PROVENANCE})
         h.append({"role": "assistant", "content": f"a{i}"})
     return h
 

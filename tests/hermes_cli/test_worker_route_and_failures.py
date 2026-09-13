@@ -130,6 +130,62 @@ def test_ordinary_profile_inheritance_remains_compatible(tmp_path):
     assert card_model_route(task(), tmp_path) == {"provider": "antigravity", "model": "test-model"}
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "model: [unterminated\n",
+        "- model\n- is-not-a-mapping\n",
+    ],
+)
+def test_corrupt_profile_blocks_worker_route_resolution(tmp_path, contents):
+    (tmp_path / "config.yaml").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Failed to load configuration"):
+        card_model_route(
+            task(model_override=None, provider_override=None), tmp_path
+        )
+
+
+def test_corrupt_profile_cannot_reuse_cached_route_config(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"model:\n  default: {REQUIRED_MODEL}\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="explicit provider and model"):
+        card_model_route(
+            task(model_override=None, provider_override=None), tmp_path
+        )
+
+    config_path.write_text("model: [unterminated\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Failed to load configuration"):
+        card_model_route(
+            task(model_override=None, provider_override=None), tmp_path
+        )
+
+
+def test_profile_route_uses_effective_managed_config(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: ${PROFILE_MODEL}\n", encoding="utf-8"
+    )
+    managed_home = tmp_path / "managed"
+    managed_home.mkdir()
+    (managed_home / "config.yaml").write_text(
+        "model:\n  default: managed-model\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PROFILE_MODEL", REQUIRED_MODEL)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_home))
+    managed_scope.invalidate_managed_cache()
+
+    assert card_model_route(
+        task(model_override=None, provider_override=None), profile_home
+    ) is None
+    managed_scope.invalidate_managed_cache()
+
+
 @pytest.mark.parametrize("provider", ["custom:auto", "custom:main", "custom:moa",
                                     "actual-computer", "actualcomputer", "aci", "custom:aci",
                                     "custom", "custom:", "custom:custom", "ollama"])

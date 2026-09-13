@@ -15,6 +15,12 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 def _make_source() -> SessionSource:
     return SessionSource(
@@ -33,7 +39,7 @@ def _make_event(text: str) -> MessageEvent:
 def _make_history(n_pairs: int = 3) -> list[dict[str, str]]:
     h: list[dict[str, str]] = []
     for i in range(n_pairs):
-        h.append({"role": "user", "content": f"u{i}"})
+        h.append({"role": "user", "content": f"u{i}", **HUMAN_PROVENANCE})
         h.append({"role": "assistant", "content": f"a{i}"})
     return h
 
@@ -83,5 +89,4 @@ async def test_aggressive_dry_run_shows_preview_plus_note():
     assert "no changes made" in result.lower()
     assert "--aggressive is not supported" in result
     runner.session_store.rewrite_transcript.assert_not_called()
-
 

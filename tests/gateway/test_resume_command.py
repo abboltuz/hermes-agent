@@ -182,7 +182,14 @@ class TestHandleResumeCommand:
         db.set_session_title("compressed_root", "Compressed Work")
         db.end_session("compressed_root", "compression")
         db.create_session("compressed_child", "telegram", user_id="12345", chat_id="67890", parent_session_id="compressed_root")
-        db.append_message("compressed_child", "user", "hello from continuation")
+        db.append_message(
+            "compressed_child",
+            "user",
+            "hello from continuation",
+            origin_kind="human_user",
+            turn_kind="prompt",
+            trust_kind="user_authorized",
+        )
         db.create_session("current_session_001", "telegram", user_id="12345", chat_id="67890")
 
         event = _make_event(text="/resume Compressed Work")
@@ -192,7 +199,15 @@ class TestHandleResumeCommand:
             event=event,
         )
         runner.session_store.load_transcript.side_effect = (
-            lambda session_id: [{"role": "user", "content": "hello from continuation"}]
+            lambda session_id: [
+                {
+                    "role": "user",
+                    "content": "hello from continuation",
+                    "origin_kind": "human_user",
+                    "turn_kind": "prompt",
+                    "trust_kind": "user_authorized",
+                }
+            ]
             if session_id == "compressed_child"
             else []
         )

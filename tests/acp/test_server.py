@@ -299,7 +299,15 @@ class TestSessionOps:
 
         new_resp = await agent.new_session(cwd="/tmp")
         state = agent.session_manager.get_session(new_resp.session_id)
-        state.history = [{"role": "user", "content": "So tell me the current state"}]
+        state.history = [
+            {
+                "role": "user",
+                "content": "So tell me the current state",
+                "origin_kind": "human_user",
+                "turn_kind": "prompt",
+                "trust_kind": "user_authorized",
+            }
+        ]
 
         mock_conn.session_update.reset_mock()
         resp = await agent.resume_session(cwd="/tmp", session_id=new_resp.session_id)
@@ -531,13 +539,22 @@ class TestSlashCommands:
         original_session_db = object()
         state.agent._session_db = original_session_db
 
-        def _compress_context(messages, system_prompt, *, approx_tokens, task_id, force):
+        def _compress_context(
+            messages,
+            system_prompt,
+            *,
+            approx_tokens,
+            task_id,
+            force,
+            trigger,
+        ):
             assert state.agent._session_db is None
             assert messages == state.history
             assert system_prompt == "system"
             assert approx_tokens == 40
             assert task_id == state.session_id
             assert force is True
+            assert trigger == "acp_manual"
             return [{"role": "user", "content": "summary"}], "new-system"
 
         state.agent._compress_context = MagicMock(side_effect=_compress_context)
@@ -566,6 +583,7 @@ class TestSlashCommands:
             approx_tokens=40,
             task_id=state.session_id,
             force=True,
+            trigger="acp_manual",
         )
         mock_save.assert_called_once_with(state.session_id)
 

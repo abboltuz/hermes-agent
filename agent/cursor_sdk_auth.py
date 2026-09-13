@@ -295,13 +295,14 @@ def read_sdk_credentials() -> dict[str, Any] | None:
         if os.name == "nt":
             raw = path.read_bytes()[: _MAX_CREDENTIAL_FILE_BYTES + 1]
         else:
+            current_uid = getattr(os, "getuid")()
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(path, flags)
             try:
                 file_stat = os.fstat(fd)
                 if (
                     not stat.S_ISREG(file_stat.st_mode)
-                    or file_stat.st_uid != os.getuid()
+                    or file_stat.st_uid != current_uid
                     or file_stat.st_mode & 0o077
                     or file_stat.st_nlink != 1
                 ):

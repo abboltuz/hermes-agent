@@ -206,7 +206,7 @@ def _make_event(text: str):
         message_type=MessageType.TEXT,
         source=_make_source(),
         message_id="m1",
-        internal=True,
+        internal=False,
     )
 
 

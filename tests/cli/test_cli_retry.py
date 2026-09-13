@@ -14,15 +14,24 @@ from hermes_state import SessionDB
 
 from tests.cli.test_cli_init import _make_cli
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
+
+def _human_message(content, **extra):
+    return {"role": "user", "content": content, **HUMAN_PROVENANCE, **extra}
+
 
 def _composite_carrier(ask="REAL ASK"):
-    return {
-        "role": "user",
-        "content": (
+    return _human_message(
+        (
             f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n"
             f"{_SUMMARY_END_MARKER}\n\n{ask}"
-        ),
-    }
+        )
+    )
 
 
 def _message_rows(db, session_id):
@@ -38,9 +47,9 @@ def test_retry_last_truncates_history_before_requeueing_message():
     cli = _make_cli()
     cli._session_db = None
     cli.conversation_history = [
-        {"role": "user", "content": "first"},
+        _human_message("first"),
         {"role": "assistant", "content": "one"},
-        {"role": "user", "content": "retry me"},
+        _human_message("retry me"),
         {"role": "assistant", "content": "old answer"},
     ]
 
@@ -48,11 +57,11 @@ def test_retry_last_truncates_history_before_requeueing_message():
 
     assert retry_msg == "retry me"
     assert cli.conversation_history == [
-        {"role": "user", "content": "first"},
+        _human_message("first"),
         {"role": "assistant", "content": "one"},
     ]
 
-    cli.conversation_history.append({"role": "user", "content": retry_msg})
+    cli.conversation_history.append(_human_message(retry_msg))
     cli.conversation_history.append({"role": "assistant", "content": "new answer"})
 
     assert [m["content"] for m in cli.conversation_history if m["role"] == "user"] == [
@@ -72,7 +81,7 @@ def test_process_command_retry_requeues_original_message_not_retry_command():
 
     cli._pending_input = _Queue()
     cli.conversation_history = [
-        {"role": "user", "content": "retry me"},
+        _human_message("retry me"),
         {"role": "assistant", "content": "old answer"},
     ]
 
@@ -89,11 +98,11 @@ def test_retry_fails_closed_when_warm_and_durable_targets_differ(tmp_path):
     cli._session_db = db
     cli.session_id = "cli-target-mismatch"
     db.create_session(cli.session_id, source="cli")
-    db.append_message(cli.session_id, "user", "DURABLE ASK")
+    db.append_message(cli.session_id, "user", "DURABLE ASK", **HUMAN_PROVENANCE)
     db.append_message(cli.session_id, "assistant", "old answer")
 
     history = [
-        {"role": "user", "content": "WARM ASK"},
+        _human_message("WARM ASK"),
         {"role": "assistant", "content": "old answer"},
     ]
     cli.conversation_history = history
@@ -118,7 +127,7 @@ def test_retry_fails_closed_when_transcript_changes_after_snapshot(
     cli._session_db = db
     cli.session_id = "cli-cas-race"
     db.create_session(cli.session_id, source="cli")
-    db.append_message(cli.session_id, "user", "RETRY ME")
+    db.append_message(cli.session_id, "user", "RETRY ME", **HUMAN_PROVENANCE)
     db.append_message(cli.session_id, "assistant", "failed answer")
     history = db.get_messages_as_conversation(cli.session_id)
     cli.conversation_history = history
@@ -167,11 +176,12 @@ def test_rewind_matches_warm_raw_carrier_to_durable_sanitized_sidecar(
         "user",
         sanitize_context(raw_carrier).strip(),
         api_content=raw_carrier,
+        **HUMAN_PROVENANCE,
     )
     db.append_message(cli.session_id, "assistant", "failed answer")
     durable = db.get_messages_as_conversation(cli.session_id)
     cli.conversation_history = [
-        {"role": "user", "content": raw_carrier},
+        _human_message(raw_carrier),
         durable[1],
     ]
     cli._pending_input = MagicMock()
@@ -208,7 +218,7 @@ def test_rewind_keeps_the_richer_warm_prefix_after_validating_the_target(
 
     if prefix_kind == "buried_ephemeral":
         history = [
-            {"role": "user", "content": "OLDER ASK"},
+            _human_message("OLDER ASK"),
             {"role": "assistant", "content": "candidate answer"},
             {
                 "role": "user",
@@ -216,7 +226,7 @@ def test_rewind_keeps_the_richer_warm_prefix_after_validating_the_target(
                 "_verification_stop_synthetic": True,
             },
             {"role": "assistant", "content": "verified answer"},
-            {"role": "user", "content": "PLAIN TARGET"},
+            _human_message("PLAIN TARGET"),
             {"role": "assistant", "content": "failed answer"},
         ]
         durable_prefix = [
@@ -232,9 +242,9 @@ def test_rewind_keeps_the_richer_warm_prefix_after_validating_the_target(
             {"type": "image_url", "image_url": {"url": "data:image/png,AA"}},
         ]
         history = [
-            {"role": "user", "content": media_content},
+            _human_message(media_content),
             {"role": "assistant", "content": "older answer"},
-            {"role": "user", "content": "PLAIN TARGET"},
+            _human_message("PLAIN TARGET"),
             {"role": "assistant", "content": "failed answer"},
         ]
         durable_prefix = [
@@ -245,8 +255,15 @@ def test_rewind_keeps_the_richer_warm_prefix_after_validating_the_target(
         expected_active = [1, 1, 0, 0]
 
     for role, content in durable_prefix:
-        db.append_message(cli.session_id, role, content)
-    db.append_message(cli.session_id, "user", "PLAIN TARGET")
+        db.append_message(
+            cli.session_id,
+            role,
+            content,
+            **(HUMAN_PROVENANCE if role == "user" else {}),
+        )
+    db.append_message(
+        cli.session_id, "user", "PLAIN TARGET", **HUMAN_PROVENANCE
+    )
     db.append_message(cli.session_id, "assistant", "failed answer")
     cli.conversation_history = history
     cli._pending_input = MagicMock()
@@ -273,7 +290,12 @@ def test_retry_last_durably_preserves_composite_carrier_scaffold(tmp_path):
     cli._session_db = db
     cli.session_id = "cli-carrier-retry"
     db.create_session(cli.session_id, source="cli")
-    db.append_message(cli.session_id, "user", _composite_carrier()["content"])
+    db.append_message(
+        cli.session_id,
+        "user",
+        _composite_carrier()["content"],
+        **HUMAN_PROVENANCE,
+    )
     db.append_message(cli.session_id, "assistant", "failed answer")
     cli.conversation_history = db.get_messages_as_conversation(cli.session_id)
     old_history = cli.conversation_history
@@ -312,6 +334,7 @@ def test_retry_last_rejects_media_before_db_or_memory_mutation():
                 {"type": "text", "text": "look again"},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
             ],
+            **HUMAN_PROVENANCE,
         },
         {"role": "assistant", "content": "old answer"},
     ]
@@ -329,7 +352,7 @@ def test_retry_last_db_failure_leaves_warm_history_unchanged():
     db.get_messages_as_conversation.side_effect = OSError("db unavailable")
     cli._session_db = db
     history = [
-        {"role": "user", "content": "retry me"},
+        _human_message("retry me"),
         {"role": "assistant", "content": "old answer"},
     ]
     cli.conversation_history = history
@@ -345,9 +368,14 @@ def test_undo_last_prefills_live_text_and_retains_durable_scaffold(tmp_path):
     cli._session_db = db
     cli.session_id = "cli-carrier-undo"
     db.create_session(cli.session_id, source="cli")
-    db.append_message(cli.session_id, "user", "older ask")
+    db.append_message(cli.session_id, "user", "older ask", **HUMAN_PROVENANCE)
     db.append_message(cli.session_id, "assistant", "older answer")
-    db.append_message(cli.session_id, "user", _composite_carrier()["content"])
+    db.append_message(
+        cli.session_id,
+        "user",
+        _composite_carrier()["content"],
+        **HUMAN_PROVENANCE,
+    )
     db.append_message(cli.session_id, "assistant", "failed answer")
     cli.conversation_history = db.get_messages_as_conversation(cli.session_id)
     cli._prefill_input_buffer = MagicMock()

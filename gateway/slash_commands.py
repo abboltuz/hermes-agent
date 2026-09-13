@@ -4311,8 +4311,16 @@ class GatewaySlashCommandsMixin:
         if _preview:
             # Report what WOULD be compressed — no agent, no writes.
             from agent.model_metadata import estimate_request_tokens_rough
+            _preview_fields = (
+                "role",
+                "content",
+                "origin_kind",
+                "turn_kind",
+                "trust_kind",
+                "provenance_metadata",
+            )
             _pv_msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
+                {key: m[key] for key in _preview_fields if key in m}
                 for m in history
                 if m.get("role") in {"user", "assistant"} and m.get("content")
             ]
