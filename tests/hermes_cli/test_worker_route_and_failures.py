@@ -130,6 +130,39 @@ def test_ordinary_profile_inheritance_remains_compatible(tmp_path):
     assert card_model_route(task(), tmp_path) == {"provider": "antigravity", "model": "test-model"}
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "model: [unterminated\n",
+        "- model\n- is-not-a-mapping\n",
+    ],
+)
+def test_corrupt_profile_blocks_worker_route_resolution(tmp_path, contents):
+    (tmp_path / "config.yaml").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Failed to load configuration"):
+        card_model_route(
+            task(model_override=None, provider_override=None), tmp_path
+        )
+
+
+def test_corrupt_profile_cannot_reuse_cached_route_config(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"model:\n  default: {REQUIRED_MODEL}\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="explicit provider and model"):
+        card_model_route(
+            task(model_override=None, provider_override=None), tmp_path
+        )
+
+    config_path.write_text("model: [unterminated\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Failed to load configuration"):
+        card_model_route(
+            task(model_override=None, provider_override=None), tmp_path
+        )
+
+
 def test_profile_route_uses_effective_managed_config(tmp_path, monkeypatch):
     from hermes_cli import managed_scope
 

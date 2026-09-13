@@ -3437,7 +3437,9 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
-def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
+def load_config_readonly(
+    config_path: Optional[Path] = None, *, strict: bool = False
+) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3461,8 +3463,15 @@ def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
     process-wide ``HERMES_HOME``. This is used by dispatch code that must
     inspect another profile's effective configuration while still applying
     the canonical normalization, environment expansion, and managed overlay.
+
+    ``strict=True`` rejects malformed or non-mapping user configuration
+    instead of serving defaults or a cached last-known-good value. Use it for
+    pre-dispatch policy gates where a fallback could authorize work that the
+    selected profile intended to forbid.
     """
-    return _load_config_impl(want_deepcopy=False, config_path=config_path)
+    return _load_config_impl(
+        want_deepcopy=False, config_path=config_path, strict=strict
+    )
 
 
 def write_platform_config_field(
@@ -3638,7 +3647,10 @@ def apply_terminal_config_to_env(
 
 
 def _load_config_impl(
-    *, want_deepcopy: bool, config_path: Optional[Path] = None
+    *,
+    want_deepcopy: bool,
+    config_path: Optional[Path] = None,
+    strict: bool = False,
 ) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         if config_path is None:
@@ -3682,7 +3694,12 @@ def _load_config_impl(
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if (
+            not strict
+            and cached is not None
+            and cache_sig is not None
+            and cached[:4] == cache_sig
+        ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
@@ -3697,7 +3714,13 @@ def _load_config_impl(
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                    parsed_user_config = fast_safe_load(f)
+                if parsed_user_config is None:
+                    user_config = {}
+                elif isinstance(parsed_user_config, dict):
+                    user_config = parsed_user_config
+                else:
+                    raise ValueError("configuration root must be a mapping")
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -3708,6 +3731,10 @@ def _load_config_impl(
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                if strict:
+                    raise ValueError(
+                        f"Failed to load configuration from {config_path}: {e}"
+                    ) from e
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default

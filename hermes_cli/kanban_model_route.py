@@ -31,7 +31,9 @@ def card_model_route(task, profile_home=None):
         from hermes_cli.config import load_config_readonly
 
         path = Path(profile_home) / "config.yaml"
-        config = load_config_readonly(path)
+        # Dispatch must fail closed: a corrupt profile must not silently fall
+        # back to defaults and bypass the required-route sentinel.
+        config = load_config_readonly(path, strict=True)
         configured = config.get("model") or {}
         configured_model = configured.get("default") if isinstance(configured, dict) else configured
         required = configured_model == REQUIRED_MODEL
