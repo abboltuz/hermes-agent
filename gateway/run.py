@@ -49,6 +49,8 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_HEARTBEAT_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -132,7 +134,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|context\s+compaction\s+is\s+already\s+running"
     r"|context\s+compaction\s+is\s+still\s+running"
     r"|context\s+compaction\s+finished\s+[—-]\s+rebuilding"
-    r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    r"|compacting\s+context\s+[—-]\s+(?:still\s+)?summarizing\s+earlier\s+conversation"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
@@ -342,6 +344,8 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         _status_template_to_regex(_template)
         for _template in (
             COMPACTION_STATUS,
+            COMPACTION_HEARTBEAT_STATUS,
+            COMPACTION_DONE_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
             PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
             IDLE_COMPACTION_STATUS_TEMPLATE,

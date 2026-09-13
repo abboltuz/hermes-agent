@@ -19,6 +19,10 @@ class _RateLimitError(Exception):
     )
 
 
+def test_wrap_tool_name_preserves_normalized_mcp_name():
+    assert bypass._wrap_tool_name("mcp__linear_get_issue") == "mcp__linear_get_issue"
+
+
 def _adapter_module():
     def build_anthropic_kwargs(*, is_oauth=False):
         return {"is_oauth": is_oauth}

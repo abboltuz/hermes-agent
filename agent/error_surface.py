@@ -51,8 +51,6 @@ _REASON_TO_LAYER = {
     "auth_permanent": LAYER_AUTH,
     "billing": LAYER_BILLING,
     "billing_unverified": LAYER_BILLING,
-    # These are deterministic refusals from Hermes' pre-transport context
-    # guard, not verdicts returned by the selected model/provider.
 }
 
 # Transport-ish reasons: the failure is between us and the base_url, not a

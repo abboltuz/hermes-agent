@@ -9,12 +9,18 @@ from unittest.mock import MagicMock, patch
 
 from tests.cli.test_cli_init import _make_cli
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 def _make_history() -> list[dict[str, str]]:
     # 8 messages = 4 exchanges.
     h: list[dict[str, str]] = []
     for i in range(4):
-        h.append({"role": "user", "content": f"u{i}"})
+        h.append({"role": "user", "content": f"u{i}", **HUMAN_PROVENANCE})
         h.append({"role": "assistant", "content": f"a{i}"})
     return h
 

@@ -16,6 +16,12 @@ from agent import background_review as br
 
 def _msg(role, content, tool_calls=None):
     m = {"role": role, "content": content}
+    if role == "user":
+        m.update(
+            origin_kind="human_user",
+            turn_kind="prompt",
+            trust_kind="user_authorized",
+        )
     if tool_calls:
         m["tool_calls"] = tool_calls
     return m

@@ -28,16 +28,15 @@ def card_model_route(task, profile_home=None):
     provider = str(getattr(task, "provider_override", None) or "").strip()
     required = False
     if profile_home:
-        import yaml
+        from hermes_cli.config import load_config_readonly
 
         path = Path(profile_home) / "config.yaml"
-        if path.is_file():
-            config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            if not isinstance(config, dict):
-                raise ValueError("Worker profile configuration must be a mapping")
-            configured = config.get("model") or {}
-            configured_model = configured.get("default") if isinstance(configured, dict) else configured
-            required = configured_model == REQUIRED_MODEL
+        # Dispatch must fail closed: a corrupt profile must not silently fall
+        # back to defaults and bypass the required-route sentinel.
+        config = load_config_readonly(path, strict=True)
+        configured = config.get("model") or {}
+        configured_model = configured.get("default") if isinstance(configured, dict) else configured
+        required = configured_model == REQUIRED_MODEL
     if model == REQUIRED_MODEL or (required and (not model or not provider)):
         raise ValueError("Card requires an explicit provider and model before worker startup")
     if provider and not model:

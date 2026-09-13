@@ -116,7 +116,7 @@ def _codex_message_response(text: str):
     )
 
 
-def _codex_tool_call_response():
+def _codex_tool_call_response(input_tokens: int = 12):
     return SimpleNamespace(
         output=[
             SimpleNamespace(
@@ -127,7 +127,11 @@ def _codex_tool_call_response():
                 arguments="{}",
             )
         ],
-        usage=SimpleNamespace(input_tokens=12, output_tokens=4, total_tokens=16),
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=4,
+            total_tokens=input_tokens + 4,
+        ),
         status="completed",
         model="gpt-5-codex",
     )
@@ -1678,7 +1682,7 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     agent.context_compressor.threshold_tokens = 20_000
 
     responses = [
-        _codex_tool_call_response(),
+        _codex_tool_call_response(input_tokens=3_200),
         _codex_message_response("Summary after compaction."),
     ]
     requests = []
@@ -1755,7 +1759,7 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     agent._ensure_db_session()
 
     responses = [
-        _codex_tool_call_response(),
+        _codex_tool_call_response(input_tokens=3_200),
         _codex_message_response("Summary after compaction."),
     ]
     monkeypatch.setattr(

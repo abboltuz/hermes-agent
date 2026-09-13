@@ -461,10 +461,15 @@ memory:
 
 class TestOpenVikingTurnConversion:
     def test_extract_current_turn_anchors_on_latest_matching_user_and_assistant(self):
+        human = {
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+        }
         messages = [
-            {"role": "user", "content": "Please inspect the repository for assemble hooks."},
+            {"role": "user", "content": "Please inspect the repository for assemble hooks.", **human},
             {"role": "assistant", "content": "Earlier answer."},
-            {"role": "user", "content": "Please inspect the repository for assemble hooks."},
+            {"role": "user", "content": "Please inspect the repository for assemble hooks.", **human},
             {
                 "role": "assistant",
                 "content": "I will search the codebase.",
@@ -497,8 +502,13 @@ class TestOpenVikingTurnConversion:
         assert turn == messages[2:]
 
     def test_messages_to_openviking_batch_coalesces_tool_results(self):
+        human = {
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+        }
         turn = [
-            {"role": "user", "content": "Please inspect the repository for assemble hooks."},
+            {"role": "user", "content": "Please inspect the repository for assemble hooks.", **human},
             {
                 "role": "assistant",
                 "content": "I will search the codebase.",
