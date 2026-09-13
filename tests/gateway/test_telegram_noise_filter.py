@@ -3,6 +3,7 @@
 import pytest
 
 from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
@@ -149,18 +150,25 @@ def test_all_chat_gateways_suppress_noise(platform, message):
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
 @pytest.mark.parametrize(
-    "message", ROUTINE_COMPRESSION_STATUS_SAMPLES, ids=lambda m: m[:32]
+    "message",
+    tuple(
+        message
+        for message in ROUTINE_COMPRESSION_STATUS_SAMPLES
+        if message != COMPACTION_DONE_STATUS
+    ),
+    ids=lambda m: m[:32],
 )
 def test_all_routine_compression_statuses_suppressed_from_source_constants(
     platform, message
 ):
-    """Every ROUTINE compression status the agent actually emits is filtered.
+    """Every nonterminal ROUTINE compression status is filtered.
 
     Iterates the sample-formatted status strings built from the SAME
     constants the emission sites use (agent/conversation_compression.py's
     ROUTINE_COMPRESSION_STATUS_SAMPLES), so a reworded emit site that drifts
     past the noise regex fails here without anyone remembering to re-copy
-    the literal into this file.
+    the literal into this file. The completion edge is intentionally visible
+    and pinned by ``test_compaction_completion_notice_reaches_chat``.
     """
     assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
 

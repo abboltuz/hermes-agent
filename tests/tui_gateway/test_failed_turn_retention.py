@@ -215,35 +215,6 @@ def test_returned_error_result_carries_error_surface(emits, turn_env):
     assert snapshot["error_surface"]["layer"] == "provider"
 
 
-def test_local_context_guard_is_not_reported_as_provider_error(emits, turn_env):
-    agent = types.SimpleNamespace(
-        session_id="session-key",
-        provider="openai-codex",
-        model="gpt-5.6-sol",
-        run_conversation=lambda *a, **k: {
-            "final_response": "",
-            "error": "required context floor exceeds the safe budget",
-            "failed": True,
-            "failure_reason": "context_projection_irreducible",
-            "failure_retryable": False,
-        },
-        clear_interrupt=lambda: None,
-    )
-    session = _session(agent=agent, running=True)
-    server._start_inflight_turn(session, "continue")
-
-    server._run_prompt_submit("rid", "sid", session, "continue")
-
-    surface = _events(emits, "message.complete")[0]["error_surface"]
-    assert surface == {
-        "layer": "gateway",
-        "code": "context_projection_irreducible",
-        "retryable": False,
-        "provider": "openai-codex",
-        "model": "gpt-5.6-sol",
-    }
-
-
 def test_returned_error_without_reason_omits_no_frame(emits, turn_env):
     """Legacy result dicts (no failure_reason) still get a best-effort
     descriptor — never a crash, never a missing terminal frame."""

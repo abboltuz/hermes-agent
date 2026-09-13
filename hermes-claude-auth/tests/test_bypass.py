@@ -205,6 +205,7 @@ def test_wrap_tool_name_namespaces_to_mcp_hermes():
 
 def test_wrap_tool_name_is_idempotent_when_already_namespaced():
     assert _wrap_tool_name("mcp__hermes__Bash") == "mcp__hermes__Bash"
+    assert _wrap_tool_name("mcp__linear_get_issue") == "mcp__linear_get_issue"
 
 
 def test_unwrap_tool_name_lowercases_first_char():

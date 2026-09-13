@@ -588,6 +588,19 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
                     "session_id": "proc_watch",
                     "event_id": "proc_watch",
                 },
+                "provenance": {
+                    "origin_kind": "internal_system",
+                    "turn_kind": "notification",
+                    "trust_kind": "trusted_internal",
+                    "provenance_metadata": {
+                        "producer": "gateway_wake",
+                        "source": "process",
+                        "event_kind": "process_notification",
+                        "platform": "api_server",
+                        "event_id": "proc_watch",
+                        "session_id": "raw-hq-session-id",
+                    },
+                },
             },
         }
     ]
@@ -633,6 +646,19 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
                     "kind": "process_notification",
                     "session_id": "proc_watch",
                     "event_id": "proc_watch",
+                },
+                "provenance": {
+                    "origin_kind": "internal_system",
+                    "turn_kind": "notification",
+                    "trust_kind": "trusted_internal",
+                    "provenance_metadata": {
+                        "producer": "gateway_wake",
+                        "source": "process",
+                        "event_kind": "process_notification",
+                        "platform": "api_server",
+                        "event_id": "proc_watch",
+                        "session_id": "raw-origin-sid",
+                    },
                 },
             },
         )

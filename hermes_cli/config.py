@@ -3437,7 +3437,7 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
-def load_config_readonly() -> Dict[str, Any]:
+def load_config_readonly(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3456,8 +3456,13 @@ def load_config_readonly() -> Dict[str, Any]:
     Note: this returns a plain ``dict`` (not ``MappingProxyType``) so
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
+
+    ``config_path`` selects an explicit profile config without changing the
+    process-wide ``HERMES_HOME``. This is used by dispatch code that must
+    inspect another profile's effective configuration while still applying
+    the canonical normalization, environment expansion, and managed overlay.
     """
-    return _load_config_impl(want_deepcopy=False)
+    return _load_config_impl(want_deepcopy=False, config_path=config_path)
 
 
 def write_platform_config_field(
@@ -3632,10 +3637,15 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *, want_deepcopy: bool, config_path: Optional[Path] = None
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        if config_path is None:
+            ensure_hermes_home()
+            config_path = get_config_path()
+        else:
+            config_path = Path(config_path)
         path_key = str(config_path)
 
         try:

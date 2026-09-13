@@ -38,6 +38,7 @@ class DummyAgent:
         focus_topic=None,
         force=False,
         defer_context_engine_notification=False,
+        trigger=None,
     ):
         self.calls.append(
             {
@@ -46,6 +47,7 @@ class DummyAgent:
                 "approx_tokens": approx_tokens,
                 "focus_topic": focus_topic,
                 "force": force,
+                "trigger": trigger,
                 "defer_context_engine_notification": (
                     defer_context_engine_notification
                 ),
@@ -91,6 +93,7 @@ def test_manual_compress_does_not_pass_cached_system_prompt(monkeypatch):
     assert call["system_message"] is None
     assert call["system_message"] != cli.agent._cached_system_prompt
     assert call["focus_topic"] == "database schema"
+    assert call["trigger"] == "cli_manual"
     assert cli.session_id == "new-session"
     assert cli._pending_title is None
     assert len(cli.agent.flush_calls) == 1

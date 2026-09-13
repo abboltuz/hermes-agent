@@ -61,9 +61,22 @@ def _render_history(history, show_ts):
 def test_history_shows_timestamp_for_stored_turns():
     ts = time.time()
     hist = [
-        {"role": "user", "content": "hello", "timestamp": ts},
+        {
+            "role": "user",
+            "content": "hello",
+            "timestamp": ts,
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+        },
         {"role": "assistant", "content": "hi", "timestamp": ts + 60},
-        {"role": "user", "content": "live turn, no ts"},
+        {
+            "role": "user",
+            "content": "live turn, no ts",
+            "origin_kind": "human_user",
+            "turn_kind": "prompt",
+            "trust_kind": "user_authorized",
+        },
     ]
     out = _render_history(hist, show_ts=True)
     hhmm = datetime.fromtimestamp(ts).strftime("%H:%M")
@@ -71,5 +84,4 @@ def test_history_shows_timestamp_for_stored_turns():
     assert "[Hermes #2]  [" in out
     # a turn with no stored timestamp must NOT get a fabricated time
     assert "[You #3]\n" in out
-
 

@@ -22,6 +22,12 @@ from hermes_cli.config import (
     DEFAULT_CONFIG,
 )
 
+HUMAN_PROVENANCE = {
+    "origin_kind": "human_user",
+    "turn_kind": "prompt",
+    "trust_kind": "user_authorized",
+}
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -2126,16 +2132,28 @@ class TestWebServerEndpoints:
                 "user",
                 "REAL ASK",
                 timestamp=123.0,
+                **HUMAN_PROVENANCE,
             )
             db.archive_and_compact(
                 "compacted-carrier-display",
-                [{"role": "user", "content": carrier, "timestamp": 123.0}],
+                [
+                    {
+                        "role": "user",
+                        "content": carrier,
+                        "timestamp": 123.0,
+                        **HUMAN_PROVENANCE,
+                    }
+                ],
             )
             db.append_message(
                 "compacted-carrier-display",
                 "user",
                 handoff,
                 timestamp=124.0,
+                display_kind="hidden",
+                origin_kind="internal_system",
+                turn_kind="summary",
+                trust_kind="trusted_internal",
             )
             db.append_message(
                 "compacted-carrier-display",

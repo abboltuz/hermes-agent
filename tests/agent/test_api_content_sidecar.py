@@ -1029,6 +1029,9 @@ class TestStaleConfirmationRedactionDropsSidecar:
                 "content": "confirm forced restart",
                 "api_content": "confirm forced restart\n\nPLUGIN-CTX",
                 "timestamp": 1000.0,
+                "origin_kind": "human_user",
+                "turn_kind": "prompt",
+                "trust_kind": "user_authorized",
             }
         ]
         cleaned = strip_stale_dangerous_confirmations(
