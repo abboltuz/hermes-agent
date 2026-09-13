@@ -2880,8 +2880,10 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         opencode_model_api_mode,
         normalize_opencode_model_id,
     )
+    from providers import get_provider_profile
 
     pconfig = PROVIDER_REGISTRY[provider_id]
+    provider_profile = get_provider_profile(provider_id)
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
 
@@ -3081,7 +3083,13 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
                 f'  Showing {len(model_list)} keyless free models — use "Enter custom model name" for others.'
             )
     else:
-        curated = _PROVIDER_MODELS.get(provider_id, [])
+        static_curated = _PROVIDER_MODELS.get(provider_id, [])
+        curated = list(
+            static_curated
+            or (
+                provider_profile.fallback_models if provider_profile is not None else ()
+            )
+        )
 
         # Try models.dev first — returns tool-capable models, filtered for noise
         mdev_models: list = []
@@ -3116,7 +3124,18 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             api_key_for_probe = existing_key or (
                 get_env_value(key_env) if key_env else ""
             )
-            live_models = fetch_api_models(api_key_for_probe, effective_base)
+            # Profiles injected into the provider registry are the source of
+            # truth for their catalog semantics. In particular, a profile can
+            # filter a mixed /models response down to agent-capable entries.
+            # Keep the legacy generic probe for providers whose curated list
+            # still lives in _PROVIDER_MODELS.
+            if provider_profile is not None and not static_curated:
+                live_models = provider_profile.fetch_models(
+                    api_key=api_key_for_probe,
+                    base_url=effective_base,
+                )
+            else:
+                live_models = fetch_api_models(api_key_for_probe, effective_base)
             if live_models and len(live_models) >= len(curated):
                 model_list = live_models
                 print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
