@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 import urllib.request
+from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
@@ -11,6 +14,21 @@ from hermes_cli.auth import is_runtime_provider_routable
 from hermes_cli.provider_catalog import provider_catalog_by_slug
 from providers import get_provider_profile
 from providers.base import ProviderProfile
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _reset_provider_discovery() -> None:
+    import providers
+
+    providers._REGISTRY.clear()
+    providers._ALIASES.clear()
+    providers._PROVIDER_LIST_CACHE = None
+    providers._discovered = False
+    for module_name in list(sys.modules):
+        if module_name.startswith("plugins.model_providers"):
+            del sys.modules[module_name]
 
 
 class _Response:
@@ -146,3 +164,110 @@ def test_custom_base_url_preserves_generic_openai_catalog_contract():
         base_url="https://gateway.example.test/v1",
         timeout=1.25,
     )
+
+
+def test_interactive_setup_uses_profile_filtered_live_catalog(monkeypatch):
+    from hermes_cli.model_setup_flows import _model_flow_api_key_provider
+
+    profile = get_provider_profile("mistral")
+    assert profile is not None
+    live_models = [f"agentic-live-{index}" for index in range(6)]
+    selected_catalog: list[str] = []
+
+    def capture_selection(models: list[str], **_kwargs: object) -> None:
+        selected_catalog.extend(models)
+        return None
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-secret")
+    with (
+        patch(
+            "hermes_cli.main._prompt_api_key",
+            return_value=("test-secret", False),
+        ),
+        patch("hermes_cli.model_setup_flows.line_input", return_value=""),
+        patch("agent.models_dev.list_agentic_models", return_value=[]),
+        patch.object(
+            profile, "fetch_models", return_value=live_models
+        ) as profile_fetch,
+        patch(
+            "hermes_cli.models.fetch_api_models",
+            side_effect=AssertionError("raw catalog probe bypassed provider profile"),
+        ),
+        patch(
+            "hermes_cli.auth._prompt_model_selection",
+            side_effect=capture_selection,
+        ),
+    ):
+        _model_flow_api_key_provider({}, "mistral", "")
+
+    assert selected_catalog == live_models
+    profile_fetch.assert_called_once_with(
+        api_key="test-secret",
+        base_url="https://api.mistral.ai/v1",
+    )
+
+
+def test_interactive_setup_uses_profile_fallback_catalog(monkeypatch):
+    from hermes_cli.model_setup_flows import _model_flow_api_key_provider
+
+    profile = get_provider_profile("mistral")
+    assert profile is not None
+    selected_catalog: list[str] = []
+
+    def capture_selection(models: list[str], **_kwargs: object) -> None:
+        selected_catalog.extend(models)
+        return None
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-secret")
+    with (
+        patch(
+            "hermes_cli.main._prompt_api_key",
+            return_value=("test-secret", False),
+        ),
+        patch("hermes_cli.model_setup_flows.line_input", return_value=""),
+        patch("agent.models_dev.list_agentic_models", return_value=[]),
+        patch.object(profile, "fetch_models", return_value=None),
+        patch(
+            "hermes_cli.models.fetch_api_models",
+            side_effect=AssertionError("raw catalog probe bypassed provider profile"),
+        ),
+        patch(
+            "hermes_cli.auth._prompt_model_selection",
+            side_effect=capture_selection,
+        ),
+    ):
+        _model_flow_api_key_provider({}, "mistral", "")
+
+    assert selected_catalog == list(profile.fallback_models)
+
+
+def test_profile_loads_from_sealed_bundled_plugins_layout(tmp_path, monkeypatch):
+    """Packaged runtimes load provider code outside Python site-packages."""
+
+    bundled_root = tmp_path / "share" / "hermes-agent" / "plugins"
+    sealed_mistral = bundled_root / "model-providers" / "mistral"
+    shutil.copytree(
+        REPO_ROOT / "plugins" / "model-providers" / "mistral",
+        sealed_mistral,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+
+    try:
+        with monkeypatch.context() as sealed_env:
+            sealed_env.setenv("HERMES_BUNDLED_PLUGINS", str(bundled_root))
+            _reset_provider_discovery()
+
+            profile = get_provider_profile("mistral")
+
+            assert profile is not None
+            module = sys.modules[profile.__class__.__module__]
+            module_file = module.__file__
+            assert module_file is not None
+            assert (
+                Path(module_file).resolve()
+                == (sealed_mistral / "__init__.py").resolve()
+            )
+    finally:
+        # Leave global discovery pristine for suites that run test files in one
+        # interpreter; the monkeypatch context has already restored the env.
+        _reset_provider_discovery()
