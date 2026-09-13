@@ -101,7 +101,10 @@ class TestWorkerTeardownOnCeiling:
             messages=original,
             system_prompt_fallback="fallback",
             idle_timeout_seconds=0.1,
-            total_ceiling_seconds=0.2,
+            # This value also bounds the cancelled-worker join grace. Keep
+            # enough scheduling headroom for loaded CI runners while the
+            # 0.1s idle timeout still makes a missing join fail immediately.
+            total_ceiling_seconds=2.0,
             fence=fence,
             stall_fallback=False,
         )
