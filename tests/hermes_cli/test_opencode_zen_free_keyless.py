@@ -95,7 +95,26 @@ class TestFreeRuntime:
     def test_headers_override_sdk_bearer(self):
         headers = opencode_zen_free_headers()
         assert headers["Authorization"] == ""
-        assert headers["X-Title"] == "Hermes Agent"
+
+    def test_headers_impersonate_opencode_cli(self):
+        """Free tier serves only the official CLI fingerprint (relay 400s
+        honest third-party attribution), so wire headers carry the CLI
+        User-Agent + client id and no Hermes Referer/Title."""
+        headers = opencode_zen_free_headers()
+        assert headers["User-Agent"] == "opencode/latest"
+        assert headers["x-opencode-client"] == "cli"
+        assert "HTTP-Referer" not in headers
+        assert "X-Title" not in headers
+        for key in ("x-opencode-session", "x-opencode-project", "x-opencode-request"):
+            assert headers[key], key
+
+    def test_request_ids_not_frozen(self):
+        """IDs are fresh per headers build — static IDs repeated across
+        requests read as multiplexed abuse on the relay side."""
+        first = opencode_zen_free_headers()
+        second = opencode_zen_free_headers()
+        assert first["x-opencode-request"] != second["x-opencode-request"]
+        assert first["x-opencode-session"] != second["x-opencode-session"]
 
 
 class TestRuntimeProviderKeylessRouting:

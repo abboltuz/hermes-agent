@@ -37,6 +37,21 @@ class TestOpenCodeFreeProviderRegistration:
         profile = get_provider_profile("opencode-free")
         assert profile.default_headers.get("Authorization") == ""
 
+    def test_provider_headers_carry_cli_fingerprint(self):
+        """Static half of the CLI fingerprint lives on the profile (dynamic
+        request IDs merge per client build). Must match the shared
+        hermes_cli.models contract — never a duplicated literal."""
+        from hermes_cli.models import (
+            OPENCODE_CLI_CLIENT_ID,
+            OPENCODE_CLI_USER_AGENT,
+        )
+        from providers import get_provider_profile
+        profile = get_provider_profile("opencode-free")
+        assert profile.default_headers.get("User-Agent") == OPENCODE_CLI_USER_AGENT
+        assert profile.default_headers.get("x-opencode-client") == OPENCODE_CLI_CLIENT_ID
+        assert "HTTP-Referer" not in profile.default_headers
+        assert "X-Title" not in profile.default_headers
+
     def test_provider_uses_chat_completions_mode(self):
         from providers import get_provider_profile
         profile = get_provider_profile("opencode-free")
