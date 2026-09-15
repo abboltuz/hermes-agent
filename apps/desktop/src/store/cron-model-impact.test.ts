@@ -13,6 +13,7 @@ vi.mock('@/hermes', () => ({
 }))
 
 import {
+  applyModelAssignment,
   CRON_MODEL_IMPACT_NOTIFICATION_ID,
   invalidateCronModelImpactScope,
   setMainModelAssignment
@@ -114,7 +115,40 @@ describe('setMainModelAssignment', () => {
     expect($notifications.get()).toEqual([])
   })
 
-  it('rejects non-persisted confirmation outcomes without changing impact state', async () => {
+  it('asks for guard confirm and resends once with the ack on accept', async () => {
+    setModelAssignment.mockResolvedValueOnce({
+      ok: false,
+      scope: 'main',
+      provider: 'openrouter',
+      model: 'openai/gpt-5.5-pro',
+      confirm_required: true,
+      confirm_message: 'Confirm this expensive model.'
+    } satisfies ModelAssignmentResponse)
+    setModelAssignment.mockResolvedValueOnce(response(positive('Confirmed job')))
+
+    const seen: string[] = []
+
+    const result = await setMainModelAssignment({ provider: 'openrouter', model: 'openai/gpt-5.5-pro' }, null, {
+      confirm: async message => {
+        seen.push(message)
+
+        return true
+      }
+    })
+
+    expect(result.ok).toBe(true)
+    expect(seen).toEqual(['Confirm this expensive model.'])
+    expect(setModelAssignment).toHaveBeenCalledTimes(2)
+    expect(setModelAssignment.mock.calls[0][0]).not.toHaveProperty('confirm_expensive_model')
+    expect(setModelAssignment.mock.calls[1][0]).toMatchObject({
+      scope: 'main',
+      provider: 'openrouter',
+      model: 'openai/gpt-5.5-pro',
+      confirm_expensive_model: true
+    })
+  })
+
+  it('keeps the previous model with a visible cancel when the guard is declined', async () => {
     setModelAssignment.mockResolvedValueOnce(response(positive()))
     await setMainModelAssignment({ provider: 'nous', model: 'one' })
 
@@ -127,14 +161,43 @@ describe('setMainModelAssignment', () => {
       confirm_message: 'Confirm this expensive model.'
     } satisfies ModelAssignmentResponse)
 
-    await expect(setMainModelAssignment({ provider: 'openrouter', model: 'openai/gpt-5.5-pro' })).rejects.toThrow(
-      'Confirm this expensive model.'
-    )
+    await expect(
+      setMainModelAssignment({ provider: 'openrouter', model: 'openai/gpt-5.5-pro' }, null, {
+        confirm: async () => false
+      })
+    ).rejects.toThrow('Model switch cancelled.')
+    expect(setModelAssignment).toHaveBeenCalledTimes(2)
     expect($notifications.get()).toHaveLength(1)
     const action = $notifications.get()[0].action
     const reviewCount = $cronReviewRequest.get()
     action?.onClick()
     expect($cronReviewRequest.get()).toBe(reviewCount + 1)
+  })
+
+  it('fails instead of looping when the acked resend still requires confirm', async () => {
+    setModelAssignment.mockResolvedValueOnce({
+      ok: false,
+      scope: 'main',
+      provider: 'openrouter',
+      model: 'openai/gpt-5.5-pro',
+      confirm_required: true,
+      confirm_message: 'Confirm this expensive model.'
+    } satisfies ModelAssignmentResponse)
+    setModelAssignment.mockResolvedValueOnce({
+      ok: false,
+      scope: 'main',
+      provider: 'openrouter',
+      model: 'openai/gpt-5.5-pro',
+      confirm_required: true,
+      confirm_message: 'Still guarded.'
+    } satisfies ModelAssignmentResponse)
+
+    await expect(
+      setMainModelAssignment({ provider: 'openrouter', model: 'openai/gpt-5.5-pro' }, null, {
+        confirm: async () => true
+      })
+    ).rejects.toThrow('Still guarded.')
+    expect(setModelAssignment).toHaveBeenCalledTimes(2)
   })
 
   it('publishes only the latest same-profile assignment when responses reverse', async () => {
@@ -195,5 +258,46 @@ describe('setMainModelAssignment', () => {
 
     expect($notifications.get()).toEqual([])
     expect(setModelAssignment).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces the guard confirm for auxiliary picks instead of silently dropping them', async () => {
+    setModelAssignment.mockResolvedValueOnce({
+      ok: false,
+      scope: 'auxiliary',
+      provider: 'commandcode',
+      model: 'muse-spark-1.3-contributor',
+      confirm_required: true,
+      confirm_message: 'Confirm this expensive model.'
+    } satisfies ModelAssignmentResponse)
+    setModelAssignment.mockResolvedValueOnce({
+      ok: true,
+      scope: 'auxiliary',
+      provider: 'commandcode',
+      model: 'muse-spark-1.3-contributor'
+    } satisfies ModelAssignmentResponse)
+
+    const seen: string[] = []
+
+    const result = await applyModelAssignment(
+      { provider: 'commandcode', model: 'muse-spark-1.3-contributor', scope: 'auxiliary', task: 'vision' },
+      null,
+      {
+        confirm: async message => {
+          seen.push(message)
+
+          return true
+        }
+      }
+    )
+
+    expect(result.ok).toBe(true)
+    expect(seen).toEqual(['Confirm this expensive model.'])
+    expect(setModelAssignment).toHaveBeenCalledTimes(2)
+    expect(setModelAssignment.mock.calls[0][0]).not.toHaveProperty('confirm_expensive_model')
+    expect(setModelAssignment.mock.calls[1][0]).toMatchObject({
+      scope: 'auxiliary',
+      task: 'vision',
+      confirm_expensive_model: true
+    })
   })
 })

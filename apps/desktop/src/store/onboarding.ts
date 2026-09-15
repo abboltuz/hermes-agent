@@ -320,11 +320,17 @@ async function completeWithModelConfirm(
     // Persist the chosen provider/model before the runtime gate so a stale
     // config provider (e.g. anthropic from a prior failed setup) cannot make
     // setup.runtime_check validate the wrong backend after a fresh OAuth login.
+    // A guarded expensive default must not auto-apply here: decline the guard
+    // so onboarding surfaces the error instead of hanging on a confirm.
     try {
-      const res = await setMainModelAssignment({
-        provider: defaults.providerSlug,
-        model: defaults.defaultModel
-      })
+      const res = await setMainModelAssignment(
+        {
+          provider: defaults.providerSlug,
+          model: defaults.defaultModel
+        },
+        null,
+        { confirm: async () => false }
+      )
 
       notifyGatewayTools(res.gateway_tools)
     } catch (error) {

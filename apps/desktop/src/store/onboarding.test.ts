@@ -468,7 +468,7 @@ describe('OAuth onboarding', () => {
 
     const state = $desktopOnboarding.get()
     expect(state.flow.status).toBe('error')
-    expect(state.flow.status === 'error' ? state.flow.message : '').toContain('Confirm this expensive model.')
+    expect(state.flow.status === 'error' ? state.flow.message : '').toContain('Model switch cancelled.')
     expect(requestGatewayMock).not.toHaveBeenCalledWith('setup.runtime_check', expect.anything())
   })
 })

@@ -144,33 +144,55 @@ function publishImpact(impact: CronModelImpact, profile: string, connection: str
   })
 }
 
-export async function setMainModelAssignment(
-  request: Omit<ModelAssignmentRequest, 'scope'>,
-  scopeProfile?: null | string
+export type ModelAssignmentConfirm = (message: string) => Promise<boolean>
+
+function defaultGuardConfirm(message: string): Promise<boolean> {
+  return new Promise(resolve => {
+    let settled = false
+
+    const settle = (value: boolean, id: string) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      dismissNotification(id)
+      resolve(value)
+    }
+
+    const id = notify({
+      kind: 'warning',
+      title: 'Expensive Model Warning',
+      message,
+      action: {
+        label: translateNow('common.confirm'),
+        onClick: () => settle(true, id)
+      },
+      onDismiss: () => settle(false, id)
+    })
+  })
+}
+
+async function sendAssignment(
+  request: ModelAssignmentRequest,
+  scopeProfile?: null | string,
+  ack = false
 ): Promise<ModelAssignmentResponse> {
-  const { connection, generation } = beginCronModelImpactAssignment()
-  const profile = profileIdentity()
+  const body = ack ? { ...request, confirm_expensive_model: true } : { ...request }
 
   // Only pass the extra arg when a scope override exists, so unscoped callers
   // keep the exact legacy call shape.
-  const result =
-    scopeProfile == null
-      ? await setModelAssignment({ ...request, scope: 'main' })
-      : await setModelAssignment({ ...request, scope: 'main' }, scopeProfile)
+  return scopeProfile == null ? await setModelAssignment(body) : await setModelAssignment(body, scopeProfile)
+}
 
-  if (result.ok !== true) {
-    throw new Error(result.confirm_message?.trim() || translateNow('cron.modelImpact.saveFailed'))
-  }
-
-  // A scoped assignment targets ANOTHER profile's backend: its cron impact
-  // belongs to that profile, and the review action would open the ACTIVE
-  // profile's cron view — skip the warning rather than mis-route it.
-  if (scopeProfile != null) {
-    return result
-  }
-
+function publishMainImpact(
+  result: ModelAssignmentResponse,
+  profile: string,
+  connection: string,
+  generation: number
+): void {
   if (!currentResponseScope(profile, connection, generation)) {
-    return result
+    return
   }
 
   // Missing means an older backend. It is not evidence that an existing impact
@@ -182,7 +204,70 @@ export async function setMainModelAssignment(
       publishImpact(impact, profile, connection, generation)
     }
   }
+}
 
+/** Shared guard handshake for every POST /api/model/set scope.
+ *
+ * The backend answers guarded picks with confirm_required and writes nothing.
+ * Callers must surface the confirm and resend once with the ack — otherwise
+ * the follow-up refresh repaints the previous model (silent revert).
+ */
+export async function applyModelAssignment(
+  request: ModelAssignmentRequest,
+  scopeProfile?: null | string,
+  opts?: { confirm?: ModelAssignmentConfirm }
+): Promise<ModelAssignmentResponse> {
+  const { connection, generation } = beginCronModelImpactAssignment()
+  const profile = profileIdentity()
+  const confirm = opts?.confirm ?? defaultGuardConfirm
+
+  const first = await sendAssignment(request, scopeProfile)
+
+  if (first.ok === true) {
+    if (request.scope === 'main' && scopeProfile == null) {
+      publishMainImpact(first, profile, connection, generation)
+    }
+
+    return first
+  }
+
+  if (first.confirm_required !== true) {
+    throw new Error(first.confirm_message?.trim() || translateNow('cron.modelImpact.saveFailed'))
+  }
+
+  const message = first.confirm_message?.trim() || translateNow('cron.modelImpact.saveFailed')
+  const accepted = await confirm(message)
+
+  if (!accepted) {
+    throw new Error('Model switch cancelled.')
+  }
+
+  const second = await sendAssignment(request, scopeProfile, true)
+
+  if (second.ok !== true || second.confirm_required === true) {
+    throw new Error(second.confirm_message?.trim() || translateNow('cron.modelImpact.saveFailed'))
+  }
+
+  if (request.scope === 'main' && scopeProfile == null) {
+    publishMainImpact(second, profile, connection, generation)
+  }
+
+  return second
+}
+
+export async function setMainModelAssignment(
+  request: Omit<ModelAssignmentRequest, 'scope'>,
+  scopeProfile?: null | string,
+  opts?: { confirm?: ModelAssignmentConfirm }
+): Promise<ModelAssignmentResponse> {
+  const result = await applyModelAssignment({ ...request, scope: 'main' }, scopeProfile, opts)
+
+  // A scoped assignment targets ANOTHER profile's backend: its cron impact
+  // belongs to that profile, and the review action would open the ACTIVE
+  // profile's cron view — applyModelAssignment already skipped the warning.
+
+  // applyModelAssignment already published the cron impact for unscoped main
+  // assignments and skipped it for scoped ones.
   return result
 }
 
