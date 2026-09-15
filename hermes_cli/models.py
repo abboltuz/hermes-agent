@@ -564,6 +564,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nemotron-3-ultra-free",
         "nemotron-3.5-lightning-free",
         "muse-spark-1.2-contributor-free",
+        "muse-spark-1.3-contributor-free",
     ],
     # OpenCode free tier — keyless (no OpenCode account needed). Synced
     # against live GET /zen/v1/models + anonymous probes (2026-08-21);
@@ -581,6 +582,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nemotron-3-ultra-free",
         "nemotron-3.5-lightning-free",
         "muse-spark-1.2-contributor-free",
+        "muse-spark-1.3-contributor-free",
     ],
     # Synced against https://opencode.ai/docs/go/ + live GET /zen/go/v1/models
     # (2026-08-20).
