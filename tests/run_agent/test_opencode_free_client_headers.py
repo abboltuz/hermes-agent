@@ -9,6 +9,11 @@ The client therefore must ship an EMPTY ``Authorization`` default header for
 every opencode-free build, which overrides the OpenAI SDK's always-injected
 ``Authorization: Bearer <api_key>`` so no credential-shaped value ever
 reaches the wire.
+
+The remaining headers impersonate the official OpenCode CLI (User-Agent
+``opencode/latest`` + ``x-opencode-client: cli`` + fresh request IDs): the
+relay serves the free tier only to its own client and 400/429s honest
+third-party attribution. Paid Zen/Go traffic keeps Hermes attribution.
 """
 from unittest.mock import MagicMock, patch
 
@@ -63,9 +68,10 @@ def test_opencode_free_blanks_authorization_header(mock_openai):
 
 
 @patch("run_agent.OpenAI")
-def test_opencode_free_sends_hermes_attribution(mock_openai):
-    """Keyless requests still identify as Hermes (attribution headers match
-    the opencode zen/go profiles)."""
+def test_opencode_free_sends_cli_fingerprint(mock_openai):
+    """Keyless requests impersonate the official OpenCode CLI — the relay
+    serves the free tier only to its own client (400/429 otherwise), so
+    Hermes attribution must NOT appear on this path."""
     mock_openai.return_value = MagicMock()
     create_openai_client(
         _FakeAgent(api_key="opencode-zen-free-keyless"),
@@ -74,8 +80,12 @@ def test_opencode_free_sends_hermes_attribution(mock_openai):
         shared=False,
     )
     headers = _zen_call_headers(mock_openai)
-    assert headers.get("X-Title") == "Hermes Agent"
-    assert str(headers.get("User-Agent", "")).startswith("HermesAgent/")
+    assert headers.get("User-Agent") == "opencode/latest"
+    assert headers.get("x-opencode-client") == "cli"
+    assert "X-Title" not in headers
+    assert "HTTP-Referer" not in headers
+    for key in ("x-opencode-session", "x-opencode-project", "x-opencode-request"):
+        assert headers.get(key), key
 
 
 @patch("run_agent.OpenAI")
