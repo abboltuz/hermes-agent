@@ -40,10 +40,15 @@ class CLIAgentSetupMixin:
         _primary_exc = None
         runtime = None
         try:
+            # Pass the effective model (CLI -m override included): model-
+            # dependent routing (OpenCode free-tier heal, per-model api_mode)
+            # must see the model we will actually call, not the config
+            # default. None/empty falls back to config exactly as before.
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                target_model=self.model or None,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -61,7 +66,7 @@ class CLIAgentSetupMixin:
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key
 
-                        _fb_kwargs = {"requested": _fb_provider}
+                        _fb_kwargs = {"requested": _fb_provider, "target_model": _fb_model}
                         if _fb.get("base_url"):
                             _fb_kwargs["explicit_base_url"] = _fb["base_url"]
                         _fb_api_key = resolve_entry_api_key(_fb)
@@ -206,6 +211,9 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                # getattr: the mixin is also exercised by minimal test
+                # doubles without a .model; missing means "no override".
+                target_model=getattr(self, "model", None) or None,
             )
         except Exception:
             return False
