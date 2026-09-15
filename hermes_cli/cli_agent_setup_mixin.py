@@ -211,7 +211,9 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
-                target_model=self.model or None,
+                # getattr: the mixin is also exercised by minimal test
+                # doubles without a .model; missing means "no override".
+                target_model=getattr(self, "model", None) or None,
             )
         except Exception:
             return False
