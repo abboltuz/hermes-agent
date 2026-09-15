@@ -40,10 +40,15 @@ class CLIAgentSetupMixin:
         _primary_exc = None
         runtime = None
         try:
+            # Pass the effective model (CLI -m override included): model-
+            # dependent routing (OpenCode free-tier heal, per-model api_mode)
+            # must see the model we will actually call, not the config
+            # default. None/empty falls back to config exactly as before.
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                target_model=self.model or None,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -206,6 +211,7 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                target_model=self.model or None,
             )
         except Exception:
             return False

@@ -680,3 +680,37 @@ def test_custom_endpoint_key_env_is_a_valid_posix_name_for_ip_endpoints():
         assert _ENV_VAR_NAME_RE.match(custom_endpoint_key_env(identity)), identity
 
 
+
+
+def test_cli_model_override_drives_opencode_free_heal(monkeypatch):
+    """Kanban-worker shape: ``-m <free-slug> --provider opencode`` with a
+    config default that is NOT free (the coder profile's
+    ``__KANBAN_CARD_MODEL_REQUIRED__`` sentinel). Credential resolution must
+    heal to the keyless runtime for the -m model. Pre-fix it resolved keys
+    for the config default instead, so workers went out keyed with honest
+    Hermes attribution and the relay 400'd (free-tier client gate)."""
+    cli = _import_cli()
+    from hermes_cli.models import OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
+
+    monkeypatch.setitem(cli.CLI_CONFIG, "model", {
+        "default": "__KANBAN_CARD_MODEL_REQUIRED__",
+        "provider": "opencode",
+        "base_url": "",
+    })
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider._get_model_config",
+        lambda: {
+            "default": "__KANBAN_CARD_MODEL_REQUIRED__",
+            "provider": "opencode",
+        },
+    )
+    for var in ("OPENCODE_ZEN_API_KEY", "OPENCODE_GO_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    shell = cli.HermesCLI(
+        model="muse-spark-1.3-contributor-free", compact=True, max_turns=1
+    )
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.api_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
+    assert shell.api_mode == "codex_responses"

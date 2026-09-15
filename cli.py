@@ -8911,7 +8911,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # runtime provider resolution owns credentials.
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-                resolved = resolve_runtime_provider(requested=stored_provider)
+                resolved = resolve_runtime_provider(
+                    requested=stored_provider,
+                    target_model=stored_model,
+                )
                 if resolved.get("api_key"):
                     self.api_key = resolved["api_key"]
                     self._credential_pool = resolved.get("credential_pool")
