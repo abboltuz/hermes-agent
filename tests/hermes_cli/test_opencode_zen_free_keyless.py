@@ -71,6 +71,18 @@ class TestFreeRuntime:
         assert rt["api_mode"] == "chat_completions"
         assert rt["default_headers"]["Authorization"] == ""
 
+    def test_zen_muse_spark_13_free_heals_to_keyless(self):
+        """muse-spark-1.3-contributor-free (live on the Zen relay) heals to
+        the keyless runtime like 1.2 does — otherwise a zen-keyed selection
+        hits the relay's free-tier client gate (HTTP 400)."""
+        for slug in ("muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free"):
+            rt = opencode_zen_free_runtime("opencode-zen", slug)
+            assert rt is not None, slug
+            assert rt["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER, slug
+            assert rt["base_url"] == "https://opencode.ai/zen/v1", slug
+            assert rt["api_mode"] == "codex_responses", slug
+            assert rt["default_headers"]["Authorization"] == "", slug
+
     def test_go_provider_heals_to_zen(self):
         # Free slugs only exist on the Zen relay; a Go selection must be
         # routed to Zen (the Go relay rejects the model outright).
