@@ -20,6 +20,7 @@ describe('persisted transcript provenance', () => {
       scope: { connectionId: 'connection-a', profile: 'default' },
       storedSessionId: 'stored-a'
     })
+
     const proven = { ...state(), transcriptProvenance: expected }
     const wrongSession = { ...proven, transcriptProvenance: { ...expected, storedSessionId: 'stored-b' } }
 
@@ -37,6 +38,7 @@ describe('persisted transcript provenance', () => {
         storedSessionId: 'stored-a'
       })
     }
+
     const invalidated = invalidatePersistedDisplayTranscriptAuthority({ ...proven, storedSessionId: 'stored-b' })
 
     expect(invalidated.transcriptProvenance).toBeUndefined()

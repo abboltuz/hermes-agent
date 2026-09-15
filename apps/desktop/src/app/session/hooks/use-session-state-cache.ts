@@ -25,7 +25,10 @@ import { $sessionTiles, publishSessionState, releaseSessionTranscript } from '@/
 import type { ClientSessionState } from '../../types'
 import { SessionStateCache } from '../session-state-cache'
 
-import { invalidatePersistedDisplayTranscriptAuthority, suppressTranscriptForView } from './use-session-actions/transcript-provenance'
+import {
+  invalidatePersistedDisplayTranscriptAuthority,
+  suppressTranscriptForView
+} from './use-session-actions/transcript-provenance'
 import { chatMessageArraysEquivalent } from './use-session-actions/utils'
 
 interface SessionStateCacheOptions {
@@ -197,6 +200,7 @@ export function useSessionStateCache({
   const holdSessionTranscriptView = useCallback((runtimeId: string): (() => void) => {
     const token = Symbol(runtimeId)
     transcriptViewGateByRuntimeIdRef.current.set(runtimeId, token)
+
     return () => {
       if (transcriptViewGateByRuntimeIdRef.current.get(runtimeId) === token) {
         transcriptViewGateByRuntimeIdRef.current.delete(runtimeId)

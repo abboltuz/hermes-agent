@@ -94,8 +94,7 @@ function tailStateFromPage(
 
   return {
     nextOffset: pagination.offset + page.messages.length,
-    possiblyTruncated:
-      pagination.has_more ?? (assumeArchiveWhenUnknown || page.messages.length >= pagination.limit),
+    possiblyTruncated: pagination.has_more ?? (assumeArchiveWhenUnknown || page.messages.length >= pagination.limit),
     profile
   }
 }

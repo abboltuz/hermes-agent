@@ -233,24 +233,22 @@ export async function resolveDurableRowId(
     return undefined
   }
 
-  const durableUsers = messages.filter(
-    message => {
-      const authorizedActor =
-        (message.origin_kind === 'human_user' || message.origin_kind === 'external_actor') &&
-        (message.turn_kind === 'prompt' ||
-          message.turn_kind === 'task_instruction' ||
-          message.turn_kind === 'ui_action') &&
-        message.trust_kind === 'user_authorized'
+  const durableUsers = messages.filter(message => {
+    const authorizedActor =
+      (message.origin_kind === 'human_user' || message.origin_kind === 'external_actor') &&
+      (message.turn_kind === 'prompt' ||
+        message.turn_kind === 'task_instruction' ||
+        message.turn_kind === 'ui_action') &&
+      message.trust_kind === 'user_authorized'
 
-      return (
-        message.role === 'user' &&
-        authorizedActor &&
-        !message.display_kind &&
-        typeof message.row_id === 'number' &&
-        Number.isInteger(message.row_id)
-      )
-    }
-  )
+    return (
+      message.role === 'user' &&
+      authorizedActor &&
+      !message.display_kind &&
+      typeof message.row_id === 'number' &&
+      Number.isInteger(message.row_id)
+    )
+  })
 
   const matches = durableUsers.filter(message => (message.text ?? '').trim() === wanted)
 

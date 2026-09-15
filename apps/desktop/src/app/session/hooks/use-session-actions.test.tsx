@@ -842,7 +842,9 @@ function ResumeTimerHarness({
       // the projected runtime the foreground owner before delivering it so the
       // production session-scoped view gate is exercised, not a direct atom set.
       setActiveSessionId(runtimeId)
-      queueMicrotask(() => updateSessionState(runtimeId, previous => ({ ...previous, ...state }), state.storedSessionId))
+      queueMicrotask(() =>
+        updateSessionState(runtimeId, previous => ({ ...previous, ...state }), state.storedSessionId)
+      )
     })
   }, [actions.resumeSession, activeSessionIdRef, onReady, updateSessionState])
 
@@ -2053,6 +2055,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
       current: new Map([['stored-warm', 'runtime-warm']])
     }
+
     const warmState = clientState('stored-warm')
     warmState.messages = [
       {
@@ -2061,9 +2064,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
         parts: [{ type: 'text', text: 'unproven compressed runtime tail' }]
       }
     ]
+
     const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
       current: new Map([['runtime-warm', warmState]])
     }
+
     setSessions([storedSession({ id: 'stored-warm', message_count: 1 })])
     vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('REST unavailable'))
 
@@ -2071,9 +2076,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       if (method === 'session.activate') {
         return {
           info: {},
-          messages: [
-            { content: 'unproven compressed runtime tail', role: 'assistant', timestamp: 1 }
-          ],
+          messages: [{ content: 'unproven compressed runtime tail', role: 'assistant', timestamp: 1 }],
           messages_omitted: false,
           resumed: 'stored-warm',
           running: false,
@@ -2081,8 +2084,10 @@ describe('resumeSession warm-cache mapping integrity', () => {
           session_key: 'stored-warm'
         } as never
       }
+
       return {} as never
     })
+
     const viewSyncs: ClientSessionState[] = []
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
 
@@ -2117,6 +2122,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
           session_key: 'stored-warm'
         } as never
       }
+
       return {} as never
     })
 
@@ -2155,9 +2161,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     // authoritative persisted-display provenance for this session.
     await act(async () => {
       projectRuntime!('runtime-warm', {
-        messages: [
-          { id: 'late-tail', role: 'assistant', parts: [{ type: 'text', text: 'late compressed tail' }] }
-        ]
+        messages: [{ id: 'late-tail', role: 'assistant', parts: [{ type: 'text', text: 'late compressed tail' }] }]
       } as ClientSessionState)
       await Promise.resolve()
     })
@@ -2183,6 +2187,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
           session_key: 'stored-warm'
         } as never
       }
+
       return {} as never
     })
 
@@ -2193,7 +2198,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
       await resume!('stored-warm', true)
     })
 
-    expect($messages.get().some(message => message.parts.some(part => part.type === 'text' && part.text === 'persisted answer'))).toBe(true)
+    expect(
+      $messages
+        .get()
+        .some(message => message.parts.some(part => part.type === 'text' && part.text === 'persisted answer'))
+    ).toBe(true)
   })
   it('pins an untagged row to the active registry connection instead of the same-named local profile', async () => {
     setConnection({ connectionId: 'hermes01', mode: 'remote' } as never)
@@ -2505,6 +2514,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
       timestamp: index + 1
     }))
+
     setSessions([storedSession({ id: 'stored-A', message_count: persisted.length })])
     vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: persisted, session_id: 'stored-A' } as never)
 
@@ -2512,6 +2522,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       if (method === 'session.resume') {
         throw new Error('resume unavailable')
       }
+
       return {} as never
     })
 
@@ -2549,6 +2560,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
         }
       ]
     }
+
     expect(projectRuntime).not.toBeNull()
     await act(async () => {
       projectRuntime!('rt-A', runtimeProjection)

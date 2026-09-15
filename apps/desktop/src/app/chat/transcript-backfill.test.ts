@@ -259,10 +259,7 @@ describe('mergePersistedTailIntoRuntime', () => {
 
     expect(mergePersistedTailIntoRuntime(pending, persisted)).toEqual(pending)
 
-    const complete = [
-      pending[0],
-      { ...pending[1], pending: false, parts: [{ type: 'text' as const, text: 'Done.' }] }
-    ]
+    const complete = [pending[0], { ...pending[1], pending: false, parts: [{ type: 'text' as const, text: 'Done.' }] }]
 
     expect(mergePersistedTailIntoRuntime(complete, persisted)).toEqual(complete)
   })

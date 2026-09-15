@@ -60,7 +60,9 @@ vi.mock('@/store/thread-scroll', () => ({
 }))
 
 vi.mock('@/store/windows', () => ({ isSecondaryWindow: () => false }))
-vi.mock('../message-render-boundary', () => ({ MessageRenderBoundary: ({ children }: { children: unknown }) => children }))
+vi.mock('../message-render-boundary', () => ({
+  MessageRenderBoundary: ({ children }: { children: unknown }) => children
+}))
 vi.mock('./transcript-window', () => ({
   resolveShowEarlierAction: () => null,
   useTranscriptWindow: () => ({ olderAvailable: false, expandWindow: vi.fn() })
@@ -92,6 +94,7 @@ describe('ThreadMessageList integration contracts', () => {
   it('backfills the mounted transcript in two animation frames', () => {
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       harness.frames.push(callback)
+
       return harness.frames.length
     })
     vi.stubGlobal('cancelAnimationFrame', () => {})
@@ -116,14 +119,16 @@ describe('ThreadMessageList integration contracts', () => {
     const view = renderList()
     harness.paneVisible = false
 
-    act(() => view.rerender(
-      <ThreadMessageList
-        clampToComposer={false}
-        components={components}
-        sessionId="stored-session"
-        sessionKey="stored-session-2"
-      />
-    ))
+    act(() =>
+      view.rerender(
+        <ThreadMessageList
+          clampToComposer={false}
+          components={components}
+          sessionId="stored-session"
+          sessionKey="stored-session-2"
+        />
+      )
+    )
     view.unmount()
 
     expect(harness.resetPublishedScroll).not.toHaveBeenCalled()

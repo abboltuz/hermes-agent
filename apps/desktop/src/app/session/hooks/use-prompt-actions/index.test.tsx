@@ -1209,10 +1209,12 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       command: 'goal write the implementation plan',
       session_id: RUNTIME_SESSION_ID
     })
-    expect(calls[1]?.params).toEqual(withMessageId({
-      session_id: RUNTIME_SESSION_ID,
-      text: 'write the implementation plan'
-    }))
+    expect(calls[1]?.params).toEqual(
+      withMessageId({
+        session_id: RUNTIME_SESSION_ID,
+        text: 'write the implementation plan'
+      })
+    )
 
     const renderedText = states
       .flatMap(state => {
@@ -2333,10 +2335,13 @@ describe('usePromptActions redirectPrompt', () => {
     const accepted = await handle!.redirectPrompt('  nudge the run  ')
 
     expect(accepted).toBe(true)
-    expect(requestGateway).toHaveBeenCalledWith('session.redirect', withMessageId({
-      session_id: RUNTIME_SESSION_ID,
-      text: 'nudge the run'
-    }))
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.redirect',
+      withMessageId({
+        session_id: RUNTIME_SESSION_ID,
+        text: 'nudge the run'
+      })
+    )
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
     expect((capturedStates.at(-1)?.messages as unknown[]).at(-1)).toMatchObject({
       role: 'user',
@@ -2476,10 +2481,13 @@ describe('usePromptActions redirectPrompt', () => {
     )
 
     expect(await handle!.redirectPrompt('build-window nudge')).toBe(true)
-    expect(requestGateway).toHaveBeenCalledWith('session.redirect', withMessageId({
-      session_id: RUNTIME_SESSION_ID,
-      text: 'build-window nudge'
-    }))
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.redirect',
+      withMessageId({
+        session_id: RUNTIME_SESSION_ID,
+        text: 'build-window nudge'
+      })
+    )
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
     expect((capturedStates.at(-1)?.messages as unknown[]).at(-1)).toMatchObject({
       role: 'user',
@@ -2526,13 +2534,9 @@ describe('usePromptActions redirectPrompt', () => {
 
     expect(await handle!.redirectPrompt('reconnect nudge')).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['session.redirect', 'session.resume', 'session.redirect'])
-    expect(calls[0]?.params).toEqual(
-      withMessageId({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge' })
-    )
+    expect(calls[0]?.params).toEqual(withMessageId({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge' }))
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
-    expect(calls[2]?.params).toEqual(
-      withMessageId({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge' })
-    )
+    expect(calls[2]?.params).toEqual(withMessageId({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge' }))
     expect(handle!.activeSessionIdRef.current).toBe(RECOVERED_SESSION_ID)
   })
 })
@@ -2767,10 +2771,12 @@ describe('usePromptActions file attachment sync', () => {
       name: 'report.txt',
       data_url: 'data:text/plain;base64,aGVsbG8='
     })
-    expect(calls[1]?.params).toEqual(withMessageId({
-      session_id: RUNTIME_SESSION_ID,
-      text: '@file:.hermes/desktop-attachments/report.txt\n\nconvert this to epub'
-    }))
+    expect(calls[1]?.params).toEqual(
+      withMessageId({
+        session_id: RUNTIME_SESSION_ID,
+        text: '@file:.hermes/desktop-attachments/report.txt\n\nconvert this to epub'
+      })
+    )
   })
 
   it('uploads Windows file bytes when local mode fronts a POSIX WSL/Docker backend', async () => {
@@ -3326,9 +3332,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
-    expect(calls[2]?.params).toEqual(
-      withMessageId({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
-    )
+    expect(calls[2]?.params).toEqual(withMessageId({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' }))
   })
 
   it('resumes the stored session and retries once when reloadFromMessage (regenerate) reports "session not found"', async () => {
@@ -3543,21 +3547,25 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[0]?.params).toEqual(withMessageId({
-      queued: true,
-      session_id: 'rt-background-stale',
-      text: 'queued background message after wake'
-    }))
+    expect(calls[0]?.params).toEqual(
+      withMessageId({
+        queued: true,
+        session_id: 'rt-background-stale',
+        text: 'queued background message after wake'
+      })
+    )
     expect(calls[1]?.params).toEqual({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
       omit_messages: true
     })
-    expect(calls[2]?.params).toEqual(withMessageId({
-      queued: true,
-      session_id: RECOVERED_SESSION_ID,
-      text: 'queued background message after wake'
-    }))
+    expect(calls[2]?.params).toEqual(
+      withMessageId({
+        queued: true,
+        session_id: RECOVERED_SESSION_ID,
+        text: 'queued background message after wake'
+      })
+    )
     expect(handle!.activeSessionIdRef.current).toBe(RUNTIME_SESSION_ID)
   })
 
@@ -3741,10 +3749,12 @@ describe('usePromptActions sleep/wake session recovery', () => {
       source: 'desktop',
       omit_messages: true
     })
-    expect(calls[2]?.params).toEqual(withMessageId({
-      session_id: RECOVERED_SESSION_ID,
-      text: 'message during starved loop'
-    }))
+    expect(calls[2]?.params).toEqual(
+      withMessageId({
+        session_id: RECOVERED_SESSION_ID,
+        text: 'message during starved loop'
+      })
+    )
   })
 
   it('resumes the SELECTED stored session instead of minting a new one when activeSessionId is null (#55578 split)', async () => {
@@ -5431,10 +5441,13 @@ describe('usePromptActions stale-closure session routing', () => {
     // A redirect reaches the model mid-turn. Sent to the stale session, the
     // correction lands in a conversation the user is no longer looking at —
     // this is the observed "session suddenly working on another chat's task".
-    expect(requestGateway).toHaveBeenCalledWith('session.redirect', withMessageId({
-      session_id: RUNTIME_SESSION_B,
-      text: 'actually use Postgres'
-    }))
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.redirect',
+      withMessageId({
+        session_id: RUNTIME_SESSION_B,
+        text: 'actually use Postgres'
+      })
+    )
     expect(requestGateway).not.toHaveBeenCalledWith(
       'session.redirect',
       expect.objectContaining({ session_id: RUNTIME_SESSION_ID })

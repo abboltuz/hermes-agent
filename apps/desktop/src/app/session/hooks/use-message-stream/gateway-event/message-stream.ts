@@ -361,11 +361,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     // in-app alert so a failed turn cannot look like the agent simply stopped
     // when the bubble is outside the viewport. Billing and disk-full failures
     // already have dedicated alerts with better recovery guidance.
-    if (
-      failure &&
-      !payload?.billing &&
-      !isDiskFullErrorMessage(failure.error)
-    ) {
+    if (failure && !payload?.billing && !isDiskFullErrorMessage(failure.error)) {
       notify({
         id: `turn-error:${sessionId}`,
         kind: 'error',

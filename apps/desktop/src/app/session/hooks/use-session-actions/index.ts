@@ -116,7 +116,7 @@ import {
   createPersistedDisplayTranscriptProvenance,
   hasPersistedDisplayTranscriptProvenance,
   shouldPaintPersistedTranscript,
-  suppressTranscriptForView,
+  suppressTranscriptForView
 } from './transcript-provenance'
 import {
   appendLiveSessionProjection,
@@ -921,6 +921,7 @@ export function useSessionActions({
           // terminal events go to the detached socket while the stale snapshot
           // leaves Desktop showing only the pre-disconnect partial answer.
           const shouldRefreshPersistedTranscript = !isWatchWindow()
+
           const expectedProvenance = stored
             ? createPersistedDisplayTranscriptProvenance({
                 lineageRootId: stored._lineage_root_id ?? null,
@@ -928,9 +929,15 @@ export function useSessionActions({
                 storedSessionId
               })
             : null
-          const hasValidProvenance = Boolean(expectedProvenance && hasPersistedDisplayTranscriptProvenance(cachedViewState, expectedProvenance))
-          const suppressUnprovenWarmTranscript = !resumedSameSelectedSession && shouldRefreshPersistedTranscript && !hasValidProvenance
-          const releaseHeldTranscriptView = suppressUnprovenWarmTranscript ? holdSessionTranscriptView?.(cachedRuntimeId) : undefined
+
+          const hasValidProvenance = Boolean(
+            expectedProvenance && hasPersistedDisplayTranscriptProvenance(cachedViewState, expectedProvenance)
+          )
+          const suppressUnprovenWarmTranscript =
+            !resumedSameSelectedSession && shouldRefreshPersistedTranscript && !hasValidProvenance
+          const releaseHeldTranscriptView = suppressUnprovenWarmTranscript
+            ? holdSessionTranscriptView?.(cachedRuntimeId)
+            : undefined
 
           setFreshDraftReady(false)
           clearNotifications()
@@ -938,7 +945,10 @@ export function useSessionActions({
           selectedStoredSessionIdRef.current = storedSessionId
           setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
-          syncSessionStateToView(cachedRuntimeId, suppressTranscriptForView(cachedViewState, suppressUnprovenWarmTranscript))
+          syncSessionStateToView(
+            cachedRuntimeId,
+            suppressTranscriptForView(cachedViewState, suppressUnprovenWarmTranscript)
+          )
           setCurrentCwdTransient(cachedViewState.cwd)
           // The warm cache IS this conversation's own workspace truth, so the
           // switch is already re-homed here. This claim cannot wait for
@@ -1131,6 +1141,7 @@ export function useSessionActions({
                   (persisted.messages.length || !activatedMessages.length)
                 ) {
                   persistedDisplayEstablished = true
+
                   // The REST hydration is a newest-tail page; graft it onto any
                   // older pages the previous view already backfilled so
                   // re-activating a scrolled-back session keeps its history.
@@ -1210,9 +1221,11 @@ export function useSessionActions({
                 cachedRuntimeId,
                 suppressTranscriptForView(activatedState, suppressUnprovenWarmTranscript)
               )
+
               if (persistedDisplayEstablished) {
                 releaseHeldTranscriptView?.()
               }
+
               // Cache backend transcript truth only. The pending/running bit and
               // any synthetic clarify row are a live resume projection and must
               // not survive after the server-side request expires.
@@ -1237,6 +1250,7 @@ export function useSessionActions({
             if (isSessionGoneError(error)) {
               releaseHeldTranscriptView?.()
             }
+
             // The cached runtime id was minted by a prior backend instance. A
             // pooled profile backend that gets idle-reaped (pruneSecondaryGateways)
             // and respawned across a profile swap mints fresh ids, so this mapping
@@ -1396,14 +1410,17 @@ export function useSessionActions({
           const previousMessages = resumedSameSelectedSession
             ? preserveLocalPendingTurnMessages(viewMessagesForReconcile(), resumeStartMessages)
             : viewMessagesForReconcile()
+
           const graftedPrefetch = graftRefreshedTailOntoBackfill(
             toChatMessages(prefetchedResult.messages),
             previousMessages
           )
+
           prefetchedTranscriptMessages = graftedPrefetch
           localSnapshot = reconcileAuthoritativeChatMessages(graftedPrefetch, previousMessages)
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
+
           if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
             setMessages(localSnapshot)
           }
@@ -1572,6 +1589,7 @@ export function useSessionActions({
 
         const visibleMessagesForView =
           pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? messagesForView
+
         const transcriptProvenance =
           prefetchApplied && prefetchMatchesResumedSession && stored
             ? createPersistedDisplayTranscriptProvenance({

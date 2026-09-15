@@ -90,6 +90,7 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
 
       try {
         const snapshot = await rpc.listAccounts({ signal: controller.signal })
+
         return applySnapshot(snapshot, expectedProfile, expectedGeneration)
       } catch (reason) {
         if (
@@ -99,6 +100,7 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
         ) {
           setError(true)
         }
+
         return false
       }
     },
@@ -108,6 +110,7 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
   const cancelOAuth = useCallback(
     (flow = oauth.current, updateState = true) => {
       const pending = pendingOAuthStart.current
+
       if (pending) {
         pendingOAuthStart.current = null
         pending.controller.abort()
@@ -117,16 +120,19 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
         if (updateState && pending) {
           setConnecting(false)
         }
+
         return
       }
 
       if (oauth.current === flow) {
         oauth.current = null
       }
+
       clearInterval(flow.timer)
       flow.controller.abort()
       const scopedRpc = createAntigravityRpc(requestGateway, () => flow.profile)
       void scopedRpc.cancelOAuth(flow.sessionId).catch(() => undefined)
+
       if (updateState) {
         setConnecting(false)
       }
@@ -163,11 +169,13 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
 
       try {
         const snapshot = await operation(rpc, controller.signal)
+
         return applySnapshot(snapshot, expectedProfile, expectedGeneration)
       } catch (reason) {
         if (!isAbort(reason)) {
           notifyError(reason, copy.mutationFailed)
         }
+
         return false
       } finally {
         setBusy(current => (current === key ? null : current))
@@ -191,6 +199,7 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
 
     setPriorityErrors(current => {
       const { [account.id]: _, ...rest } = current
+
       return rest
     })
     void runMutation(`priority:${account.id}`, (client, signal) =>
@@ -246,6 +255,7 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
       controller: new AbortController(),
       profile: $activeGatewayProfile.get()
     }
+
     pendingOAuthStart.current = pending
     setConnecting(true)
 
@@ -255,25 +265,30 @@ function AntigravityAccountsForProfile({ embedded, onConfigSaved }: AntigravityA
       if (pendingOAuthStart.current !== pending || pending.profile !== $activeGatewayProfile.get()) {
         const scopedRpc = createAntigravityRpc(requestGateway, () => pending.profile)
         void scopedRpc.cancelOAuth(start.sessionId).catch(() => undefined)
+
         return
       }
 
       pendingOAuthStart.current = null
       // startOAuth validates the authorization URL before this presentation layer receives it.
       openExternalLink(start.authUrl)
+
       const flow: OAuthFlow = {
         controller: pending.controller,
         profile: pending.profile,
         sessionId: start.sessionId,
         timer: setInterval(() => void poll(flow), start.pollIntervalMs)
       }
+
       oauth.current = flow
     } catch (reason) {
       if (pendingOAuthStart.current === pending) {
         pendingOAuthStart.current = null
+
         if (!isAbort(reason)) {
           notifyError(reason, copy.connectFailed)
         }
+
         setConnecting(false)
       }
     }

@@ -64,14 +64,13 @@ const semanticMessageId = (value?: null | SessionSemanticEnvelope) => {
 
 const isLocalHuman = (value?: null | SessionSemanticEnvelope) =>
   value?.origin_kind === 'human_user' &&
-    (value.turn_kind === 'prompt' || value.turn_kind === 'task_instruction' || value.turn_kind === 'ui_action') &&
-    value.trust_kind === 'user_authorized'
+  (value.turn_kind === 'prompt' || value.turn_kind === 'task_instruction' || value.turn_kind === 'ui_action') &&
+  value.trust_kind === 'user_authorized'
 
 const liveSemanticMessage = (text: string, value?: null | SessionSemanticEnvelope): Msg => {
   const metadata = value?.display_metadata
 
-  const displayText =
-    metadata && typeof metadata.display_text === 'string' ? metadata.display_text.trim() : ''
+  const displayText = metadata && typeof metadata.display_text === 'string' ? metadata.display_text.trim() : ''
 
   const actor =
     !value?.origin_kind || value.origin_kind === 'legacy_unknown'

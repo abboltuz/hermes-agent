@@ -32,6 +32,7 @@ const account = (suffix: string, patch: Partial<AntigravityAccount> = {}): Antig
 })
 
 const snapshot = (accounts: AntigravityAccount[]) => ({ accounts })
+
 const oauthStart = {
   authUrl: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=desktop',
   expiresAt: 999_999,
@@ -54,6 +55,7 @@ const rpc: Record<keyof AntigravityRpc, ReturnType<typeof vi.fn>> = {
 function deferred<T>() {
   let reject!: (reason?: unknown) => void
   let resolve!: (value: T) => void
+
   const promise = new Promise<T>((innerResolve, innerReject) => {
     resolve = innerResolve
     reject = innerReject

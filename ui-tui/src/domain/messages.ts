@@ -40,8 +40,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       timestamp,
       trust_kind,
       turn_kind
-    } =
-      row as TranscriptRow
+    } = row as TranscriptRow
 
     const createdAt =
       typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 ? timestamp : undefined

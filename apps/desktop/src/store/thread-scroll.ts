@@ -52,6 +52,7 @@ export const onScrollToBottomRequest = (handler: () => void, sessionId: string |
 
   return () => {
     scoped.delete(handler)
+
     if (scoped.size === 0) {
       handlers.delete(sessionId)
     }

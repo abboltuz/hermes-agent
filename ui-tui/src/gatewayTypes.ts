@@ -190,7 +190,7 @@ export interface SessionResumeResponse {
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]
-  queued?: null | SessionSemanticEnvelope & { user?: string }
+  queued?: null | (SessionSemanticEnvelope & { user?: string })
   queued_prompts?: Array<SessionSemanticEnvelope & { user?: string }>
   resumed?: string
   running?: boolean
@@ -246,7 +246,7 @@ export interface SessionActivateResponse {
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]
-  queued?: null | SessionSemanticEnvelope & { user?: string }
+  queued?: null | (SessionSemanticEnvelope & { user?: string })
   queued_prompts?: Array<SessionSemanticEnvelope & { user?: string }>
   running?: boolean
   session_id: string

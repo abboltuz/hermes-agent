@@ -170,6 +170,7 @@ function parseAccount(value: unknown): AntigravityAccount {
   }
 
   const email = value.email
+
   if (email !== undefined && email !== null && !isSafeText(email, 320)) {
     throw invalidResponse()
   }

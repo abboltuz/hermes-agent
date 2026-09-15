@@ -600,10 +600,7 @@ export function preserveLocalPendingTurnMessages(
       return Boolean(left.semanticId) && left.semanticId === right.semanticId
     }
 
-    return (
-      textWithoutReferenceLines(chatMessageText(left)) ===
-      textWithoutReferenceLines(chatMessageText(right))
-    )
+    return textWithoutReferenceLines(chatMessageText(left)) === textWithoutReferenceLines(chatMessageText(right))
   }
 
   const preserved: ChatMessage[] = []
@@ -646,11 +643,7 @@ export function preserveLocalPendingTurnMessages(
       continue
     }
 
-    if (
-      isOptimisticUser &&
-      latestAuthoritativeUser &&
-      sameUserTurn(latestAuthoritativeUser, message)
-    ) {
+    if (isOptimisticUser && latestAuthoritativeUser && sameUserTurn(latestAuthoritativeUser, message)) {
       continue
     }
 
@@ -808,11 +801,7 @@ function transientDisplayText(text: string, value?: null | SessionSemanticEnvelo
   return isLocalHumanEnvelope(value) ? visible : `[${semanticActorLabel(value)}] ${visible}`
 }
 
-function transientUserMessage(
-  id: string,
-  text: string,
-  semantic?: null | SessionSemanticEnvelope
-): ChatMessage {
+function transientUserMessage(id: string, text: string, semantic?: null | SessionSemanticEnvelope): ChatMessage {
   const semanticId = semanticMessageId(semantic)
 
   return {
@@ -980,9 +969,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
       return
     }
 
-    projected.push(
-      transientUserMessage(`user-inflight-correction-${index}-${sessionId}`, correction, semantics)
-    )
+    projected.push(transientUserMessage(`user-inflight-correction-${index}-${sessionId}`, correction, semantics))
   }
 
   // Corrections typed while the turn ran are ordered by ARRIVAL: each lands
@@ -1129,10 +1116,7 @@ export function dedupeInflightUserAgainstTranscript(
   const persistedTail = persistedMessages.slice(suffixStart)
   const inflightSemanticId = semanticMessageId(projection.inflight)
 
-  if (
-    inflightSemanticId &&
-    persistedTail.some(message => message.semanticId === inflightSemanticId)
-  ) {
+  if (inflightSemanticId && persistedTail.some(message => message.semanticId === inflightSemanticId)) {
     return { ...projection, [safelyPersistedInflightUser]: true }
   }
 

@@ -4,6 +4,7 @@ import { ANTIGRAVITY_RPC_METHODS, type AntigravityGatewayRequest, createAntigrav
 
 const ACCOUNT_ID = 'acct_123e4567-e89b-12d3-a456-426614174000'
 const SESSION_ID = '123e4567-e89b-12d3-a456-426614174000'
+
 const AUTH_URL =
   'https://accounts.google.com/o/oauth2/v2/auth?client_id=desktop-client&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback&scope=openid&code_challenge=challenge&code_challenge_method=S256&state=state&access_type=offline&prompt=consent'
 
@@ -69,6 +70,7 @@ describe('createAntigravityRpc', () => {
     const request: AntigravityGatewayRequest = vi.fn(async () => ({
       accounts: { accounts: [{ ...snapshot.accounts[0], email: 'artem@example.test', refreshToken: 'private' }] }
     }))
+
     await expect(createAntigravityRpc(request, () => 'default').listAccounts()).resolves.toEqual({
       accounts: [{ ...snapshot.accounts[0], email: 'artem@example.test' }]
     })
@@ -154,9 +156,11 @@ describe('createAntigravityRpc', () => {
 
     const [, params] = oauthStartCall!
     expect(params).toBeDefined()
+
     if (!params) {
       throw new Error('OAuth start params were not recorded')
     }
+
     expect(params).toStrictEqual({ profile: 'alpha' })
     expect(Object.hasOwn(params, 'project_id')).toBe(false)
   })

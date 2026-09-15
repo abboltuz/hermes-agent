@@ -124,9 +124,7 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
 function isLocalUserActor(message: SessionMessage): boolean {
   return (
     message.origin_kind === 'human_user' &&
-    (message.turn_kind === 'prompt' ||
-      message.turn_kind === 'task_instruction' ||
-      message.turn_kind === 'ui_action') &&
+    (message.turn_kind === 'prompt' || message.turn_kind === 'task_instruction' || message.turn_kind === 'ui_action') &&
     message.trust_kind === 'user_authorized'
   )
 }
@@ -235,8 +233,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         ? 'system'
         : message.role
 
-    const displayRole =
-      timelineRole === 'user' && !isLocalUserActor(message) ? 'system' : timelineRole
+    const displayRole = timelineRole === 'user' && !isLocalUserActor(message) ? 'system' : timelineRole
 
     // Persisted user turns carry `@image:<path>` directive lines inline in
     // the text (see tui_gateway/server.py's persist-time rewrite). The

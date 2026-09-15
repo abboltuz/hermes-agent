@@ -1364,10 +1364,7 @@ describe('appendLiveSessionProjection', () => {
     )
 
     expect(restored.filter(message => message.role === 'user')).toHaveLength(2)
-    expect(restored.map(message => message.semanticId).filter(Boolean)).toEqual([
-      'desktop:human-1',
-      'desktop:human-2'
-    ])
+    expect(restored.map(message => message.semanticId).filter(Boolean)).toEqual(['desktop:human-1', 'desktop:human-2'])
   })
 
   // Corrections typed while a turn ran are their own user bubbles on the same

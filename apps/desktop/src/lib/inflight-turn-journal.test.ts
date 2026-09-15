@@ -745,11 +745,7 @@ describe('mergeInFlightMessages', () => {
 
     const result = mergeInFlightMessages(base, tail, { keepPending: true })
 
-    expect(result.messages.map(message => message.id)).toEqual([
-      'db-legacy',
-      'live-new',
-      'assistant-stream-new'
-    ])
+    expect(result.messages.map(message => message.id)).toEqual(['db-legacy', 'live-new', 'assistant-stream-new'])
   })
 
   it('does not attach a repeated-text journal tail to a different semantic turn', () => {
@@ -763,10 +759,7 @@ describe('mergeInFlightMessages', () => {
     const result = mergeInFlightMessages(base, tail, { keepPending: true })
 
     expect(result.applied).toBe(true)
-    expect(result.messages.map(message => message.semanticId).filter(Boolean)).toEqual([
-      'desktop:old',
-      'desktop:new'
-    ])
+    expect(result.messages.map(message => message.semanticId).filter(Boolean)).toEqual(['desktop:old', 'desktop:new'])
   })
 
   it('treats an error-bearing assistant row as recoverable content', () => {

@@ -24,8 +24,11 @@ const toTranscriptMessages = (rows: unknown) =>
   projectTranscriptMessages(
     Array.isArray(rows)
       ? rows.map(row =>
-          row && typeof row === 'object' && (row as { role?: string }).role === 'user' &&
-          !(row as { origin_kind?: string }).origin_kind && !(row as { display_kind?: string }).display_kind
+          row &&
+          typeof row === 'object' &&
+          (row as { role?: string }).role === 'user' &&
+          !(row as { origin_kind?: string }).origin_kind &&
+          !(row as { display_kind?: string }).display_kind
             ? { ...HUMAN_PROVENANCE, ...row }
             : row
         )

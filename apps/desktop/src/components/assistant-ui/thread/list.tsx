@@ -594,13 +594,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
   useEffect(() => publishThreadAtBottom(isAtBottom, { paneVisible }), [isAtBottom, paneVisible])
-  useEffect(() => createThreadScrollCleanup(paneVisibleRef, () => resetPublishedThreadScroll({ paneVisible: true })), [])
+  useEffect(
+    () => createThreadScrollCleanup(paneVisibleRef, () => resetPublishedThreadScroll({ paneVisible: true })),
+    []
+  )
 
   // Floating jump button (outside this subtree) → return to the bottom.
-  useEffect(
-    () => onScrollToBottomRequest(() => void scrollToBottom(), sessionId ?? null),
-    [scrollToBottom, sessionId]
-  )
+  useEffect(() => onScrollToBottomRequest(() => void scrollToBottom(), sessionId ?? null), [scrollToBottom, sessionId])
 
   // Waking from display: hidden (HUD mode hides the main window; OS hide does
   // the same to any window): rAF and ResizeObserver may have been frozen, so
@@ -644,6 +644,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => {
     const el = scrollRef.current
+
     if (el && shouldSnapOnRunStart(el.scrollHeight - el.scrollTop - el.clientHeight)) {
       scrollToBottom()
     }
@@ -673,9 +674,11 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     }
 
     const sessionSwitched = settleKeyRef.current !== sessionKey
+
     if (sessionSwitched) {
       settledNonEmptyRef.current = false
     }
+
     if (!shouldRePinOnTranscriptReload({ sessionSwitched, settledNonEmpty: settledNonEmptyRef.current })) {
       return
     }

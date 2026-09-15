@@ -52,14 +52,14 @@ const TREE_GROUP = '[data-tree-group]'
 
 export const visibleClarifyCard = (): HTMLElement | null => {
   const cards = queryAllVisible<HTMLElement>(BLOCKING_IN_SURFACE)
+
   if (cards.length < 2) {
     return cards[0] ?? null
   }
 
   for (const zone of [$hoveredTreeGroup.get(), $activeTreeGroup.get()]) {
-    const card = zone
-      ? cards.find(el => el.closest<HTMLElement>(TREE_GROUP)?.dataset.treeGroup === zone)
-      : undefined
+    const card = zone ? cards.find(el => el.closest<HTMLElement>(TREE_GROUP)?.dataset.treeGroup === zone) : undefined
+
     if (card) {
       return card
     }
