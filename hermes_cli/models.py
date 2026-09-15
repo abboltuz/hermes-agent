@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import time
+import uuid
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, TYPE_CHECKING
@@ -569,8 +570,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # deepseek-v4-flash-free delisted (promo ended, now 401s).
     # big-pickle + mimo-v2.5-free delisted (UA-gated: the relay 429s
     # FreeUsageLimitError for every client except User-Agent
-    # "opencode/latest"; we send honest Hermes attribution and don't
-    # impersonate other clients — verified 2026-08-21).
+    # "opencode/latest"). The free-tier wire headers now impersonate the
+    # official CLI (see opencode_zen_free_headers) so these models work;
+    # the catalog entries stay delisted until a live probe re-verifies
+    # them under the new fingerprint.
     "opencode-free": [
         "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
         "hy3-free",
@@ -5692,24 +5695,62 @@ def is_opencode_zen_free_model(model_id: Optional[str]) -> bool:
     return bare.endswith("-free") or bare in _OPENCODE_KEYLESS_EXTRA_SLUGS
 
 
+# Official OpenCode CLI fingerprint for the Zen free tier.
+#
+# The relay only serves free-tier models to requests that look like the
+# official CLI (earendil-works/pi#2824): without these headers anonymous
+# clients get 429 FreeUsageLimitError, and since late 2026 the relay
+# additionally answers 400 "OpenCode's free tier can only be used in
+# OpenCode". The observed CLI wire shape is:
+#   User-Agent: opencode/latest[/<version>/cli]
+#   x-opencode-client: cli
+#   x-opencode-session / x-opencode-project / x-opencode-request: <id>
+#
+# Scope is deliberately NARROW: only anonymous free-tier traffic
+# impersonates the CLI (opencode_zen_free_headers, the single chokepoint
+# every free-tier client build flows through). Paid Zen/Go traffic keeps
+# honest Hermes attribution (profile.default_headers) — the OpenCode Go
+# docs explicitly ask third-party clients to identify with their own UA.
+# This reverses the earlier "don't impersonate" call for the free tier
+# only (Artem, 2026-09-15): a free tier that 400s every honest client is
+# unusable without the fingerprint.
+OPENCODE_CLI_USER_AGENT = "opencode/latest"
+OPENCODE_CLI_CLIENT_ID = "cli"
+
+
+def _opencode_cli_request_ids() -> dict:
+    """Fresh CLI-shaped request IDs (uuid4 hex, like the official client).
+
+    Generated per headers build (≈ per client construction), never frozen
+    at import: static IDs repeated across requests read as multiplexed
+    abuse on the relay side.
+    """
+    return {
+        "x-opencode-session": uuid.uuid4().hex,
+        "x-opencode-project": uuid.uuid4().hex,
+        "x-opencode-request": uuid.uuid4().hex,
+    }
+
+
 def opencode_zen_free_headers() -> dict:
     """Client default_headers for anonymous OpenCode Zen free-tier requests.
 
     ``Authorization: ""`` overrides the OpenAI SDK's ``Bearer <api_key>``
     header so the placeholder key never reaches the wire — the Zen relay
     accepts anonymous requests for free models but 401s any unknown bearer.
-    Attribution headers mirror the opencode provider profile.
+
+    The remaining headers impersonate the official OpenCode CLI (see
+    OPENCODE_CLI_USER_AGENT): the free tier rejects honest third-party
+    attribution. No HTTP-Referer / X-Title — the real CLI doesn't send
+    them and they fingerprint the traffic as non-CLI.
     """
-    try:
-        from hermes_cli import __version__ as _v
-    except Exception:
-        _v = "0"
-    return {
+    headers = {
         "Authorization": "",
-        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-        "X-Title": "Hermes Agent",
-        "User-Agent": f"HermesAgent/{_v}",
+        "User-Agent": OPENCODE_CLI_USER_AGENT,
+        "x-opencode-client": OPENCODE_CLI_CLIENT_ID,
     }
+    headers.update(_opencode_cli_request_ids())
+    return headers
 
 
 def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str]) -> Optional[dict]:

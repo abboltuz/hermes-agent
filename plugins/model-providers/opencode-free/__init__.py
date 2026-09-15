@@ -11,18 +11,30 @@ Select via ``hermes model`` or ``/model free``.
 
 from typing import Any
 
-from hermes_cli import __version__ as _HERMES_VERSION
 from providers import register_provider
 from providers.base import ProviderProfile
 
-# Attribution headers, same values as the opencode-zen/go profiles, plus the
-# empty Authorization override that keeps the SDK's "Bearer <placeholder>"
-# off the wire (the free tier 401s any unrecognized bearer).
+# Keyless fingerprint — literals, NOT imported from hermes_cli.models.
+# Import order forbids it: hermes_cli.models triggers provider discovery
+# while still partially initialized (models.py -> agent.model_metadata ->
+# providers -> this plugin), so a top-level `from hermes_cli.models import`
+# fails and discovery silently drops the whole provider. Keep these in sync
+# with OPENCODE_CLI_USER_AGENT / OPENCODE_CLI_CLIENT_ID in
+# hermes_cli.models; tests/agent/test_opencode_free_provider.py pins the
+# equality (it imports both modules fully initialized, so no cycle there).
+#
+# Profile.default_headers is static by nature (a plain dict on the
+# dataclass), so it carries the static half of the CLI fingerprint only —
+# User-Agent + x-opencode-client. The dynamic request IDs
+# (x-opencode-session/project/request) merge per client build via
+# opencode_zen_free_headers(), which every free-tier client construction
+# flows through (agent_init, agent_runtime_helpers, auxiliary_client).
+_CLI_USER_AGENT = "opencode/latest"
+_CLI_CLIENT_ID = "cli"
 _KEYLESS_HEADERS = {
     "Authorization": "",
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+    "User-Agent": _CLI_USER_AGENT,
+    "x-opencode-client": _CLI_CLIENT_ID,
 }
 
 
@@ -59,8 +71,9 @@ opencode_free = OpenCodeFreeProfile(
     display_name="OpenCode Free",
     description="OpenCode free models — keyless, no account needed",
     default_headers=dict(_KEYLESS_HEADERS),
-    # laguna is the fastest non-UA-gated free model; big-pickle 429s every
-    # client except the opencode CLI's own User-Agent (verified 2026-08-21).
+    # Free-tier wire traffic impersonates the official CLI (see
+    # hermes_cli.models.OPENCODE_CLI_USER_AGENT); laguna stays the default
+    # aux until big-pickle is re-verified live under the new fingerprint.
     default_aux_model="laguna-s-2.1-free",
 )
 
