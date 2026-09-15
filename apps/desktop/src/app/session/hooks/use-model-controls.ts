@@ -6,7 +6,7 @@ import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
-import { notifyError } from '@/store/notifications'
+import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
@@ -25,9 +25,10 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 interface ModelControlsOptions {
   queryClient: QueryClient
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  confirmGuardedSwitch?: (message: string) => Promise<boolean>
 }
 
-export function useModelControls({ queryClient, requestGateway }: ModelControlsOptions) {
+export function useModelControls({ queryClient, requestGateway, confirmGuardedSwitch }: ModelControlsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
   const profileRefreshEpochRef = useRef(0)
@@ -164,6 +165,43 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
     [queryClient]
   )
 
+  // Backend answers guarded picks with confirm_required and writes nothing.
+  // Surface the confirm and resend once with the ack — otherwise the refresh
+  // repaints the previous model (silent revert).
+  const confirmGuard = useCallback(
+    (message: string): Promise<boolean> => {
+      if (confirmGuardedSwitch) {
+        return confirmGuardedSwitch(message)
+      }
+
+      return new Promise(resolve => {
+        let settled = false
+
+        const settle = (value: boolean, id: string) => {
+          if (settled) {
+            return
+          }
+
+          settled = true
+          dismissNotification(id)
+          resolve(value)
+        }
+
+        const id = notify({
+          kind: 'warning',
+          title: 'Expensive Model Warning',
+          message,
+          action: {
+            label: 'Confirm',
+            onClick: () => settle(true, id)
+          },
+          onDismiss: () => settle(false, id)
+        })
+      })
+    },
+    [confirmGuardedSwitch]
+  )
+
   // Returns whether the switch succeeded so callers can await it before applying
   // follow-up changes. The composer model is plain UI state: with no live
   // session it's just stored (and shipped on the next session.create); with one
@@ -235,11 +273,65 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
         const scope = persistsAsDefault ? '--global' : '--session'
 
-        const result = await requestGateway<{ deferred?: boolean }>('config.set', {
-          session_id: liveSessionId,
-          key: 'model',
-          value: `${selection.model} --provider ${selection.provider} ${scope}`
-        })
+        const rollback = () => {
+          if (touchesPrimary) {
+            setCurrentModel(prevModel)
+            setCurrentProvider(prevProvider)
+            setCurrentModelSource(prevSource)
+          } else if (liveSessionId) {
+            sessionTileDelegate()?.updateSession(liveSessionId, state => ({
+              ...state,
+              model: prevModel,
+              provider: prevProvider
+            }))
+          }
+
+          updateModelOptionsCache(
+            liveSessionId,
+            prevProvider,
+            prevModel,
+            touchesPrimary && !liveSessionId,
+            liveGatewayProfile
+          )
+        }
+
+        const sendSwitch = (ack: boolean) =>
+          requestGateway<{ deferred?: boolean; confirm_required?: boolean; confirm_message?: string }>('config.set', {
+            session_id: liveSessionId,
+            key: 'model',
+            value: `${selection.model} --provider ${selection.provider} ${scope}`,
+            ...(ack ? { confirm_expensive_model: true } : {})
+          })
+
+        const result = await sendSwitch(false)
+
+        if (result?.confirm_required === true) {
+          const message = result.confirm_message?.trim() || 'This model has unusually high known pricing.'
+
+          const accepted = await confirmGuard(message)
+
+          if (!accepted) {
+            rollback()
+            notifyError(new Error('Model switch cancelled.'), copy.modelSwitchFailed)
+
+            return false
+          }
+
+          const confirmed = await sendSwitch(true)
+
+          if (confirmed?.confirm_required === true) {
+            rollback()
+            notifyError(new Error(confirmed.confirm_message?.trim() || 'Model switch failed.'), copy.modelSwitchFailed)
+
+            return false
+          }
+
+          if (!confirmed?.deferred) {
+            void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+          }
+
+          return true
+        }
 
         // A pick made DURING a turn is queued by the gateway and applied at the
         // next turn start (`deferred`). Re-fetching now would answer with the
@@ -285,7 +377,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         return false
       }
     },
-    [copy.modelSwitchFailed, queryClient, requestGateway, updateModelOptionsCache]
+    [copy.modelSwitchFailed, confirmGuard, queryClient, requestGateway, updateModelOptionsCache]
   )
 
   return { applySavedMainModel, refreshCurrentModel, selectModel }

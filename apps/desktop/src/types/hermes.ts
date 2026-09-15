@@ -695,33 +695,37 @@ export interface SessionResumeResponse {
     interrupted_at: number
   }
   hydrating?: boolean
-  inflight?: null | SessionSemanticEnvelope & {
-    assistant?: string
-    /** Mid-turn redirect corrections, oldest first. The turn's original prompt
-     *  stays in `user`; these are the follow-ups typed while it ran. */
-    corrections?: string[]
-    /** Semantic envelopes parallel to corrections. */
-    correction_provenance?: SessionSemanticEnvelope[]
-    /** Parallel to `corrections`: the length of `assistant` already streamed
-     *  when each correction was accepted. Lets a resume rebuild arrival order —
-     *  the correction bubble lands after the output the user had already seen
-     *  and before the output it redirected (#73793). Omitted by older
-     *  gateways. */
-    correction_offsets?: number[]
-    /** Retained failed turn: the error the terminal frame carried (the frame
-     *  itself may have been lost to a disconnect). */
-    error?: string
-    /** Structured {layer, code, retryable} descriptor for the retained failed
-     *  turn (see agent/error_surface.py). Omitted by older gateways. */
-    error_surface?: unknown
-    recoverable?: boolean
-    status?: string
-    streaming?: boolean
-    user?: string
-  }
-  queued?: null | SessionSemanticEnvelope & {
-    user?: string
-  }
+  inflight?:
+    | null
+    | (SessionSemanticEnvelope & {
+        assistant?: string
+        /** Mid-turn redirect corrections, oldest first. The turn's original prompt
+         *  stays in `user`; these are the follow-ups typed while it ran. */
+        corrections?: string[]
+        /** Semantic envelopes parallel to corrections. */
+        correction_provenance?: SessionSemanticEnvelope[]
+        /** Parallel to `corrections`: the length of `assistant` already streamed
+         *  when each correction was accepted. Lets a resume rebuild arrival order —
+         *  the correction bubble lands after the output the user had already seen
+         *  and before the output it redirected (#73793). Omitted by older
+         *  gateways. */
+        correction_offsets?: number[]
+        /** Retained failed turn: the error the terminal frame carried (the frame
+         *  itself may have been lost to a disconnect). */
+        error?: string
+        /** Structured {layer, code, retryable} descriptor for the retained failed
+         *  turn (see agent/error_surface.py). Omitted by older gateways. */
+        error_surface?: unknown
+        recoverable?: boolean
+        status?: string
+        streaming?: boolean
+        user?: string
+      })
+  queued?:
+    | null
+    | (SessionSemanticEnvelope & {
+        user?: string
+      })
   /** Complete accepted FIFO. New gateways also expose the head in `queued`
    *  for backward compatibility. */
   queued_prompts?: Array<SessionSemanticEnvelope & { user?: string }>
@@ -1405,6 +1409,9 @@ export interface ModelAssignmentRequest {
   /** OpenAI-compatible endpoint URL. Only honored for custom/local providers
    *  on the main slot — wires a self-hosted endpoint into runtime resolution. */
   base_url?: string
+  /** Ack for the expensive / data-training selection guard. When the backend
+   *  answers confirm_required, the client resends once with this set. */
+  confirm_expensive_model?: boolean
   model: string
   provider: string
   scope: 'main' | 'auxiliary'

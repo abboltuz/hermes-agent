@@ -56,14 +56,17 @@ type Controls = ReturnType<typeof useModelControls>
 
 function Harness({
   onReady,
-  requestGateway
+  requestGateway,
+  confirmGuardedSwitch
 }: {
   onReady: (controls: Controls) => void
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  confirmGuardedSwitch?: (message: string) => Promise<boolean>
 }) {
   const controls = useModelControls({
     queryClient: new QueryClient(),
-    requestGateway
+    requestGateway,
+    confirmGuardedSwitch
   })
 
   onReady(controls)
@@ -385,6 +388,93 @@ describe('useModelControls', () => {
     expect(getCurrentModelSource()).toBe('manual')
     expect(requestGateway).not.toHaveBeenCalled()
     expect(setGlobalModel).not.toHaveBeenCalled()
+  })
+
+  it('surfaces the guard confirm and resends once with the ack on accept', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+
+    const requestGateway = vi
+      .fn(
+        async () =>
+          ({
+            key: 'model',
+            value: 'muse-spark-1.3-contributor',
+            confirm_required: true,
+            confirm_message: 'Confirm this expensive model.'
+          }) as never
+      )
+      .mockResolvedValueOnce({
+        key: 'model',
+        value: 'muse-spark-1.3-contributor',
+        confirm_required: true,
+        confirm_message: 'Confirm this expensive model.'
+      } as never)
+      .mockResolvedValueOnce({ key: 'model', value: 'muse-spark-1.3-contributor' } as never)
+
+    const seen: string[] = []
+    let controls!: Controls
+
+    render(
+      <Harness
+        confirmGuardedSwitch={async message => {
+          seen.push(message)
+
+          return true
+        }}
+        onReady={value => (controls = value)}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(controls.selectModel({ model: 'muse-spark-1.3-contributor', provider: 'commandcode' })).resolves.toBe(
+      true
+    )
+
+    expect(seen).toEqual(['Confirm this expensive model.'])
+    expect(requestGateway).toHaveBeenCalledTimes(2)
+    expect(requestGateway).toHaveBeenLastCalledWith(
+      'config.set',
+      expect.objectContaining({ confirm_expensive_model: true })
+    )
+    expect($currentModel.get()).toBe('muse-spark-1.3-contributor')
+    expect($currentProvider.get()).toBe('commandcode')
+  })
+
+  it('rolls back visibly when the guard confirm is declined', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+
+    const requestGateway = vi.fn(
+      async () =>
+        ({
+          key: 'model',
+          value: 'muse-spark-1.3-contributor',
+          confirm_required: true,
+          confirm_message: 'Confirm this expensive model.'
+        }) as never
+    )
+
+    let controls!: Controls
+
+    render(
+      <Harness
+        confirmGuardedSwitch={async () => false}
+        onReady={value => (controls = value)}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(controls.selectModel({ model: 'muse-spark-1.3-contributor', provider: 'commandcode' })).resolves.toBe(
+      false
+    )
+
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect($currentModel.get()).toBe('fable-5')
+    expect($currentProvider.get()).toBe('nous')
+    expect(notifyError).toHaveBeenCalled()
   })
 
   it('updates only the active profile new-chat cache', async () => {
