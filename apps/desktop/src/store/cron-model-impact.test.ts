@@ -300,4 +300,27 @@ describe('setMainModelAssignment', () => {
       confirm_expensive_model: true
     })
   })
+
+  it('does not let auxiliary writes invalidate a pending main impact', async () => {
+    const main = deferred<ModelAssignmentResponse>()
+    setModelAssignment.mockReturnValueOnce(main.promise)
+    const mainCall = setMainModelAssignment({ provider: 'nous', model: 'main-model' })
+
+    setModelAssignment.mockResolvedValueOnce({
+      ok: true,
+      scope: 'auxiliary',
+      provider: 'commandcode',
+      model: 'aux-model'
+    } satisfies ModelAssignmentResponse)
+    await applyModelAssignment(
+      { provider: 'commandcode', model: 'aux-model', scope: 'auxiliary', task: 'vision' },
+      null
+    )
+
+    main.resolve(response(positive('Main job')))
+    await mainCall
+
+    const notification = $notifications.get().find(item => item.id === CRON_MODEL_IMPACT_NOTIFICATION_ID)
+    expect(notification?.detail).toContain('Main job')
+  })
 })

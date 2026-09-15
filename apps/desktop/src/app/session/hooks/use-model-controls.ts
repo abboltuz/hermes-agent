@@ -3,7 +3,7 @@ import { useCallback, useRef } from 'react'
 
 import type { ModelSelection } from '@/app/shell/model-menu-panel'
 import { getGlobalModelInfo } from '@/hermes'
-import { useI18n } from '@/i18n'
+import { translateNow, useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
@@ -192,7 +192,7 @@ export function useModelControls({ queryClient, requestGateway, confirmGuardedSw
           title: 'Expensive Model Warning',
           message,
           action: {
-            label: 'Confirm',
+            label: translateNow('common.confirm'),
             onClick: () => settle(true, id)
           },
           onDismiss: () => settle(false, id)
