@@ -217,7 +217,11 @@ export async function applyModelAssignment(
   scopeProfile?: null | string,
   opts?: { confirm?: ModelAssignmentConfirm }
 ): Promise<ModelAssignmentResponse> {
-  const { connection, generation } = beginCronModelImpactAssignment()
+  // Cron-impact generation tracking belongs to the main slot only. Aux writes
+  // must not bump the generation — otherwise a concurrent in-flight main
+  // response would read as stale and its scheduled-jobs warning would drop.
+  const trackCron = request.scope === 'main'
+  const { connection, generation } = trackCron ? beginCronModelImpactAssignment() : getCronModelImpactScope()
   const profile = profileIdentity()
   const confirm = opts?.confirm ?? defaultGuardConfirm
 
