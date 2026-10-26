@@ -35,6 +35,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -47,10 +48,25 @@ _ALIASES: dict[str, str] = {}
 _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _discovered = False
 
-# Repo-root ``plugins/model-providers/`` — populated at discovery time.
-_BUNDLED_PLUGINS_DIR = (
+# Repo-root fallback for development checkouts. Packaged runtimes expose the
+# separately shipped plugin tree through ``HERMES_BUNDLED_PLUGINS`` instead.
+_REPO_BUNDLED_PROVIDERS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
 )
+
+
+def _bundled_provider_plugins_dir() -> Path:
+    """Locate the bundled ``plugins/model-providers`` directory.
+
+    Nix and other sealed layouts keep plugin source outside ``site-packages``
+    and point the runtime at its root with ``HERMES_BUNDLED_PLUGINS``. Honour
+    the same contract as the general plugin loader; use the repository path
+    only when no packaged-layout override is present.
+    """
+    bundled_root = os.getenv("HERMES_BUNDLED_PLUGINS")
+    if bundled_root:
+        return Path(bundled_root) / "model-providers"
+    return _REPO_BUNDLED_PROVIDERS_DIR
 
 
 def register_provider(profile: ProviderProfile) -> None:
@@ -203,7 +219,7 @@ def _discover_entry_point_providers() -> None:
         if hasattr(eps, "select"):
             group_eps = list(eps.select(group=group))
         else:  # pragma: no cover — legacy interpreters
-            group_eps = list(eps.get(group, []))  # type: ignore[attr-defined]
+            group_eps = list(eps.get(group, []))
     except Exception as exc:
         logger.debug("entry-point provider scan skipped: %s", exc)
         return
@@ -259,11 +275,15 @@ def _requires_arguments(fn) -> bool:
     except (TypeError, ValueError):  # pragma: no cover — builtins/C callables
         return False
     for param in sig.parameters.values():
-        if param.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        ) and param.default is inspect.Parameter.empty:
+        if (
+            param.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            and param.default is inspect.Parameter.empty
+        ):
             return True
     return False
 
@@ -272,7 +292,9 @@ def _discover_providers() -> None:
     """Populate the registry by importing every provider plugin.
 
     Order:
-      1. Bundled plugins at ``<repo>/plugins/model-providers/<name>/``
+      1. Bundled plugins at
+         ``$HERMES_BUNDLED_PLUGINS/model-providers/<name>/`` when configured,
+         otherwise ``<repo>/plugins/model-providers/<name>/``
       2. User plugins at ``$HERMES_HOME/plugins/model-providers/<name>/``
       3. Legacy per-file modules at ``providers/<name>.py`` (back-compat)
 
@@ -301,8 +323,9 @@ def _discover_providers() -> None:
     _discover_entry_point_providers()
 
     # 1. Bundled plugins — shipped with hermes-agent.
-    if _BUNDLED_PLUGINS_DIR.is_dir():
-        for child in sorted(_BUNDLED_PLUGINS_DIR.iterdir()):
+    bundled_dir = _bundled_provider_plugins_dir()
+    if bundled_dir.is_dir():
+        for child in sorted(bundled_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
             _import_plugin_dir(child, "bundled")
